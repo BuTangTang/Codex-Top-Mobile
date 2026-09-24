@@ -139,11 +139,81 @@ describe('desktop control lifecycle', () => {
         expect(hook.getCurrent().busy).toBe(false);
     });
 
+    /** 首次发送的旧已完成尾轮不能消除等待；新轮次快照到达才收起已过时的受理提示。 */
+    it('clears an accepted start only after observing a new turn', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const oldTerminal = { ...snapshot, state: 'completed', textSendMode: 'start', requests: [] };
+        mocks.read.mockResolvedValue({ ok: true, snapshot: oldTerminal });
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        await act(async () => { await hook.getCurrent().sendText('start text', async () => 'accepted'); });
+        expect(hook.getCurrent().outcome).toBe('accepted');
+        expect(hook.getCurrent().outcomeKind).toBe('start');
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBe('accepted');
+        mocks.read.mockRejectedValueOnce(new Error('offline'));
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBe('accepted');
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...oldTerminal, turnId: 'new-completed-turn' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBeNull();
+    });
+
+    /** 新轮次观察先于受理返回时，迟到 ACK 不能重新显示已经过时的等待提示。 */
+    it('does not restore an accepted start hint after its new turn was already observed', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        const reply = createDeferred<'accepted'>();
+        let sending!: ReturnType<ReturnType<typeof useDirectSessionControl>['sendText']>;
+        await act(async () => { sending = hook.getCurrent().sendText('start text', () => reply.promise); });
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, turnId: 'new-turn', state: 'completed', textSendMode: 'start' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        await act(async () => { reply.resolve('accepted'); expect((await sending).outcome).toBe('accepted'); });
+        expect(hook.getCurrent().outcome).toBeNull();
+    });
+
+    /** 追加只接受自己 expectedTurnId 的终态；旧轮次或重复 running 都不是完成证据。 */
+    it('clears an accepted steer hint only on its exact turn terminal result', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        mocks.action.mockResolvedValue({ ok: true, result: { status: 'accepted', turnId: 'turn' } });
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        await act(async () => { await hook.getCurrent().steer('append text'); });
+        expect(hook.getCurrent().outcome).toBe('accepted');
+        expect(hook.getCurrent().outcomeKind).toBe('steer');
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, turnId: 'old-turn', state: 'completed' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBe('accepted');
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBeNull();
+    });
+
+    /** 观察刷新只清理已确认受理的过时提示，未知投递和同轮次重投锁必须继续保留。 */
+    it('keeps an unknown steer outcome and duplicate lock after terminal refresh', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        mocks.action.mockResolvedValue({ ok: true, result: { status: 'unknown', reason: 'delivery_outcome_unknown' } });
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        await act(async () => { await hook.getCurrent().steer('append text'); });
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBe('unknown');
+        mocks.read.mockResolvedValue({ ok: true, snapshot });
+        await act(async () => { await hook.getCurrent().steer('append text'); });
+        expect(mocks.action).toHaveBeenCalledTimes(1);
+        expect(hook.getCurrent().outcome).toBe('unknown');
+    });
+
     it('keeps unknown approval outcomes and forbids repeating the same revision', async () => {
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         mocks.action.mockResolvedValue({ ok: true, result: { status: 'unknown', reason: 'approval_outcome_unknown' } });
         await act(async () => { await hook.getCurrent().decide(request, 'allow_once'); });
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', requests: [] } });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().outcome).toBe('unknown');
+        expect(hook.getCurrent().outcomeKind).toBe('approval');
+        mocks.read.mockResolvedValue({ ok: true, snapshot });
+        await act(async () => { await hook.getCurrent().refresh(); });
         await act(async () => { await hook.getCurrent().decide(request, 'deny'); });
         expect(mocks.action).toHaveBeenCalledTimes(1);
         expect(mocks.action).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'linked', operationId: 'operation-once', expectedTurnId: 'turn', revision: 'rev' }), { serverId: 'server', onIssued: expect.any(Function) });

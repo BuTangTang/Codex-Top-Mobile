@@ -19,7 +19,7 @@ describe('desktop approval panel', () => {
         const { DesktopApprovalPanel } = await import('./DesktopApprovalPanel');
         const request = { requestId: 'r', revision: 'v', kind: 'unsupported' as const, canDecide: false, reason,
             files: [{ path: '/synthetic/a', kind: 'add' }, { path: '/synthetic/b', kind: 'delete' }, { path: '/synthetic/c', kind: 'update' }, { path: '/synthetic/d', kind: 'future_file_kind' }] };
-        const control = { snapshot: { v: 1 as const, turnId: 'turn', state: 'running' as const, requests: [request] }, error: null, busy: false, loading: false, outcome: null, refresh: vi.fn(), decide: vi.fn(), steer: vi.fn(), sendText: vi.fn(), isRequestLocked: () => false };
+        const control = { snapshot: { v: 1 as const, turnId: 'turn', state: 'running' as const, requests: [request] }, error: null, busy: false, loading: false, outcome: null, outcomeKind: null, refresh: vi.fn(), decide: vi.fn(), steer: vi.fn(), sendText: vi.fn(), isRequestLocked: () => false };
         const screen = await renderScreen(<DesktopApprovalPanel control={control} canWrite />);
         const text = JSON.stringify(screen.tree.toJSON());
         expect(text).toContain(expected);
@@ -32,11 +32,24 @@ describe('desktop approval panel', () => {
         expect(screen.findByTestId('desktop-approval-allow-r')?.props.disabled).toBe(true);
     });
 
+    /** 开始、追加和审批必须显示各自语义，清理 outcome 后不留下空刷新面板。 */
+    it.each([
+        ['start', '消息已接收'], ['steer', '补充已接收'], ['approval', '审批请求已接收'],
+    ] as const)('labels an accepted %s operation and removes its settled panel', async (outcomeKind, expected) => {
+        const { DesktopApprovalPanel } = await import('./DesktopApprovalPanel');
+        const control = { snapshot: null, error: null, busy: false, loading: false,
+            outcome: 'accepted' as const, outcomeKind, refresh: vi.fn(), decide: vi.fn(), steer: vi.fn(), sendText: vi.fn(), isRequestLocked: () => false };
+        const screen = await renderScreen(<DesktopApprovalPanel control={control} canWrite />);
+        expect(screen.findByTestId('desktop-control-outcome')?.props.children).toContain(expected);
+        await act(async () => { screen.tree.update(<DesktopApprovalPanel control={{ ...control, outcome: null, outcomeKind: null }} canWrite />); });
+        expect(screen.findByTestId('desktop-approval-panel')).toBeNull();
+    });
+
     it('shows actual details and submits only an explicit one-time decision', async () => {
         const { DesktopApprovalPanel } = await import('./DesktopApprovalPanel');
         const request = { requestId: 'r', revision: 'v', kind: 'command' as const, canDecide: true, command: 'echo sample', cwd: '/synthetic' };
         const decide = vi.fn();
-        const control = { snapshot: { v: 1 as const, turnId: 'turn', state: 'running' as const, requests: [request] }, error: null, busy: false, loading: false, outcome: null, refresh: vi.fn(), decide, steer: vi.fn(), sendText: vi.fn(), isRequestLocked: () => false };
+        const control = { snapshot: { v: 1 as const, turnId: 'turn', state: 'running' as const, requests: [request] }, error: null, busy: false, loading: false, outcome: null, outcomeKind: null, refresh: vi.fn(), decide, steer: vi.fn(), sendText: vi.fn(), isRequestLocked: () => false };
         const screen = await renderScreen(<DesktopApprovalPanel control={control} canWrite />);
         expect(screen.findByTestId('desktop-approval-command-r')?.props.children).toBe('echo sample');
         screen.pressByTestId('desktop-approval-allow-r');

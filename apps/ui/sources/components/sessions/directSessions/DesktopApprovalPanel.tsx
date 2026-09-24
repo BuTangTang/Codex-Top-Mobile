@@ -46,6 +46,27 @@ function formatApprovalReason(reason: string): string {
     }
 }
 
+/** 提示只描述本次操作的受理结果，开始、补充与审批不共用误导性的补充文案。 */
+function formatControlOutcome(control: Pick<ReturnType<typeof useDirectSessionControl>, 'outcome' | 'outcomeKind'>): string {
+    if (control.outcome === 'accepted') {
+        switch (control.outcomeKind) {
+            case 'start': return '消息已接收，等待桌面开始处理。';
+            case 'steer': return '补充已接收，等待原会话后续输出。';
+            case 'approval': return '审批请求已接收，等待桌面确认。';
+            default: return '操作已接收，等待桌面后续状态。';
+        }
+    }
+    if (control.outcome === 'unknown') {
+        switch (control.outcomeKind) {
+            case 'start': return '消息投递结果待确认，请核对桌面最新状态，勿重复提交。';
+            case 'steer': return '补充投递结果待确认，请核对桌面最新状态，勿重复提交。';
+            case 'approval': return '审批结果待确认，请核对桌面最新状态，勿重复提交。';
+            default: return '操作结果待确认，请核对桌面最新状态，勿重复提交。';
+        }
+    }
+    return '桌面未接受这次操作，请核对最新状态。';
+}
+
 /** 展示原桌面请求的完整范围；只有明确可决定且未发出的版本允许一次性操作。 */
 export function DesktopApprovalPanel(props: Readonly<{
     control: ReturnType<typeof useDirectSessionControl>;
@@ -61,7 +82,7 @@ export function DesktopApprovalPanel(props: Readonly<{
         {control.loading ? <Text style={styles.hint}>正在核对桌面状态…</Text> : null}
         {control.error ? <Text style={styles.hint}>暂无法读取桌面待处理详情，请刷新或在电脑上查看。</Text> : null}
         {control.outcome ? <Text testID="desktop-control-outcome" style={styles.hint} accessibilityLiveRegion="polite">
-            {control.outcome === 'accepted' ? '补充已接收，等待原会话后续输出。' : control.outcome === 'unknown' ? '操作结果待确认，请核对桌面最新状态，勿重复提交。' : '桌面未接受这次操作，请核对最新状态。'}
+            {formatControlOutcome(control)}
         </Text> : null}
         {requests.map(/** 保留请求与版本身份，只有原控制器确认可决定时开放按钮。 */ (request) => {
             const disabled = !props.canWrite || control.busy || control.loading || !request.canDecide || control.snapshot?.state !== 'running' || control.isRequestLocked(request);

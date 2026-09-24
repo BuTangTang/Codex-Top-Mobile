@@ -5,6 +5,7 @@ import { useActiveServerAccountScope } from '@/sync/store/hooks';
 import { randomUUID } from '@/platform/randomUUID';
 
 type ControlOutcome = 'accepted' | 'unknown' | 'rejected';
+type ControlOutcomeContext = Readonly<{ kind: 'start' | 'steer' | 'approval'; turnId: string }>;
 type TextSendResult = Readonly<{ outcome: ControlOutcome; mode?: 'start' | 'steer' }>;
 type StartTextSend = (isCurrent: () => boolean) => Promise<ControlOutcome>;
 type ControlViewState = {
@@ -13,8 +14,9 @@ type ControlViewState = {
     busy: boolean;
     loading: boolean;
     outcome: ControlOutcome | null;
+    outcomeContext: ControlOutcomeContext | null;
 };
-const EMPTY_CONTROL_VIEW: ControlViewState = { snapshot: null, error: null, busy: false, loading: false, outcome: null };
+const EMPTY_CONTROL_VIEW: ControlViewState = { snapshot: null, error: null, busy: false, loading: false, outcome: null, outcomeContext: null };
 
 /** 原桌面控制的单一界面寿命：隔离账号目标、拒绝陈旧回包，并保留未知操作结果。 */
 export function useDirectSessionControl(params: Readonly<{
@@ -47,9 +49,18 @@ export function useDirectSessionControl(params: Readonly<{
     /** 只更新当前寿命的界面，不把旧账号结果短暂显示在新账号中。 */
     const updateView = React.useCallback((patch: Partial<ControlViewState>) => {
         if (!isCurrent()) return;
-        setViewState((previous) => isCurrent()
-            ? { ...(previous.lifetime === lifetime ? previous : EMPTY_CONTROL_VIEW), ...patch, lifetime }
-            : previous);
+        setViewState((previous) => {
+            if (!isCurrent()) return previous;
+            const next = { ...(previous.lifetime === lifetime ? previous : EMPTY_CONTROL_VIEW), ...patch, lifetime };
+            const context = next.outcomeContext;
+            const observed = next.snapshot;
+            // 只清理已被真实新进展替代的受理文案；不推导完成，也不触碰未知结果或去重锁。
+            const acceptedHintIsObsolete = next.outcome === 'accepted' && context && observed && (
+                (context.kind === 'start' && observed.turnId !== context.turnId)
+                || (context.kind === 'steer' && observed.turnId === context.turnId && observed.state !== 'running')
+            );
+            return acceptedHintIsObsolete ? { ...next, outcome: null, outcomeContext: null } : next;
+        });
     }, [isCurrent, lifetime]);
 
     /** 返回本次读取值；同账号同目标也只接纳最后一次读取，失败不会返回缓存。 */
@@ -88,7 +99,7 @@ export function useDirectSessionControl(params: Readonly<{
         if (!isCurrent() || lifetime.flight) return null;
         const flight = {};
         lifetime.flight = flight;
-        updateView({ busy: true, outcome: null });
+        updateView({ busy: true, outcome: null, outcomeContext: null });
         return flight;
     }, [isCurrent, lifetime, updateView]);
     /** 仅释放自己取得的锁，迟到请求不能结束新目标的忙状态。 */
@@ -132,6 +143,7 @@ export function useDirectSessionControl(params: Readonly<{
         if (!flight) return;
         const isFlightCurrent = () => isCurrent() && lifetime.flight === flight;
         lifetime.issued.add(key);
+        updateView({ outcomeContext: { kind: 'approval', turnId: snapshot.turnId } });
         try {
             const result = await dispatch({ machineId: params.machineId, sessionId: params.sessionId, kind: 'approval', operationId: randomUUID(), expectedTurnId: snapshot.turnId, requestId: request.requestId, revision: request.revision, decision }, isFlightCurrent);
             // 只有明确未提交才解除本地锁；未知结果保持锁定，刷新不会重放授权。
@@ -139,7 +151,7 @@ export function useDirectSessionControl(params: Readonly<{
         } finally {
             releaseFlight(flight);
         }
-    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.sessionId, releaseFlight, snapshot]);
+    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.sessionId, releaseFlight, snapshot, updateView]);
 
     /** 原桌面新快照是文本选路的唯一依据；不从历史观察状态推断发送能力。 */
     const sendTextWithMode = React.useCallback(async (
@@ -163,6 +175,9 @@ export function useDirectSessionControl(params: Readonly<{
                 if (isFlightCurrent()) updateView({ outcome: 'rejected' });
                 return { outcome: isFlightCurrent() ? 'rejected' : 'unknown' };
             }
+            // 种类与基准轮次仅用于提示措辞和失效判断，不参与发送授权或锁的生命周期。
+            const outcomeContext: ControlOutcomeContext = { kind: mode, turnId: fresh.turnId };
+            updateView({ outcomeContext });
             const key = JSON.stringify([mode, fresh.turnId]);
             if (lifetime.uncertainTextSendKey === key) {
                 updateView({ outcome: 'unknown' });
@@ -180,7 +195,8 @@ export function useDirectSessionControl(params: Readonly<{
             }
             if (!isFlightCurrent()) return { outcome: 'unknown', mode };
             if (result !== 'unknown') lifetime.uncertainTextSendKey = null;
-            updateView({ outcome: result });
+            // 观察可能先于 ACK 到达；用同一上下文合并，避免迟到受理重新挂回旧文案。
+            updateView({ outcome: result, outcomeContext });
             return { outcome: result, mode };
         } finally {
             releaseFlight(flight);
@@ -197,6 +213,7 @@ export function useDirectSessionControl(params: Readonly<{
     /** 决策按钮复用单次发出记录，刷新不会把仍未确认的同一请求重新启用。 */
     const isRequestLocked = React.useCallback((request: DesktopApprovalV1) =>
         lifetime.issued.has(JSON.stringify([snapshot?.turnId, request.requestId, request.revision])), [lifetime, snapshot?.turnId]);
-    return React.useMemo(() => ({ snapshot: enabled ? snapshot : null, error, busy, loading, outcome, refresh, decide, sendText, steer, isRequestLocked }),
-        [enabled, snapshot, error, busy, loading, outcome, refresh, decide, sendText, steer, isRequestLocked]);
+    const outcomeKind = view.outcomeContext?.kind ?? null;
+    return React.useMemo(() => ({ snapshot: enabled ? snapshot : null, error, busy, loading, outcome, outcomeKind, refresh, decide, sendText, steer, isRequestLocked }),
+        [enabled, snapshot, error, busy, loading, outcome, outcomeKind, refresh, decide, sendText, steer, isRequestLocked]);
 }
