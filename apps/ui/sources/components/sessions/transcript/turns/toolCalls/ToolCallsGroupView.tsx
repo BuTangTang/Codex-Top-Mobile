@@ -25,6 +25,7 @@ import { TRANSCRIPT_WEB_TOOL_CALL_PREPEND_ANCHOR_TEST_ID_PREFIX } from '@/compon
 import { renderGroupedToolCallRowContent } from '@/components/sessions/transcript/toolCalls/units/groupedToolCallRowContent';
 import {
     resolveGroupedPreviewSidechainIds,
+    shouldKeepPendingToolCallVisible,
     shouldRenderGroupedToolCallWithMessageView,
 } from '@/components/sessions/transcript/toolCalls/units/groupedToolCallRowRenderDecision';
 import { resolveToolRowPinAction } from '@/components/sessions/transcript/toolCalls/ToolCallPinAction';
@@ -75,6 +76,7 @@ type ToolCallsGroupViewWithSessionCommonProps = ToolCallsGroupViewProps & Readon
     toolRouteCommon: TranscriptToolRouteCommon;
 }>;
 
+/** 独立工具组也消费会话公共策略，避免与虚拟列表的手机展示分叉。 */
 export const ToolCallsGroupView = React.memo((props: ToolCallsGroupViewProps) => {
     const transcriptSessionCommon = useTranscriptSessionCommon(props.sessionId);
     const forkCommon = React.useMemo(() => transcriptSessionCommon.fork, [
@@ -97,6 +99,7 @@ export const ToolCallsGroupView = React.memo((props: ToolCallsGroupViewProps) =>
         transcriptSessionCommon.messageDisplay.workspacePath,
     ]);
     const toolChromeCommon = React.useMemo(() => transcriptSessionCommon.toolChrome, [
+        transcriptSessionCommon.toolChrome.compactToolCalls,
         transcriptSessionCommon.toolChrome.toolViewTimelineChromeMode,
         transcriptSessionCommon.toolChrome.transcriptToolCallsCollapsedPreviewCount,
         transcriptSessionCommon.toolChrome.transcriptToolCallsGroupShowBackground,
@@ -117,10 +120,12 @@ export const ToolCallsGroupView = React.memo((props: ToolCallsGroupViewProps) =>
     );
 });
 
+/** 渲染工具组；手机折叠保留可操作审批，详情继续使用原工具和审批组件。 */
 export const ToolCallsGroupViewWithSessionCommon = React.memo((props: ToolCallsGroupViewWithSessionCommonProps) => {
     const { theme } = useUnistyles();
     const { getMappingKey } = useToolCallsGroupMappingHelper();
     const {
+        compactToolCalls,
         toolViewTimelineChromeMode,
         transcriptToolCallsCollapsedPreviewCount,
         transcriptToolCallsGroupShowBackground,
@@ -143,12 +148,14 @@ export const ToolCallsGroupViewWithSessionCommon = React.memo((props: ToolCallsG
         : null;
     const previewCount = resolveTranscriptToolCallsCollapsedPreviewCount(transcriptToolCallsCollapsedPreviewCount);
     const previewMessages = React.useMemo(() => {
-        if (expanded || previewCount <= 0) return [];
+        if (expanded) return [];
+        if (compactToolCalls) return props.toolMessages.filter((message) => shouldKeepPendingToolCallVisible(message, props.interaction));
+        if (previewCount <= 0) return [];
         return props.toolMessages.slice(-previewCount);
-    }, [expanded, previewCount, props.toolMessages]);
+    }, [compactToolCalls, expanded, previewCount, props.interaction, props.toolMessages]);
 
     const hiddenCount = expanded ? 0 : Math.max(0, count - previewMessages.length);
-    const showExpandButton = !expanded && hiddenCount > 0;
+    const showExpandButton = !compactToolCalls && !expanded && hiddenCount > 0;
     const showCollapsedPreview = previewMessages.length > 0;
     const { setExpanded } = props;
     const onCollapse = React.useCallback(() => setExpanded(false), [setExpanded]);
@@ -215,6 +222,7 @@ export const ToolCallsGroupViewWithSessionCommon = React.memo((props: ToolCallsG
                 count={count}
                 expanded={expanded}
                 onCollapse={onCollapse}
+                onExpand={compactToolCalls ? onExpand : undefined}
             />
 
             <View style={[styles.contentRow, normalizedChromeMode === 'activity_feed' ? styles.contentRowFeed : styles.contentRowCards]}>

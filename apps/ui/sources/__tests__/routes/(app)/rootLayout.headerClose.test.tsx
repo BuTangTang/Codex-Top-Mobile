@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { act } from 'react-test-renderer';
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { pressTestInstanceAsync, renderScreen } from '@/dev/testkit';
 
@@ -20,7 +21,10 @@ const stackNavigationMock = vi.hoisted(() => ({
     getState: vi.fn(() => stackNavigationState),
 }));
 const platformState = vi.hoisted(() => ({
-    os: 'ios' as 'ios' | 'web',
+    os: 'ios' as 'ios' | 'android' | 'web',
+}));
+const reduceMotionBoundary = vi.hoisted(() => ({
+    listener: null as ((enabled: boolean) => void) | null,
 }));
 
 vi.mock('react-native-reanimated', async () => {
@@ -35,6 +39,14 @@ vi.mock('react-native', async () => {
     });
     return {
         ...reactNative,
+        // 仅替代系统事件，实际减少动态 hook 与导航选项仍走生产路径。
+        AccessibilityInfo: {
+            isReduceMotionEnabled: async () => false,
+            addEventListener: (_event: string, listener: (enabled: boolean) => void) => {
+                reduceMotionBoundary.listener = listener;
+                return { remove: () => {} };
+            },
+        },
         Keyboard: {
             ...reactNative.Keyboard,
             dismiss: keyboardDismissSpy,
@@ -212,6 +224,7 @@ function getStackScreenOptions(
 
 describe('app stack modal header close buttons', () => {
     beforeEach(() => {
+        act(() => reduceMotionBoundary.listener?.(false));
         routerBackSpy.mockReset();
         safeRouterBackSpy.mockReset();
         stackNavigationMock.navigate.mockReset();
@@ -224,6 +237,45 @@ describe('app stack modal header close buttons', () => {
         windowState.height = 600;
         stackNavigationState.index = 0;
         stackNavigationState.routes = [{ key: 'current-route' }];
+    });
+
+    // 会话 push/pop 只在原生手机启用；平板、web 和其他 cockpit 页面保持原规则。
+    it.each(['ios', 'android'] as const)('uses the native phone conversation transition on %s', async (os) => {
+        platformState.os = os;
+        windowState.width = 390;
+        windowState.height = 844;
+        const { default: RootLayout } = await import('@/app/(app)/_layout');
+        const screen = await renderScreen(<RootLayout />);
+        const options = getStackScreenOptions(screen, 'session/[id]/index');
+        expect(options.animation).toBe(os === 'ios' ? 'simple_push' : 'slide_from_right');
+        expect(options.gestureEnabled).toBe(true);
+        expect(options.headerShown).toBe(false);
+        if (os === 'ios') expect(options.animationDuration).toBe(250);
+        expect(getStackScreenOptions(screen, 'session/[id]/files').animation).toBe('none');
+        await screen.unmount();
+    });
+
+    it.each(['ios', 'web'] as const)('keeps the existing non-phone transition on %s', async (os) => {
+        platformState.os = os;
+        windowState.width = os === 'web' ? 390 : 820;
+        windowState.height = 1180;
+        const { default: RootLayout } = await import('@/app/(app)/_layout');
+        const screen = await renderScreen(<RootLayout />);
+        expect(getStackScreenOptions(screen, 'session/[id]/index').animation).toBe('none');
+        await screen.unmount();
+    });
+
+    it('responds to reduced motion without replacing the phone conversation route', async () => {
+        windowState.width = 390;
+        windowState.height = 844;
+        const { default: RootLayout } = await import('@/app/(app)/_layout');
+        const screen = await renderScreen(<RootLayout />);
+        expect(getStackScreenOptions(screen, 'session/[id]/index').animation).toBe('simple_push');
+        await act(async () => reduceMotionBoundary.listener?.(true));
+        expect(getStackScreenOptions(screen, 'session/[id]/index').animation).toBe('none');
+        await act(async () => reduceMotionBoundary.listener?.(false));
+        expect(getStackScreenOptions(screen, 'session/[id]/index').animation).toBe('simple_push');
+        await screen.unmount();
     });
 
     it('exposes a native close affordance for the new-session modal', async () => {

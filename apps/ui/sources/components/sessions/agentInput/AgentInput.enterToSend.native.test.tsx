@@ -313,6 +313,76 @@ function findMultiTextInput(screen: Awaited<ReturnType<typeof renderScreen>>) {
 }
 
 describe('AgentInput (enter to send on native)', () => {
+    /** 手机圆形提交保留空输入的语音优先级，停止和发送回调不能被误触发。 */
+    it.each([false, true])('keeps compact microphone ownership when micActive=%s', async (micActive) => {
+        const { AgentInputSubmitButton } = await import('./components/AgentInputSubmitButton');
+        const mic = vi.fn();
+        const stop = vi.fn();
+        const send = vi.fn();
+        const screen = await renderScreen(<AgentInputSubmitButton compact testID="compact-mic"
+            disabled={false} hasSendableContent={false} micPressHandler={mic} micActive={micActive}
+            canStop onStop={stop} onSend={send} />);
+        expect(screen.findByTestId('compact-mic')?.props.accessibilityLabel).toBe('voiceAssistant.label');
+        await act(async () => { screen.pressByTestId('compact-mic'); });
+        expect(mic).toHaveBeenCalledTimes(1);
+        expect(stop).not.toHaveBeenCalled();
+        expect(send).not.toHaveBeenCalled();
+    });
+
+    /** 验证手机使用当前文字行高限制输入视口，字号变化不重建输入或丢失草稿。 */
+    it('caps phone input at five lines and retains the same input when text scale changes', async () => {
+        mocks.dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 };
+        const { AgentInput } = await import('./AgentInput');
+        const props = { sessionId: 'phone-lines', value: 'draft', onChangeText: mocks.onChangeText,
+            placeholder: 'p', onSend: mocks.onSend, inputMaxHeight: 300,
+            autocompleteKinds: [], autocompleteSuggestions: async () => [] };
+        const screen = await renderScreen(<AgentInput {...props} />);
+        const input = findMultiTextInput(screen);
+        expect(input.props.maxHeight).toBe(126);
+        mocks.dimensions = { ...mocks.dimensions, fontScale: 2 };
+        await act(async () => { screen.tree.update(<AgentInput {...props} placeholder="scaled" />); });
+        expect(findMultiTextInput(screen)).toBe(input);
+        expect(input.props.maxHeight).toBe(236);
+        expect(input.props.value).toBe('draft');
+    });
+
+    /** 手机更多菜单必须仍能转交原文件与停止动作，不以隐藏工具行删除能力。 */
+    it('opens existing phone file and stop actions from the composer more menu', async () => {
+        mocks.dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 };
+        const { AgentInput } = await import('./AgentInput');
+        const onAbort = vi.fn(async () => {});
+        const onFileViewerPress = vi.fn();
+        const onAttach = vi.fn();
+        const onPermissionClick = vi.fn();
+        const screen = await renderScreen(<AgentInput
+            sessionId="phone-menu" value="draft" onChangeText={mocks.onChangeText}
+            placeholder="p" onSend={mocks.onSend} onAbort={onAbort} showAbortButton
+            onFileViewerPress={onFileViewerPress} onPermissionClick={onPermissionClick}
+            extraActionChips={[{ key: 'attachments', controlId: 'attachments', render: () => null,
+                collapsedAction: () => ({ id: 'attach-existing', label: 'Attach', onPress: onAttach }) }]}
+            autocompleteKinds={[]} autocompleteSuggestions={async () => []}
+        />);
+        const input = findMultiTextInput(screen);
+        expect(screen.findByTestId('agent-input-action-menu-button')).not.toBeNull();
+        await act(async () => { screen.pressByTestId('agent-input-action-menu-button'); });
+        // 原生 Portal 在单元环境不挂载；验证进入原有 overlay 的真实动作及其回调。
+        const overlay = screen.findAll((node) => node.props.showActionMenu === true && Array.isArray(node.props.actionMenuActions))[0];
+        expect(overlay).toBeDefined();
+        const actions = overlay!.props.actionMenuActions;
+        expect(actions.map((action: { id: string }) => action.id)).toEqual(expect.arrayContaining(['files', 'stop', 'attach-existing', 'permission']));
+        await act(async () => { actions.find((action: { id: string }) => action.id === 'files').onPress(); });
+        expect(onFileViewerPress).toHaveBeenCalledTimes(1);
+        await act(async () => { actions.find((action: { id: string }) => action.id === 'attach-existing').onPress(); });
+        expect(onAttach).toHaveBeenCalledTimes(1);
+        await act(async () => { actions.find((action: { id: string }) => action.id === 'permission').onPress(); });
+        expect(onPermissionClick).toHaveBeenCalledTimes(1);
+        await act(async () => { screen.pressByTestId('agent-input-action-menu-button'); });
+        await act(async () => { actions.find((action: { id: string }) => action.id === 'stop').onPress(); });
+        expect(onAbort).toHaveBeenCalledTimes(1);
+        expect(mocks.onSend).not.toHaveBeenCalled();
+        expect(findMultiTextInput(screen)).toBe(input);
+    });
+
     afterEach(() => {
         mocks.dimensions = { width: 900, height: 600, scale: 1, fontScale: 1 };
         settingState.webEnterToSend = true;
@@ -337,7 +407,7 @@ describe('AgentInput (enter to send on native)', () => {
         };
         const screen = await renderScreen(<AgentInput {...props} />);
         const input = findMultiTextInput(screen);
-        expect(screen.getTextContent()).toContain('common.send');
+        expect(screen.findByTestId('session-composer-send')?.props.accessibilityLabel).toBe('common.send');
         await act(async () => { screen.pressByTestId('session-composer-send'); });
         expect(mocks.onSend).toHaveBeenCalledTimes(1);
         await act(async () => { screen.tree.update(<AgentInput {...props} isSending />); });
@@ -349,7 +419,7 @@ describe('AgentInput (enter to send on native)', () => {
         expect(findMultiTextInput(screen)).toBe(input);
     });
 
-    /** 手机移除工作台工具，原发送控件仍能停止运行，审批提示不被工具行一起隐藏。 */
+    /** 手机将工具收进更多，原发送控件仍能停止运行，审批提示不随工具行隐藏。 */
     it('hides phone workspace actions while keeping stop and pending permissions', async () => {
         mocks.dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 };
         const { AgentInput } = await import('./AgentInput');

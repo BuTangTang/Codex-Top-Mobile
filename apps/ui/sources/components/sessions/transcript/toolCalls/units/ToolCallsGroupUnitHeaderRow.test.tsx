@@ -56,6 +56,22 @@ async function renderHeaderRow(props: Record<string, unknown>) {
 const GROUP_CAP_RADIUS_PX = 12; // theme.borderRadius.xl
 
 describe('ToolCallsGroupUnitHeaderRow', () => {
+    // 手机从同一摘要行展开，读屏同步获得折叠状态。
+    it('expands compact groups from the accessible header', async () => {
+        const setExpanded = vi.fn();
+        const screen = await renderHeaderRow({
+            toolMessages: [createToolCallMessageFixture({ id: 'm1', createdAt: 1 })],
+            setExpanded,
+            ...createTranscriptSessionCommonPropsFixture({ toolChromeCommon: { compactToolCalls: true } }),
+        });
+        const header = screen.findByTestId('transcript-tool-calls-header');
+        expect(header?.props.accessibilityState).toMatchObject({ expanded: false });
+        expect(header?.props.accessibilityRole).toBe('button');
+        expect(screen.findByTestId('icon:caret-down')).not.toBeNull();
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(setExpanded).toHaveBeenCalledWith(true);
+    });
+
     it('shows the tool-calls title with count and a completed status icon when all tools completed', async () => {
         const screen = await renderHeaderRow({
             toolMessages: [

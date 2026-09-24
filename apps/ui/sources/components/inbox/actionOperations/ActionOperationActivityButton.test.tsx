@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View } from 'react-native';
+import { Pressable, View } from 'react-native';
 import { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import type { ActionOperationSnapshotV1 } from '@happier-dev/protocol';
@@ -71,6 +71,29 @@ function operation(overrides: Partial<ActionOperationSnapshotV1> = {}): ActionOp
 }
 
 describe('ActionOperationActivityButtonView', () => {
+    /** 没有活动时更多入口仍存在，但不挂载账本或绘制独立活动按钮。 */
+    it('keeps a custom trigger available without mounting an empty ledger', async () => {
+        const { ActionOperationActivityButtonView } = await import('./ActionOperationActivityButton');
+        const screen = await renderScreen(
+            <ActionOperationActivityButtonView
+                operations={[]}
+                hasAttention={false}
+                observationForOperation={() => 'available'}
+                contextForOperation={() => null}
+                onOpenOperation={() => {}}
+                onMarkVisibleTerminalSeen={() => {}}
+                renderTrigger={({ hasAttention }: { hasAttention: boolean }) => (
+                    <View testID="more-trigger" accessibilityState={{ disabled: !hasAttention }} />
+                )}
+            />,
+        );
+
+        expect(screen.findByTestId('more-trigger')).not.toBeNull();
+        expect(screen.findByTestId('more-trigger')?.props.accessibilityState.disabled).toBe(true);
+        expect(screen.findByTestId('action-operation-activity-button')).toBeNull();
+        expect(screen.findByTestId('action-operation-activity-popover')).toBeNull();
+    });
+
     it('stays absent when there is no active or unseen operation', async () => {
         const { ActionOperationActivityButtonView } = await import('./ActionOperationActivityButton');
         const screen = await renderScreen(
@@ -177,6 +200,38 @@ describe('ActionOperationActivityButtonView', () => {
 });
 
 describe('ActionOperationActivityButton', () => {
+    /** 自定义更多入口沿用同一懒加载 owner，打开后已读更新不会卸载账本。 */
+    it('opens the lazy model-backed ledger from a custom trigger and releases it on close', async () => {
+        const terminal = operation({ operationId: 'operation-custom-trigger', state: 'succeeded', settledAt: 200 });
+        actionOperationStore.merge(terminal);
+        storageHooks.useAllMachines.mockClear();
+        storageHooks.useAllSessions.mockClear();
+        storageHooks.useAllSessionListRenderables.mockClear();
+        const { ActionOperationActivityButton } = await import('./ActionOperationActivityButton');
+        const screen = await renderScreen(
+            <ActionOperationActivityButton
+                renderTrigger={({ onPress, open }: { onPress: () => void; open: boolean }) => (
+                    <Pressable testID="more-activity-trigger" onPress={onPress} accessibilityState={{ expanded: open }} />
+                )}
+            />,
+        );
+
+        expect(screen.findByTestId('action-operation-activity-button')).toBeNull();
+        expect(storageHooks.useAllMachines).not.toHaveBeenCalled();
+        expect(storageHooks.useAllSessions).not.toHaveBeenCalled();
+        expect(storageHooks.useAllSessionListRenderables).not.toHaveBeenCalled();
+        await screen.pressByTestIdAsync('more-activity-trigger');
+        expect(screen.findByTestId(`action-operation-row-${terminal.operationId}`)).not.toBeNull();
+        expect(actionOperationStore.getState().terminalSeenAtById.has(terminal.operationId)).toBe(true);
+        expect(screen.findByTestId('more-activity-trigger')?.props.accessibilityState.expanded).toBe(true);
+
+        await act(async () => {
+            (capturedPopoverProps.current?.onRequestClose as () => void)();
+        });
+        expect(screen.findByTestId('action-operation-activity-popover')).toBeNull();
+        expect(screen.findByTestId('more-activity-trigger')?.props.accessibilityState.expanded).toBe(false);
+    });
+
     it('does not mount detail-only subscriptions until the popover opens', async () => {
         const active = operation({ operationId: 'operation-lazy-details' });
         actionOperationStore.merge(active);

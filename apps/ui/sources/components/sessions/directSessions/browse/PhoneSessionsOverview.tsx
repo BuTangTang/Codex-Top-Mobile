@@ -1,13 +1,14 @@
 import * as React from 'react';
-import { useLocalSearchParams, useRouter } from 'expo-router';
-import { AppState, Pressable, View } from 'react-native';
+import { useLocalSearchParams } from 'expo-router';
+import { AppState, Pressable, View, StyleSheet as NativeStyleSheet } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
-import Animated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 import { Text, TextInput } from '@/components/ui/text/Text';
 import { Icon } from '@/components/ui/icons/Icon';
-import { MOTION_STANDARD_BEZIER, motionTokens } from '@/components/ui/motion/motionTokens';
-import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
+import { Header } from '@/components/navigation/Header';
+import { BrandLogo } from '@/components/ui/navigation/BrandLogo';
+import { ITEM_TITLE_TEXT_METRICS, ITEM_SUBTITLE_TEXT_METRICS } from '@/components/ui/lists/itemDensityMetrics';
+import { Typography } from '@/constants/Typography';
 import { useAllMachines } from '@/sync/domains/state/storage';
 import { useActiveServerAccountScope, useProfile, useSettings, useSocketStatus } from '@/sync/store/hooks';
 import { useSessionListRuntimeNowMs } from '@/hooks/session/sessionListRuntimeClock';
@@ -16,46 +17,35 @@ import { usePhoneMachineProjects } from '@/components/settings/machines/usePhone
 import { getMachineDisplayName, isMachineOnline } from '@/utils/sessions/machineUtils';
 import { PhoneDirectBrowseCandidatesList } from './DirectBrowseCandidatesList';
 import { PhoneBrowseSourceOwner } from './PhoneBrowseSourceOwner';
-import { aggregatePhoneBrowseSources, type PhoneBrowsePhase, type PhoneBrowseRow, type PhoneBrowseSnapshot, type PhoneBrowseSource } from './phoneBrowseAggregation';
+import { aggregatePhoneBrowseSources, type PhoneBrowseRow, type PhoneBrowseSnapshot, type PhoneBrowseSource } from './phoneBrowseAggregation';
 import { t } from '@/text';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
 
-const PHASES = [{ id: 'running', label: '运行中' }, { id: 'needs_input', label: '待处理' }, { id: 'completed', label: '已完成' }] as const;
-const phaseEasing = Easing.bezier(...MOTION_STANDARD_BEZIER);
+/** 首页只保留一个紧凑标题栏和按需搜索，颜色与字号沿用应用语义规范。 */
 const styles = StyleSheet.create((theme) => ({
     screen: { flex: 1, backgroundColor: theme.colors.surface.base },
-    toolbar: { flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.border.default },
-    tabs: { flex: 1, flexDirection: 'row' },
-    tab: { flex: 1, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
-    tabLabel: { fontSize: 14, color: theme.colors.text.secondary },
-    selectedLabel: { color: theme.colors.accent.blue, fontWeight: '600' },
-    indicator: { position: 'absolute', left: 0, bottom: 0, height: 2, backgroundColor: theme.colors.accent.blue },
-    iconHit: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
-    search: { marginHorizontal: 16, marginVertical: 6, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, backgroundColor: theme.colors.surface.inset, color: theme.colors.text.primary, fontSize: 14 },
-    hint: { paddingHorizontal: 16, paddingVertical: 10, color: theme.colors.text.secondary, fontSize: 12 },
-    historyTitle: { flex: 1, paddingHorizontal: 16, fontSize: 14, color: theme.colors.text.primary },
-    historyLink: { minHeight: 44, justifyContent: 'center', paddingHorizontal: 16 },
-    historyLinkText: { color: theme.colors.text.secondary, fontSize: 12 },
+    header: { backgroundColor: theme.colors.surface.base, borderBottomWidth: NativeStyleSheet.hairlineWidth, borderBottomColor: theme.colors.border.default },
+    headerContent: { paddingHorizontal: 8, paddingVertical: 4, minHeight: 48, height: 'auto' },
+    title: { flex: 1, textAlign: 'center', color: theme.colors.text.primary, ...ITEM_TITLE_TEXT_METRICS.comfortable, ...Typography.default('semiBold') },
+    iconHit: { width: 48, minHeight: 48, alignItems: 'center', justifyContent: 'center' },
+    search: { marginHorizontal: 16, marginVertical: 8, minHeight: 48, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, backgroundColor: theme.colors.input.background, color: theme.colors.input.text, ...ITEM_TITLE_TEXT_METRICS.cozy },
+    hint: { paddingHorizontal: 16, paddingVertical: 10, color: theme.colors.text.secondary, ...ITEM_SUBTITLE_TEXT_METRICS.cozy },
 }));
 
-/** 三态标签保留短位移动效；减少动态效果时直接定位，不重挂实际列表。 */
-function PhoneBrowsePhaseTabs(props: Readonly<{ phase: PhoneBrowsePhase; onChange: (phase: PhoneBrowsePhase) => void }>) {
-    const reducedMotion = useReducedMotionPreference();
-    const [width, setWidth] = React.useState(0);
-    const offset = useSharedValue(0);
-    const phaseIndex = PHASES.findIndex((phase) => phase.id === props.phase);
-    React.useEffect(() => {
-        const nextOffset = width / PHASES.length * phaseIndex;
-        offset.value = reducedMotion ? nextOffset : withTiming(nextOffset, { duration: motionTokens.durationMs.fast, easing: phaseEasing });
-    }, [offset, phaseIndex, reducedMotion, width]);
-    const animatedStyle = useAnimatedStyle(() => ({ transform: [{ translateX: offset.value }] }));
-    return <View style={styles.tabs} accessibilityRole="tablist" onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
-        {PHASES.map((phase) => <Pressable key={phase.id} testID={`phone-sessions-status:${phase.id}`} accessibilityRole="tab" accessibilityLabel={phase.label}
-            accessibilityState={{ selected: phase.id === props.phase }} style={styles.tab} onPress={() => props.onChange(phase.id)}>
-            <Text style={[styles.tabLabel, phase.id === props.phase ? styles.selectedLabel : null]}>{phase.label}</Text>
-        </Pressable>)}
-        <Animated.View pointerEvents="none" style={[styles.indicator, { width: width / PHASES.length }, animatedStyle]} />
-    </View>;
+/** 同一个标题栏覆盖正常列表和账号范围错误，保留安全区、原 Logo 与可选搜索。 */
+function PhoneSessionsHeader(props: Readonly<{ title?: string; searchOpen?: boolean; onToggleSearch?: () => void }>) {
+    const { theme } = useUnistyles();
+    return <Header
+        title={<Text testID="phone-sessions-title" accessibilityRole="header" style={styles.title}>{props.title ?? t('tabs.sessions')}</Text>}
+        headerLeft={() => <View style={styles.iconHit}><BrandLogo testID="phone-sessions-logo" size={24} /></View>}
+        headerRight={() => props.onToggleSearch ? <Pressable testID="phone-sessions-search-toggle" accessibilityRole="button" accessibilityLabel={t(props.searchOpen ? 'common.close' : 'sessionsList.searchSessions')} accessibilityState={{ expanded: props.searchOpen }} style={styles.iconHit}
+            onPress={props.onToggleSearch}>
+            <Icon name={props.searchOpen ? 'x' : 'magnifying-glass'} size={20} color={theme.colors.text.primary} />
+        </Pressable> : <View style={styles.iconHit} />}
+        headerStyle={styles.header}
+        headerContentStyle={styles.headerContent}
+        headerShadowVisible={false}
+    />;
 }
 
 /** 账号、服务器或明确路由范围变化时重挂，防止旧身份的候选和动作流入新入口。 */
@@ -63,16 +53,16 @@ export function PhoneSessionsOverview() {
     const scope = useActiveServerAccountScope();
     const params = useLocalSearchParams<{ machineId?: string; serverId?: string; projectId?: string; sourceKey?: string }>();
     const machineId = typeof params.machineId === 'string' ? params.machineId : undefined;
-    if (!scope) return <View style={styles.screen}><Text style={styles.hint}>尚未连接账号</Text></View>;
+    if (!scope) return <View style={styles.screen}><PhoneSessionsHeader /><Text style={styles.hint}>尚未连接账号</Text></View>;
     if (params.serverId !== undefined && params.serverId !== scope.serverId) {
-        return <View style={styles.screen}><Text testID="phone-sessions-unavailable" style={styles.hint}>电脑不属于当前连接，请返回电脑列表重新选择。</Text></View>;
+        return <View style={styles.screen}><PhoneSessionsHeader /><Text testID="phone-sessions-unavailable" style={styles.hint}>电脑不属于当前连接，请返回电脑列表重新选择。</Text></View>;
     }
     if (params.machineId !== undefined && !machineId?.trim()) {
-        return <View style={styles.screen}><Text testID="phone-sessions-machine-unavailable" style={styles.hint}>电脑范围已失效，请返回电脑列表重新选择。</Text></View>;
+        return <View style={styles.screen}><PhoneSessionsHeader /><Text testID="phone-sessions-machine-unavailable" style={styles.hint}>电脑范围已失效，请返回电脑列表重新选择。</Text></View>;
     }
     const hasProjectParams = params.projectId !== undefined || params.sourceKey !== undefined;
     if (hasProjectParams && (!machineId || typeof params.projectId !== 'string' || !params.projectId.trim() || typeof params.sourceKey !== 'string' || !params.sourceKey.trim())) {
-        return <View style={styles.screen}><Text testID="phone-sessions-project-unavailable" style={styles.hint}>项目范围已失效，请返回电脑列表重新选择。</Text></View>;
+        return <View style={styles.screen}><PhoneSessionsHeader /><Text testID="phone-sessions-project-unavailable" style={styles.hint}>项目范围已失效，请返回电脑列表重新选择。</Text></View>;
     }
     const projectKey = hasProjectParams ? JSON.stringify([params.sourceKey, params.projectId]) : undefined;
     return <ScopedPhoneSessionsOverview key={JSON.stringify([scope.serverId, scope.accountId, machineId, projectKey])} serverId={scope.serverId} accountId={scope.accountId} machineId={machineId} projectKey={projectKey} />;
@@ -80,7 +70,6 @@ export function PhoneSessionsOverview() {
 
 /** 首页统一展示同账号电脑；电脑页带入的明确范围则展示该范围全部真实历史。 */
 function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; accountId: string; machineId?: string; projectKey?: string }>) {
-    const router = useRouter();
     const focused = useIsFocused();
     const socket = useSocketStatus();
     const [appActive, setAppActive] = React.useState(AppState.currentState === 'active');
@@ -115,7 +104,6 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     const nowMs = Date.now();
     const [query, setQuery] = React.useState('');
     const [searchOpen, setSearchOpen] = React.useState(false);
-    const [phase, setPhase] = React.useState<PhoneBrowsePhase>('running');
     const [snapshots, setSnapshots] = React.useState<Readonly<Record<string, PhoneBrowseSnapshot | undefined>>>({});
     const actionPending = React.useRef(false);
     const openingKeyRef = React.useRef<string | null>(null);
@@ -148,9 +136,9 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
         });
     }, []);
     const aggregate = React.useMemo(() => aggregatePhoneBrowseSources({
-        ...scope, sources, snapshots, phase: history ? null : phase, nowMs,
+        ...scope, sources, snapshots, phase: null, nowMs,
         projectRequired: Boolean(scope.projectKey), project: selectedProject,
-    }), [scope.serverId, scope.accountId, scope.projectKey, sources, snapshots, history, phase, nowMs, selectedProject, observationScope]);
+    }), [scope.serverId, scope.accountId, scope.projectKey, sources, snapshots, nowMs, selectedProject, observationScope]);
 
     /** 用户明确刷新时复用现有 owner；单飞防止下拉和重试同时重启同一请求。 */
     const refresh = React.useCallback(async () => {
@@ -185,29 +173,21 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     }, []);
 
     return <View testID="phone-sessions-overview" style={styles.screen}>
-        <View style={styles.toolbar}>
-            {history ? <Text style={styles.historyTitle} numberOfLines={1}>{selectedProject?.name || '全部历史'}</Text> : <PhoneBrowsePhaseTabs phase={phase} onChange={setPhase} />}
-            <Pressable testID="phone-sessions-search-toggle" accessibilityRole="button" accessibilityLabel={searchOpen ? '关闭搜索' : '搜索会话'} accessibilityState={{ expanded: searchOpen }} style={styles.iconHit}
-                onPress={() => setSearchOpen((open) => !open)}>
-                <Icon name={searchOpen ? 'x' : 'magnifying-glass'} size={18} color={theme.colors.text.primary} />
-            </Pressable>
-        </View>
-        {searchOpen ? <TextInput testID="phone-sessions-search" accessibilityLabel="搜索会话" placeholder="搜索标题或项目" placeholderTextColor={theme.colors.input.placeholder} value={query} onChangeText={setQuery} style={styles.search} /> : null}
+        <PhoneSessionsHeader title={history ? selectedProject?.name || t('directSessions.browseCandidates') : undefined}
+            searchOpen={searchOpen} onToggleSearch={() => setSearchOpen((open) => !open)} />
+        {searchOpen ? <TextInput testID="phone-sessions-search" accessibilityLabel={t('sessionsList.searchSessions')} placeholder={t('directSessions.browseSearchPlaceholder')} placeholderTextColor={theme.colors.input.placeholder} value={query} onChangeText={setQuery} style={styles.search} /> : null}
         {machines.length === 0 ? <Text style={styles.hint}>还没有连接的电脑，请在电脑端登录同一账号。</Text> : null}
         {scope.machineId && visibleMachines.length === 0 ? <Text testID="phone-sessions-machine-unavailable" style={styles.hint}>当前账号下没有所选电脑，请返回重新选择。</Text> : null}
         {scope.projectKey && projectState.loading && !projectState.projects ? <Text style={styles.hint}>{t('codexTopProjects.loading')}</Text> : null}
         {projectUnavailable ? <Text testID="phone-sessions-project-unavailable" style={styles.hint}>{t('codexTopProjects.missing')}</Text> : null}
         {scope.projectKey && selectedComputer && !isMachineOnline(selectedComputer, nowMs) ? <Text style={styles.hint}>{t('codexTopProjects.offline')}</Text> : null}
-        {!history && aggregate.hasUnclassified ? <Pressable testID="phone-sessions-history-link" accessibilityRole="button" style={styles.historyLink} onPress={() => router.push('/settings/machines')}>
-            <Text style={styles.historyLinkText}>部分会话未列入分类，查看历史</Text>
-        </Pressable> : null}
         {sources.map((source) => <PhoneBrowseSourceOwner key={source.key} source={source} serverId={scope.serverId} searchQuery={searchOpen ? query : ''}
             discoveryEnabled={discoveryEnabled && source.online} observationScope={observationScope} actionPending={openingKey !== null} isActionPending={isOpening} onSnapshot={publishSnapshot} />)}
-        <PhoneDirectBrowseCandidatesList rows={aggregate.rows} nowMs={nowMs} history={history}
+        <PhoneDirectBrowseCandidatesList rows={aggregate.rows} nowMs={nowMs} motionActive={focused && appActive}
             openingKey={openingKey} onSelectRow={openRow}
             loading={aggregate.loading || Boolean(scope.projectKey && projectState.loading)} loadingMore={aggregate.loadingMore}
             incomplete={aggregate.incomplete || Boolean(projectState.error)} hasMore={aggregate.hasMore} hasSearch={searchOpen && Boolean(query.trim())}
             canLoadMore={aggregate.loadMoreSources.length > 0} canRefresh={aggregate.refreshSources.length > 0 || Boolean(scope.projectKey && !projectState.loading)}
-            onRefresh={() => { void refresh(); }} onLoadMore={() => { void loadMore(); }} />
+            onRefresh={refresh} onLoadMore={() => { void loadMore(); }} />
     </View>;
 }

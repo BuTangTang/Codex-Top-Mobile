@@ -175,7 +175,9 @@ describe('ComposerKeyboardScaffold native', () => {
         });
 
         expect(scaffoldLayout.measuredHeight).toBe(144);
-        expect(screen.tree.root.findAllByType('AnimatedView' as never)).toHaveLength(1);
+        // 只有输入框参与高度测量，底部绘制层不能变成第二个布局来源。
+        expect(screen.tree.root.findAllByType('AnimatedView' as never)
+            .filter((node) => typeof node.props.onLayout === 'function')).toHaveLength(1);
         act(() => {
             screen.tree.unmount();
         });
@@ -214,6 +216,68 @@ describe('ComposerKeyboardScaffold native', () => {
         act(() => {
             screen.tree.unmount();
         });
+    });
+
+    it('covers the region below an opaque session composer throughout keyboard movement without changing measurements', async () => {
+        const { ComposerKeyboardScaffold } = await import('./ComposerKeyboardScaffold.native');
+        const element = (
+            <ComposerKeyboardScaffold
+                mode="session"
+                testID="scaffold"
+                contentTestID="content"
+                composerTestID="composer"
+                composer={<View testID="input" />}
+            >
+                <View testID="history" />
+            </ComposerKeyboardScaffold>
+        );
+        const screen = await renderScreen(element);
+        const content = findViewByTestID(screen, 'content');
+        const composer = findComposerAnimatedView(screen.tree, 'composer');
+        act(() => {
+            findViewByTestID(screen, 'scaffold')?.props.onLayout({ nativeEvent: { layout: { height: 738 } } });
+            composer?.props.onLayout({ nativeEvent: { layout: { height: 144 } } });
+        });
+
+        // 关闭、展开、收起键盘时，遮挡层顶部始终贴住输入框底部，防止历史正文穿透手势区。
+        for (const bottomInset of [34, 280, 34, 0]) {
+            scaffoldLayout.bottomInset = bottomInset;
+            act(() => { screen.tree.update(React.cloneElement(element)); });
+            const bottomSurface = findComposerAnimatedView(screen.tree, 'composer-keyboard-bottom-surface');
+            expect(bottomSurface).toBeDefined();
+            const surfaceStyle = Object.assign({}, ...bottomSurface!.props.style.flat());
+            expect(surfaceStyle).toMatchObject({ position: 'absolute', left: 0, right: 0, bottom: 0 });
+            expect(surfaceStyle.height).toBe(bottomInset);
+            expect(surfaceStyle.backgroundColor).toBeTruthy();
+            expect(surfaceStyle.backgroundColor).toBe(resolveStyleBackgroundColor(composer?.props.style));
+            expect(resolveStyleTranslateY(composer?.props.style)).toBe(-surfaceStyle.height);
+            expect(bottomSurface!.props.pointerEvents).toBe('none');
+            expect(bottomSurface!.props.onLayout).toBeUndefined();
+            expect(findViewByTestID(screen, 'content')).toBe(content);
+            expect(findComposerAnimatedView(screen.tree, 'composer')).toBe(composer);
+            expect(scaffoldLayout.scaffoldHeight).toBe(738);
+            expect(scaffoldLayout.measuredHeight).toBe(144);
+        }
+        act(() => { screen.tree.unmount(); });
+    });
+
+    it.each([
+        { mode: 'session', surface: 'transparent' },
+        { mode: 'newSession', surface: 'opaque' },
+        { mode: 'newSession', surface: 'transparent' },
+    ] as const)('preserves the bottom surface of $mode / $surface presentations', async ({ mode, surface }) => {
+        scaffoldLayout.bottomInset = 34;
+        const { ComposerKeyboardScaffold } = await import('./ComposerKeyboardScaffold.native');
+        const screen = await renderScreen(
+            <ComposerKeyboardScaffold mode={mode} surface={surface} composerTestID="composer" composer={<View />}>
+                <View />
+            </ComposerKeyboardScaffold>,
+        );
+
+        // 透明展示及新建页面继续使用原来的绘制策略，不新增遮挡层。
+        expect(findComposerAnimatedView(screen.tree, 'composer-keyboard-bottom-surface')).toBeUndefined();
+        expect(resolveStyleTranslateY(findComposerAnimatedView(screen.tree, 'composer')?.props.style)).toBe(-34);
+        act(() => { screen.tree.unmount(); });
     });
 
     it('keeps the new-session scaffold on flex:1 so it inherits the native modal content frame', async () => {

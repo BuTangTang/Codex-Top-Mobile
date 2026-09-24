@@ -1,9 +1,10 @@
 import * as React from 'react';
-import type { ReactTestInstance } from 'react-test-renderer';
+import { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AppPaneProvider, useAppPaneContext } from '@/components/appShell/panes/AppPaneProvider';
-import { pressTestInstance, renderScreen, standardCleanup, type RenderScreenResult } from '@/dev/testkit';
+import { pressTestInstance, renderScreen, resetBrowserSessionDraftPersistenceForTest, standardCleanup, type RenderScreenResult } from '@/dev/testkit';
 import { installSessionShellCommonModuleMocks } from './sessionShellTestHelpers';
+import { actionOperationStore } from '@/sync/domains/actionOperations/actionOperationStore';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 (globalThis as any).__DEV__ = false;
@@ -11,6 +12,7 @@ import { installSessionShellCommonModuleMocks } from './sessionShellTestHelpers'
 type SessionMachineTargetTestValue = { machineId: string; basePath: string } | null;
 
 const headerActionMenuSpy = vi.hoisted(() => vi.fn());
+const activityAccountState = vi.hoisted(() => ({ accountId: '' }));
 const attachedTerminalState = vi.hoisted(() => ({ available: false, open: vi.fn() }));
 const sessionConnectedServicesAuthSwitchSpy = vi.hoisted(() => vi.fn());
 const openRightSpy = vi.hoisted(() => vi.fn());
@@ -38,6 +40,7 @@ const resolveSessionWorkspacePresentationSpy = vi.hoisted(() => vi.fn((params: a
   machineLabel: params?.target?.machineId ?? 'unknown',
 })));
 const routerPushSpy = vi.hoisted(() => vi.fn());
+const routerNavigateSpy = vi.hoisted(() => vi.fn());
 const routerBackSpy = vi.hoisted(() => vi.fn(() => {
   (globalThis as any).location.href = 'http://localhost/session/s1/previous';
   (globalThis as any).location.pathname = '/session/s1/previous';
@@ -79,9 +82,11 @@ const sessionState = vi.hoisted(() => ({
   } as any,
 }));
 
+/** 补齐原生动画边界的滚动容器，让真实账本弹层可在当前宿主夹具内展开。 */
 vi.mock('react-native-reanimated', () => {
   const Animated = {
     View: 'Animated.View',
+    ScrollView: 'Animated.ScrollView',
     createAnimatedComponent: (component: unknown) => component,
   };
   return {
@@ -326,6 +331,7 @@ installSessionShellCommonModuleMocks({
     return createExpoRouterMock({
       router: {
         push: routerPushSpy,
+        navigate: routerNavigateSpy,
         back: routerBackSpy,
         replace: vi.fn(),
         setParams: vi.fn(),
@@ -348,6 +354,9 @@ installSessionShellCommonModuleMocks({
         { getState: getStorageStateForTest },
       ) as any,
       useSession: () => sessionState.session,
+      useActiveServerAccountScope: () => activityAccountState.accountId
+        ? { accountId: activityAccountState.accountId, serverId: 'server-1' }
+        : null,
       useIsDataReady: () => true,
       useRealtimeStatus: () => ({ current: { status: 'connected' } as any }),
       useSessionMessages: () => ({ messages: sessionMessagesState.messages, isLoaded: true }),
@@ -451,9 +460,71 @@ function getHeaderExtraItemIds(props: any): string[] {
 }
 
 describe('SessionView header action menu visibility', () => {
+  /** 只有原生手机将真实活动入口收进更多，网页和平板仍保留原按钮。 */
+  it.each([
+    { os: 'android' as const, deviceType: 'phone' as const, folded: true },
+    { os: 'android' as const, deviceType: 'tablet' as const, folded: false },
+    { os: 'web' as const, deviceType: 'phone' as const, folded: false },
+  ])('keeps activity reachable on $os $deviceType with folded=$folded', async ({ os, deviceType, folded }) => {
+    // 有账号的会话会读取真实草稿 owner，先通过标准夹具完成存储准备。
+    await resetBrowserSessionDraftPersistenceForTest();
+    platformState.os = os;
+    responsiveState.deviceType = deviceType;
+    windowDimensionsState.width = deviceType === 'phone' ? 390 : 900;
+    activityAccountState.accountId = `header-activity-${os}-${deviceType}`;
+    actionOperationStore.merge({
+      version: 1,
+      operationId: activityAccountState.accountId,
+      revision: 1,
+      actionId: 'session.fork',
+      state: 'succeeded',
+      scope: { accountId: activityAccountState.accountId, machineId: 'machine-1', sessionId: 's1' },
+      title: 'Fork session',
+      createdAt: 100,
+      settledAt: 200,
+      cancellation: 'unsupported',
+    });
+    const screen = await renderSessionView();
+    const items = getHeaderExtraItemIds(getLastHeaderActionMenuProps());
+    expect(items.includes('header.openActionOperations')).toBe(folded);
+    // 检查实际可点按钮，避免把承载相同 testID 参数的复合组件误算为可见入口。
+    const activityButtons = screen.findAll((node) => (node.type as unknown) === 'Pressable'
+      && node.props.testID === 'session-header-action-operations');
+    expect(activityButtons.length > 0).toBe(!folded);
+    if (folded) {
+      // 真正从菜单打开后，既有详情 owner 才标记已读；只显示菜单项不算路径可达。
+      expect(actionOperationStore.getState().terminalSeenAtById.has(activityAccountState.accountId)).toBe(false);
+      await act(async () => {
+        expect(getLastHeaderActionMenuProps().onSelectExtraItem('header.openActionOperations')).toBe(true);
+      });
+      expect(actionOperationStore.getState().terminalSeenAtById.has(activityAccountState.accountId)).toBe(true);
+    }
+  });
+
+  /** 手机详情和终端改由更多打开，仍由现有导航 owner 决定真实目的地。 */
+  it('folds phone details and terminal into more without losing their destinations', async () => {
+    platformState.os = 'android';
+    windowDimensionsState.width = 390;
+    responsiveState.deviceType = 'phone';
+    multiPaneSettingState.enabled = true;
+    executionRunsFeatureState.enabled = true;
+    const screen = await renderSessionView();
+    const props = getLastHeaderActionMenuProps();
+    expect(getHeaderExtraItemIds(props)).toContain('header.openSessionInfo');
+    expect(getHeaderExtraItemIds(props)).toContain('header.openTerminal');
+    expect(findPressableByAccessibilityLabel(screen, 'sessionInfo.title')).toBeUndefined();
+    expect(findPressableByAccessibilityLabel(screen, 'settings.terminal')).toBeUndefined();
+    expect(props.onSelectExtraItem('header.openSessionInfo')).toBe(true);
+    expect(routerNavigateSpy).toHaveBeenCalledWith('/session/s1/info?serverId=server-1', expect.any(Object));
+    expect(props.onSelectExtraItem('header.openTerminal')).toBe(true);
+    expect(routerPushSpy).toHaveBeenCalledWith('/session/s1/terminal?serverId=server-1');
+  });
+
+  /** 每例释放渲染树并恢复账号、平台与导航夹具，避免活动投影串入后续测试。 */
   afterEach(() => {
     vi.useRealTimers();
     standardCleanup();
+    activityAccountState.accountId = '';
     sessionState.session = {
       id: 's1',
       metadata: null,
@@ -490,6 +561,7 @@ describe('SessionView header action menu visibility', () => {
     readDisplayMachineTargetForSessionSpy.mockReturnValue(null);
     resolveSessionWorkspacePresentationSpy.mockClear();
     routerPushSpy.mockReset();
+    routerNavigateSpy.mockReset();
     routerBackSpy.mockReset();
     navigateWithBlurOnWebSpy.mockClear();
     windowDimensionsState.width = 800;

@@ -83,9 +83,11 @@ vi.mock('@/components/ui/lists/flashListCompat/FlashListCompat', async () =>
     (await import('@/dev/testkit/harness/chatListHarness')).createFlashListChatListModuleMock()
 );
 
-vi.mock('@/utils/platform/responsive', () => ({
-    useHeaderHeight: () => 0,
-}));
+vi.mock('@/utils/platform/responsive', async (importOriginal) => {
+    // 保留真实手机尺寸判断，只替代测试不测量的顶栏高度。
+    const actual = await importOriginal<typeof import('@/utils/platform/responsive')>();
+    return { ...actual, useHeaderHeight: () => 0 };
+});
 
 vi.mock('react-native-safe-area-context', () => ({
     useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),

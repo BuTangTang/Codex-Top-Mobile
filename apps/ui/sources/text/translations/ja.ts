@@ -6638,6 +6638,20 @@ localTailscale: {
   },
 
   directSessions: {
+    phoneList: {
+      running: "运行中",
+      needsInput: "等待处理",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+      unknown: "状态未知",
+      loading: "正在加载…",
+      incomplete: "列表未完整，点此重试",
+      loadingMore: "正在加载更多…",
+      emptyIncomplete: "暂未读全会话，请刷新重试",
+      emptyPage: "当前页暂无会话，可继续加载",
+      empty: "暂无会话",
+    },
     browseListChanged: "セッション一覧が更新されました。一覧を再読み込みしてから、続きを読み込んでください。",
     browseListIncomplete: "現在の一覧には、まだすべてのセッションが含まれていません。他にもセッションがある可能性があります。しばらくしてから一覧を再読み込みしてお試しください。",
     historyPreviewOnly: "現在の取得元からはプレビューのみを読み取れます。セッションの全履歴は読み取れません。",

@@ -6718,6 +6718,20 @@ export const it: TranslationStructure = {
   },
 
   directSessions: {
+    phoneList: {
+      running: "运行中",
+      needsInput: "等待处理",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+      unknown: "状态未知",
+      loading: "正在加载…",
+      incomplete: "列表未完整，点此重试",
+      loadingMore: "正在加载更多…",
+      emptyIncomplete: "暂未读全会话，请刷新重试",
+      emptyPage: "当前页暂无会话，可继续加载",
+      empty: "暂无会话",
+    },
     browseListChanged: "L’elenco delle sessioni è cambiato. Aggiornalo per continuare il caricamento.",
     browseListIncomplete: "Questo elenco non include ancora tutte le sessioni. Potrebbero essercene altre disponibili. Aggiorna l’elenco e riprova più tardi.",
     historyPreviewOnly: "È disponibile solo un’anteprima. Non è possibile leggere la cronologia completa della sessione dalla fonte attuale.",

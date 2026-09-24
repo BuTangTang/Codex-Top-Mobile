@@ -11,6 +11,7 @@ import { createModalModuleMock } from '@/dev/testkit/mocks/modal';
 import { createStorageModuleStub } from '@/dev/testkit/mocks/storage';
 import { createTextModuleMock } from '@/dev/testkit/mocks/text';
 import { createUnistylesMock } from '@/dev/testkit/mocks/unistyles';
+import { createSafeAreaContextMock } from '@/dev/testkit/mocks/nativeEnvironment';
 import { createCapturingFlatListMock } from '@/dev/testkit/mocks/flashList';
 import { installNewSessionComponentsCommonModuleMocks } from '../../new/components/newSessionComponentsTestHelpers';
 
@@ -151,6 +152,8 @@ vi.mock('@/sync/ops/machineDirectSessions', () => ({
     machineDirectSessionLinkEnsure: linkEnsureSpy,
     machineDirectSessionsProjectsList: projectsListSpy,
 }));
+
+vi.mock('react-native-safe-area-context', () => createSafeAreaContextMock({ safeArea: { top: 0, bottom: 0, left: 0, right: 0 }, keyboard: { isVisible: false, height: 0 } }));
 
 const directSessionsBrowseScreenModulePromise = import('./DirectSessionsBrowseScreen');
 const defaultCandidatesImplementation = candidatesListSpy.getMockImplementation()!;
@@ -354,6 +357,100 @@ describe('DirectSessionsBrowseScreen', () => {
             await act(async () => { screen.tree.unmount(); });
             // 公共列表时钟也使用 AppState；只要求该页面释放它自己新增的监听。
             expect(appStateBoundary.getListenerCount()).toBe(listenersWhileMounted - 1);
+        } finally { vi.useRealTimers(); }
+    });
+
+    /** 自动 LIST 继续更新事实，但阅读期间只冻结行顺序，回到顶部再采用最新排序。 */
+    it('keeps reading rows in place through automatic discovery and releases their order at the top', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        vi.useFakeTimers();
+        try {
+            activeScopeState.value = { serverId: 's', accountId: 'a' };
+            machinesState = [machinesState[0]!];
+            let refreshed = false;
+            candidatesListSpy.mockImplementation(async (request) => ({
+                ok: true,
+                candidates: request.source.kind === 'codexHome' && request.source.home === 'user'
+                    ? refreshed
+                        ? [phoneCandidate('new', 'running', 100), phoneCandidate('second', 'completed', 200), phoneCandidate('first', 'running', 300)]
+                        : [phoneCandidate('first', 'running', 100), phoneCandidate('second', 'running', 200), phoneCandidate('removed', 'running', 300)]
+                    : [], nextCursor: null,
+            }));
+            const screen = await renderScreen(<PhoneSessionsOverview />);
+            const list = () => screen.findAllByType('FlatList')[0]!;
+            const oldSecond = list().props.data[1];
+            const sourceCount = candidatesListSpy.mock.calls.length;
+            await act(async () => { list().props.onScroll?.({ nativeEvent: { contentOffset: { y: 160 } } }); });
+            refreshed = true;
+            await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+            expect(candidatesListSpy).toHaveBeenCalledTimes(sourceCount * 2);
+            expect(list().props.data.map((row: { candidate: { remoteSessionId: string } }) => row.candidate.remoteSessionId)).toEqual(['first', 'second', 'new']);
+            const currentSecond = list().props.data[1];
+            expect(currentSecond).not.toBe(oldSecond);
+            expect(currentSecond.lifecycle.state).toBe('completed');
+            await act(async () => { screen.pressByTestId(`phone-session:${currentSecond.key}`); });
+            expect(linkEnsureSpy).toHaveBeenCalledWith(expect.objectContaining({ remoteSessionId: 'second' }), { serverId: 's' });
+            await act(async () => { list().props.onScroll?.({ nativeEvent: { contentOffset: { y: 0 } } }); });
+            expect(list().props.data.map((row: { candidate: { remoteSessionId: string } }) => row.candidate.remoteSessionId)).toEqual(['new', 'second', 'first']);
+        } finally { vi.useRealTimers(); }
+    });
+
+    /** 持续动效只由真实可见行和现有页面活动信号启停，离开视口不能继续旋转。 */
+    it('runs lifecycle motion only for viewable rows on the focused foreground page', async () => {
+        const animation = await import('react-native-reanimated');
+        const repeat = vi.spyOn(animation, 'withRepeat');
+        const cancel = vi.spyOn(animation, 'cancelAnimation');
+        try {
+            activeScopeState.value = { serverId: 's', accountId: 'a' };
+            machinesState = [machinesState[0]!];
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('running', 'running')], nextCursor: null });
+            const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+            const screen = await renderScreen(<PhoneSessionsOverview />);
+            const list = () => screen.findAllByType('FlatList')[0]!;
+            const visible = () => [{ key: list().props.data[0].key, item: list().props.data[0], index: 0, isViewable: true }];
+            expect(repeat).not.toHaveBeenCalled();
+            await act(async () => { list().props.onViewableItemsChanged({ viewableItems: visible(), changed: visible() }); });
+            expect(repeat).toHaveBeenCalled();
+            const started = repeat.mock.calls.length;
+            const cancellations = cancel.mock.calls.length;
+            await act(async () => { list().props.onViewableItemsChanged({ viewableItems: [], changed: [] }); });
+            expect(cancel.mock.calls.length).toBeGreaterThan(cancellations);
+            focusState.value = false;
+            await screen.update(<PhoneSessionsOverview />);
+            await act(async () => { list().props.onViewableItemsChanged({ viewableItems: visible(), changed: visible() }); });
+            expect(repeat).toHaveBeenCalledTimes(started);
+            focusState.value = true;
+            await screen.update(<PhoneSessionsOverview />);
+            expect(repeat.mock.calls.length).toBeGreaterThan(started);
+            const beforeSleep = cancel.mock.calls.length;
+            await act(async () => { appStateBoundary.emit('background'); });
+            expect(cancel.mock.calls.length).toBeGreaterThan(beforeSleep);
+        } finally { repeat.mockRestore(); cancel.mockRestore(); }
+    });
+
+    /** 正常后台发现不激活下拉指示，手动刷新仍使用同一个列表及请求 owner。 */
+    it('keeps automatic refresh silent while showing progress for an explicit pull refresh', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        vi.useFakeTimers();
+        try {
+            activeScopeState.value = { serverId: 's', accountId: 'a' };
+            machinesState = [machinesState[0]!];
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('first', 'running')], nextCursor: null });
+            const screen = await renderScreen(<PhoneSessionsOverview />);
+            const list = () => screen.findAllByType('FlatList')[0]!;
+            const pending: Array<(value: DirectSessionsCandidatesListResponse) => void> = [];
+            candidatesListSpy.mockImplementation(() => new Promise((resolve) => pending.push(resolve)));
+            await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+            expect(pending.length).toBeGreaterThan(0);
+            expect(list().props.refreshing).toBe(false);
+            expect(list().props.data).not.toHaveLength(0);
+            await act(async () => { pending.splice(0).forEach((finish) => finish({ ok: true, candidates: [phoneCandidate('first', 'running')], nextCursor: null })); });
+            await act(async () => { list().props.onRefresh(); });
+            expect(list().props.refreshing).toBe(true);
+            await act(async () => { pending.splice(0).forEach((finish) => finish({ ok: true, candidates: [phoneCandidate('first', 'running')], nextCursor: null })); });
+            expect(list().props.refreshing).toBe(false);
         } finally { vi.useRealTimers(); }
     });
 
@@ -1314,22 +1411,23 @@ describe('DirectSessionsBrowseScreen', () => {
         expect(screen.findAllByType('FlatList')).toHaveLength(1);
         expect(screen.findAllByType('DropdownMenu')).toHaveLength(0);
         expect(screen.findByTestId('phone-sessions-search')).toBeNull();
+        expect(screen.findByTestId('phone-sessions-title')).not.toBeNull();
         await act(async () => { screen.pressByTestId('phone-sessions-search-toggle'); });
         expect(screen.findByTestId('phone-sessions-search')).not.toBeNull();
-        expect(screen.findByTestId('phone-sessions-status:running')?.props.accessibilityState).toEqual({ selected: true });
+        expect(screen.findByTestId('phone-sessions-status:running')).toBeNull();
         expect(screen.findByTestId('phone-sessions-status:all')).toBeNull();
-        expect(screen.findByTestId('phone-sessions-status:completed')).not.toBeNull();
+        expect(screen.findByTestId('phone-sessions-status:completed')).toBeNull();
         expect(screen.findByTestId('direct-session-provider-picker-trigger')).toBeNull();
     });
 
-    it('classifies explicit facts across computers, sorts one list and opens the exact original source', async () => {
+    it('shows every explicit lifecycle in one sorted list and opens the exact original source', async () => {
         activeScopeState.value = { serverId: 'phone-server', accountId: 'phone-account' };
         machinesState = machinesState.map((machine) => ({ ...machine, active: true }));
         candidatesListSpy.mockImplementation(async (request) => ({
             ok: true,
             candidates: request.source.kind === 'codexHome' && request.source.home === 'user'
                 ? request.machineId === 'machine-1'
-                    ? [phoneCandidate('running-older', 'running', 3000), phoneCandidate('wait', 'needs_input'), phoneCandidate('done', 'completed'), phoneCandidate('unknown', 'unknown'), phoneCandidate('failed', 'failed')]
+                    ? [phoneCandidate('running-older', 'running', 3000), phoneCandidate('wait', 'needs_input', 2000), phoneCandidate('done', 'completed', 4000), phoneCandidate('unknown', 'unknown', 5000), phoneCandidate('failed', 'failed', 6000), phoneCandidate('cancelled', 'cancelled', 7000)]
                     : [phoneCandidate('running-newer', 'running')]
                 : [],
             nextCursor: null,
@@ -1338,18 +1436,15 @@ describe('DirectSessionsBrowseScreen', () => {
         const screen = await renderScreen(<PhoneSessionsOverview />);
         await flushHookEffects();
         const list = () => screen.findAllByType('FlatList')[0]!;
-        expect(list().props.data.map((row: any) => row.candidate.remoteSessionId)).toEqual(['running-newer', 'running-older']);
+        expect(list().props.data.map((row: any) => row.candidate.remoteSessionId)).toEqual(['running-newer', 'wait', 'running-older', 'done', 'unknown', 'failed', 'cancelled']);
         const requestCount = candidatesListSpy.mock.calls.length;
         const newer = list().props.data[0];
         await act(async () => { screen.pressByTestId(`phone-session:${newer.key}`); });
         expect(linkEnsureSpy).toHaveBeenCalledWith(expect.objectContaining({ machineId: 'machine-2', remoteSessionId: 'running-newer', source: { kind: 'codexHome', home: 'user', homePath: '/work/actual-home' } }), { serverId: 'phone-server' });
-        await act(async () => { screen.pressByTestId('phone-sessions-status:needs_input'); });
-        expect(list().props.data.map((row: any) => row.candidate.remoteSessionId)).toEqual(['wait']);
-        await act(async () => { screen.pressByTestId('phone-sessions-status:completed'); });
-        expect(list().props.data.map((row: any) => row.candidate.remoteSessionId)).toEqual(['done']);
+        expect(new Set(list().props.data.map((row: { lifecycle: { state: string } }) => row.lifecycle.state)))
+            .toEqual(new Set(['running', 'needs_input', 'completed', 'unknown', 'failed', 'cancelled']));
         expect(candidatesListSpy).toHaveBeenCalledTimes(requestCount);
-        await act(async () => { screen.pressByTestId('phone-sessions-history-link'); });
-        expect(routerPushSpy).toHaveBeenCalledWith('/settings/machines');
+        expect(screen.findByTestId('phone-sessions-history-link')).toBeNull();
     });
 
     it('keeps a fast computer pageable while another source is slow, and restores rows after a failed page', async () => {

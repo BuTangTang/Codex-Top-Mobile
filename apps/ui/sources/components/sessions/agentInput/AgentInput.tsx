@@ -3,7 +3,7 @@ import * as React from 'react';
 import { View, Platform, useWindowDimensions, ViewStyle, Pressable, ScrollView } from 'react-native';
 import { layout } from '@/components/ui/layout/layout';
 import { MultiTextInput, KeyPressEvent, type MultiTextInputSubmitBehavior } from '@/components/ui/forms/MultiTextInput';
-import { MULTI_TEXT_INPUT_BASE_FONT_SIZE } from '@/components/ui/forms/multiTextInputTypography';
+import { MULTI_TEXT_INPUT_BASE_FONT_SIZE, MULTI_TEXT_INPUT_BASE_LINE_HEIGHT } from '@/components/ui/forms/multiTextInputTypography';
 import {
     areActiveWordsEqual,
     areLiveInputTextStatusesEqual,
@@ -71,6 +71,7 @@ import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import {
     clampNumber,
     computeAgentInputDefaultMaxHeight,
+    computePhoneSessionInputMaxHeight,
     computeAgentInputKeyboardOpenVariableSectionMaxHeight,
     computeMeasuredPanelInputMaxHeight,
     resolveAgentInputHostPanelMaxHeight,
@@ -659,6 +660,7 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
         borderTopWidth: StyleSheet.hairlineWidth,
         borderTopColor: theme.colors.border.default,
     },
+    phoneMoreButton: { minWidth: 48, minHeight: 48, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
     phoneComposerRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8 },
     // 横排必须覆盖纵向区域的显式 flexGrow: 0；Yoga 不会用 flex 简写覆盖它。
     phoneComposerVariableSection: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, paddingBottom: 0 },
@@ -1143,7 +1145,9 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     const isPhoneSession = useDeviceType() === 'phone' && Platform.OS !== 'web' && Boolean(props.sessionId);
     const styles = stylesheet;
     const { theme } = useUnistyles();
-    const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+    const { width: screenWidth, height: screenHeight, fontScale } = useWindowDimensions();
+    const configuredUiFontScale = useLocalSetting('uiFontScale');
+    const uiFontScale = Number.isFinite(configuredUiFontScale) && configuredUiFontScale > 0 ? configuredUiFontScale : 1;
     const voiceEnabled = useFeatureEnabled('voice');
     const uiBackdropBlurEnabled = useLocalSetting('uiBackdropBlurEnabled') !== false;
     const keyboardShortcutsV2Enabled = useSetting('keyboardShortcutsV2Enabled') === true;
@@ -1206,7 +1210,14 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
             footerHeight: actionFooterHeightPx + composerAttentionHeightPx,
         });
     }, [actionFooterHeightPx, composerAttentionHeightPx, effectivePanelMaxHeight]);
-    const fallbackInputMaxHeight = props.inputMaxHeight ?? defaultInputMaxHeight;
+    // 原生输入仍由 MultiTextInput 自然从一行增高；这里只限制视口，超出后保留其内部滚动。
+    const fallbackInputMaxHeight = isPhoneSession
+        ? computePhoneSessionInputMaxHeight({
+            lineHeight: Math.ceil(MULTI_TEXT_INPUT_BASE_LINE_HEIGHT * uiFontScale) * (fontScale || 1),
+            verticalPadding: 16,
+            availableHeight: effectivePanelMaxHeight ?? props.inputMaxHeight ?? defaultInputMaxHeight,
+        })
+        : props.inputMaxHeight ?? defaultInputMaxHeight;
     const minimumMeasuredPanelFixedChromeHeight = Platform.OS === 'web'
         ? actionFooterHeightPx
             + composerAttentionHeightPx
@@ -1232,7 +1243,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         panelHeightPx,
         props.sessionId,
     ]);
-    const inputExpansionCollapsedMaxHeight = typeof props.inputExpansion?.collapsedMaxHeight === 'number'
+    const inputExpansionCollapsedMaxHeight = !isPhoneSession && typeof props.inputExpansion?.collapsedMaxHeight === 'number'
         && Number.isFinite(props.inputExpansion.collapsedMaxHeight)
         && props.inputExpansion.collapsedMaxHeight > 0
         ? props.inputExpansion.collapsedMaxHeight
@@ -1690,13 +1701,15 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         return 'auto';
     }, [agentInputChipDensity]);
 
+    /** 手机将已支持动作收进原有更多菜单，大屏继续尊重工具排列偏好。 */
     const effectiveActionBarLayout = React.useMemo<'wrap' | 'scroll' | 'collapsed'>(() => {
+        if (isPhoneSession) return 'collapsed';
         return resolveAgentInputActionBarLayout({
             configuredLayout: agentInputActionBarLayout,
             platform: Platform.OS,
             isMobileLayout: isMobileLayoutWidth(screenWidth),
         });
-    }, [agentInputActionBarLayout, screenWidth]);
+    }, [agentInputActionBarLayout, isPhoneSession, screenWidth]);
 
     // In labels mode: always show; in icons mode: never show; in auto: show for 'always' policy chips.
     const showChipLabels = effectiveChipDensity === 'labels' || effectiveChipDensity === 'auto';
@@ -2666,6 +2679,27 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
     }, [canStopFromComposer, handleComposerAbortShortcut, handleComposerFocusShortcut]);
     useKeyboardShortcutHandlers(keyboardShortcutHandlers);
 
+    /** 手机把原权限入口也转交更多菜单，保留现有权限选择和外部回调。 */
+    const actionMenuExtraActionChips = React.useMemo(() => {
+        if (!isPhoneSession || !showPermissionChip) return props.extraActionChips;
+        const permissionAction: AgentInputExtraActionChip = {
+            key: 'phone-permission',
+            controlId: 'permission',
+            /** 此描述只供折叠菜单使用，不额外渲染工具行。 */
+            render: () => null,
+            /** 菜单仅转交既有权限入口，不创建新的权限策略。 */
+            collapsedAction: ({ dismiss }) => ({
+                id: 'permission',
+                label: effectivePermissionLabel,
+                /** 先关闭更多，再由原控件 owner 打开已有权限界面。 */
+                onPress: () => {
+                    dismiss();
+                    handlePermissionPress();
+                },
+            }),
+        };
+        return [permissionAction, ...(props.extraActionChips ?? [])];
+    }, [effectivePermissionLabel, handlePermissionPress, isPhoneSession, props.extraActionChips, showPermissionChip]);
     const {
         handleActionMenuPress,
         actionMenuActions,
@@ -2701,7 +2735,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         currentPath: props.currentPath,
         resumeSessionId: props.resumeSessionId,
         sessionId: props.sessionId,
-        extraActionChips: props.extraActionChips,
+        extraActionChips: actionMenuExtraActionChips,
         openCollapsedOptionsPopover: (chipKey) => {
             if (!chipKey) {
                 closeSelectionOverlay('collapsedExtra');
@@ -3221,7 +3255,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         </View>
     );
 
-    /** 手机会话仅保留输入旁的提交控件；审批提示独立显示，大屏仍测量原工具行。 */
+    /** 手机提交与更多入口放在输入旁；审批提示独立显示，大屏仍测量原工具行。 */
     const renderActionFooterSection = () => (
         <View
             style={styles.nativeKeyboardFooterSection}
@@ -3258,7 +3292,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                 <AgentInputOverlayLayer
                     screenWidth={screenWidth}
                     showPermissionPopover={showPermissionPopover && Boolean(props.onPermissionModeChange)}
-                    permissionChipAnchorRef={permissionChipAnchorRef}
+                    permissionChipAnchorRef={isPhoneSession ? actionMenuAnchorRef : permissionChipAnchorRef}
                     onPermissionPopoverRequestClose={closePermissionPopover}
                     onPermissionSelect={handlePermissionSelect}
                     agentId={agentId}
@@ -3506,6 +3540,19 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                         <View style={styles.nativeKeyboardPanelContent}>
                             {renderComposerAttentionRequests()}
                             <View style={isPhoneSession ? styles.phoneComposerRow : undefined}>
+                                {isPhoneSession && hasActionMenuPopoverSections ? (
+                                    <Pressable
+                                        ref={actionMenuAnchorRef}
+                                        testID="agent-input-action-menu-button"
+                                        accessibilityRole="button"
+                                        accessibilityLabel={t('agentInput.actionMenu.title')}
+                                        accessibilityState={{ expanded: showActionMenu }}
+                                        onPress={handleActionMenuPress}
+                                        style={styles.phoneMoreButton}
+                                    >
+                                        <Icon name="plus" size={22} color={theme.colors.text.secondary} />
+                                    </Pressable>
+                                ) : null}
                                 <View
                                     style={[
                                         styles.nativeKeyboardVariableSection,

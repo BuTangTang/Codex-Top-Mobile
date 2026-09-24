@@ -510,6 +510,9 @@ const maybeDrainDeferredNewerMessagesMock = vi.hoisted(() => vi.fn());
 const settingValues: Record<string, any> = {};
 const runtimeMockState = vi.hoisted(() => ({
     headerHeight: 0,
+    width: 1024,
+    height: 768,
+    dimensionListeners: new Set<() => void>(),
     platformOs: 'web' as 'web' | 'ios' | 'android',
     safeAreaTop: 0,
 }));
@@ -671,7 +674,15 @@ vi.mock('react-native', async () => {
     return createReactNativeWebMock(
         {
                                     Dimensions: {
-                                        get: () => ({ width: 1024, height: 768, scale: 1, fontScale: 1 }),
+                                        get: () => ({ width: runtimeMockState.width, height: runtimeMockState.height, scale: 1, fontScale: 1 }),
+                                    },
+                                    // 通过真实原生边界的订阅语义触发变化，不能被 ChatList 的 props memo 吞掉。
+                                    useWindowDimensions: () => {
+                                        React.useSyncExternalStore((listener) => {
+                                            runtimeMockState.dimensionListeners.add(listener);
+                                            return () => runtimeMockState.dimensionListeners.delete(listener);
+                                        }, () => `${runtimeMockState.width}:${runtimeMockState.height}`);
+                                        return { width: runtimeMockState.width, height: runtimeMockState.height };
                                     },
                                     Platform: {
                                         get OS() {
@@ -700,9 +711,11 @@ vi.mock('@/components/sessions/shell/useSessionScreenIsFocused', () => ({
     useSessionScreenIsFocused: () => true,
 }));
 
-vi.mock('@/utils/platform/responsive', () => ({
-    useHeaderHeight: () => runtimeMockState.headerHeight,
-}));
+vi.mock('@/utils/platform/responsive', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/utils/platform/responsive')>();
+    // 手机判定走真实尺寸边界，顶栏继续使用本夹具已有控制值。
+    return { useDeviceType: actual.useDeviceType, useHeaderHeight: () => runtimeMockState.headerHeight };
+});
 
 vi.mock('react-native-safe-area-context', () => ({
     useSafeAreaInsets: () => ({ top: runtimeMockState.safeAreaTop, bottom: 0, left: 0, right: 0 }),
@@ -1121,6 +1134,8 @@ describe('ChatList (FlashList v2)', () => {
         __resetDefaultTranscriptItemHeightCacheForTests();
         __resetTranscriptWarmPaintCacheForTests();
         runtimeMockState.platformOs = 'web';
+        runtimeMockState.width = 1024;
+        runtimeMockState.height = 768;
         capturedFlashListProps = null;
         flashListChatListHarnessState.flashListProps = null;
         renderedFlatListCount = 0;
@@ -1579,6 +1594,45 @@ describe('ChatList (FlashList v2)', () => {
         function listDataIds(): string[] {
             return (getCapturedFlashListProps()?.data ?? []).map((item: any) => item.id);
         }
+
+        // 手机默认摘要在完整列表路径上生效，用户展开与设备尺寸变化保留同一组状态。
+        it('keeps short phone groups collapsed and preserves manual expansion across tablet resizing', async () => {
+            configureToolTurn(['t1', 't2'], { previewCount: 1 });
+            runtimeMockState.width = 390;
+            runtimeMockState.height = 844;
+            const { ChatList } = await import('./ChatList');
+            const screen = await renderTrackedFlashListChatList(<ChatList session={{ ...sessionState }} />);
+            await screen.settle();
+            expect(listDataIds()).toEqual([`${groupId}#footer`, `${groupId}#header`]);
+
+            await act(async () => renderedToolGroupUnitHeaderProps.at(-1).setExpanded(true));
+            await screen.settle();
+            const expandedIds = listDataIds();
+            expect(expandedIds).toContain(`${groupId}#tool:t1`);
+            expect(expandedIds).toContain(`${groupId}#tool:t2`);
+            const phoneRenderItem = getCapturedFlashListProps().renderItem;
+
+            await act(async () => {
+                runtimeMockState.width = 1024;
+                runtimeMockState.height = 768;
+                runtimeMockState.dimensionListeners.forEach((listener) => listener());
+            });
+            await screen.settle();
+            expect(listDataIds()).toEqual(expandedIds);
+            expect(getCapturedFlashListProps().renderItem).not.toBe(phoneRenderItem);
+            expect(renderedToolGroupUnitHeaderProps.at(-1).toolChromeCommon.compactToolCalls).toBe(false);
+
+            await act(async () => {
+                runtimeMockState.width = 390;
+                runtimeMockState.height = 844;
+                runtimeMockState.dimensionListeners.forEach((listener) => listener());
+            });
+            await screen.settle();
+            await act(async () => renderedToolGroupUnitHeaderProps.at(-1).setExpanded(false));
+            await screen.settle();
+            expect(listDataIds()).toEqual([`${groupId}#footer`, `${groupId}#header`]);
+            await screen.unmount();
+        });
 
         it('turns a prepend that merges into the visible group into BETWEEN-row insertion with stable keys', async () => {
             configureToolTurn(['t2', 't3']);

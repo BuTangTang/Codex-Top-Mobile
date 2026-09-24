@@ -6392,6 +6392,20 @@ export const pl: TranslationStructure = {
   },
 
   directSessions: {
+    phoneList: {
+      running: "运行中",
+      needsInput: "等待处理",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+      unknown: "状态未知",
+      loading: "正在加载…",
+      incomplete: "列表未完整，点此重试",
+      loadingMore: "正在加载更多…",
+      emptyIncomplete: "暂未读全会话，请刷新重试",
+      emptyPage: "当前页暂无会话，可继续加载",
+      empty: "暂无会话",
+    },
     browseListChanged: "Lista sesji uległa zmianie. Odśwież ją, aby kontynuować wczytywanie.",
     browseListIncomplete: "Ta lista nie obejmuje jeszcze wszystkich sesji. Mogą być dostępne kolejne sesje. Odśwież listę i spróbuj ponownie później.",
     historyPreviewOnly: "Dostępny jest tylko podgląd. Nie można odczytać pełnej historii sesji z bieżącego źródła.",

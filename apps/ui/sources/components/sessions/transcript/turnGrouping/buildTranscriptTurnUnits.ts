@@ -114,6 +114,7 @@ function buildMessageItem(params: Readonly<{
     };
 }
 
+/** 按原顺序投影组内工具；折叠例外仍使用原工具行标识和展开状态。 */
 function appendToolGroupUnits(params: Readonly<{
     output: TranscriptTurnUnitListItem[];
     groupId: string;
@@ -124,6 +125,7 @@ function appendToolGroupUnits(params: Readonly<{
     groupItemMetadata: ForkMessageMetadata | null;
     isGroupExpanded: (toolMessageIds: readonly string[]) => boolean;
     collapsedPreviewCount: number;
+    isToolVisibleWhenCollapsed?: (toolMessageId: string, isReadOnlyContext: boolean) => boolean;
 }>): void {
     if (params.toolMessageIds.length === 0) return;
 
@@ -135,11 +137,16 @@ function appendToolGroupUnits(params: Readonly<{
         ?? readMessageMetadata(params.metadataByMessageId, firstToolMessageId);
     const capMetadataFields = metadataFields(capMetadata);
 
+    const previewStartIndex = Math.max(0, toolMessageIds.length - params.collapsedPreviewCount);
+    const isToolVisibleWhenCollapsed = params.isToolVisibleWhenCollapsed;
     const visibleToolMessageIds = expanded
         ? toolMessageIds
-        : params.collapsedPreviewCount > 0
-            ? toolMessageIds.slice(Math.max(0, toolMessageIds.length - params.collapsedPreviewCount))
-            : [];
+        : isToolVisibleWhenCollapsed
+            ? toolMessageIds.filter((id, index) => index >= previewStartIndex || isToolVisibleWhenCollapsed(
+                id,
+                (readMessageMetadata(params.metadataByMessageId, id) ?? params.groupItemMetadata)?.isReadOnlyContext === true,
+            ))
+            : toolMessageIds.slice(previewStartIndex);
     const hiddenCount = expanded ? 0 : toolMessageIds.length - visibleToolMessageIds.length;
 
     params.output.push({
@@ -193,12 +200,14 @@ function appendToolGroupUnits(params: Readonly<{
     });
 }
 
+/** 保持普通预览策略；调用方可为手机待审批工具提供折叠可见例外。 */
 export function buildTranscriptTurnUnits(params: Readonly<{
     items: readonly TranscriptTurnUnitSourceItem[];
     getMessageById: (messageId: string) => Message | null;
     metadataByMessageId?: Readonly<Record<string, { originSessionId: string; isReadOnlyContext: boolean }>>;
     isGroupExpanded: (toolMessageIds: readonly string[]) => boolean;
     collapsedPreviewCount: number; // already-resolved K; <= 0 means no preview tail
+    isToolVisibleWhenCollapsed?: (toolMessageId: string, isReadOnlyContext: boolean) => boolean;
 }>): TranscriptTurnUnitListItem[] {
     const collapsedPreviewCount = normalizeCollapsedPreviewCount(params.collapsedPreviewCount);
     const output: TranscriptTurnUnitListItem[] = [];
@@ -230,6 +239,7 @@ export function buildTranscriptTurnUnits(params: Readonly<{
                     groupItemMetadata: null,
                     isGroupExpanded: params.isGroupExpanded,
                     collapsedPreviewCount,
+                    isToolVisibleWhenCollapsed: params.isToolVisibleWhenCollapsed,
                 });
             }
             continue;
@@ -249,6 +259,7 @@ export function buildTranscriptTurnUnits(params: Readonly<{
                 groupItemMetadata,
                 isGroupExpanded: params.isGroupExpanded,
                 collapsedPreviewCount,
+                isToolVisibleWhenCollapsed: params.isToolVisibleWhenCollapsed,
             });
             continue;
         }

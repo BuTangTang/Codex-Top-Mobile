@@ -1,7 +1,6 @@
 import * as React from 'react';
-import { View, Pressable } from 'react-native';
+import { View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
-import { useSocketStatus } from '@/sync/domains/state/storage';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import {
     useVisibleSessionListPaneState,
@@ -21,21 +20,11 @@ import {
 } from '@/components/sessions/shell/surface/sessionListSurfaceOwnership';
 import { FABWide } from '@/components/ui/buttons/FABWide';
 import { PhoneSessionsOverview } from '@/components/sessions/directSessions/browse/PhoneSessionsOverview';
-import { Header } from '@/components/navigation/Header';
-import { StatusDot } from '@/components/ui/status/StatusDot';
 import { Typography } from '@/constants/Typography';
 import { t } from '@/text';
-import { isUsingCustomServer } from '@/sync/domains/server/serverConfig';
-import { trackFriendsSearch } from '@/track';
-import { ActionOperationActivityButton } from '@/components/inbox/actionOperations/ActionOperationActivityButton';
-import { useFriendsIdentityReadiness } from '@/hooks/server/useFriendsIdentityReadiness';
-import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { Text } from '@/components/ui/text/Text';
 import { getFeatureBuildPolicyDecision } from '@/sync/domains/features/featureBuildPolicy';
 import type { FeatureId } from '@happier-dev/protocol';
-import { Icon } from '@/components/ui/icons/Icon';
-import { BrandLogo } from '@/components/ui/navigation/BrandLogo';
-import { ITEM_TITLE_TEXT_METRICS } from '@/components/ui/lists/itemDensityMetrics';
 import {
     shouldForceFreshNewSessionEntryFromPressEvent,
     useResolveNewSessionOrdinaryEntryRoute,
@@ -62,12 +51,6 @@ const styles = StyleSheet.create((theme) => ({
     },
     phoneContainer: {
         flex: 1,
-    },
-    phoneHeaderContent: {
-        paddingHorizontal: 4,
-        paddingVertical: 8,
-        minHeight: 48,
-        height: 'auto',
     },
     sidebarContentContainer: {
         flex: 1,
@@ -124,40 +107,6 @@ const styles = StyleSheet.create((theme) => ({
         textAlign: 'center',
         ...Typography.default(),
     },
-    titleContainer: {
-        flex: 1,
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: 8,
-        marginLeft: 0,
-    },
-    titleText: {
-        ...ITEM_TITLE_TEXT_METRICS.comfortable,
-        flexShrink: 1,
-        color: theme.colors.chrome.header.foreground,
-        ...Typography.default('semiBold'),
-    },
-    statusContainer: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        marginTop: -2,
-    },
-    statusText: {
-        fontSize: 11,
-        lineHeight: 16,
-        ...Typography.default(),
-    },
-    headerButton: {
-        width: 32,
-        height: 32,
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    headerButtonsRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: 2,
-    },
     primaryPaneFallback: {
         flex: 1,
         flexBasis: 0,
@@ -177,85 +126,6 @@ const styles = StyleSheet.create((theme) => ({
 }));
 
 const SESSION_GETTING_STARTED_GUIDANCE_FEATURE_ID = 'app.ui.sessionGettingStartedGuidance' as const satisfies FeatureId;
-
-// Tab header configuration (zen excluded as that tab is disabled)
-const TAB_TITLES = {
-    sessions: 'tabs.sessions',
-    inbox: 'tabs.inbox',
-    friends: 'tabs.friends',
-    settings: 'tabs.settings',
-} as const;
-
-// Active tabs (excludes zen which is disabled)
-type ActiveTabType = 'sessions' | 'inbox' | 'friends' | 'settings';
-
-/** 手机页头以原 Logo 和紧凑标题定位页面，文字放大时允许自然增高。 */
-const HeaderTitle = React.memo(({ activeTab }: { activeTab: ActiveTabType }) => {
-    return (
-        <View style={styles.titleContainer}>
-            <BrandLogo size={24} />
-            <Text accessibilityRole="header" style={styles.titleText}>
-                {t(TAB_TITLES[activeTab])}
-            </Text>
-        </View>
-    );
-});
-
-/** 主标题右侧复用原新建草稿入口，不在底栏重复创建操作。 */
-const HeaderRight = React.memo(({ activeTab }: { activeTab: ActiveTabType }) => {
-    const router = useRouter();
-    const { theme } = useUnistyles();
-    const isCustomServer = isUsingCustomServer();
-    const friendsIdentityReadiness = useFriendsIdentityReadiness();
-    const friendsIdentityReady = friendsIdentityReadiness.isReady;
-    // 本阶段手机暂不开放新建，避免旧 runner 流程出现在桌面会话入口。
-    if (activeTab === 'sessions') return null;
-
-    if (activeTab === 'friends') {
-        return (
-            <View style={styles.headerButtonsRow}>
-                <ActionOperationActivityButton testID="main-header-action-operations" />
-                <Pressable
-                    onPress={() => {
-                        trackFriendsSearch();
-                        router.push('/friends/search');
-                    }}
-                    hitSlop={15}
-                    style={[styles.headerButton, { opacity: friendsIdentityReady ? 1 : 0.5 }]}
-                    disabled={!friendsIdentityReady}
-                    accessibilityState={{ disabled: !friendsIdentityReady }}
-                >
-                    <Icon name="user-plus" size={24} color={theme.colors.chrome.header.foreground} />
-                </Pressable>
-            </View>
-        );
-    }
-
-    if (activeTab === 'inbox') {
-        return <ActionOperationActivityButton testID="main-header-action-operations" />;
-    }
-
-    if (activeTab === 'settings') {
-        if (!isCustomServer) {
-            // Empty view to maintain header centering
-            return <ActionOperationActivityButton testID="main-header-action-operations" />;
-        }
-        return (
-            <View style={styles.headerButtonsRow}>
-                <ActionOperationActivityButton testID="main-header-action-operations" />
-                <Pressable
-                    onPress={() => router.push('/settings/server')}
-                    hitSlop={15}
-                    style={styles.headerButton}
-                >
-                    <Icon name="hard-drives" size={24} color={theme.colors.chrome.header.foreground} />
-                </Pressable>
-            </View>
-        );
-    }
-
-    return null;
-});
 
 const SidebarMainViewContent = React.memo(function SidebarMainViewContent({
     isTablet,
@@ -377,7 +247,6 @@ const PhoneTabbedMainViewContent = React.memo(function PhoneTabbedMainViewConten
     isTablet: boolean;
     pathname: string;
 }>) {
-    const { theme } = useUnistyles();
     if (isTablet) {
         const buildPolicyDecision = getFeatureBuildPolicyDecision(SESSION_GETTING_STARTED_GUIDANCE_FEATURE_ID);
         if (buildPolicyDecision !== 'deny') {
@@ -394,15 +263,6 @@ const PhoneTabbedMainViewContent = React.memo(function PhoneTabbedMainViewConten
 
     return (
         <View style={styles.phoneContainer}>
-            <View style={{ backgroundColor: theme.colors.background.canvas }}>
-                <Header
-                    title={<HeaderTitle activeTab="sessions" />}
-                    headerRight={() => <HeaderRight activeTab="sessions" />}
-                    headerContentStyle={styles.phoneHeaderContent}
-                    headerShadowVisible={false}
-                    headerTransparent={true}
-                />
-            </View>
             <PhoneSessionsOverview />
         </View>
     );

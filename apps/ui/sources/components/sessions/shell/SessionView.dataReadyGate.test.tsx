@@ -41,6 +41,7 @@ const deviceTypeState = vi.hoisted(() => ({
 const safeAreaState = vi.hoisted(() => ({
     bottom: 0,
 }));
+const platformState = vi.hoisted(() => ({ os: 'web' as 'web' | 'android' }));
 
 vi.mock('react-native-gesture-handler', () => {
     function createGesture(kind: string) {
@@ -138,13 +139,15 @@ installSessionShellCommonModuleMocks({
             Pressable: 'Pressable',
             ActivityIndicator: 'ActivityIndicator',
             Platform: {
-                OS: 'web',
+                get OS() { return platformState.os; },
                 select: (spec: Record<string, unknown>) =>
-                    spec && Object.prototype.hasOwnProperty.call(spec, 'web')
-                        ? (spec as any).web
+                    spec && Object.prototype.hasOwnProperty.call(spec, platformState.os)
+                        ? spec[platformState.os]
                         : (spec as any).default,
             },
-            useWindowDimensions: () => ({ width: 1200, height: 800 }),
+            useWindowDimensions: () => platformState.os === 'android'
+                ? ({ width: 411, height: 914, fontScale: 1, scale: 2.625 })
+                : ({ width: 1200, height: 800, fontScale: 1, scale: 1 }),
         }),
     unistyles: async () =>
         createUnistylesMock({
@@ -409,6 +412,7 @@ describe('SessionView (data ready gating)', () => {
         gestureHandlerState.gestures = [];
         deviceTypeState.value = 'tablet';
         safeAreaState.bottom = 0;
+        platformState.os = 'web';
         standardCleanup();
         chatListPropsSpy.mockReset();
     });
@@ -599,6 +603,23 @@ describe('SessionView (data ready gating)', () => {
 
         const agentContentView = screen.tree.findByType('AgentContentView' as never);
         expect(agentContentView.props.safeAreaBottom).toBe(0);
+    });
+
+    it.each([24, 48])('leaves the %s dp phone bottom inset with the keyboard scaffold alone', async (bottom) => {
+        // 手机实际系统导航栏由键盘支架避让，外层不可再次缩小同一内容区域。
+        platformState.os = 'android';
+        deviceTypeState.value = 'phone';
+        safeAreaState.bottom = bottom;
+        const { SessionView } = await sessionViewModulePromise;
+        const screen = await renderScreen(<AppPaneProvider><SessionView id="s1" /></AppPaneProvider>);
+        const containers = screen.tree.findAllByType('View' as never).filter((node) => {
+            const style = flattenStyle(node.props.style);
+            return style.flexBasis === 0 && style.flexGrow === 1;
+        });
+        expect(containers).toHaveLength(1);
+        expect(Number(flattenStyle(containers[0]?.props.style).paddingBottom ?? 0)).toBe(0);
+        expect(screen.tree.findByType('AgentContentView' as never).props.safeAreaBottom).toBe(bottom);
+        expect(screen.findAllByTestId('session-composer-input')).toHaveLength(1);
     });
 
     it('does not expose a gesture handle that can unintentionally open cockpit mode from the composer', async () => {

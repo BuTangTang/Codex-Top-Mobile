@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Pressable, View, type StyleProp, type ViewStyle } from 'react-native';
+import { Platform, Pressable, View, type StyleProp, type ViewStyle } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { ToolCallMessage } from '@/sync/domains/messages/messageTypes';
@@ -134,6 +134,7 @@ export function ToolCallsGroupUnitRowScaffold(props: Readonly<{ children: React.
  * The grouped tool-calls header row: icon, title + count, status indicator, and the
  * collapse affordance (chevron + press) when expanded. Shared between the whole-card
  * ToolCallsGroupView and the per-unit header row.
+ * 手机通过可选展开回调复用同一表头，并向读屏报告当前展开状态。
  */
 export const ToolCallsGroupHeaderChrome = React.memo(function ToolCallsGroupHeaderChrome(props: Readonly<{
     chromeMode: GroupedToolCallChromeMode;
@@ -141,17 +142,22 @@ export const ToolCallsGroupHeaderChrome = React.memo(function ToolCallsGroupHead
     count: number;
     expanded: boolean;
     onCollapse: () => void;
+    onExpand?: () => void;
 }>) {
     const { theme } = useUnistyles();
-    const headerPressable = props.expanded;
+    const headerPressable = props.expanded || props.onExpand != null;
 
     return (
         <Pressable
             testID="transcript-tool-calls-header"
-            onPress={headerPressable ? props.onCollapse : undefined}
+            onPress={props.expanded ? props.onCollapse : props.onExpand}
             disabled={!headerPressable}
+            accessibilityRole={headerPressable ? 'button' : undefined}
+            accessibilityLabel={headerPressable ? t('session.toolCalls') : undefined}
+            accessibilityState={headerPressable ? { expanded: props.expanded } : undefined}
             style={({ pressed }) => [
                 chromeStyles.header,
+                props.onExpand != null && chromeStyles.compactHeader,
                 headerPressable && pressed && (props.chromeMode === 'activity_feed' ? chromeStyles.headerFeedPressed : chromeStyles.headerCardsPressed),
             ]}
         >
@@ -172,9 +178,9 @@ export const ToolCallsGroupHeaderChrome = React.memo(function ToolCallsGroupHead
                         <Icon name="check-circle" size={GROUP_STATUS_ICON_SIZE_PX} color={theme.colors.state.success.foreground} />
                     )}
                 </View>
-                {props.expanded ? (
+                {headerPressable ? (
                     <Icon
-                        name="caret-up"
+                        name={props.expanded ? 'caret-up' : 'caret-down'}
                         size={16}
                         color={theme.colors.text.secondary}
                     />
@@ -208,6 +214,9 @@ export const ToolCallsGroupExpandMoreChrome = React.memo(function ToolCallsGroup
 const GROUP_STATUS_ICON_SIZE_PX = ICON_SIZE.sm;
 
 const chromeStyles = StyleSheet.create((theme) => ({
+    compactHeader: {
+        minHeight: Platform.OS === 'android' ? 48 : 44,
+    },
     header: {
         flexDirection: 'row',
         alignItems: 'center',

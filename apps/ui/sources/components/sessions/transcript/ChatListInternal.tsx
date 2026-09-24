@@ -295,6 +295,7 @@ type ScheduledPinToBottom = BottomFollowScheduledWrite<WebTranscriptScrollMetric
 const TRANSCRIPT_SCROLL_AUTO_REPIN_THROTTLE_MS = 200;
 const TRANSCRIPT_SCROLL_USER_INTENT_AUTO_PIN_DELAY_MS = 250;
 const TRANSCRIPT_SCROLL_USER_INTENT_RECENT_MS = 500;
+/** 装配现有转录列表 owner，并将公共手机工具摘要策略传入投影与自动展开流程。 */
 export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
     // Historical Agent attribution, resolved once for the whole transcript.
     // A Session can change Agent without changing identity, and every tool row
@@ -668,7 +669,8 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
     const transcriptScrollPinEnabled = useSetting('transcriptScrollPinEnabled');
     const transcriptScrollPinOffsetThresholdPx = useSetting('transcriptScrollPinOffsetThresholdPx');
     const transcriptScrollAutoFollowWhenPinned = useSetting('transcriptScrollAutoFollowWhenPinned');
-    const transcriptToolCallsCollapsedPreviewCountSetting = useSetting('transcriptToolCallsCollapsedPreviewCount');
+    // 工具预览和行内表头消费同一公共策略，避免手机列表再从设置读出另一份默认值。
+    const { compactToolCalls, transcriptToolCallsCollapsedPreviewCount: transcriptToolCallsCollapsedPreviewCountSetting } = props.toolChromeCommon;
     // F-4 (2026-08-11): the height-bearing half of the action-draft option resolution, so an
     // `action-draft` row's size key moves when a SYNCED settings push adds or removes one of its
     // chips while the row is offscreen. This hook is deliberately the narrow variant — one
@@ -1223,6 +1225,8 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
     } = telemetryHost;
     const tuning = sync.getSyncTuning();
     const itemsPipeline = useTranscriptItemsPipeline({
+        compactToolCalls,
+        compactPendingToolCallIds: props.compactPendingToolCallIds,
         activeTargetWindowTargetRef,
         activeThinkingMessageId: props.activeThinkingMessageId,
         canonicalWindowedItemsRef,
@@ -2313,6 +2317,7 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
         return thresholdPx / listLayoutHeight;
     }, [listLayoutHeight, resolveBackwardPrefetchThresholdPx]);
     useTranscriptToolAutoExpandEffect({
+        compactToolCalls,
         applyToolCallsGroupExpanded,
         expandedToolCallsAnchorMessageIds,
         hasAutoExpandedToolCallsGroups: (sessionId) => sessionOpenLatch.hasAutoExpandedToolCallsGroups(sessionId),

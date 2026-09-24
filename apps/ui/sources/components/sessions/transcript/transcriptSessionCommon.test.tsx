@@ -1,7 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { renderHook, standardCleanup } from '@/dev/testkit';
 import type { Settings } from '@/sync/domains/settings/settings';
+
+const device = vi.hoisted(() => ({ os: 'web', width: 390, height: 844 }));
+
+// 只替换原生尺寸边界，保留真实的手机/平板判定。
+vi.mock('react-native', async () => {
+    const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+    return createReactNativeWebMock({
+        Platform: { get OS() { return device.os; } },
+        useWindowDimensions: () => ({ width: device.width, height: device.height }),
+    });
+});
 
 vi.mock('@/hooks/server/useFeatureEnabled', () => ({
     useFeatureEnabled: () => false,
@@ -43,6 +54,28 @@ vi.mock('@/sync/domains/state/storage', async () => {
 });
 
 describe('useTranscriptSessionCommon', () => {
+    beforeEach(() => Object.assign(device, { os: 'web', width: 390, height: 844 }));
+
+    // 手机默认只保留可展开摘要；窄网页与原生平板继续服从原设置。
+    it.each([
+        ['android', 390, 844, true],
+        ['ios', 844, 390, true],
+        ['android', 800, 1280, false],
+        ['web', 390, 844, false],
+    ])('limits compact tools to %s at %sx%s: %s', async (os, width, height, compact) => {
+        Object.assign(device, { os, width, height });
+        const { useTranscriptSessionCommon } = await import('./transcriptSessionCommon');
+        const hook = await renderHook(() => useTranscriptSessionCommon('s1'));
+
+        expect(hook.getCurrent().toolChrome).toMatchObject({
+            compactToolCalls: compact,
+            toolViewTimelineChromeMode: compact ? 'activity_feed' : 'cards',
+            transcriptToolCallsCollapsedPreviewCount: compact ? 0 : 5,
+            transcriptToolCallsGroupShowBackground: !compact,
+        });
+        await hook.unmount();
+    });
+
     it('includes row-level transcript message action settings in message display common', async () => {
         const { useTranscriptSessionCommon } = await import('./transcriptSessionCommon');
         const hook = await renderHook(() => useTranscriptSessionCommon('s1'));

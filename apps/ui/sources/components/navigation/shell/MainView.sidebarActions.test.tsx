@@ -312,14 +312,12 @@ describe('MainView sidebar actions', () => {
         expect(() => findPressableByLabel(tree!, 'Open automations')).toThrow();
     });
 
-    it('keeps the phone header compact without reopening deferred native creation', async () => {
+    /** 首页自己拥有唯一标题和搜索栏，外壳不叠加第二条标题或新建入口。 */
+    it('lets the phone overview own the single header without reopening deferred native creation', async () => {
         platformState.isTablet = false;
         const screen = await renderScreen(<MainView variant="phone" />);
-        const header = screen.tree.findByType('Header');
-        const renderedHeaderRight = await renderScreen(header.props.headerRight());
-        const renderedTitle = await renderScreen(header.props.title);
-        expect(renderedTitle.findAllByType('ConnectionStatusControl')).toHaveLength(0);
-        expect(renderedHeaderRight.findAllByType('Pressable')).toHaveLength(0);
+        expect(screen.findAllByType('Header')).toHaveLength(0);
+        expect(screen.findAllByType('Pressable')).toHaveLength(0);
         expect(routerPushSpy).not.toHaveBeenCalled();
         expect(screen.tree.findAllByType('TabBar')).toHaveLength(0);
     });
@@ -471,12 +469,11 @@ describe('MainView sidebar actions', () => {
         tabState.activeTab = 'settings';
 
         const screen = await renderScreen(<MainView variant="phone" />);
-        const header = screen.tree.findByType('Header');
-        const renderedHeaderRight = await renderScreen(header.props.headerRight());
+        expect(screen.findAllByType('Header')).toHaveLength(0);
 
         expect(tabState.setActiveTab).not.toHaveBeenCalled();
         expect(routerReplaceSpy).not.toHaveBeenCalledWith('/settings');
-        expect(renderedHeaderRight.findAllByType('Pressable')).toHaveLength(0);
+        expect(screen.findAllByType('Pressable')).toHaveLength(0);
     });
 
     it('renders direct session storage tabs in the sidebar empty state when direct sessions are enabled', async () => {

@@ -9,6 +9,7 @@ import { ComposerKeyboardProvider } from './ComposerKeyboardContext';
 import type { ComposerKeyboardScaffoldProps } from './ComposerKeyboardScaffoldTypes';
 import { useComposerKeyboardLayout } from './useComposerKeyboardLayout.native';
 
+/** 复用同一键盘布局管理正文、输入框及安全区绘制，避免重复计算底部间距。 */
 export function ComposerKeyboardScaffold(props: ComposerKeyboardScaffoldProps): React.ReactElement {
     const { theme } = useUnistyles();
     const windowDimensions = useWindowDimensions();
@@ -48,6 +49,10 @@ export function ComposerKeyboardScaffold(props: ComposerKeyboardScaffoldProps): 
     const composerAnimatedStyle = useAnimatedStyle(() => ({
         transform: [{ translateY: -layout.bottomInset.value }],
     }), [layout]);
+    // 输入框上移后，以同一 inset 遮住其下方正文；只绘制，不计入输入框或正文高度。
+    const bottomSurfaceAnimatedStyle = useAnimatedStyle(() => ({
+        height: layout.bottomInset.value,
+    }), [layout]);
     const handleScaffoldLayout = React.useCallback((event: LayoutChangeEvent) => {
         layout.setScaffoldMeasuredHeight?.(event.nativeEvent.layout.height);
     }, [layout]);
@@ -75,6 +80,23 @@ export function ComposerKeyboardScaffold(props: ComposerKeyboardScaffoldProps): 
                 >
                     {props.children}
                 </View>
+                {props.mode === 'session' && !isTransparentSurface ? (
+                    <Animated.View
+                        testID="composer-keyboard-bottom-surface"
+                        pointerEvents="none"
+                        accessible={false}
+                        style={[
+                            {
+                                position: 'absolute',
+                                left: 0,
+                                right: 0,
+                                bottom: 0,
+                                backgroundColor: surfaceBackgroundColor,
+                            },
+                            bottomSurfaceAnimatedStyle,
+                        ]}
+                    />
+                ) : null}
                 <Animated.View
                     testID={props.composerTestID}
                     onLayout={handleComposerLayout}

@@ -1,7 +1,12 @@
 import * as React from 'react';
-import { FlatList, Pressable, View, type ListRenderItemInfo } from 'react-native';
+import { FlatList, Pressable, View, StyleSheet as NativeStyleSheet, type ListRenderItemInfo, type NativeSyntheticEvent, type NativeScrollEvent, type ViewToken } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import Animated, { cancelAnimation, Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
+import { Icon, type IconName } from '@/components/ui/icons/Icon';
+import { ITEM_TITLE_TEXT_METRICS, ITEM_SUBTITLE_TEXT_METRICS } from '@/components/ui/lists/itemDensityMetrics';
+import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
+import { MOTION_STANDARD_BEZIER, motionTokens } from '@/components/ui/motion/motionTokens';
 
 import { Item } from '@/components/ui/lists/Item';
 import { ItemGroup } from '@/components/ui/lists/ItemGroup';
@@ -23,6 +28,7 @@ import { useSessionCockpitBottomChromeHeight } from '@/components/workspaceCockp
 
 type AppTheme = Theme;
 
+/** 桌面沿用既有列表，手机以主题语义色和可缩放字号呈现平面两行。 */
 const stylesheet = StyleSheet.create((theme: AppTheme) => ({
     helperText: {
         paddingHorizontal: 16,
@@ -63,11 +69,15 @@ const stylesheet = StyleSheet.create((theme: AppTheme) => ({
         gap: 8,
     },
     phoneList: { flex: 1, backgroundColor: theme.colors.surface.base },
-    phoneRow: { minHeight: 60, paddingHorizontal: 16, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.border.default },
+    phoneRow: { minHeight: 80, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', gap: 12, borderBottomWidth: NativeStyleSheet.hairlineWidth, borderBottomColor: theme.colors.border.default },
+    phoneRowBody: { flex: 1, gap: 6 },
+    phoneStatusSlot: { width: 20, height: 20, alignItems: 'center', justifyContent: 'center' },
+    phoneRunningArc: { width: 18, height: 18, borderWidth: 2, borderRadius: 9, borderLeftColor: theme.colors.accent.blue, borderRightColor: theme.colors.accent.blue, borderTopColor: 'transparent', borderBottomColor: 'transparent' },
     phoneRowPressed: { backgroundColor: theme.colors.surface.inset },
-    phoneTitleLine: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-    phoneTitle: { flex: 1, fontSize: 15, color: theme.colors.text.primary },
-    phoneMeta: { fontSize: 12, color: theme.colors.text.secondary },
+    phoneTitleLine: { flexDirection: 'row', alignItems: 'baseline', gap: 12 },
+    phoneTitle: { flex: 1, ...ITEM_TITLE_TEXT_METRICS.comfortable, color: theme.colors.text.primary },
+    phoneMeta: { ...ITEM_SUBTITLE_TEXT_METRICS.cozy, color: theme.colors.text.secondary },
+    phoneSource: { flex: 1, ...ITEM_SUBTITLE_TEXT_METRICS.cozy, color: theme.colors.text.secondary },
     phoneFooter: { minHeight: 44, paddingHorizontal: 16, alignItems: 'center', justifyContent: 'center' },
     phoneAction: { fontSize: 13, color: theme.colors.accent.blue },
 }));
@@ -209,45 +219,97 @@ export const DirectBrowseCandidatesList = React.memo(function DirectBrowseCandid
     );
 });
 
-/** 紧凑历史的异常状态保留原意，不伪装为运行、待处理或完成。 */
-function phoneHistoryStatusLabel(row: PhoneBrowseRow): string | null {
-    if (row.lifecycle.state === 'failed') return '执行失败';
-    if (row.lifecycle.state === 'cancelled') return '已取消';
-    if (row.lifecycle.state === 'unknown') return '状态待确认';
-    return null;
+type PhoneLifecycleState = PhoneBrowseRow['lifecycle']['state'];
+const STATUS_LABEL_KEYS = {
+    running: 'directSessions.phoneList.running',
+    needs_input: 'directSessions.phoneList.needsInput',
+    completed: 'directSessions.phoneList.completed',
+    failed: 'directSessions.phoneList.failed',
+    cancelled: 'directSessions.phoneList.cancelled',
+    unknown: 'directSessions.phoneList.unknown',
+} as const;
+const STATUS_ICONS: Record<Exclude<PhoneLifecycleState, 'running'>, IconName> = {
+    needs_input: 'clock', completed: 'check-circle', failed: 'warning-circle', cancelled: 'x-circle', unknown: 'question',
+};
+const statusEasing = Easing.bezier(...MOTION_STANDARD_BEZIER);
+const phoneViewabilityConfig = { itemVisiblePercentThreshold: 1 };
+
+/** 符号只呈现已验证状态；进入视口且页面活动时运行双弧，离开或减少动态时停止。 */
+function PhoneBrowseStatus(props: Readonly<{ state: PhoneLifecycleState; color: string; animate: boolean }>) {
+    const rotation = useSharedValue(0);
+    const opacity = useSharedValue(1);
+    const previousState = React.useRef(props.state);
+    const running = props.state === 'running';
+    React.useEffect(() => {
+        if (!props.animate || !running) {
+            cancelAnimation(rotation);
+            rotation.value = 0;
+            return;
+        }
+        rotation.value = withRepeat(withTiming(360, { duration: 1000, easing: Easing.linear }), -1, false);
+        return () => cancelAnimation(rotation);
+    }, [props.animate, rotation, running]);
+    React.useEffect(() => {
+        const changed = previousState.current !== props.state;
+        previousState.current = props.state;
+        cancelAnimation(opacity);
+        if (changed && props.animate) {
+            opacity.value = 0.35;
+            opacity.value = withTiming(1, { duration: motionTokens.durationMs.base, easing: statusEasing });
+        } else {
+            opacity.value = 1;
+        }
+        return () => cancelAnimation(opacity);
+    }, [opacity, props.animate, props.state]);
+    const rotationStyle = useAnimatedStyle(() => ({ transform: [{ rotate: `${rotation.value}deg` }] }));
+    const opacityStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+    return <Animated.View accessible={false} style={[stylesheet.phoneStatusSlot, opacityStyle]}>
+        {running ? <Animated.View style={[stylesheet.phoneRunningArc, rotationStyle]} />
+            : <Icon name={STATUS_ICONS[props.state as Exclude<PhoneLifecycleState, 'running'>]} size={20} weight={props.state === 'completed' ? 'fill' : 'regular'} color={props.color} />}
+    </Animated.View>;
 }
 
-/** 一条手机会话只占两行，保留来源 owner 的打开动作和明确的等待反馈。 */
-function PhoneBrowseCandidateRow(props: Readonly<{ row: PhoneBrowseRow; nowMs: number; history: boolean; openingKey: string | null; onSelectRow: (row: PhoneBrowseRow) => Promise<void> }>) {
+/** 两行显示标题、时间与真实来源，状态文字覆盖全部结果，长标题随字体自然增高。 */
+function PhoneBrowseCandidateRow(props: Readonly<{ row: PhoneBrowseRow; nowMs: number; animate: boolean; openingKey: string | null; onSelectRow: (row: PhoneBrowseRow) => Promise<void> }>) {
     const { row } = props;
     const { theme } = useUnistyles();
     const title = buildDirectBrowseCandidateDisplayTitle(row.candidate);
-    const status = props.history ? phoneHistoryStatusLabel(row) : null;
-    const sourceLabel = status ? `${row.sourceLabel} · ${status}` : row.sourceLabel;
+    const state = row.lifecycle.state;
+    const status = t(STATUS_LABEL_KEYS[state]);
+    const color = state === 'running' ? theme.colors.accent.blue
+        : state === 'needs_input' ? theme.colors.accent.orange
+        : state === 'completed' ? theme.colors.state.success.foreground
+        : state === 'failed' ? theme.colors.state.danger.foreground : theme.colors.text.secondary;
     const opening = props.openingKey === row.key || row.snapshot.linkingSessionId === row.candidate.remoteSessionId;
     const disabled = props.openingKey !== null || row.snapshot.linkingSessionId !== null;
     return <Pressable
         testID={`phone-session:${row.key}`}
         accessibilityRole="button"
-        accessibilityLabel={`${title}，${sourceLabel}`}
+        accessibilityLabel={`${title}，${row.sourceLabel}，${status}`}
         accessibilityState={{ busy: opening, disabled }}
         disabled={disabled}
         onPress={() => { void props.onSelectRow(row); }}
         style={({ pressed }) => [stylesheet.phoneRow, pressed ? stylesheet.phoneRowPressed : null]}
     >
-        <View style={stylesheet.phoneTitleLine}>
-            <Text style={stylesheet.phoneTitle} numberOfLines={1}>{title}</Text>
-            {opening ? <ActivitySpinner size="small" color={theme.colors.text.secondary} /> : <Text style={stylesheet.phoneMeta}>{row.timeMs === null ? '—' : formatRelativeTimeShort(row.timeMs, props.nowMs)}</Text>}
+        <PhoneBrowseStatus state={state} color={color} animate={props.animate} />
+        <View style={stylesheet.phoneRowBody}>
+            <View style={stylesheet.phoneTitleLine}>
+                <Text style={stylesheet.phoneTitle}>{title}</Text>
+                {opening ? <ActivitySpinner size="small" color={theme.colors.text.secondary} animationEnabled={props.animate} /> : <Text style={stylesheet.phoneMeta}>{row.timeMs === null ? '—' : formatRelativeTimeShort(row.timeMs, props.nowMs)}</Text>}
+            </View>
+            <View style={stylesheet.phoneTitleLine}>
+                <Text style={stylesheet.phoneSource}>{row.sourceLabel}</Text>
+                <Text testID={`phone-session-status:${row.key}`} style={[stylesheet.phoneMeta, { color }]}>{status}</Text>
+            </View>
         </View>
-        <Text style={stylesheet.phoneMeta} numberOfLines={1}>{sourceLabel}</Text>
     </Pressable>;
 }
 
-/** 多电脑共用唯一滚动、空态和页尾；所有翻页仍回到各来源现有的游标 owner。 */
+/** 多电脑共用唯一列表；阅读时只保留键的顺序，候选、状态和点击动作始终取当前 owner 对象。 */
 export function PhoneDirectBrowseCandidatesList(props: Readonly<{
     rows: readonly PhoneBrowseRow[];
     nowMs: number;
-    history: boolean;
+    motionActive?: boolean;
     openingKey: string | null;
     onSelectRow: (row: PhoneBrowseRow) => Promise<void>;
     loading: boolean;
@@ -257,39 +319,92 @@ export function PhoneDirectBrowseCandidatesList(props: Readonly<{
     canLoadMore: boolean;
     canRefresh: boolean;
     hasSearch: boolean;
-    onRefresh: () => void;
+    onRefresh: () => Promise<void>;
     onLoadMore: () => void;
 }>) {
     const { theme } = useUnistyles();
     const bottomChromeHeight = useSessionCockpitBottomChromeHeight();
-    const renderRow = React.useCallback(({ item }: ListRenderItemInfo<PhoneBrowseRow>) => <PhoneBrowseCandidateRow row={item} nowMs={props.nowMs} history={props.history} openingKey={props.openingKey} onSelectRow={props.onSelectRow} />, [props.nowMs, props.history, props.openingKey, props.onSelectRow]);
+    const reducedMotion = useReducedMotionPreference();
+    const [readingBelowTop, setReadingBelowTop] = React.useState(false);
+    const readingBelowTopRef = React.useRef(false);
+    const orderRef = React.useRef<readonly string[]>([]);
+    const [visibleKeys, setVisibleKeys] = React.useState<ReadonlySet<string>>(() => new Set());
+    const [manualRefreshing, setManualRefreshing] = React.useState(false);
+    const refreshPending = React.useRef(false);
+    const mounted = React.useRef(true);
+    React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+    const rows = React.useMemo(() => {
+        if (!readingBelowTop) return props.rows;
+        const byKey = new Map(props.rows.map((row) => [row.key, row]));
+        const ordered: PhoneBrowseRow[] = [];
+        for (const key of orderRef.current) {
+            const row = byKey.get(key);
+            if (row) ordered.push(row);
+            byKey.delete(key);
+        }
+        // 新行追加在阅读区域后；已移除的键不会留在展示缓存里。
+        ordered.push(...byKey.values());
+        return ordered;
+    }, [props.rows, readingBelowTop]);
+    React.useLayoutEffect(() => { orderRef.current = rows.map((row) => row.key); }, [rows]);
+    /** 只在进入阅读区或回到顶部时更新展示状态，滚动帧不写入 React 状态。 */
+    const onScroll = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+        const belowTop = event.nativeEvent.contentOffset.y > 0;
+        if (readingBelowTopRef.current === belowTop) return;
+        readingBelowTopRef.current = belowTop;
+        setReadingBelowTop(belowTop);
+    }, []);
+    /** 由原 FlatList 的可见性回调暂停屏外旋转，不增加轮询或独立视口 owner。 */
+    const onViewableItemsChanged = React.useCallback(({ viewableItems }: { viewableItems: ViewToken<PhoneBrowseRow>[] }) => {
+        const next = new Set(viewableItems.filter((token) => token.isViewable).map((token) => token.item.key));
+        setVisibleKeys((current) => current.size === next.size && [...current].every((key) => next.has(key)) ? current : next);
+    }, []);
+    /** 手动刷新才显示下拉进度；原请求 owner 仍处理单飞、失败与分页。 */
+    const refresh = React.useCallback(async () => {
+        if (refreshPending.current) return;
+        refreshPending.current = true;
+        setManualRefreshing(true);
+        try { await props.onRefresh(); }
+        finally {
+            refreshPending.current = false;
+            if (mounted.current) setManualRefreshing(false);
+        }
+    }, [props.onRefresh]);
+    const animate = props.motionActive === true && !reducedMotion;
+    const renderRow = React.useCallback(({ item }: ListRenderItemInfo<PhoneBrowseRow>) => <PhoneBrowseCandidateRow row={item} nowMs={props.nowMs} animate={animate && visibleKeys.has(item.key)} openingKey={props.openingKey} onSelectRow={props.onSelectRow} />, [props.nowMs, animate, visibleKeys, props.openingKey, props.onSelectRow]);
     const keyForRow = React.useCallback((row: PhoneBrowseRow) => row.key, []);
+    const extraData = React.useMemo(() => ({ nowMs: props.nowMs, animate, visibleKeys, openingKey: props.openingKey, onSelectRow: props.onSelectRow }), [props.nowMs, animate, visibleKeys, props.openingKey, props.onSelectRow]);
     const footer = <View>
-        {props.incomplete ? <Pressable testID="phone-sessions-retry" accessibilityRole="button" onPress={props.onRefresh} disabled={!props.canRefresh} style={stylesheet.phoneFooter}>
-            <Text style={stylesheet.phoneAction}>{!props.canRefresh && props.loading ? '正在同步…' : '部分会话未同步 · 重试'}</Text>
+        {props.incomplete ? <Pressable testID="phone-sessions-retry" accessibilityRole="button" onPress={() => { void refresh(); }} disabled={!props.canRefresh} style={stylesheet.phoneFooter}>
+            <Text style={stylesheet.phoneAction}>{t(!props.canRefresh && props.loading ? 'directSessions.phoneList.loading' : 'directSessions.phoneList.incomplete')}</Text>
         </Pressable> : null}
         {props.hasMore ? <Pressable testID="phone-sessions-load-more" accessibilityRole="button" onPress={props.onLoadMore} disabled={!props.canLoadMore} style={stylesheet.phoneFooter}>
-            <Text style={stylesheet.phoneAction}>{props.loadingMore ? '正在加载…' : '继续加载'}</Text>
+            <Text style={stylesheet.phoneAction}>{t(props.loadingMore ? 'directSessions.phoneList.loadingMore' : 'directSessions.browseLoadMore')}</Text>
         </Pressable> : null}
-        {!props.incomplete && props.rows.length > 0 && props.loading ? <View style={stylesheet.phoneFooter}><ActivitySpinner size="small" color={theme.colors.text.secondary} /></View> : null}
     </View>;
     const empty = <View testID="phone-sessions-empty" style={stylesheet.loadingRow}>
-        {props.loading ? <ActivitySpinner size="small" color={theme.colors.text.secondary} /> : <Text style={stylesheet.helperText}>
-            {props.incomplete ? '已同步的会话中暂无匹配项' : props.hasMore ? '当前页暂无匹配会话' : props.hasSearch ? '没有匹配的会话' : props.history ? '暂无历史会话' : '暂无这类会话'}
+        {props.loading ? <ActivitySpinner size="small" color={theme.colors.text.secondary} animationEnabled={animate} /> : <Text style={stylesheet.helperText}>
+            {t(props.incomplete ? 'directSessions.phoneList.emptyIncomplete' : props.hasMore ? 'directSessions.phoneList.emptyPage' : props.hasSearch ? 'directSessions.browseNoSearchResults' : 'directSessions.phoneList.empty')}
         </Text>}
     </View>;
     return <FlatList
         testID="phone-sessions-list"
         style={stylesheet.phoneList}
-        contentContainerStyle={{ paddingBottom: 16 + bottomChromeHeight }}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 16 + bottomChromeHeight }}
         scrollIndicatorInsets={{ bottom: bottomChromeHeight }}
-        data={props.rows}
+        data={rows}
+        extraData={extraData}
         keyExtractor={keyForRow}
         renderItem={renderRow}
         ListEmptyComponent={empty}
         ListFooterComponent={footer}
         keyboardShouldPersistTaps="handled"
-        refreshing={props.loading}
-        onRefresh={props.onRefresh}
+        maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 1 }}
+        onScroll={onScroll}
+        scrollEventThrottle={16}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={phoneViewabilityConfig}
+        refreshing={manualRefreshing}
+        onRefresh={() => { void refresh(); }}
     />;
 }

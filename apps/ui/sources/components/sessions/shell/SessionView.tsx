@@ -44,11 +44,12 @@ import { SessionHeaderActionMenu } from '@/components/sessions/actions/SessionHe
 import { resolveSessionHeaderActionTargetPx, SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
 import { SessionHeaderIconWithCount } from '@/components/sessions/actions/SessionHeaderIconWithCount';
 import { SessionHeaderInfoButton } from '@/components/sessions/actions/SessionHeaderInfoButton';
-import { ActionOperationActivityButton } from '@/components/inbox/actionOperations/ActionOperationActivityButton';
+import { ActionOperationActivityButton, type ActionOperationActivityTriggerProps } from '@/components/inbox/actionOperations/ActionOperationActivityButton';
 import { PANE_ACTION_RAIL_WIDTH } from '@/components/appShell/panes/PaneActionRailContext';
 import { useAppPaneActionRailVisible } from '@/components/appShell/panes/hooks/useAppPaneActionRailVisible';
 import { useSessionCockpitChromeRegistration } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 import { SessionHeaderSubagentsButton } from '@/components/sessions/actions/SessionHeaderSubagentsButton';
+import { useSessionTerminalAction } from '@/components/sessions/terminal/useSessionTerminalAction';
 import { SessionHeaderTerminalButton } from '@/components/sessions/actions/SessionHeaderTerminalButton';
 import { useOpenAttachedSessionTerminal } from '@/components/sessions/terminal/openAttachedSessionTerminal';
 import { SessionHeaderTranscriptNavigationButton, useTranscriptNavigationSurface } from '@/components/sessions/actions/SessionHeaderTranscriptNavigationButton';
@@ -942,6 +943,8 @@ type SessionHeaderRightElementProps = Readonly<{
 const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(props: SessionHeaderRightElementProps) {
     const { theme } = useUnistyles();
     const router = useRouter();
+    const isPhone = useDeviceType() === 'phone' && Platform.OS !== 'web';
+    const { available: terminalAvailable, onPress: openTerminal } = useSessionTerminalAction({ sessionId: props.sessionId, scopeId: props.paneScopeId, serverId: props.currentSessionRouteServerId });
     const openAgentRoster = useOpenSessionTarget({
         sessionId: props.sessionId,
         scopeId: props.paneScopeId,
@@ -994,8 +997,16 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
         && props.directSessionRuntime.status.notifications?.capability === 'explicit_lifecycle_v1'
         && hasSessionWriteAccess(props.session.accessLevel));
 
-    // 即使菜单打开后能力变化，也先检查当前投影；真正执行仍由 hook 获取 fresh status。
+    /** 菜单转交既有详情、终端与控制 owner，打开后能力变化仍检查当前投影。 */
     const handleHeaderExtraItemSelect = React.useCallback((actionId: string) => {
+        if (actionId === 'header.openSessionInfo') {
+            props.onOpenSessionInfo();
+            return true;
+        }
+        if (actionId === 'header.openTerminal') {
+            if (terminalAvailable) openTerminal();
+            return true;
+        }
         if (actionId === 'header.followNotifications' || actionId === 'header.unfollowNotifications') {
             if (canOfferNotifications && !props.directSessionRuntime.notificationsBusy) {
                 void props.directSessionRuntime.setNotificationsEnabled(actionId === 'header.followNotifications').then((result) => {
@@ -1036,10 +1047,17 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
         // glyph is folded away, so on a phone this menu item is the only way into the roster — and
         // it used to open a right pane that is structurally hidden there.
         return openAgentRoster({ kind: 'agentRoster' });
-    }, [attachedSessionTerminal, canOfferTakeover, canOfferNotifications, props.directSessionRuntime, openAgentRoster, transcriptNavigation, props.directControl, props.mobileWorkspaceExperienceToggleActionId, props.onToggleWorkspaceExperience]);
+    }, [terminalAvailable, openTerminal, props.onOpenSessionInfo, attachedSessionTerminal, canOfferTakeover, canOfferNotifications, props.directSessionRuntime, openAgentRoster, transcriptNavigation, props.directControl, props.mobileWorkspaceExperienceToggleActionId, props.onToggleWorkspaceExperience]);
 
+    /** 手机保留单一更多入口，将原有详情与可用终端动作收进同一菜单。 */
     const headerExtraItems = React.useMemo(() => {
         const items: DropdownMenuItem[] = [];
+        if (isPhone) {
+            items.push({ id: 'header.openSessionInfo', title: t('sessionInfo.title'), icon: <Icon name="info" size={16} color={theme.colors.text.secondary} /> });
+            if (terminalAvailable && !actionRailVisible && !cockpitHasTerminal) {
+                items.push({ id: 'header.openTerminal', title: t('settings.terminal'), icon: <Icon name="terminal" size={16} color={theme.colors.text.secondary} /> });
+            }
+        }
         // 关注独立于置顶，能力和开关值均读取同一个 Direct runtime。
         if (canOfferNotifications) {
             const followed = props.directSessionRuntime.status?.notifications?.enabled === true;
@@ -1072,7 +1090,7 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
                 icon: <Icon name="terminal" size={16} color={theme.colors.text.secondary} />,
             });
         }
-        if (!props.shouldFoldHeaderIconActions) return items;
+        if (!isPhone && !props.shouldFoldHeaderIconActions) return items;
 
         // Offered only where it leads somewhere. Below the fold this menu is the phone's ONLY way to
         // transcript navigation, and navigation exists solely as a right-pane tab or a cockpit
@@ -1107,6 +1125,10 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
         }
         return items;
     }, [
+        isPhone,
+        terminalAvailable,
+        actionRailVisible,
+        cockpitHasTerminal,
         attachedSessionTerminal.available,
         canOfferTakeover,
         canOfferNotifications,
@@ -1127,6 +1149,35 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
     const badgeLabel =
         props.sessionAutomationsEnabledCount > 99 ? '99+' : String(props.sessionAutomationsEnabledCount);
 
+    /** 手机更多入口只接收账本 owner 的摘要与打开动作，不额外订阅或加载活动详情。 */
+    const renderHeaderActionMenu = React.useCallback((activityTrigger?: ActionOperationActivityTriggerProps) => {
+        const extraItems = activityTrigger?.hasAttention ? [
+            {
+                id: 'header.openActionOperations',
+                testID: 'session-header-open-action-operations',
+                title: t('inbox.updates'),
+                icon: <Icon name="pulse" size={16} color={theme.colors.text.secondary} />,
+            },
+            ...headerExtraItems,
+        ] : headerExtraItems;
+        /** 菜单自行关闭后交回原账本打开动作，其余动作继续使用既有分派。 */
+        const handleMenuItemSelect = (actionId: string) => {
+            if (activityTrigger && actionId === 'header.openActionOperations') {
+                activityTrigger.onPress();
+                return true;
+            }
+            return handleHeaderExtraItemSelect(actionId);
+        };
+        return (
+            <SessionHeaderActionMenu
+                sessionId={props.sessionId}
+                session={props.session}
+                extraItems={extraItems.length > 0 ? extraItems : undefined}
+                onSelectExtraItem={activityTrigger ? handleMenuItemSelect : handleHeaderExtraItemSelect}
+            />
+        );
+    }, [handleHeaderExtraItemSelect, headerExtraItems, props.session, props.sessionId, theme.colors.text.secondary]);
+
     return (
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             <ActionOperationActivityButton
@@ -1134,17 +1185,13 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
                 testID="session-header-action-operations"
                 buttonSize={resolveSessionHeaderActionTargetPx()}
                 iconSize={SESSION_HEADER_ICON_SIZE_PX}
+                renderTrigger={isPhone ? renderHeaderActionMenu : undefined}
             />
-            <SessionHeaderActionMenu
-                sessionId={props.sessionId}
-                session={props.session}
-                extraItems={headerExtraItems.length > 0 ? headerExtraItems : undefined}
-                onSelectExtraItem={handleHeaderExtraItemSelect}
-            />
-            {!props.shouldFoldHeaderIconActions && !actionRailVisible && !cockpitOwnsSession ? (
+            {!isPhone ? renderHeaderActionMenu() : null}
+            {!isPhone && !props.shouldFoldHeaderIconActions && !actionRailVisible && !cockpitOwnsSession ? (
                 <SessionHeaderTranscriptNavigationButton sessionId={props.sessionId} scopeId={props.paneScopeId} />
             ) : null}
-            {!props.shouldFoldHeaderIconActions && !actionRailVisible ? (
+            {!isPhone && !props.shouldFoldHeaderIconActions && !actionRailVisible ? (
                 <SessionHeaderSubagentsButton
                     sessionId={props.sessionId}
                     scopeId={props.paneScopeId}
@@ -1152,18 +1199,15 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
                     activeCount={openAgentCount}
                 />
             ) : null}
-            {!actionRailVisible && !cockpitHasTerminal ? (
+            {!isPhone && !actionRailVisible && !cockpitHasTerminal ? (
                 <SessionHeaderTerminalButton
                     sessionId={props.sessionId}
                     scopeId={props.paneScopeId}
                     serverId={props.currentSessionRouteServerId}
                 />
             ) : null}
-{/* Never folded. Session details used to be reachable by pressing the avatar, which was
-                shown on every width; moving that navigation to an icon that folds below 520pt would
-                delete the only path to it on phones rather than tidy the row. */}
-            <SessionHeaderInfoButton onPress={props.onOpenSessionInfo} />
-            {!props.shouldFoldHeaderIconActions && props.showAutomations && props.sessionAutomationsEnabledCount > 0 ? (
+            {!isPhone ? <SessionHeaderInfoButton onPress={props.onOpenSessionInfo} /> : null}
+            {!isPhone && !props.shouldFoldHeaderIconActions && props.showAutomations && props.sessionAutomationsEnabledCount > 0 ? (
                 <Pressable
                     onPress={() => navigateWithBlurOnWeb(() => router.push(buildCurrentSessionHref('/automations') as any))}
                     style={({ pressed }) => ({
@@ -6642,7 +6686,8 @@ function SessionViewLoaded({
     }, [contentWidthSurfaceId, windowWidth]);
     const contentPaddingBottom = resolveSessionViewContentBottomSpacing({
         chatBottomSpacing,
-        safeAreaBottomPx: safeArea.bottom,
+        // 手机由既有 ComposerKeyboardScaffold 统一避让键盘和安全区，外层不再重复缩高。
+        safeAreaBottomPx: deviceType === 'phone' && Platform.OS !== 'web' ? 0 : safeArea.bottom,
         availableWidthPx: resolveSessionViewAvailableWidth({
             measuredContentWidthPx: measuredContentWidth,
             windowWidthPx: windowWidth,

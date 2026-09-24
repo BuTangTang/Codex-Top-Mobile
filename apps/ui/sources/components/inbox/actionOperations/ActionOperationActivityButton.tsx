@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Platform, Pressable, View } from 'react-native';
+import { Platform, Pressable, View, type GestureResponderEvent } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import type { ActionOperationSnapshotV1 } from '@happier-dev/protocol';
 
@@ -17,6 +17,12 @@ import { openActionOperationDetail } from './openActionOperationDetail';
 import { useActionOperationActivityModel } from './useActionOperationActivityModel';
 import { requestActionOperationStop } from './requestActionOperationStop';
 
+export type ActionOperationActivityTriggerProps = Readonly<{
+    hasAttention: boolean;
+    open: boolean;
+    onPress: (event?: GestureResponderEvent) => void;
+}>;
+
 export type ActionOperationActivityButtonViewProps = Readonly<{
     operations: readonly ActionOperationSnapshotV1[];
     activeCount?: number;
@@ -33,6 +39,7 @@ export type ActionOperationActivityButtonViewProps = Readonly<{
     buttonSize?: number;
     iconSize?: number;
     testID?: string;
+    renderTrigger?: (props: ActionOperationActivityTriggerProps) => React.ReactNode;
 }>;
 
 type ActionOperationActivityPopoverPlacement = Readonly<{
@@ -53,8 +60,10 @@ type ActionOperationActivityButtonChromeProps = Readonly<{
     buttonSize?: number;
     iconSize?: number;
     testID?: string;
+    renderTrigger?: (props: ActionOperationActivityTriggerProps) => React.ReactNode;
 }>;
 
+/** 触发器只改变入口展示；账本展开状态、锚点和详情懒加载仍由此处统一管理。 */
 const ActionOperationActivityButtonChrome = React.memo(function ActionOperationActivityButtonChrome(
     props: ActionOperationActivityButtonChromeProps,
 ) {
@@ -68,40 +77,35 @@ const ActionOperationActivityButtonChrome = React.memo(function ActionOperationA
         height: number;
     }> | null>(null);
     const visible = props.hasAttention || open;
+    /** 关闭账本时卸载详情订阅，保留外层更多菜单入口。 */
     const handleRequestClose = React.useCallback(() => setOpen(false), []);
+    /** 原按钮与更多菜单共用打开动作；网页仍以实际按钮矩形定位。 */
+    const handlePress = React.useCallback((event?: GestureResponderEvent) => {
+        if (!open && !props.hasAttention) return;
+        if (!open && Platform.OS === 'web') {
+            const target = event?.currentTarget as unknown as {
+                getBoundingClientRect?: () => Readonly<{ left: number; top: number; width: number; height: number }>;
+            };
+            const rect = target?.getBoundingClientRect?.();
+            if (rect) {
+                setWebAnchorRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
+            }
+        }
+        setOpen((current) => !current);
+    }, [open, props.hasAttention]);
 
-    if (!visible) return null;
+    // 自定义入口可承载其他菜单动作，无活动时也不能把整个更多菜单隐藏。
+    if (!visible && !props.renderTrigger) return null;
 
     const tintColor = props.tintColor ?? theme.colors.chrome.header.foreground;
     return (
         <View ref={anchorRef} collapsable={false} style={styles.anchor}>
-            <Pressable
+            {props.renderTrigger ? props.renderTrigger({ hasAttention: props.hasAttention, open, onPress: handlePress }) : <Pressable
                 testID={props.testID ?? 'action-operation-activity-button'}
                 accessibilityRole="button"
                 accessibilityLabel={t('inbox.updates')}
                 accessibilityState={{ expanded: open }}
-                onPress={(event) => {
-                    if (!open && Platform.OS === 'web') {
-                        const target = event?.currentTarget as unknown as {
-                            getBoundingClientRect?: () => Readonly<{
-                                left: number;
-                                top: number;
-                                width: number;
-                                height: number;
-                            }>;
-                        };
-                        const rect = target?.getBoundingClientRect?.();
-                        if (rect) {
-                            setWebAnchorRect({
-                                left: rect.left,
-                                top: rect.top,
-                                width: rect.width,
-                                height: rect.height,
-                            });
-                        }
-                    }
-                    setOpen((current) => !current);
-                }}
+                onPress={handlePress}
                 style={({ pressed }) => [
                     styles.button,
                     props.buttonSize != null ? {
@@ -120,7 +124,7 @@ const ActionOperationActivityButtonChrome = React.memo(function ActionOperationA
                         <TabBadge testID="action-operation-activity-attention-dot" variant="dot" />
                     )}
                 </View>
-            </Pressable>
+            </Pressable>}
             {open ? props.renderDetails({
                 anchorRef,
                 anchor: webAnchorRect ? {
@@ -208,6 +212,7 @@ const ActionOperationActivityDetailsView = React.memo(function ActionOperationAc
     );
 });
 
+/** 受控视图沿用既有账本模型参数，并将可选入口交给统一展示层。 */
 export const ActionOperationActivityButtonView = React.memo(function ActionOperationActivityButtonView(
     props: ActionOperationActivityButtonViewProps,
 ) {
@@ -253,6 +258,7 @@ export const ActionOperationActivityButtonView = React.memo(function ActionOpera
             buttonSize={props.buttonSize}
             iconSize={props.iconSize}
             testID={props.testID}
+            renderTrigger={props.renderTrigger}
         />
     );
 });
@@ -277,12 +283,14 @@ const ActionOperationActivityDetails = React.memo(function ActionOperationActivi
     );
 });
 
+/** 常驻入口只订阅轻量摘要；自定义更多入口不会提前挂载详情模型。 */
 export const ActionOperationActivityButton = React.memo(function ActionOperationActivityButton(props: Readonly<{
     preferredSessionId?: string | null;
     tintColor?: string;
     buttonSize?: number;
     iconSize?: number;
     testID?: string;
+    renderTrigger?: (props: ActionOperationActivityTriggerProps) => React.ReactNode;
 }>) {
     const accountId = useActiveServerAccountScope()?.accountId ?? '';
     const summary = useActionOperationActivitySummary(accountId);
@@ -297,6 +305,7 @@ export const ActionOperationActivityButton = React.memo(function ActionOperation
             buttonSize={props.buttonSize}
             iconSize={props.iconSize}
             testID={props.testID}
+            renderTrigger={props.renderTrigger}
         />
     );
 });

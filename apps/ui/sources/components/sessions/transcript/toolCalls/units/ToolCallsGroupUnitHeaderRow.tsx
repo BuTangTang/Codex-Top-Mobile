@@ -41,6 +41,7 @@ export const ToolCallsGroupUnitHeaderRow = React.memo(function ToolCallsGroupUni
     );
 });
 
+/** 复用公共摘要样式，手机在同一表头提供展开与收起操作。 */
 export const ToolCallsGroupUnitHeaderRowWithSessionCommon = React.memo(function ToolCallsGroupUnitHeaderRowWithSessionCommon(
     props: ToolCallsGroupUnitHeaderRowProps & TranscriptSessionCommonProps,
 ) {
@@ -48,6 +49,8 @@ export const ToolCallsGroupUnitHeaderRowWithSessionCommon = React.memo(function 
     const chromeMode = toolCallsGroupChromeModeForVariant(variant);
     const { setExpanded } = props;
     const onCollapse = React.useCallback(() => setExpanded(false), [setExpanded]);
+    // 仍调用列表持有的展开 owner，保持虚拟行及阅读锚点的一致性。
+    const onExpand = React.useCallback(() => setExpanded(true), [setExpanded]);
 
     const status = resolveToolCallsGroupStatus({
         toolMessages: props.toolMessages,
@@ -73,6 +76,7 @@ export const ToolCallsGroupUnitHeaderRowWithSessionCommon = React.memo(function 
                         count={props.toolMessages.length}
                         expanded={props.expanded}
                         onCollapse={onCollapse}
+                        onExpand={props.toolChromeCommon.compactToolCalls ? onExpand : undefined}
                     />
                 </ToolCallsGroupUnitRowFrame>
             </TranscriptEnterWrapper>

@@ -71,6 +71,8 @@ import { createTranscriptWindowGapItem } from '@/components/sessions/transcript/
 type Ref<T> = { current: T };
 
 export type TranscriptItemsPipelineDeps = Readonly<{
+    compactToolCalls?: boolean;
+    compactPendingToolCallIds?: readonly string[];
     activeTargetWindowTargetRef: Ref<any>;
     activeThinkingMessageId: string | null;
     canonicalWindowedItemsRef: Ref<readonly ChatTranscriptListItem[]>;
@@ -122,8 +124,11 @@ export type TranscriptItemsPipelineDeps = Readonly<{
     webHotColdCountsRef: Ref<{ coldCount: number; hotCount: number }>;
 }>;
 
+/** 沿用已有转录投影与窗口 owner，手机仅合并工具摘要的展开入口。 */
 export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
     const {
+        compactToolCalls,
+        compactPendingToolCallIds,
         activeTargetWindowTargetRef,
         activeThinkingMessageId,
         canonicalWindowedItemsRef,
@@ -191,19 +196,30 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
         return toolMessages;
     }, [getTurnMessageById]);
 
+    const compactPendingToolCallIdSet = React.useMemo(() => new Set(compactPendingToolCallIds), [compactPendingToolCallIds]);
+    // 消费根订阅的稳定审批集合，分组缓存不变时也能及时移除失效行。
+    const isToolVisibleWhenCollapsed = React.useCallback((messageId: string, isReadOnlyContext: boolean) => (
+        !isReadOnlyContext && compactPendingToolCallIdSet.has(messageId)
+    ), [compactPendingToolCallIdSet]);
+
     const decomposedItems = React.useMemo<ChatTranscriptListItem[]>(() => {
-        return buildTranscriptTurnUnits({
+        const units = buildTranscriptTurnUnits({
             // Window gaps are projection output, never turn-decomposition input.
             items: items.filter((item) => item.kind !== 'transcript-window-gap'),
             getMessageById: getTurnMessageById,
             metadataByMessageId: forkMessageMetadataById ?? undefined,
             isGroupExpanded: (toolMessageIds) => toolMessageIds.some((id) => expandedToolCallsAnchorMessageIds.has(id)),
             collapsedPreviewCount: resolveTranscriptToolCallsCollapsedPreviewCount(transcriptToolCallsCollapsedPreviewCountSetting),
+            isToolVisibleWhenCollapsed: compactToolCalls ? isToolVisibleWhenCollapsed : undefined,
         });
+        // 手机由摘要表头展开，不再生成独立“更多”行；工具行和锚点保持原标识。
+        return compactToolCalls ? units.filter((item) => item.kind !== 'tool-group-expand') : units;
     }, [
+        compactToolCalls,
         expandedToolCallsAnchorMessageIds,
         forkMessageMetadataById,
         getTurnMessageById,
+        isToolVisibleWhenCollapsed,
         items,
         transcriptToolCallsCollapsedPreviewCountSetting,
     ]);
@@ -624,6 +640,7 @@ type ToolCallsGroupExpansionRequest = Readonly<{
 }>;
 
 export type TranscriptToolAutoExpandEffectDeps = Readonly<{
+    compactToolCalls?: boolean;
     applyToolCallsGroupExpanded: (request: ToolCallsGroupExpansionRequest) => void;
     expandedToolCallsAnchorMessageIds: ReadonlySet<string>;
     hasAutoExpandedToolCallsGroups: (sessionId: string) => boolean;
@@ -638,8 +655,10 @@ export type TranscriptToolAutoExpandEffectDeps = Readonly<{
     transcriptToolCallsCollapsedPreviewCountSetting: unknown;
 }>;
 
+/** 为旧布局补足短记录内容；手机保持默认折叠，等待用户主动展开。 */
 export function useTranscriptToolAutoExpandEffect(deps: TranscriptToolAutoExpandEffectDeps): void {
     const {
+        compactToolCalls,
         applyToolCallsGroupExpanded,
         expandedToolCallsAnchorMessageIds,
         hasAutoExpandedToolCallsGroups,
@@ -703,6 +722,8 @@ export function useTranscriptToolAutoExpandEffect(deps: TranscriptToolAutoExpand
     ]);
 
     React.useEffect(() => {
+        // 短记录也不覆盖手机摘要默认值，且不消费旧布局的一次自动展开状态。
+        if (compactToolCalls) return;
         if (jumpToSeq != null) return;
         if (!sessionId) return;
         if (hasAutoExpandedToolCallsGroups(sessionId)) return;

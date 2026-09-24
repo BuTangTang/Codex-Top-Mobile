@@ -75,9 +75,11 @@ export function installFlashListChatListCommonModuleMocks(
         return createFlashListChatListReactNativeMock();
     });
 
-    vi.mock('@/utils/platform/responsive', () => ({
-        useHeaderHeight: () => 0,
-    }));
+    vi.mock('@/utils/platform/responsive', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('@/utils/platform/responsive')>();
+        // 保留真实尺寸判定，只沿用既有测试的固定顶栏边界。
+        return { useDeviceType: actual.useDeviceType, useHeaderHeight: () => 0 };
+    });
 
     vi.mock('@/components/sessions/shell/useSessionScreenIsFocused', async () => {
         const React = await import('react');

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     computeAgentInputDefaultMaxHeight,
+    computePhoneSessionInputMaxHeight,
     computeExistingSessionComposerPanelMaxHeight,
     computeExistingSessionComposerInputMaxHeight,
     computeAgentInputKeyboardOpenPanelMaxHeight,
@@ -11,6 +12,14 @@ import {
 } from './inputMaxHeight';
 
 describe('inputMaxHeight', () => {
+    /** 手机输入保留五行阅读空间，并遵守宿主提供的更小可用高度。 */
+    it('caps phone input at five scaled lines plus its input padding', () => {
+        expect(computePhoneSessionInputMaxHeight({ lineHeight: 22, verticalPadding: 16, availableHeight: 300 })).toBe(126);
+        expect(computePhoneSessionInputMaxHeight({ lineHeight: 44, verticalPadding: 16, availableHeight: 300 })).toBe(236);
+        expect(computePhoneSessionInputMaxHeight({ lineHeight: 44, verticalPadding: 16, availableHeight: 100 })).toBe(100);
+        expect(computePhoneSessionInputMaxHeight({ lineHeight: 22, verticalPadding: 16, availableHeight: 0 })).toBe(0);
+    });
+
     it('reduces default max height when keyboard is open (native)', () => {
         const closed = computeAgentInputDefaultMaxHeight({ platform: 'ios', screenHeight: 800, keyboardHeight: 0 });
         const open = computeAgentInputDefaultMaxHeight({ platform: 'ios', screenHeight: 800, keyboardHeight: 300 });

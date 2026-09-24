@@ -1,6 +1,6 @@
 import { Image } from 'expo-image';
 import * as React from 'react';
-import { Platform, View } from 'react-native';
+import { Platform, Pressable, View } from 'react-native';
 import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
@@ -12,7 +12,7 @@ import { hapticsLight } from '@/components/ui/theme/haptics';
 import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
 import { t } from '@/text';
 import { Icon } from '@/components/ui/icons/Icon';
-import { ITEM_TITLE_TEXT_METRICS } from '@/components/ui/lists/itemDensityMetrics';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 
 import {
     resolveAgentContinuationSubmitPresentation,
@@ -32,8 +32,10 @@ const SUBMIT_HIT_SLOP = { top: 5, bottom: 10, left: 0, right: 0 } as const;
 /** 紧凑操作沿用蓝色语义主题，触摸区域至少 48，内容可随字体自然增高。 */
 const stylesheet = StyleSheet.create((theme) => ({
     compactShape: { marginLeft: 0, marginRight: 0, marginTop: 0, marginBottom: 0, paddingTop: 0, paddingBottom: 0 },
-    compactButton: { minHeight: 48, minWidth: 48, justifyContent: 'center', borderRadius: 8, backgroundColor: theme.colors.state.active.background },
-    compactButtonText: { ...ITEM_TITLE_TEXT_METRICS.cozy, color: theme.colors.state.active.onTint },
+    compactButton: { height: 48, width: 48, alignItems: 'center', justifyContent: 'center', borderRadius: 24, backgroundColor: theme.colors.state.active.background },
+    compactButtonDisabled: { backgroundColor: theme.colors.state.neutral.background },
+    compactButtonPressed: { opacity: 0.72 },
+    compactContinuation: { minHeight: 48, minWidth: 48 },
     shapeClip: {
         flexDirection: 'row',
         alignItems: 'center',
@@ -188,10 +190,11 @@ export const AgentInputSubmitButton = React.memo(function AgentInputSubmitButton
             />
         ) : undefined;
         return (
-            <AgentInputSubmitShape>
+            <AgentInputSubmitShape compact={props.compact}>
                 <RoundButton
                     testID={props.testID}
-                    size="small"
+                    size={props.compact ? 'large' : 'small'}
+                    style={props.compact ? stylesheet.compactContinuation : undefined}
                     // "Continue with [mark]". Pressing this does not only send — it
                     // continues the Session with another Agent — so the control says
                     // so on its face rather than only in a popover the reader has
@@ -221,21 +224,25 @@ export const AgentInputSubmitButton = React.memo(function AgentInputSubmitButton
         const label = micHoldsSubmit ? t('voiceAssistant.label')
             : showStopWhenEmpty ? t('runs.stop.stopRunA11y')
                 : (props.submitAccessibilityLabel ?? t('common.send'));
+        const loading = Boolean(props.isSending || (showStopWhenEmpty && props.isStopping));
+        const disabled = props.disabled || loading;
+        const tint = disabled ? theme.colors.text.secondary : theme.colors.state.active.onTint;
         return (
             <AgentInputSubmitShape compact>
-                <RoundButton
+                <Pressable
                     testID={props.testID}
-                    title={label}
+                    accessibilityRole="button"
                     accessibilityLabel={label}
                     accessibilityHint={!props.hasSendableContent && !micHoldsSubmit && !showStopWhenEmpty ? t('session.inputPlaceholder') : undefined}
-                    size="large"
-                    display="inverted"
-                    style={stylesheet.compactButton}
-                    textStyle={stylesheet.compactButtonText}
-                    disabled={props.disabled}
-                    loading={props.isSending || (showStopWhenEmpty && props.isStopping)}
+                    accessibilityState={{ disabled, busy: loading }}
+                    style={({ pressed }) => [stylesheet.compactButton, disabled ? stylesheet.compactButtonDisabled : null, pressed ? stylesheet.compactButtonPressed : null]}
+                    disabled={disabled}
                     onPress={submitPress}
-                />
+                >
+                    {loading ? <ActivitySpinner size="small" color={tint} /> : (
+                        <Icon name={micHoldsSubmit ? (props.micActive ? 'stop-circle' : 'microphone') : showStopWhenEmpty ? 'stop' : 'arrow-up'} size={22} color={tint} />
+                    )}
+                </Pressable>
             </AgentInputSubmitShape>
         );
     }

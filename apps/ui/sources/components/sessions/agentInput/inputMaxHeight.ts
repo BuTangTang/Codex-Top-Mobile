@@ -194,3 +194,15 @@ export function computeAgentInputKeyboardOpenVariableSectionMaxHeight(params: {
     const availableVariableSectionHeight = Math.max(0, safePanel - safeFooter);
     return clampNumber(availableVariableSectionHeight, 120, availableVariableSectionHeight);
 }
+
+/** 按当前文字行高保留约五行输入空间；宿主可用高度更小时优先避免遮住正文和键盘。 */
+export function computePhoneSessionInputMaxHeight(params: {
+    lineHeight: number;
+    verticalPadding: number;
+    availableHeight: number;
+}): number {
+    const lineHeight = Number.isFinite(params.lineHeight) ? Math.max(0, params.lineHeight) : 0;
+    const verticalPadding = Number.isFinite(params.verticalPadding) ? Math.max(0, params.verticalPadding) : 0;
+    const availableHeight = Number.isFinite(params.availableHeight) ? Math.max(0, params.availableHeight) : 0;
+    return Math.min(availableHeight, Math.ceil(lineHeight * 5 + verticalPadding));
+}

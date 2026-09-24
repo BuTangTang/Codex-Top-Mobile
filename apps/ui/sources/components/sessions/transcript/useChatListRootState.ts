@@ -27,6 +27,8 @@ import { useTranscriptRootThinkingState } from '@/components/sessions/transcript
 import { useTranscriptRootMessages } from '@/components/sessions/transcript/items/useTranscriptRootMessages';
 import { resolveTranscriptEventEmphasisByMessageId } from '@/components/sessions/transcript/events/transcriptEventEmphasis';
 import type { Message } from '@/sync/domains/messages/messageTypes';
+import { deriveReadOnlyTranscriptInteraction } from '@/components/sessions/transcript/forkContext/deriveReadOnlyTranscriptInteraction';
+import { shouldKeepPendingToolCallVisible } from '@/components/sessions/transcript/toolCalls/units/groupedToolCallRowRenderDecision';
 
 export function resolveLatestCommittedActivityKey(params: Readonly<{
     messageIdsOldestFirst: readonly string[];
@@ -140,6 +142,14 @@ export function useChatListRootState(props: ChatListProps) {
             presence: props.session.presence,
         });
     }, [props.session.accessLevel, props.session.canApprovePermissions, props.session.active, props.session.presence]);
+    // 复用根消息订阅；原地更新也重新判断，只有可见审批 ID 改变才更新下游投影。
+    const pendingToolCallIds = transcriptSessionCommon.toolChrome.compactToolCalls
+        ? messageIdsOldestFirst.filter((id) => shouldKeepPendingToolCallVisible(
+            messagesById[id] ?? null,
+            deriveReadOnlyTranscriptInteraction(interaction, forkAwareMessageDescriptors?.metadataByMessageId[id]?.isReadOnlyContext === true),
+        ))
+        : [];
+    const compactPendingToolCallIds = useStableValueBySignature(pendingToolCallIds, JSON.stringify(pendingToolCallIds));
     const internalMessagesById = forkedTranscriptEnabled ? messagesById : EMPTY_MESSAGES_BY_ID;
 
     return {
@@ -162,6 +172,7 @@ export function useChatListRootState(props: ChatListProps) {
             messagePins: sessionMessagePins,
             onToggleMessagePin: togglePersistedSessionMessagePin,
             messagesById: internalMessagesById,
+            compactPendingToolCallIds,
             eventEmphasisByMessageId,
             forkMessageMetadataById: forkAwareMessageDescriptors?.metadataByMessageId ?? null,
             committedMessagesCount: messageIdsOldestFirst.length,

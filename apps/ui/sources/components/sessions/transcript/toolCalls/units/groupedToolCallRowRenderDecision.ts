@@ -1,7 +1,11 @@
 import { isSubAgentTranscriptToolName } from '@happier-dev/protocol/tools/v2';
 
 import { resolveToolTranscriptSidechainId } from '@/components/tools/shell/views/resolveToolTranscriptSidechainId';
-import type { ToolCallMessage } from '@/sync/domains/messages/messageTypes';
+import type { Message, ToolCallMessage } from '@/sync/domains/messages/messageTypes';
+import type { TranscriptInteraction } from '@/utils/sessions/deriveTranscriptInteraction';
+import { shouldShowGenericPermissionPromptForRequest } from '@/utils/sessions/permissions/permissionPromptPolicy';
+import { resolveInactiveSessionToolCallFailure } from '@/components/tools/shell/permissions/resolveInactiveSessionToolCallFailure';
+import { resolveToolStatusIndicatorKind } from '@/components/tools/shell/presentation/resolveToolStatusIndicatorKind';
 
 /**
  * Pure render decisions for one grouped tool-call row.
@@ -13,6 +17,20 @@ import type { ToolCallMessage } from '@/sync/domains/messages/messageTypes';
  */
 
 export type GroupedToolCallChromeMode = 'activity_feed' | 'cards';
+
+/** 手机折叠组保留可操作的待审批工具，权限与失效状态沿用现有 owner。 */
+export function shouldKeepPendingToolCallVisible(
+    message: Message | null,
+    interaction: TranscriptInteraction,
+): boolean {
+    if (message?.kind !== 'tool-call' || !interaction.canApprovePermissions || message.tool.permission?.status !== 'pending') return false;
+    const tool = resolveInactiveSessionToolCallFailure({
+        tool: message.tool,
+        permissionDisabledReason: interaction.permissionDisabledReason,
+    });
+    return resolveToolStatusIndicatorKind(tool) === 'permission_pending'
+        && shouldShowGenericPermissionPromptForRequest({ toolName: tool.name, requestKind: tool.permission?.kind });
+}
 
 const GROUPED_TOOL_CALL_CHROME_MODES = [
     'activity_feed',

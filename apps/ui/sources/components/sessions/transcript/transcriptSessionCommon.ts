@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { Platform } from 'react-native';
 
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import type { Settings } from '@/sync/domains/settings/settings';
@@ -15,6 +16,7 @@ import {
     useSetting,
 } from '@/sync/domains/state/storage';
 import type { TranscriptInteraction } from '@/utils/sessions/deriveTranscriptInteraction';
+import { useDeviceType } from '@/utils/platform/responsive';
 
 export type TranscriptSessionCommonSettings = Pick<Settings,
     | 'sessionReplayEnabled'
@@ -89,7 +91,10 @@ export type TranscriptToolChromeCommon = Pick<TranscriptSessionCommonSettings,
     | 'toolViewTimelineChromeMode'
     | 'transcriptToolCallsCollapsedPreviewCount'
     | 'transcriptToolCallsGroupShowBackground'
->;
+> & Readonly<{
+    /** 原生手机将工具过程收进同一行摘要，展开状态仍由原列表管理。 */
+    compactToolCalls?: boolean;
+}>;
 
 export type TranscriptToolRouteCommon = Readonly<{
     messagesById: Readonly<Record<string, Message>>;
@@ -119,7 +124,10 @@ export function hasTranscriptSessionCommonProps(
         && props.toolRouteCommon != null;
 }
 
+/** 汇总会话展示设置，并在这里统一派生手机工具摘要策略。 */
 export function useTranscriptSessionCommon(sessionId: string): TranscriptSessionCommon {
+    const deviceType = useDeviceType();
+    const compactToolCalls = (Platform.OS === 'ios' || Platform.OS === 'android') && deviceType === 'phone';
     const sessionForkSupportSource = useSessionForkSupportSource(sessionId);
     const workspacePath = useSessionWorkspacePath(sessionId);
     const messagesById = useSessionMessagesById(sessionId);
@@ -199,11 +207,14 @@ export function useTranscriptSessionCommon(sessionId: string): TranscriptSession
             workspacePath,
         ]);
 
+    // 只改变展示投影，不写入跨端设置；网页和平板继续使用原设置值。
     const toolChrome = React.useMemo<TranscriptToolChromeCommon>(() => ({
-            toolViewTimelineChromeMode,
-            transcriptToolCallsCollapsedPreviewCount,
-            transcriptToolCallsGroupShowBackground,
+            compactToolCalls,
+            toolViewTimelineChromeMode: compactToolCalls ? 'activity_feed' : toolViewTimelineChromeMode,
+            transcriptToolCallsCollapsedPreviewCount: compactToolCalls ? 0 : transcriptToolCallsCollapsedPreviewCount,
+            transcriptToolCallsGroupShowBackground: compactToolCalls ? false : transcriptToolCallsGroupShowBackground,
         }), [
+            compactToolCalls,
             toolViewTimelineChromeMode,
             transcriptToolCallsCollapsedPreviewCount,
             transcriptToolCallsGroupShowBackground,

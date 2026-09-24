@@ -87,6 +87,23 @@ function collapsedAlways(): boolean {
 }
 
 describe('buildTranscriptTurnUnits', () => {
+    // 两种源分组共用折叠例外，待审批行与预览尾部去重并保持展开前后的 ID。
+    it.each(['linear', 'turn'] as const)('preserves stable tool IDs for collapsed exceptions in %s groups', (mode) => {
+        const messages = indexMessages([toolMessage('pending', 1), toolMessage('hidden', 2), toolMessage('tail', 3)]);
+        const group = { kind: 'tool-calls-group' as const, id: 'g1', toolMessageIds: ['pending', 'hidden', 'tail'], createdAt: 1 };
+        const items = mode === 'linear' ? [group] : [turnItem({ id: 'turn-1', userMessageId: null, content: [{ kind: 'tool_calls', id: 'g1', toolMessageIds: group.toolMessageIds }] })];
+        const params = { items, getMessageById: lookupIn(messages), collapsedPreviewCount: 1 };
+        const collapsed = buildTranscriptTurnUnits({ ...params, isGroupExpanded: collapsedAlways, isToolVisibleWhenCollapsed: (id, readOnly) => !readOnly && id === 'pending' });
+        const toolIds = (rows: TranscriptTurnUnitListItem[]) => rows.filter((row) => row.kind === 'tool-group-tool').map((row) => row.id);
+        expect(toolIds(collapsed)).toEqual(['g1#tool:pending', 'g1#tool:tail']);
+        expect(collapsed[0]).toMatchObject({ expanded: false, hiddenCount: 1 });
+        const expanded = buildTranscriptTurnUnits({ ...params, isGroupExpanded: expandedAlways });
+        expect(toolIds(expanded).filter((id) => toolIds(collapsed).includes(id))).toEqual(toolIds(collapsed));
+        const readOnly = buildTranscriptTurnUnits({ ...params, isGroupExpanded: collapsedAlways, metadataByMessageId: { pending: { originSessionId: 'parent', isReadOnlyContext: true } }, isToolVisibleWhenCollapsed: (id, readOnlyContext) => !readOnlyContext && id === 'pending' });
+        expect(toolIds(readOnly)).toEqual(['g1#tool:tail']);
+        expect(toolIds(buildTranscriptTurnUnits({ ...params, isGroupExpanded: collapsedAlways }))).toEqual(['g1#tool:tail']);
+    });
+
     it('passes non-turn, non-group items through unchanged by reference', () => {
         const forkDivider: ChatListItem = {
             kind: 'fork-divider',

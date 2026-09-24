@@ -3,6 +3,8 @@ import 'react-native-reanimated';
 import * as React from 'react';
 import { Keyboard, Platform, Pressable, TouchableOpacity, useWindowDimensions } from 'react-native';
 import { isRunningOnMac } from '@/utils/platform/platform';
+import { useDeviceType } from '@/utils/platform/responsive';
+import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
 import { useUnistyles } from 'react-native-unistyles';
 import { t } from '@/text';
 import { useAuth } from '@/auth/context/AuthContext';
@@ -42,6 +44,18 @@ const MAIN_TAB_STACK_SCREEN_OPTIONS = { animation: 'none' } as const;
 const SESSION_COCKPIT_SURFACE_STACK_SCREEN_OPTIONS = {
     animation: 'none',
     headerShown: false,
+} as const;
+// 手机会话沿用原生 push/pop；iOS 使用可定时的 simple_push，Android 由系统中等转场时长控制。
+const PHONE_SESSION_IOS_STACK_SCREEN_OPTIONS = {
+    headerShown: false,
+    animation: 'simple_push',
+    animationDuration: 250,
+    gestureEnabled: true,
+} as const;
+const PHONE_SESSION_ANDROID_STACK_SCREEN_OPTIONS = {
+    headerShown: false,
+    animation: 'slide_from_right',
+    gestureEnabled: true,
 } as const;
 const UNAUTH_SHELL_STACK_SCREEN_OPTIONS = { headerShown: false } as const;
 const NEW_SESSION_HEADER_TITLE_TYPOGRAPHY = Typography.header();
@@ -115,9 +129,17 @@ const AuthenticatedAppShellRuntimes = React.memo(function AuthenticatedAppShellR
     );
 });
 
+/** 组合既有导航与全局运行入口，并按原生手机和系统减少动态偏好选择会话转场。 */
 const RootLayoutShell = React.memo(function RootLayoutShell(): React.ReactElement {
     const auth = useAuth();
     const { theme } = useUnistyles();
+    const deviceType = useDeviceType();
+    const reducedMotionPreferred = useReducedMotionPreference();
+    // 只替换会话正文路由；平板、web、Mac 及其他 cockpit 页面保留原有选项。
+    const sessionScreenOptions = Platform.OS !== 'web' && !isRunningOnMac()
+        && deviceType === 'phone' && !reducedMotionPreferred
+        ? Platform.OS === 'ios' ? PHONE_SESSION_IOS_STACK_SCREEN_OPTIONS : PHONE_SESSION_ANDROID_STACK_SCREEN_OPTIONS
+        : SESSION_COCKPIT_SURFACE_STACK_SCREEN_OPTIONS;
     const friendsIdentityReadiness = useFriendsIdentityReadiness();
     const friendsIdentityReady = friendsIdentityReadiness.isReady;
 
@@ -333,7 +355,7 @@ const RootLayoutShell = React.memo(function RootLayoutShell(): React.ReactElemen
             />
             <Stack.Screen
                 name="session/[id]/index"
-                options={SESSION_COCKPIT_SURFACE_STACK_SCREEN_OPTIONS}
+                options={sessionScreenOptions}
             />
             <Stack.Screen
                 name="session/[id]/message/[messageId]"

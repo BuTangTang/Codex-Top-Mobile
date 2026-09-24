@@ -59,7 +59,7 @@ interface ChatHeaderViewProps {
     gutterElement?: React.ReactNode;
 }
 
-/** 展示真实会话标题与来源，手机用左对齐两行布局保留正文空间。 */
+/** 展示真实会话标题与来源，手机居中显示两行标题与短来源，保留正文空间。 */
 export const ChatHeaderView = React.memo(function ChatHeaderView({
     title,
     subtitle,
@@ -159,7 +159,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
                         testID={backButtonTestId}
                         accessibilityRole="button"
                         accessibilityLabel={t('common.back')}
-                        style={[styles.backButton, {
+                        style={[styles.backButton, isPhone ? styles.phoneBackButton : null, {
                             width: resolveSessionHeaderActionTargetPx(),
                             height: resolveSessionHeaderActionTargetPx(),
                             alignItems: 'center',
@@ -188,6 +188,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
                             accessibilityLabel={title}
                             style={[
                                 styles.title,
+                                isPhone ? styles.phoneTitle : null,
                                 {
                                     color: theme.colors.chrome.header.foreground,
                                     ...Typography.default('semiBold')
@@ -224,11 +225,12 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
                     </View>
                     {subtitle && (
                         <Text
-                            numberOfLines={isPhone ? 2 : 1}
+                            numberOfLines={1}
                             accessibilityLabel={subtitle}
                             ellipsizeMode={shouldUseWebSubtitleStartEllipsis ? undefined : subtitleEllipsizeMode}
                             style={[
                                 styles.subtitle,
+                                isPhone ? styles.phoneSubtitle : null,
                                 shouldUseWebSubtitleStartEllipsis ? styles.subtitleHeadWeb : null,
                                 {
                                     color: theme.colors.text.secondary,
@@ -315,8 +317,11 @@ const styles = StyleSheet.create((theme) => ({
         borderBottomColor: theme.colors.border.default,
         elevation: 0,
     },
-    phoneTitleContainer: { alignItems: 'flex-start', paddingVertical: 4 },
-    phoneTitleRow: { justifyContent: 'flex-start' },
+    phoneBackButton: { marginRight: 0 },
+    phoneTitleContainer: { alignItems: 'center', paddingVertical: 6 },
+    phoneTitleRow: { justifyContent: 'center' },
+    phoneTitle: { textAlign: 'center', fontSize: 16 },
+    phoneSubtitle: { textAlign: 'center', lineHeight: 16 },
     titleContainer: {
         flex: 1,
         justifyContent: 'center',

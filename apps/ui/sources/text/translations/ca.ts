@@ -6015,6 +6015,20 @@ deps: {
     },
 
     directSessions: {
+        phoneList: {
+            running: "运行中",
+            needsInput: "等待处理",
+            completed: "已完成",
+            failed: "失败",
+            cancelled: "已取消",
+            unknown: "状态未知",
+            loading: "正在加载…",
+            incomplete: "列表未完整，点此重试",
+            loadingMore: "正在加载更多…",
+            emptyIncomplete: "暂未读全会话，请刷新重试",
+            emptyPage: "当前页暂无会话，可继续加载",
+            empty: "暂无会话",
+        },
         browseListChanged: "La llista de sessions ha canviat. Actualitza-la per continuar carregant.",
         browseListIncomplete: "Aquesta llista encara no inclou totes les sessions. És possible que n’hi hagi més. Actualitza-la i torna-ho a provar més tard.",
         historyPreviewOnly: "Només hi ha disponible una previsualització. No es pot llegir l’historial complet de la sessió des de la font actual.",

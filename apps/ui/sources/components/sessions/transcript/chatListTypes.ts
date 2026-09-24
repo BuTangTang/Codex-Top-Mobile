@@ -89,6 +89,8 @@ export type ChatListInternalProps = Readonly<{
     messagePins: readonly PersistedSessionMessagePinV1[];
     onToggleMessagePin: (pin: PersistedSessionMessagePinV1) => void;
     messagesById: Readonly<Record<string, Message>>;
+    /** 手机折叠时仍应显示的审批行，由已有根消息订阅派生。 */
+    compactPendingToolCallIds?: readonly string[];
     eventEmphasisByMessageId: TranscriptEventEmphasisByMessageId;
     forkMessageMetadataById: TranscriptForkMessageMetadataById | null;
     committedMessagesCount: number;

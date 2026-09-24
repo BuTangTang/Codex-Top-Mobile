@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
     createToolCallMessageFixture,
+    renderStatefulToolCallsGroupView,
     renderToolCallsGroupView,
     standardCleanup,
 } from '@/dev/testkit';
@@ -14,6 +15,7 @@ import { installToolCallsGroupViewCommonModuleMocks } from './toolCallsGroupView
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 let collapsedPreviewCount: number | null = 1;
+const viewport = { width: 800, height: 600 };
 const stableMessagesById = {};
 const stableReducerState = createReducer();
 const flashListCompatMockState = vi.hoisted(() => ({
@@ -31,6 +33,7 @@ installToolCallsGroupViewCommonModuleMocks({
         return createReactNativeWebMock({
             AppState: { addEventListener: () => ({ remove: () => {} }) },
             Platform: { OS: 'ios', select: (values: any) => values?.ios ?? values?.default ?? null },
+            useWindowDimensions: () => viewport,
         });
     },
     unistyles: async () => {
@@ -121,6 +124,7 @@ vi.mock('@/components/ui/lists/flashListCompat/FlashListCompat', () => ({
 
 describe('ToolCallsGroupView (collapsed preview)', () => {
     beforeEach(() => {
+        Object.assign(viewport, { width: 800, height: 600 });
         flashListCompatMockState.mappingKeyCalls = [];
         storageHookCalls.length = 0;
         messageViewMockState.messageViewCalls = [];
@@ -128,6 +132,43 @@ describe('ToolCallsGroupView (collapsed preview)', () => {
     });
 
     afterEach(standardCleanup);
+
+    // 手机摘要必须保留仍可审批的工具，普通过程不因审批例外一起展开。
+    it('keeps only actionable permission tools visible in a collapsed phone group', async () => {
+        Object.assign(viewport, { width: 390, height: 844 });
+        const ordinary = createToolCallMessageFixture({ id: 'ordinary', createdAt: 1 });
+        const pending = createToolCallMessageFixture({ id: 'pending', createdAt: 2 });
+        pending.tool = { ...pending.tool, state: 'running', permission: { id: 'p1', kind: 'permission', status: 'pending' } };
+        const screen = await renderStatefulToolCallsGroupView({ toolMessages: [ordinary, pending] });
+        expect(screen.findAllByTestId('transcript-tool-calls-preview-row')).toHaveLength(1);
+        expect(screen.findAllByType('ToolTimelineRow' as React.ElementType).map((row) => row.props.tool.id)).toEqual([pending.tool.id]);
+        expect(screen.findByTestId('transcript-tool-calls-preview-more')).toBeNull();
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(screen.findAllByTestId('transcript-tool-calls-tool-row')).toHaveLength(2);
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(screen.findAllByTestId('transcript-tool-calls-preview-row')).toHaveLength(1);
+    });
+
+    // 整组渲染路径同样复用手机公共策略，手动展开不丢失详情。
+    it('uses a single expandable summary on phones and restores all tool rows on press', async () => {
+        Object.assign(viewport, { width: 390, height: 844 });
+        collapsedPreviewCount = 3;
+        const screen = await renderStatefulToolCallsGroupView({
+            toolMessages: [
+                createToolCallMessageFixture({ id: 'm1', createdAt: 1 }),
+                createToolCallMessageFixture({ id: 'm2', createdAt: 2 }),
+            ],
+        });
+
+        expect(screen.findAllByTestId('transcript-tool-calls-preview-row')).toHaveLength(0);
+        expect(screen.findByTestId('transcript-tool-calls-preview-more')).toBeNull();
+        expect(screen.findAllByTestId('transcript-tool-calls-tool-row')).toHaveLength(0);
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(screen.findAllByTestId('transcript-tool-calls-tool-row')).toHaveLength(2);
+        expect(screen.findByTestId('transcript-tool-calls-header')?.props.accessibilityState).toMatchObject({ expanded: true });
+        await screen.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(screen.findAllByTestId('transcript-tool-calls-tool-row')).toHaveLength(0);
+    });
 
     it('routes only visible preview rows through the FlashList mapping helper while collapsed', async () => {
         collapsedPreviewCount = 2;
