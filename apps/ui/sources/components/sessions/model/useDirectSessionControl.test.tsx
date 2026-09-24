@@ -1,15 +1,22 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act } from 'react-test-renderer';
 import { renderHook, createDeferred } from '@/dev/testkit';
-const mocks = vi.hoisted(() => ({ read: vi.fn(), action: vi.fn(), accountId: 'account-a' }));
+const mocks = vi.hoisted(() => ({ read: vi.fn(), action: vi.fn(), accountId: 'account-a', serverId: 'server' }));
 vi.mock('@/sync/ops/machineDirectSessions', () => ({ machineDirectSessionControlRead: mocks.read, machineDirectSessionControlAction: mocks.action }));
-vi.mock('@/sync/store/hooks', () => ({ useActiveServerAccountScope: () => ({ serverId: 'server', accountId: mocks.accountId }) }));
+vi.mock('@/sync/store/hooks', () => ({ useActiveServerAccountScope: () => ({ serverId: mocks.serverId, accountId: mocks.accountId }) }));
 vi.mock('@/platform/randomUUID', () => ({ randomUUID: () => 'operation-once' }));
 const request = { requestId: 'request', revision: 'rev', kind: 'command' as const, command: 'echo example', canDecide: true };
 const snapshot = { v: 1, turnId: 'turn', state: 'running', requests: [request], textSendMode: 'steer' };
 const input = { sessionId: 'linked', machineId: 'machine', serverId: 'server', enabled: true, observationKey: 'turn' };
+// 两组测试共用确定性的边界初始化，不依赖执行顺序。
+function resetControlMocks() {
+    mocks.serverId = 'server';
+    mocks.accountId = 'account-a';
+    mocks.read.mockReset().mockResolvedValue({ ok: true, snapshot });
+    mocks.action.mockReset();
+}
 describe('desktop control lifecycle', () => {
-    beforeEach(() => { mocks.accountId = 'account-a'; mocks.read.mockReset().mockResolvedValue({ ok: true, snapshot }); mocks.action.mockReset(); });
+    beforeEach(resetControlMocks);
     /** 每次点击直接消费本次读取值：缓存运行态不能把新终态错当追加。 */
     it('chooses a fresh start snapshot rather than the cached running snapshot', async () => {
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
@@ -260,5 +267,47 @@ describe('desktop control lifecycle', () => {
         await act(async () => { finish({ ok: true, snapshot }); });
         expect(hook.getCurrent().snapshot).toBeNull();
         expect(hook.getCurrent().error).toBe('offline');
+    });
+});
+
+/** 使用真实 profile 注册与别名解析，确保同服身份不被当作跨服越权。 */
+describe('desktop control server aliases', () => {
+    let createdProfileId: string | null = null;
+    beforeEach(resetControlMocks);
+    afterEach(async () => {
+        // 只清理本例通过真实 owner 注册的合成 profile，不依赖全局存储清理。
+        if (createdProfileId) {
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            profiles.removeServerProfile(createdProfileId);
+            createdProfileId = null;
+        }
+        resetControlMocks();
+    });
+    it('refreshes and sends through the route alias of the authenticated server', async () => {
+        const profiles = await import('@/sync/domains/server/serverProfiles');
+        const profile = profiles.upsertServerProfile({ serverUrl: 'https://control-alias.example.test', name: 'Synthetic' });
+        createdProfileId = profile.id;
+        profiles.setServerProfileIdentityForUrl(profile.serverUrl, 'srv_control_alias');
+        mocks.serverId = 'srv_control_alias';
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, serverId: profile.id }));
+        await act(async () => { expect(await hook.getCurrent().refresh()).not.toBeNull(); });
+        const start = vi.fn(async () => 'accepted' as const);
+        await act(async () => { expect(await hook.getCurrent().sendText('synthetic', start)).toEqual({ outcome: 'accepted', mode: 'start' }); });
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(mocks.read).toHaveBeenCalledWith({ machineId: 'machine', sessionId: 'linked' }, { serverId: profile.id });
+        await hook.unmount();
+    });
+    it('still refuses a genuinely different server', async () => {
+        mocks.serverId = 'server';
+        mocks.read.mockClear();
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, serverId: 'other-server' }));
+        const start = vi.fn(async () => 'accepted' as const);
+        await act(async () => { expect(await hook.getCurrent().refresh()).toBeNull(); await hook.getCurrent().sendText('synthetic', start); });
+        expect(start).not.toHaveBeenCalled();
+        expect(mocks.read).not.toHaveBeenCalled();
+        await hook.unmount();
     });
 });

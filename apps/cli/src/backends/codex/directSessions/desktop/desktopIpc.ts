@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
@@ -10,6 +11,7 @@ import { readDesktopConversationObservation } from './desktopConversationObserva
 enablePatches();
 
 // 私有协议证据：Desktop 26.917.51856 (10492)，src-mOb8On4V.js。
+// 完整历史的关联回执已在 26.917.62051 (10789) 核对；同一来源可能并存独立 revision 流。
 // 方法版本/帧上限/超时来自该客户端；版本匹配不代表运行构建已认证。
 // 同类协议参考：Emanuele-web04/remodex@e0e342dac5cddd40db661bfcf76e5ab0e3913ef8。
 // 这里独立实现协议边界，没有复制 Remodex 实现。
@@ -94,7 +96,11 @@ export class DesktopIpc {
     private ownerClientId: string | null = null;
     private observation: { conversationId: string; listener: (observation: DirectSessionObservationV1, continuity: 'snapshot' | 'event') => void;
         revision: number | null; state: unknown; anchor: KnownObservation | null; confirmed: boolean } | null = null;
+    private snapshotAnchor: { subscription: NonNullable<DesktopIpc['observation']>; frames: Record<string, unknown>[];
+        bytes: number; revision: number | null; timer: ReturnType<typeof setTimeout> } | null = null;
     private readonly disconnectedClients = new Set<string>();
+    private controlSnapshotAnchored = false;
+    private controlSnapshotReject: ((error: Error) => void) | null = null;
     private controlSnapshotListener: ((snapshot: unknown) => void) | null = null;
     private readonly pending = new Map<string, {
         resolve: (response: DesktopIpcResponse) => void;
@@ -175,11 +181,26 @@ export class DesktopIpc {
             sourceClientId: this.clientId, targetClientIds: [this.ownerClientId],
             params: { hostId: 'local', conversationId, following: true } });
         return () => {
+            this.clearSnapshotAnchor();
             this.observation = null;
             if (!this.failure) this.write({ type: 'broadcast', method: 'thread-stream-following-changed', version: 1,
                 sourceClientId: this.clientId, targetClientIds: [this.ownerClientId],
                 params: { hostId: 'local', conversationId, following: false } });
         };
+    }
+
+    /**
+     * 只读证明独立基线轮之后的当前尾轮：连接与订阅必须仍有效，且 next 必须精确匹配已确认的当前投影。
+     * 复用同一连续尾岛的顺序规则；陌生 scope、缺失基线或同轮状态变化均不构成换轮证明。
+     * 可在 follow 回调内同步调用，不发送请求、不水合历史，也不提升任何未确认快照的可信度。
+     */
+    confirmsFollowingTurn(conversationId: string, previousTurnId: string, next: KnownObservation): boolean {
+        const followed = this.observation;
+        if (this.failure || this.socket.destroyed || !this.socket.writable || !followed?.confirmed
+            || followed.conversationId !== conversationId || previousTurnId === next.turnId) return false;
+        const current = readDesktopConversationObservation(followed.state, conversationId);
+        if (current.state === 'unknown' || observationKey(current) !== observationKey(next)) return false;
+        return followsObservedTurn(followed.state, previousTurnId, next.turnId);
     }
 
     /** 返回本次订阅已应用的最新原 owner 状态；失联、并发替换或目标变化均不留下控制证明。 */
@@ -192,25 +213,149 @@ export class DesktopIpc {
         try {
             const ready = new Promise<void>((resolve, reject) => {
                 timer = setTimeout(() => reject(new DesktopIpcError('timeout')), REQUEST_TIMEOUT_MS);
-                this.controlSnapshotListener = () => resolve();
+                this.controlSnapshotReject = reject;
+                this.controlSnapshotListener = () => {
+                    if (this.controlSnapshotAnchored && !this.snapshotAnchor) resolve();
+                };
                 stop = this.followConversation(conversationId, () => {});
+                this.beginSnapshotAnchor();
             });
             const subscribed = this.observation;
             await ready;
             // 同一 data 批可先给快照、再给补丁或断线；只读取原订阅最新状态，不捕获首帧对象。
             if (this.failure) throw this.failure;
-            if (!subscribed || this.observation !== subscribed || subscribed.conversationId !== conversationId
+            if (!this.controlSnapshotAnchored || this.snapshotAnchor || !subscribed || this.observation !== subscribed || subscribed.conversationId !== conversationId
                 || !ipcRecord(subscribed.state)) throw new DesktopIpcError('invalid_snapshot');
             return subscribed.state;
         } finally {
             if (timer) clearTimeout(timer);
             this.controlSnapshotListener = null;
+            this.controlSnapshotReject = null;
+            this.controlSnapshotAnchored = false;
             stop?.();
         }
     }
 
-    /** 校验来源、版本、目标与连续 revision 后才应用补丁。缺口关闭当前代次，等待上层重新发现。 */
+    /** 清理当前订阅的关联等待；过期响应不能恢复已释放或更换的订阅。 */
+    private clearSnapshotAnchor(): void {
+        if (this.snapshotAnchor) clearTimeout(this.snapshotAnchor.timer);
+        this.snapshotAnchor = null;
+    }
+
+    /** 请求固定 owner 返回历史水合 revision；不把首包、最大编号或现存终态视为新事实。 */
+    private beginSnapshotAnchor(): void {
+        const subscription = this.observation;
+        if (!subscription || this.snapshotAnchor || !this.ownerClientId) return;
+        const anchor = { subscription, frames: [] as Record<string, unknown>[], bytes: 0, revision: null as number | null,
+            timer: setTimeout(() => this.fail('timeout'), REQUEST_TIMEOUT_MS) };
+        this.snapshotAnchor = anchor;
+        void this.request('thread-follower-load-complete-history', 1, { conversationId: subscription.conversationId },
+            randomUUID(), this.ownerClientId).then((response) => {
+            if (this.snapshotAnchor !== anchor || this.observation !== subscription || this.failure) return;
+            if (response.resultType === 'error') { this.fail(desktopResponseFailure(response)); return; }
+            const result = ipcRecord(response.result);
+            if (response.resultType !== 'success' || response.method !== 'thread-follower-load-complete-history'
+                || response.handledByClientId !== this.ownerClientId || !Number.isSafeInteger(result?.revision)
+                || Number(result?.revision) < 0) { this.fail('invalid_response'); return; }
+            anchor.revision = Number(result!.revision);
+            this.finishSnapshotAnchor();
+        }).catch((error) => {
+            if (this.snapshotAnchor === anchor) this.fail(error instanceof DesktopIpcError ? error.reason : 'connection_closed');
+        });
+    }
+
+    /** 从候选快照沿精确 baseRevision 重建回执指定状态；同编号的不同结果一律拒绝。 */
+    private finishSnapshotAnchor(): void {
+        const anchor = this.snapshotAnchor;
+        if (!anchor || anchor.revision === null) return;
+        const candidates = new Map<number, { state: Record<string, unknown>; index: number }>();
+        const equivalentAnchorFrames = new Set<number>();
+        for (let index = 0; index < anchor.frames.length; index++) {
+            const change = ipcRecord(ipcRecord(anchor.frames[index]!.params)?.change)!;
+            const revision = Number(change.revision);
+            if (revision > anchor.revision) continue;
+            let state: Record<string, unknown> | null;
+            if (change.type === 'snapshot') {
+                state = ipcRecord(change.conversationState);
+                if (!state) { this.fail('invalid_snapshot'); return; }
+            } else {
+                const base = candidates.get(Number(change.baseRevision));
+                if (!base) continue; // 不跨过缺失基线，也不拼接别的修订流。
+                if (!Number.isSafeInteger(change.baseRevision) || revision <= Number(change.baseRevision)) {
+                    this.fail('revision_gap'); return;
+                }
+                if (!Array.isArray(change.patches)) { this.fail('invalid_snapshot'); return; }
+                try { state = ipcRecord(applyPatches(base.state, change.patches as Patch[])); }
+                catch { this.fail('invalid_snapshot'); return; }
+                if (!state) { this.fail('invalid_snapshot'); return; }
+            }
+            const existing = candidates.get(revision);
+            if (existing && !isDeepStrictEqual(existing.state, state)) { this.fail('invalid_snapshot'); return; }
+            if (!existing) candidates.set(revision, { state, index });
+            if (revision === anchor.revision) equivalentAnchorFrames.add(index);
+        }
+        const selected = candidates.get(anchor.revision);
+        if (!selected) return; // 响应可能先到，仍受同一次请求的期限约束。
+        // 以已关联的重建结果建立一次基线，不将历史水合补丁伪装为实时生命周期事件。
+        const baseline = { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+            sourceClientId: this.ownerClientId, params: { hostId: 'local', conversationId: anchor.subscription.conversationId,
+                change: { type: 'snapshot', revision: anchor.revision, conversationState: selected.state } } };
+        // 同一回执状态的等价重建帧已验证；其余尾帧仍须逐一检查，不能吞掉新快照或缺口。
+        const frames = anchor.frames.filter((_, index) => index > selected.index && !equivalentAnchorFrames.has(index));
+        this.clearSnapshotAnchor();
+        anchor.subscription.revision = null;
+        anchor.subscription.state = null;
+        anchor.subscription.anchor = null;
+        anchor.subscription.confirmed = false;
+        this.controlSnapshotAnchored = false;
+        this.applyObservation(baseline);
+        for (const frame of frames) {
+            if (this.failure || this.observation !== anchor.subscription) break;
+            this.receiveObservation(frame);
+        }
+        // 完整消化同批尾帧后才发布控制证明，避免首帧先唤醒再遇冲突。
+        if (!this.failure && this.observation === anchor.subscription) {
+            this.controlSnapshotAnchored = true;
+            this.controlSnapshotListener?.(anchor.subscription.state);
+        }
+    }
+
+    /** 仅控制读取关联快照；长订阅保留原行为，控制遇未关联完整快照即拒绝且不重请求。 */
     private receiveObservation(message: Record<string, unknown>): void {
+        const followed = this.observation;
+        const params = ipcRecord(message.params);
+        if (!followed || params?.conversationId !== followed.conversationId || params.hostId !== 'local') return;
+        if (message.sourceClientId !== this.ownerClientId) { this.fail('owner_changed'); return; }
+        if (message.version !== 11) { this.fail('incompatible_protocol'); return; }
+        const change = ipcRecord(params.change);
+        if (!change || !Number.isSafeInteger(change.revision) || Number(change.revision) < 0) { this.fail('invalid_snapshot'); return; }
+        if (!this.snapshotAnchor && this.controlSnapshotListener && change.type === 'snapshot') {
+            if (change.revision !== followed.revision || !isDeepStrictEqual(change.conversationState, followed.state)) {
+                this.controlSnapshotAnchored = false;
+                this.fail('invalid_snapshot');
+            }
+            return;
+        }
+        const anchor = this.snapshotAnchor;
+        if (!anchor) { this.applyObservation(message); return; }
+        // 沿用协议单帧资源上限作为一次关联缓存的总字节边界，不累计无限历史。
+        anchor.bytes += Buffer.byteLength(JSON.stringify(message));
+        if (anchor.bytes > MAX_FRAME_BYTES) { this.fail('invalid_snapshot'); return; }
+        if (change.type === 'snapshot') {
+            for (const frame of anchor.frames) {
+                const previous = ipcRecord(ipcRecord(frame.params)?.change);
+                if (previous?.type === 'snapshot' && previous.revision === change.revision
+                    && !isDeepStrictEqual(previous.conversationState, change.conversationState)) {
+                    this.fail('invalid_snapshot'); return;
+                }
+            }
+        } else if (change.type !== 'patches') { this.fail('invalid_snapshot'); return; }
+        anchor.frames.push(message);
+        this.finishSnapshotAnchor();
+    }
+
+    /** 校验来源、版本、目标与连续 revision 后才应用补丁。缺口关闭当前代次，等待上层重新发现。 */
+    private applyObservation(message: Record<string, unknown>): void {
         const followed = this.observation;
         const params = ipcRecord(message.params);
         if (!followed || params?.conversationId !== followed.conversationId || params.hostId !== 'local') return;
@@ -359,6 +504,9 @@ export class DesktopIpc {
     private fail(reason: string): void {
         if (this.failure) return;
         this.failure = new DesktopIpcError(reason);
+        this.controlSnapshotAnchored = false;
+        this.clearSnapshotAnchor();
+        this.controlSnapshotReject?.(this.failure);
         const followed = this.observation;
         this.observation = null;
         if (followed) {

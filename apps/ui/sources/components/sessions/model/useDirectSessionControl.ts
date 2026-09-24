@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { areServerProfileIdentifiersEquivalent } from '@/sync/domains/server/serverProfiles';
 import type { DesktopApprovalV1, DesktopControlSnapshotV1, DirectSessionControlActionRequest } from '@happier-dev/protocol';
 import { machineDirectSessionControlRead, machineDirectSessionControlAction } from '@/sync/ops/machineDirectSessions';
 import { useActiveServerAccountScope } from '@/sync/store/hooks';
@@ -28,7 +29,8 @@ export function useDirectSessionControl(params: Readonly<{
 }>) {
     const scope = useActiveServerAccountScope();
     const serverId = params.serverId ?? scope?.serverId;
-    const enabled = params.enabled && Boolean(scope && params.machineId && serverId === scope.serverId);
+    // 路由可保留 profile 别名；由现有服务器 owner 判断同服，仍拒绝跨服控制。
+    const enabled = params.enabled && Boolean(scope && params.machineId && areServerProfileIdentifiersEquivalent(serverId, scope.serverId));
     const identity = JSON.stringify([scope?.accountId, serverId, params.machineId, params.sessionId]);
     // A→B→A 与暂时停用也开启新寿命，旧回包和 finally 不能写入新锁。
     const lifetime = React.useMemo(() => ({

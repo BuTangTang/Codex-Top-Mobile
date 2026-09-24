@@ -35,6 +35,8 @@ describe('Desktop-owned session control', () => {
     let onStart: (request: Request, socket: Socket) => void;
     let onDiscover: (request: Request, socket: Socket) => void;
     let onFollow: (request: Request, socket: Socket) => void;
+    let onHistory: (request: Request, socket: Socket) => void;
+    const snapshotRevisions = new Map<Socket, number>();
     let onAction: (request: Request, socket: Socket) => void;
     const input = { remoteSessionId: 'thread-synthetic', text: 'synthetic prompt', localId: 'message-synthetic', accountId: 'account-synthetic' };
 
@@ -48,6 +50,8 @@ describe('Desktop-owned session control', () => {
 
     /** 用独立编码的外部边界帧模拟 Desktop，刻意拆分帧头和正文。 */
     function respond(socket: Socket, value: unknown): void {
+        const change = (value as { params?: { change?: { type?: string; revision?: number } } })?.params?.change;
+        if (change?.type === 'snapshot' && typeof change.revision === 'number') snapshotRevisions.set(socket, change.revision);
         const body = Buffer.from(JSON.stringify(value));
         const header = Buffer.alloc(4);
         header.writeUInt32LE(body.length);
@@ -82,6 +86,10 @@ describe('Desktop-owned session control', () => {
         await mkdir(join(codexHome, 'ipc'), { recursive: true, mode: 0o700 });
         server = createServer((socket) => {
             sockets.add(socket);
+            // 控制拒绝会主动断开；合成服务器只容忍该关闭竞态的传输错误。
+            socket.on('error', (error: NodeJS.ErrnoException) => {
+                if (error.code !== 'EPIPE' && error.code !== 'ECONNRESET') throw error;
+            });
             socket.on('close', () => sockets.delete(socket));
             let pending = Buffer.alloc(0);
             // 这里是第三方传输边界，保留实际分帧和并发请求行为。
@@ -101,6 +109,8 @@ describe('Desktop-owned session control', () => {
                         onStart(request, socket);
                     } else if (request.method === 'thread-stream-following-changed') {
                         onFollow(request, socket);
+                    } else if (request.method === 'thread-follower-load-complete-history') {
+                        onHistory(request, socket);
                     } else if (request.method.startsWith('thread-follower-')) {
                         onAction(request, socket);
                     }
@@ -119,6 +129,10 @@ describe('Desktop-owned session control', () => {
         codexHome = join(root, 'codex');
         environment.activeServerDir = join(root, 'happier');
         requests = [];
+        snapshotRevisions.clear();
+        onHistory = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
+            result: { revision: snapshotRevisions.get(socket) ?? 1 } });
         onStart = accepted;
         onFollow = (request, socket) => {
             if (request.params.following) respond(socket, controlSnapshotFrame(idleControlState()));
@@ -138,6 +152,167 @@ describe('Desktop-owned session control', () => {
         if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
         server = undefined;
         await removeTempDir(root);
+    });
+
+    it('anchors control to the correlated owner revision instead of the stale first high snapshot', async () => {
+        let release!: () => void;
+        onFollow = (request, socket) => {
+            if (!request.params.following) return;
+            for (const [revision, turnId] of [[225, 'stale'], [51, 'current']] as const) {
+                const state = { ...idleControlState(), turns: [{ turnId, status: 'completed', items: [] }] };
+                const message = controlSnapshotFrame(state);
+                (message.params as { change: { revision: number } }).change.revision = revision;
+                respond(socket, message);
+            }
+        };
+        onHistory = (request, socket) => { release = () => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic', result: { revision: 51 } }); };
+        await startRouter();
+        let settled = false;
+        const result = getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }).finally(() => { settled = true; });
+        await vi.waitFor(() => expect(requests.some((request) => request.method === 'thread-stream-following-changed')).toBe(true));
+        expect(settled).toBe(false);
+        await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+        release();
+        expect(await result).toMatchObject({ turnId: 'current' });
+        expect(requests.find((request) => request.method === 'thread-follower-load-complete-history'))
+            .toMatchObject({ version: 1, targetClientId: 'owner-synthetic', params: { conversationId: input.remoteSessionId } });
+    });
+
+    it('anchors a contiguous patch chain at the acknowledged revision without requiring another full snapshot', async () => {
+        onHistory = (request, socket) => {
+            respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
+                params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'patches', baseRevision: 1, revision: 2,
+                    patches: [{ op: 'replace', path: ['turns', 0, 'turnId'], value: 'latest-via-patch' }] } } });
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method, resultType: 'success',
+                handledByClientId: 'owner-synthetic', result: { revision: 2 } });
+        };
+        await startRouter();
+        await expect(getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }))
+            .resolves.toMatchObject({ turnId: 'latest-via-patch' });
+        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+    });
+
+    it('rejects different reachable states at the acknowledged revision instead of preferring the full snapshot', async () => {
+        onHistory = (request, socket) => {
+            respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
+                params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'patches', baseRevision: 1, revision: 2,
+                    patches: [{ op: 'replace', path: ['turns', 0, 'turnId'], value: 'from-chain' }] } } });
+            const snapshot = controlSnapshotFrame({ ...idleControlState(), turns: [{ turnId: 'from-snapshot', status: 'completed', items: [] }] });
+            (snapshot.params as { change: { revision: number } }).change.revision = 2;
+            respond(socket, snapshot);
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method, resultType: 'success',
+                handledByClientId: 'owner-synthetic', result: { revision: 2 } });
+        };
+        await startRouter();
+        await expect(getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }))
+            .rejects.toThrow('invalid_snapshot');
+    });
+
+    it.each([false, true])('compares every reachable patch branch at the owner revision (conflict=%s)', async (conflict) => {
+        onHistory = (request, socket) => {
+            const second = controlSnapshotFrame({ ...idleControlState(), cwd: conflict ? '/conflicting-synthetic' : '/synthetic' });
+            (second.params as { change: { revision: number } }).change.revision = 2;
+            respond(socket, second);
+            for (const baseRevision of [1, 2]) respond(socket, {
+                type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
+                params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'patches', baseRevision, revision: 3,
+                    patches: [{ op: 'replace', path: ['turns', 0, 'turnId'], value: 'same-acknowledged-turn' }] } } });
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method, resultType: 'success',
+                handledByClientId: 'owner-synthetic', result: { revision: 3 } });
+        };
+        await startRouter();
+        const result = getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId });
+        if (conflict) await expect(result).rejects.toThrow('invalid_snapshot');
+        else await expect(result).resolves.toMatchObject({ turnId: 'same-acknowledged-turn' });
+    });
+
+    it('rejects conflicting states at the same owner anchor revision before a control decision', async () => {
+        onFollow = (request, socket) => {
+            if (!request.params.following) return;
+            for (const turnId of ['one', 'other']) respond(socket, controlSnapshotFrame({ ...idleControlState(),
+                turns: [{ turnId, status: 'completed', items: [] }] }));
+        };
+        await startRouter();
+        await expect(getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }))
+            .rejects.toThrow('invalid_snapshot');
+        expect(requests.some((request) => request.method === 'thread-follower-start-turn')).toBe(false);
+    });
+
+    it.each(['wrong-owner', 'unsupported'])('rejects %s history anchoring without falling back to the first snapshot', async (variant) => {
+        onHistory = (request, socket) => respond(socket, variant === 'unsupported'
+            ? { type: 'response', requestId: request.requestId, method: request.method, resultType: 'error', error: 'no-handler-for-request' }
+            : { type: 'response', requestId: request.requestId, method: request.method, resultType: 'success', handledByClientId: 'other', result: { revision: 1 } });
+        await startRouter();
+        await expect(getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }))
+            .rejects.toThrow(variant === 'unsupported' ? 'incompatible_protocol' : 'invalid_response');
+    });
+
+    it('waits for the correlated snapshot when the owner reply arrives first', async () => {
+        onFollow = () => {};
+        let deliver!: () => void;
+        onHistory = (request, socket) => {
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'success', handledByClientId: 'owner-synthetic', result: { revision: 1 } });
+            deliver = () => respond(socket, controlSnapshotFrame(idleControlState()));
+        };
+        await startRouter();
+        let settled = false;
+        const result = getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }).finally(() => { settled = true; });
+        await vi.waitFor(() => expect(deliver).toBeTypeOf('function'));
+        expect(settled).toBe(false);
+        deliver();
+        expect(await result).toMatchObject({ turnId: 'old-turn' });
+    });
+
+    it('does not amplify full snapshots into reciprocal history requests between two control reads', async () => {
+        const followers = new Set<Socket>();
+        let revision = 1;
+        let historyRequests = 0;
+        onFollow = (request, socket) => {
+            if (request.params.following) followers.add(socket); else followers.delete(socket);
+        };
+        onHistory = (request, socket) => {
+            historyRequests++;
+            // 仅测试服务端在第六次停止出帧，使有缺陷客户端的反馈回路有界可复现。
+            if (historyRequests > 6) return;
+            revision++;
+            const message = controlSnapshotFrame(idleControlState());
+            (message.params as { change: { revision: number } }).change.revision = revision;
+            for (const follower of followers) respond(follower, message);
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'success', handledByClientId: 'owner-synthetic', result: { revision } });
+        };
+        await startRouter();
+        await Promise.allSettled([
+            getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }),
+            getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId }),
+        ]);
+        expect(historyRequests).toBe(2);
+
+    });
+
+    it.each(['patch', 'snapshot', 'conflict', 'gap', 'disconnect'])('checks %s after the anchor ACK in the same incoming batch', async (variant) => {
+        onHistory = (request, socket) => {
+            const ack = { type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'success', handledByClientId: 'owner-synthetic', result: { revision: 1 } };
+            const change = variant === 'snapshot' || variant === 'conflict'
+                ? { type: 'snapshot', revision: variant === 'conflict' ? 1 : 2,
+                    conversationState: { ...idleControlState(), cwd: '/different-synthetic' } }
+                : { type: 'patches', baseRevision: variant === 'gap' ? 9 : 1, revision: variant === 'gap' ? 10 : 2,
+                    patches: [{ op: 'replace', path: ['turns', 0, 'status'], value: 'inProgress' },
+                        { op: 'replace', path: ['threadRuntimeStatus', 'type'], value: 'active' }] };
+            const event = variant === 'disconnect'
+                ? { type: 'broadcast', method: 'client-status-changed', params: { status: 'disconnected', clientId: 'owner-synthetic' } }
+                : { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
+                    params: { hostId: 'local', conversationId: input.remoteSessionId, change } };
+            socket.write(Buffer.concat([frame(ack), frame(event)]));
+        };
+        await startRouter();
+        const result = getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId });
+        if (variant === 'patch') await expect(result).resolves.toMatchObject({ state: 'running', textSendMode: 'steer' });
+        else await expect(result).rejects.toThrow(variant === 'disconnect' ? 'owner_changed' : variant === 'gap' ? 'revision_gap' : 'invalid_snapshot');
+        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
     });
 
     // 发现操作只能询问既有 owner，不能隐式打开或恢复会话。
@@ -248,8 +423,10 @@ describe('Desktop-owned session control', () => {
         const ipc = await DesktopIpc.open(codexHome);
         await ipc.discoverOwner(input.remoteSessionId);
         const observations: Array<{ state: string; turnId?: string }> = [];
+        const next = { v: 1 as const, source: 'desktop' as const, state: 'running' as const, turnId: 'current' };
+        const callbackProofs: boolean[] = [];
         let ownerSocket!: Socket;
-        const snapshot = (revision: number, turns: Array<{ turnId: string; status: string }>) => respond(ownerSocket, {
+        const snapshot = (revision: number, turns: Array<{ turnId: string; status: string }>, newerBoundary = 'exhausted') => respond(ownerSocket, {
             type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
             params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'snapshot', revision, conversationState: {
                 id: input.remoteSessionId, requests: [], turns: [], historyMode: 'paginated', canonicalVoiceHistory: true,
@@ -257,7 +434,7 @@ describe('Desktop-owned session control', () => {
                 turnHistory: { kind: 'canonical', history: { generation: 0, isComplete: true,
                     entitiesByKey: Object.fromEntries(turns.map((turn) => [turn.turnId, { ...turn, items: [] }])),
                     islands: [{ id: 'tail:0', entries: turns.map((turn) => ({ key: turn.turnId, value: turn.turnId })),
-                        olderBoundary: { status: 'exhausted' }, newerBoundary: { status: 'exhausted' } }],
+                        olderBoundary: { status: 'exhausted' }, newerBoundary: { status: newerBoundary } }],
                 } },
             } } },
         });
@@ -265,9 +442,13 @@ describe('Desktop-owned session control', () => {
             ownerSocket = socket;
             if (request.params.following) snapshot(258, [{ turnId: 'old', status: 'completed' }]);
         };
-        ipc.followConversation(input.remoteSessionId, (value) => observations.push(value));
+        ipc.followConversation(input.remoteSessionId, (value) => {
+            observations.push(value);
+            callbackProofs.push(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', next));
+        });
         await vi.waitFor(() => expect(observations).toHaveLength(2));
         expect(observations.at(-1)).toMatchObject({ state: 'unknown' });
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', next)).toBe(false);
         snapshot(259, [{ turnId: 'old', status: 'completed' }]);
         await vi.waitFor(() => expect(observations).toHaveLength(3));
         expect(observations.at(-1)).toMatchObject({ state: 'unknown' });
@@ -282,12 +463,29 @@ describe('Desktop-owned session control', () => {
                     { op: 'replace', path: ['turnHistory', 'history', 'entitiesByKey', 'unrelated', 'status'], value: 'completed' },
                 ] } } });
         await vi.waitFor(() => expect(observations.at(-1)).toMatchObject({ state: 'completed', turnId: 'unrelated' }));
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', { ...next, state: 'completed', turnId: 'unrelated' })).toBe(false);
         snapshot(294, [{ turnId: 'old', status: 'completed' }, { turnId: 'unrelated', status: 'completed' }, { turnId: 'current', status: 'inProgress' }]);
         await vi.waitFor(() => expect(observations.at(-1)).toMatchObject({ state: 'running', turnId: 'current' }));
-        snapshot(295, [{ turnId: 'old', status: 'completed' }]);
+        expect(callbackProofs.at(-1)).toBe(true);
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', next)).toBe(true);
+        expect(ipc.confirmsFollowingTurn('different-thread', 'old', next)).toBe(false);
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'missing-tail-turn', next)).toBe(false);
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'current', next)).toBe(false);
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', { ...next, state: 'completed' })).toBe(false);
+        // 不完整尾岛不能延续独立基线的当前状态证明。
+        snapshot(295, [{ turnId: 'old', status: 'completed' }, { turnId: 'current', status: 'inProgress' }], 'unknown');
         await vi.waitFor(() => expect(observations).toHaveLength(7));
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', next)).toBe(false);
+        snapshot(296, [{ turnId: 'old', status: 'completed' }]);
+        await vi.waitFor(() => expect(observations).toHaveLength(8));
         expect(observations.at(-1)).toMatchObject({ state: 'unknown' });
+        snapshot(297, [{ turnId: 'old', status: 'completed' }, { turnId: 'current', status: 'completed' }]);
+        await vi.waitFor(() => expect(observations.at(-1)).toMatchObject({ state: 'completed', turnId: 'current' }));
+        const completed = { ...next, state: 'completed' as const };
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', completed)).toBe(true);
         ipc.close();
+        expect(ipc.confirmsFollowingTurn(input.remoteSessionId, 'old', completed)).toBe(false);
+        expect(requests.some((request) => request.method === 'thread-follower-load-complete-history')).toBe(false);
     });
 
     it.each(['inProgress', 'completed'] as const)('confirms an explicit %s turn insertion after an empty baseline without requiring a placeholder id patch', async (status) => {
@@ -517,7 +715,7 @@ describe('Desktop-owned session control', () => {
         expect(await sendDesktopSessionUserMessage({ codexHome, ...input }))
             .toMatchObject({ status: 'rejected', reason: 'owner_unavailable' });
         expect(requests.filter((request) => request.type === 'request').map((request) => request.method))
-            .toEqual(['initialize', 'thread-owner-discovery', 'thread-follower-start-turn']);
+            .toEqual(['initialize', 'thread-owner-discovery', 'thread-follower-load-complete-history', 'thread-follower-start-turn']);
     });
 
     // 未证明支持当前协议的 owner 不能被宣告为可发送。

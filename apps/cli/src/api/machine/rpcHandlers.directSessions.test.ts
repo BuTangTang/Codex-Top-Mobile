@@ -4,7 +4,7 @@ import { createServer as createSocketServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { writeFakeCodexAppServerThreadListScript } from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
@@ -27,15 +27,22 @@ const getOrCreateSessionByTagMock = vi.fn();
 const commitSessionStoredMessageMock = vi.fn();
 const updateSessionMetadataWithRetryMock = vi.fn();
 
-vi.mock('@/configuration', () => ({
-  configuration: {
-    apiServerUrl: 'https://relay.invalid',
-    activeServerDir: '/tmp/happier-test-active-server',
-    happyHomeDir: '/tmp/happier-test-home',
-    logsDir: '/tmp',
-    isDaemonProcess: false,
-  },
-}));
+// 配置边界使用独立日志目录，避免真实 Logger 的保留策略清理无关 /tmp 日志。
+vi.mock('@/configuration', async () => {
+  const { mkdtemp } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return {
+    configuration: {
+      apiServerUrl: 'https://relay.invalid',
+      activeServerDir: '/tmp/happier-test-active-server',
+      happyHomeDir: '/tmp/happier-test-home',
+      logsDir: await mkdtemp(join(tmpdir(), 'codextop-rpc-logs-')),
+      isDaemonProcess: false,
+    },
+  };
+});
+afterAll(() => rm(configuration.logsDir, { recursive: true, force: true }));
 
 vi.mock('@/persistence', () => ({
   readCredentials: (...args: unknown[]) => readCredentialsMock(...args),
@@ -155,6 +162,10 @@ async function withDesktopRpcFixture(
           if (!ownerAvailable) respond(socket, { type: 'response', requestId: request.requestId, resultType: 'error', error: 'no-client-found' });
           else respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
             resultType: 'success', handledByClientId: 'original-desktop-owner', result: { supportsUntrustedAppInput: true } });
+        } else if (request.method === 'thread-follower-load-complete-history') {
+          // 现有 owner 的关联历史回执固定选中本夹具发布的唯一快照。
+          respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+            resultType: 'success', handledByClientId: 'original-desktop-owner', result: { revision: 1 } });
         } else if (request.method === 'thread-follower-start-turn') {
           if (outcome === 'unknown') socket.destroy();
           else if (outcome === 'rejected') respond(socket, { type: 'response', requestId: request.requestId, resultType: 'error', error: 'no-client-found' });
@@ -537,7 +548,8 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
         expect(requests.some((entry) => entry.method === 'thread-stream-following-changed')).toBe(false);
         await expect(attach({ ...target, leaseId: 'viewer-1', ttlMs: 45_000 })).resolves.toMatchObject({ ok: true });
         await vi.waitFor(() => expect(requests.some((entry) => entry.method === 'thread-stream-following-changed')).toBe(true));
-        await expect(status(target)).resolves.toMatchObject({ observation: { state: 'unknown' } });
+        // 新租约的一次关联快照已证明当前运行轮；未关联/未订阅时仍由上方断言保持未知。
+        await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'running', turnId: 'observed-active-turn' } }));
         publishSnapshot(2, [{ turnId: 'observed-active-turn', status: 'completed' }, { turnId: 'current', status: 'inProgress' }]);
         await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'running', turnId: 'current' }, externalControl: { canSend: true } }));
         setOwnerAvailable(false);
