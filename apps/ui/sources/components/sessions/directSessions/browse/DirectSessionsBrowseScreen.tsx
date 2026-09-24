@@ -27,9 +27,10 @@ import {
 } from './resolveDirectBrowseSourceOptions';
 import { DirectBrowseCandidatesList } from './DirectBrowseCandidatesList';
 import { shouldUseCandidateSource } from './shouldUseCandidateSource';
-import { useDirectBrowseCandidates, type DirectBrowseCandidate } from './useDirectBrowseCandidates';
+import { useDirectBrowseCandidates, type DirectBrowseCandidate, type DirectBrowseObservationScope } from './useDirectBrowseCandidates';
 import { Icon } from '@/components/ui/icons/Icon';
 import type { PhoneBrowseSnapshot } from './phoneBrowseAggregation';
+import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
 
 type DirectBrowseProviderId = DirectSessionsProviderId;
 type AppTheme = Theme;
@@ -78,6 +79,10 @@ const stylesheet = StyleSheet.create((theme: AppTheme) => ({
 export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
     phoneData?: Readonly<{
         searchQuery: string;
+        discoveryEnabled: boolean;
+        observationScope: DirectBrowseObservationScope;
+        actionPending: boolean;
+        isActionPending: () => boolean;
         onSnapshot: (snapshot: PhoneBrowseSnapshot | null) => void;
     }>;
     phonePresentation?: Readonly<{
@@ -205,6 +210,19 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         () => lockScope?.source ?? sourceOptions.find((option) => option.key === selectedSourceKey)?.source ?? sourceOptions[0]?.source ?? null,
         [lockScope, selectedSourceKey, sourceOptions],
     );
+    const actionScope = stableJsonStringify([browseServerId, activeScope?.accountId, effectiveSelectedMachineId, selectedProviderId, selectedSource]);
+    const actionScopeRef = React.useRef({ key: actionScope });
+    const actionPendingRef = React.useRef(false);
+    if (actionScopeRef.current.key !== actionScope) {
+        // 同值身份 A→B→A 也是新激活；对象身份防止第一代动作污染第三代。
+        actionScopeRef.current = { key: actionScope };
+        actionPendingRef.current = false;
+    }
+    const actionActivation = actionScopeRef.current;
+    /** 账号或来源变化后释放旧行的动作状态，旧异步结果由作用域校验拒绝。 */
+    React.useEffect(() => { setLinkingSessionId(null); setDeletingSessionId(null); }, [actionActivation]);
+    /** 同步阻止动作开始与 React 提交之间的自动请求。 */
+    const isActionPending = React.useCallback(() => actionPendingRef.current || props.phoneData?.isActionPending() === true, [props.phoneData?.isActionPending]);
     const machineMenuItems = React.useMemo(() => machines.map((machine) => ({
         id: machine.id,
         title: machine.metadata?.displayName || machine.metadata?.host || machine.id,
@@ -247,17 +265,24 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
     } = useDirectBrowseCandidates({
         machineId: effectiveSelectedMachineId,
         serverId: browseServerId,
+        accountId: activeScope?.accountId,
         providerId: selectedProviderId,
         source: selectedSource,
         searchTerm: candidateSearchTerm,
+        autoRefreshEnabled: props.phoneData?.discoveryEnabled,
+        observationScope: props.phoneData?.observationScope,
+        actionPending: Boolean(linkingSessionId || deletingSessionId || props.phoneData?.actionPending),
+        isActionPending,
     });
 
     const providerLabel = selectedProviderId
         ? t(getAgentCore(selectedProviderId).displayNameKey)
         : '';
 
+    /** 删除期间暂停发现；成功后由候选 owner 作废旧回包，跨账号结果不再应用。 */
     const handleDeleteCandidate = React.useCallback(async (candidate: DirectBrowseCandidate) => {
-        if (!effectiveSelectedMachineId || !selectedProviderId || !selectedSource || deletingSessionId) return;
+        if (!effectiveSelectedMachineId || !selectedProviderId || !selectedSource || actionPendingRef.current) return;
+        actionPendingRef.current = true;
         setDeletingSessionId(candidate.remoteSessionId);
         try {
             const request = {
@@ -266,31 +291,37 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
                 source: selectedSource,
                 remoteSessionId: candidate.remoteSessionId,
             };
-            const result = lockScope?.serverId
-                ? await machineDirectSessionCandidateDelete(request, { serverId: lockScope.serverId })
+            const result = browseServerId
+                ? await machineDirectSessionCandidateDelete(request, { serverId: browseServerId })
                 : await machineDirectSessionCandidateDelete(request);
+            if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
             if (!result.ok) {
                 Modal.alert(t('common.error'), result.error);
                 return;
             }
             removeCandidate(candidate.remoteSessionId);
         } catch (deleteError) {
+            if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
             Modal.alert(
                 t('common.error'),
                 deleteError instanceof Error ? deleteError.message : t('directSessions.deleteCandidateFailed'),
             );
         } finally {
-            setDeletingSessionId(null);
+            if (mountedRef.current && actionScopeRef.current === actionActivation) {
+                actionPendingRef.current = false;
+                setDeletingSessionId(null);
+            }
         }
-    }, [deletingSessionId, effectiveSelectedMachineId, lockScope?.serverId, removeCandidate, selectedProviderId, selectedSource]);
+    }, [actionActivation, browseServerId, effectiveSelectedMachineId, removeCandidate, selectedProviderId, selectedSource]);
 
     /** 使用候选实际来源打开原会话，禁止创建替代 runner。 */
     const handleOpenCandidate = React.useCallback(async (candidate: DirectBrowseCandidate) => {
-        if (!effectiveSelectedMachineId || !selectedProviderId || !selectedSource) return;
+        if (!effectiveSelectedMachineId || !selectedProviderId || !selectedSource || actionPendingRef.current) return;
         if (interaction === 'pickRemoteSessionId') {
             props.onPickRemoteSessionId?.(candidate.remoteSessionId);
             return;
         }
+        actionPendingRef.current = true;
         setLinkingSessionId(candidate.remoteSessionId);
         try {
             const linkEnsureExtras = resolveDirectBrowseLinkEnsureRequestExtras({
@@ -316,19 +347,22 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
             const result = browseServerId
                 ? await machineDirectSessionLinkEnsure(request, { serverId: browseServerId })
                 : await machineDirectSessionLinkEnsure(request);
-            if (!mountedRef.current) return;
+            if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
             if (!result.ok) {
                 Modal.alert(t('common.error'), result.error);
                 return;
             }
             await navigateToSession(result.sessionId);
         } catch (linkError) {
-            if (!mountedRef.current) return;
+            if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
             Modal.alert(t('common.error'), linkError instanceof Error ? linkError.message : t('directSessions.browseLinkFailed'));
         } finally {
-            if (mountedRef.current) setLinkingSessionId(null);
+            if (mountedRef.current && actionScopeRef.current === actionActivation) {
+                actionPendingRef.current = false;
+                setLinkingSessionId(null);
+            }
         }
-    }, [browseServerId, effectiveSelectedMachineId, interaction, navigateToSession, props.onPickRemoteSessionId, selectedProviderId, selectedSource]);
+    }, [actionActivation, browseServerId, effectiveSelectedMachineId, interaction, navigateToSession, props.onPickRemoteSessionId, selectedProviderId, selectedSource]);
 
     // 首页只订阅这个 owner 的快照及原动作；刷新、搜索与分页继续由原 hook 负责。
     const onPhoneSnapshot = props.phoneData?.onSnapshot;

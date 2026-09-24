@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Pressable, View } from 'react-native';
+import { AppState, Pressable, View } from 'react-native';
+import { useIsFocused } from '@react-navigation/native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 import { Text, TextInput } from '@/components/ui/text/Text';
@@ -8,7 +9,7 @@ import { Icon } from '@/components/ui/icons/Icon';
 import { MOTION_STANDARD_BEZIER, motionTokens } from '@/components/ui/motion/motionTokens';
 import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
 import { useAllMachines } from '@/sync/domains/state/storage';
-import { useActiveServerAccountScope, useProfile, useSettings } from '@/sync/store/hooks';
+import { useActiveServerAccountScope, useProfile, useSettings, useSocketStatus } from '@/sync/store/hooks';
 import { useSessionListRuntimeNowMs } from '@/hooks/session/sessionListRuntimeClock';
 import { resolveDirectBrowseSourceOptions } from './resolveDirectBrowseSourceOptions';
 import { usePhoneMachineProjects } from '@/components/settings/machines/usePhoneMachineProjects';
@@ -80,13 +81,38 @@ export function PhoneSessionsOverview() {
 /** 首页统一展示同账号电脑；电脑页带入的明确范围则展示该范围全部真实历史。 */
 function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; accountId: string; machineId?: string; projectKey?: string }>) {
     const router = useRouter();
+    const focused = useIsFocused();
+    const socket = useSocketStatus();
+    const [appActive, setAppActive] = React.useState(AppState.currentState === 'active');
+    const observationGenerationRef = React.useRef(0);
+    const [observationScope, setObservationScope] = React.useState(() => ({
+        isCurrent: () => appActive && observationGenerationRef.current === 0,
+    }));
+    /** 原生前后台边界同步作废旧范围；即使事件被 React 合并，也不能复用休眠前观测。 */
+    React.useEffect(() => {
+        let active = appActive;
+        /** 只在真实活动状态切换时换代，重复通知不打断当前请求。 */
+        const updateAppState = (state: string) => {
+            const nextActive = state === 'active';
+            if (active !== nextActive) {
+                active = nextActive;
+                const generation = ++observationGenerationRef.current;
+                setObservationScope({ isCurrent: () => nextActive && observationGenerationRef.current === generation });
+            }
+            setAppActive(nextActive);
+        };
+        updateAppState(AppState.currentState);
+        const subscription = AppState.addEventListener('change', updateAppState);
+        return () => subscription.remove();
+    }, []);
+    const discoveryEnabled = focused && appActive && socket.status === 'connected';
     const { theme } = useUnistyles();
     const machines = useAllMachines();
     const profile = useProfile();
     const settings = useSettings();
-    const clockNowMs = useSessionListRuntimeNowMs();
-    // 公共时钟负责定时重绘；刚收到的事实以本次渲染时间校验，避免被上次时钟 tick 误判成未来。
-    const nowMs = Math.max(clockNowMs, Date.now());
+    useSessionListRuntimeNowMs();
+    // 公共时钟负责重绘；墙钟用于相对展示，候选缓存年龄由其单调观测独立计算。
+    const nowMs = Date.now();
     const [query, setQuery] = React.useState('');
     const [searchOpen, setSearchOpen] = React.useState(false);
     const [phase, setPhase] = React.useState<PhoneBrowsePhase>('running');
@@ -94,6 +120,8 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     const actionPending = React.useRef(false);
     const openingKeyRef = React.useRef<string | null>(null);
     const [openingKey, setOpeningKey] = React.useState<string | null>(null);
+    /** 同步动作门禁覆盖 setState 提交前的计时器回调，并暂停所有来源。 */
+    const isOpening = React.useCallback(() => openingKeyRef.current !== null, []);
     const mountedRef = React.useRef(true);
     React.useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
     const history = Boolean(scope.machineId);
@@ -122,7 +150,7 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     const aggregate = React.useMemo(() => aggregatePhoneBrowseSources({
         ...scope, sources, snapshots, phase: history ? null : phase, nowMs,
         projectRequired: Boolean(scope.projectKey), project: selectedProject,
-    }), [scope.serverId, scope.accountId, scope.projectKey, sources, snapshots, history, phase, nowMs, selectedProject]);
+    }), [scope.serverId, scope.accountId, scope.projectKey, sources, snapshots, history, phase, nowMs, selectedProject, observationScope]);
 
     /** 用户明确刷新时复用现有 owner；单飞防止下拉和重试同时重启同一请求。 */
     const refresh = React.useCallback(async () => {
@@ -173,7 +201,8 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
         {!history && aggregate.hasUnclassified ? <Pressable testID="phone-sessions-history-link" accessibilityRole="button" style={styles.historyLink} onPress={() => router.push('/settings/machines')}>
             <Text style={styles.historyLinkText}>部分会话未列入分类，查看历史</Text>
         </Pressable> : null}
-        {sources.map((source) => <PhoneBrowseSourceOwner key={source.key} source={source} serverId={scope.serverId} searchQuery={searchOpen ? query : ''} onSnapshot={publishSnapshot} />)}
+        {sources.map((source) => <PhoneBrowseSourceOwner key={source.key} source={source} serverId={scope.serverId} searchQuery={searchOpen ? query : ''}
+            discoveryEnabled={discoveryEnabled && source.online} observationScope={observationScope} actionPending={openingKey !== null} isActionPending={isOpening} onSnapshot={publishSnapshot} />)}
         <PhoneDirectBrowseCandidatesList rows={aggregate.rows} nowMs={nowMs} history={history}
             openingKey={openingKey} onSelectRow={openRow}
             loading={aggregate.loading || Boolean(scope.projectKey && projectState.loading)} loadingMore={aggregate.loadingMore}

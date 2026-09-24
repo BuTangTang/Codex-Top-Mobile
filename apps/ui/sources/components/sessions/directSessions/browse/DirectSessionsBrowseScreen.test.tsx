@@ -5,7 +5,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushHookEffects, renderScreen } from '@/dev/testkit';
 import { createPassThroughModule } from '@/dev/testkit/mocks/components';
 import { createExpoRouterMock } from '@/dev/testkit/mocks/router';
-import { createReactNativeWebMock } from '@/dev/testkit/mocks/reactNative';
+import { createReactNativeAppStateEmitter, createReactNativeWebMock } from '@/dev/testkit/mocks/reactNative';
+import { createReactNavigationNativeMock } from '@/dev/testkit/mocks/reactNavigation';
 import { createModalModuleMock } from '@/dev/testkit/mocks/modal';
 import { createStorageModuleStub } from '@/dev/testkit/mocks/storage';
 import { createTextModuleMock } from '@/dev/testkit/mocks/text';
@@ -56,6 +57,13 @@ const profileMock = vi.hoisted(() => ({
     ],
 }));
 const activeScopeState = vi.hoisted(() => ({ value: null as { serverId: string; accountId: string } | null }));
+const focusState = vi.hoisted(() => ({ value: true }));
+const socketState = vi.hoisted(() => ({ status: 'connected' }));
+const appStateBoundary = createReactNativeAppStateEmitter();
+vi.mock('@react-navigation/native', () => ({
+    ...createReactNavigationNativeMock(),
+    useIsFocused: () => createReactNavigationNativeMock({ isFocused: focusState.value }).useIsFocused(),
+}));
 const settingsMock = vi.hoisted(() => ({
     connectedServicesProfileLabelByKey: {
         'openai-codex/work': 'Work Profile',
@@ -74,6 +82,7 @@ const expoRouterMock = createExpoRouterMock({
 
 installNewSessionComponentsCommonModuleMocks({
     reactNative: () => createReactNativeWebMock({
+        AppState: appStateBoundary.appState,
         View: 'View',
         TextInput: 'TextInput',
         ActivityIndicator: 'ActivityIndicator',
@@ -118,6 +127,7 @@ vi.mock('@/sync/store/hooks', () => ({
     useSessionListViewData: () => [],
     useProfile: () => profileMock,
     useActiveServerAccountScope: () => activeScopeState.value,
+    useSocketStatus: () => socketState,
     useSettings: () => settingsMock,
     useLocalSetting: (key: string) => key === 'uiItemDensity' ? 'comfortable' : undefined,
 }));
@@ -144,6 +154,7 @@ vi.mock('@/sync/ops/machineDirectSessions', () => ({
 
 const directSessionsBrowseScreenModulePromise = import('./DirectSessionsBrowseScreen');
 const defaultCandidatesImplementation = candidatesListSpy.getMockImplementation()!;
+const defaultLinkImplementation = linkEnsureSpy.getMockImplementation()!;
 
 type DropdownTriggerPresentation = Readonly<{
     title: string;
@@ -219,18 +230,131 @@ describe('DirectSessionsBrowseScreen', () => {
         projectsListSpy.mockReset().mockResolvedValue({ ok: true, projects: [], nativeCreate: false, unavailableReason: 'desktop_native_create_unavailable' });
         routeParams.value = {};
         activeScopeState.value = null;
+        focusState.value = true;
+        socketState.status = 'connected';
+        appStateBoundary.emit('active');
         machinesState = [
             { id: 'machine-1', active: true, metadata: { displayName: 'MacBook Pro', host: 'mbp.local' } },
             { id: 'machine-2', active: false, metadata: { displayName: 'Linux Box', host: 'linux.local' } },
         ];
         candidatesListSpy.mockReset().mockImplementation(defaultCandidatesImplementation);
-        linkEnsureSpy.mockClear();
+        linkEnsureSpy.mockReset().mockImplementation(defaultLinkImplementation);
         candidateDeleteSpy.mockClear();
         routerPushSpy.mockClear();
         routerNavigateSpy.mockClear();
         modalAlertSpy.mockClear();
         modalConfirmSpy.mockClear();
         modalConfirmSpy.mockResolvedValue(true);
+    });
+
+    it.each([false, true])('keeps retained deep-page rows unknown after AppState sleep with batched events %s and a stopped monotonic clock', async (batched) => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        vi.useFakeTimers();
+        try {
+            activeScopeState.value = { serverId: 's', accountId: 'a' };
+            routeParams.value = { serverId: 's', machineId: 'machine-1' };
+            candidatesListSpy.mockImplementation(async (request) => request.source.kind !== 'codexHome' || request.source.home !== 'user'
+                ? { ok: true, candidates: [], nextCursor: null }
+                : { ok: true, candidates: [phoneCandidate(request.cursor ? 'deep' : 'first', 'running')], nextCursor: request.cursor ? 'third' : 'second' });
+            const screen = await renderScreen(<PhoneSessionsOverview />);
+            await screen.pressByTestIdAsync('phone-sessions-load-more');
+            await flushHookEffects();
+            const before = screen.findAllByType('FlatList')[0]!.props.data;
+            expect(before).toHaveLength(2);
+            expect(before.every((row: any) => row.lifecycle.state === 'running')).toBe(true);
+            const requestsBeforeSleep = candidatesListSpy.mock.calls.length;
+            const monotonicAtSleep = performance.now();
+            if (batched) {
+                await act(async () => {
+                    appStateBoundary.emit('background');
+                    vi.setSystemTime(Date.now() + 1_200_000);
+                    appStateBoundary.emit('active');
+                });
+            } else {
+                await act(async () => { appStateBoundary.emit('background'); });
+                vi.setSystemTime(Date.now() + 1_200_000);
+                await act(async () => { appStateBoundary.emit('active'); });
+            }
+            expect(performance.now()).toBe(monotonicAtSleep);
+            await flushHookEffects();
+            const after = screen.findAllByType('FlatList')[0]!.props.data;
+            expect(new Set(after.map((row: any) => row.key))).toEqual(new Set(before.map((row: any) => row.key)));
+            expect(after.find((row: any) => row.candidate.remoteSessionId === 'first')?.lifecycle.state).toBe('running');
+            expect(after.find((row: any) => row.candidate.remoteSessionId === 'deep')?.lifecycle.state).toBe('unknown');
+            expect(after[0]?.snapshot.nextCursor).toBe('third');
+            expect(candidatesListSpy.mock.calls.slice(requestsBeforeSleep).every(([request]) => !request.cursor)).toBe(true);
+        } finally { vi.useRealTimers(); }
+    });
+
+    it('keeps fresh facts across a phone wall-clock rollback without refreshing the observation', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        const { sessionListRuntimeClock } = await import('@/hooks/session/sessionListRuntimeClock');
+        vi.useFakeTimers();
+        try {
+            activeScopeState.value = { serverId: 'server-a', accountId: 'account-a' };
+            machinesState = [machinesState[0]!];
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('current', 'running')], nextCursor: null });
+            const screen = await renderScreen(<PhoneSessionsOverview />);
+            expect(screen.findAllByType('FlatList')[0]!.props.data.length).toBeGreaterThan(0);
+            const rowCount = screen.findAllByType('FlatList')[0]!.props.data.length;
+            const requestCount = candidatesListSpy.mock.calls.length;
+            sessionListRuntimeClock.requestWake({}, Date.now() + 1);
+            await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+            vi.setSystemTime(Date.now() - 10_000);
+            await screen.update(<PhoneSessionsOverview />);
+            expect(screen.findAllByType('FlatList')[0]!.props.data).toHaveLength(rowCount);
+            expect(candidatesListSpy).toHaveBeenCalledTimes(requestCount);
+        } finally { vi.useRealTimers(); }
+    });
+
+    it('discovers new phone rows only while focused, foreground, connected and online, coalescing return signals', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        vi.useFakeTimers();
+        try {
+            activeScopeState.value = { serverId: 'server-a', accountId: 'account-a' };
+            machinesState = [machinesState[0]!];
+            focusState.value = false;
+            socketState.status = 'disconnected';
+            appStateBoundary.emit('background');
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('first', 'running')], nextCursor: null });
+            const screen = await renderScreen(<PhoneSessionsOverview />);
+            expect(candidatesListSpy).not.toHaveBeenCalled();
+            focusState.value = true;
+            await act(async () => { screen.tree.update(<PhoneSessionsOverview />); });
+            await act(async () => { appStateBoundary.emit('active'); });
+            expect(candidatesListSpy).not.toHaveBeenCalled();
+            socketState.status = 'connected';
+            await act(async () => { screen.tree.update(<PhoneSessionsOverview />); });
+            const sourceCount = candidatesListSpy.mock.calls.length;
+            expect(sourceCount).toBeGreaterThan(0);
+            expect(screen.findAllByType('Pressable').some((node) => String(node.props.testID).includes('first'))).toBe(true);
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('new', 'running')], nextCursor: null });
+            await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+            expect(candidatesListSpy).toHaveBeenCalledTimes(sourceCount * 2);
+            expect(screen.findAllByType('Pressable').some((node) => String(node.props.testID).includes('new'))).toBe(true);
+            await act(async () => { appStateBoundary.emit('background'); });
+            await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+            expect(candidatesListSpy).toHaveBeenCalledTimes(sourceCount * 2);
+            focusState.value = false;
+            socketState.status = 'disconnected';
+            await act(async () => { screen.tree.update(<PhoneSessionsOverview />); });
+            focusState.value = true;
+            socketState.status = 'connected';
+            await act(async () => { appStateBoundary.emit('active'); screen.tree.update(<PhoneSessionsOverview />); });
+            await flushHookEffects();
+            expect(candidatesListSpy).toHaveBeenCalledTimes(sourceCount * 3);
+            machinesState = [{ ...machinesState[0]!, active: false }];
+            await act(async () => { screen.tree.update(<PhoneSessionsOverview />); });
+            await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+            expect(candidatesListSpy).toHaveBeenCalledTimes(sourceCount * 3);
+            const listenersWhileMounted = appStateBoundary.getListenerCount();
+            await act(async () => { screen.tree.unmount(); });
+            // 公共列表时钟也使用 AppState；只要求该页面释放它自己新增的监听。
+            expect(appStateBoundary.getListenerCount()).toBe(listenersWhileMounted - 1);
+        } finally { vi.useRealTimers(); }
     });
 
     it('keeps rows and allows recovery at the page footer after a stale cursor and refresh failure', async () => {
@@ -333,7 +457,7 @@ describe('DirectSessionsBrowseScreen', () => {
         expect(texts).not.toContain('directSessions.browseNoCandidates');
     });
 
-    it('ignores an older append result after refreshing the same source', async () => {
+    it('shares an in-flight append with same-source refresh and allows a later explicit refresh', async () => {
         candidatesListSpy.mockResolvedValueOnce({ ok: true, candidates: [{ remoteSessionId: 'kept', updatedAtMs: 10 }], nextCursor: 'old-page', searchIncomplete: true });
         const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
         const screen = await renderScreen(<DirectSessionsBrowseScreen />);
@@ -344,10 +468,15 @@ describe('DirectSessionsBrowseScreen', () => {
         candidatesListSpy.mockResolvedValueOnce({ ok: true, candidates: [{ remoteSessionId: 'refreshed', updatedAtMs: 20 }], nextCursor: null });
         await screen.pressByTestIdAsync('direct-session-candidates-refresh');
         await flushHookEffects();
-        await act(async () => { finish({ ok: true, candidates: [{ remoteSessionId: 'stale-append', updatedAtMs: 5 }], nextCursor: 'bad-page' }); });
+        await act(async () => { finish({ ok: true, candidates: [{ remoteSessionId: 'appended', updatedAtMs: 5 }], nextCursor: 'bad-page' }); });
+        await flushHookEffects();
+        expect(candidatesListSpy).toHaveBeenCalledTimes(2);
+        expect(screen.findByTestId('direct-session-candidate:kept')).toBeTruthy();
+        expect(screen.findByTestId('direct-session-candidate:appended')).toBeTruthy();
+        await screen.pressByTestIdAsync('direct-session-candidates-refresh');
         await flushHookEffects();
         expect(screen.findByTestId('direct-session-candidate:refreshed')).toBeTruthy();
-        expect(screen.findByTestId('direct-session-candidate:stale-append')).toBeNull();
+        expect(screen.findByTestId('direct-session-candidate:appended')).toBeNull();
         expect(screen.findByTestId('direct-session-candidates-load-more')).toBeNull();
     });
 
@@ -715,6 +844,27 @@ describe('DirectSessionsBrowseScreen', () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it('rejects the first open after an A to B to A machine activation while the third activation is opening', async () => {
+        activeScopeState.value = { serverId: 'same-server', accountId: 'a' };
+        let first!: (result: { ok: boolean; sessionId: string; created: boolean }) => void;
+        let third!: (result: { ok: boolean; sessionId: string; created: boolean }) => void;
+        linkEnsureSpy.mockImplementationOnce(() => new Promise((resolve) => { first = resolve; }));
+        linkEnsureSpy.mockImplementationOnce(() => new Promise((resolve) => { third = resolve; }));
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(<DirectSessionsBrowseScreen />);
+        await act(async () => { screen.pressByTestId('direct-session-candidate:codex-session-1'); });
+        // 通过真实选择器触发重渲染，不能只更改 mock 值而让 React.memo 跳过页面。
+        await act(async () => { await findDropdownMenuByTriggerTestId(screen, 'direct-session-machine-picker-trigger')!.props?.onSelect?.('machine-2'); });
+        await act(async () => { await findDropdownMenuByTriggerTestId(screen, 'direct-session-machine-picker-trigger')!.props?.onSelect?.('machine-1'); });
+        await act(async () => { screen.pressByTestId('direct-session-candidate:codex-session-1'); });
+        expect(linkEnsureSpy).toHaveBeenCalledTimes(2);
+        await act(async () => { first({ ok: true, sessionId: 'stale-first', created: false }); });
+        expect(routerNavigateSpy).not.toHaveBeenCalled();
+        expect(screen.findByTestId('direct-session-candidate:codex-session-1')?.props.loading).toBe(true);
+        await act(async () => { third({ ok: true, sessionId: 'current-third', created: false }); });
+        expect(routerNavigateSpy.mock.calls.at(-1)?.[0]).toBe('/session/current-third');
     });
 
     it('links the selected provider session and navigates to the Happier session', async () => {
@@ -1158,7 +1308,8 @@ describe('DirectSessionsBrowseScreen', () => {
         const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
         const screen = await renderScreen(<PhoneSessionsOverview />);
         await flushHookEffects();
-        expect(new Set(candidatesListSpy.mock.calls.map(([request]) => request.machineId))).toEqual(new Set(['machine-1', 'machine-2']));
+        // 离线来源保留不完整提示，但不自动发出 LIST。
+        expect(new Set(candidatesListSpy.mock.calls.map(([request]) => request.machineId))).toEqual(new Set(['machine-1']));
         expect(candidatesListSpy).toHaveBeenCalledWith(expect.objectContaining({ machineId: 'machine-1', providerId: 'codex' }), { serverId: 'phone-server' });
         expect(screen.findAllByType('FlatList')).toHaveLength(1);
         expect(screen.findAllByType('DropdownMenu')).toHaveLength(0);
@@ -1203,6 +1354,7 @@ describe('DirectSessionsBrowseScreen', () => {
 
     it('keeps a fast computer pageable while another source is slow, and restores rows after a failed page', async () => {
         activeScopeState.value = { serverId: 's', accountId: 'a' };
+        machinesState = machinesState.map((machine) => ({ ...machine, active: true }));
         let finishSlow!: (value: DirectSessionsCandidatesListResponse) => void;
         let failPage = true;
         candidatesListSpy.mockImplementation(async (request) => {

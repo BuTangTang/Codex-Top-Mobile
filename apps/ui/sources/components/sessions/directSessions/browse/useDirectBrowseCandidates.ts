@@ -3,6 +3,10 @@ import type { DirectSessionActivityV1, DirectSessionsProviderId, DirectSessionsS
 
 import { machineDirectSessionsCandidatesList } from '@/sync/ops/machineDirectSessions';
 import { t } from '@/text';
+import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
+
+/** 一个前台观测范围；原生 AppState 变化后可在 React 提交前同步拒绝旧请求。 */
+export type DirectBrowseObservationScope = Readonly<{ isCurrent: () => boolean }>;
 
 export type DirectBrowseCandidate = Readonly<{
     remoteSessionId: string;
@@ -10,11 +14,22 @@ export type DirectBrowseCandidate = Readonly<{
     updatedAtMs: number;
     activity?: DirectSessionActivityV1;
     details?: Record<string, unknown>;
+    // 仅由当前 LIST owner 记录手机墙钟和单调时间，不写回协议或持久化；随原页保留。
+    listObservation?: Readonly<{
+        requestedAtMs: number;
+        receivedAtMs: number;
+        requestedMonotonicMs?: number;
+        receivedMonotonicMs?: number;
+        requestSequence?: number;
+        scope?: DirectBrowseObservationScope;
+    }>;
 }>;
 
 const CANDIDATES_PAGE_LIMIT = 50;
 
-type CandidateApplyMode = 'replace' | 'append' | 'merge';
+// 最近列表以 30 秒低频发现新对话；每轮完成后才计时，慢请求不会被周期重启。
+const DISCOVERY_INTERVAL_MS = 30_000;
+type CandidatePage = Readonly<{ candidates: readonly DirectBrowseCandidate[]; nextCursor: string | null; incomplete: boolean }>;
 
 function hasCandidateTitle(candidate: DirectBrowseCandidate): boolean {
     return typeof candidate.title === 'string' && candidate.title.trim().length > 0;
@@ -29,13 +44,21 @@ function mergeCandidateDetails(
     return { ...current, ...next };
 }
 
+/** 重叠页采用最近一次本机观测；生命周期和观测时间一起替换，不能给旧事实续龄。 */
 function mergeDirectBrowseCandidate(current: DirectBrowseCandidate, next: DirectBrowseCandidate): DirectBrowseCandidate {
+    // 顺序只属于本 owner，不受同毫秒请求或手机墙上时钟回拨影响。
+    const keepCurrent = (current.listObservation?.requestSequence ?? 0) > (next.listObservation?.requestSequence ?? 0);
+    const latest = keepCurrent ? current : next;
+    const earlier = keepCurrent ? next : current;
+    const details = mergeCandidateDetails(earlier.details, latest.details);
     return {
         remoteSessionId: current.remoteSessionId,
-        title: hasCandidateTitle(next) ? next.title : current.title,
-        updatedAtMs: Math.max(current.updatedAtMs, next.updatedAtMs),
-        activity: next.activity ?? current.activity,
-        details: mergeCandidateDetails(current.details, next.details),
+        title: hasCandidateTitle(latest) ? latest.title : earlier.title,
+        updatedAtMs: latest.updatedAtMs,
+        activity: latest.activity ?? earlier.activity,
+        // 新响应未提供生命周期时必须未知，不能继承旧事实再贴新接收时间。
+        details: details ? { ...details, codexLifecycle: latest.details?.codexLifecycle } : undefined,
+        listObservation: latest.listObservation,
     };
 }
 
@@ -62,16 +85,27 @@ function mergeDirectBrowseCandidates(
     return mode === 'append' ? candidates : candidates.sort(compareDirectBrowseCandidates);
 }
 
-/** 按实际来源维护候选列表；游标失效保留旧页，显式刷新成功后再替换。 */
+/** 在既有候选 owner 内维护有限分页窗口；自动、手动刷新和翻页共享单飞。 */
 export function useDirectBrowseCandidates(params: Readonly<{
     machineId: string | null;
     serverId?: string | null;
+    accountId?: string | null;
     providerId: DirectSessionsProviderId | null;
     source: DirectSessionsSource | null;
     searchTerm?: string;
+    autoRefreshEnabled?: boolean;
+    observationScope?: DirectBrowseObservationScope;
+    actionPending?: boolean;
+    isActionPending?: () => boolean;
 }>) {
-    const { machineId, providerId, searchTerm, source, serverId } = params;
-
+    const { machineId, providerId, source, serverId } = params;
+    const query = params.searchTerm?.trim() ?? '';
+    // 来源对象重新分配不代表身份变化；账号也必须属于分页和回包的隔离范围。
+    const scopeKey = stableJsonStringify([serverId, params.accountId, machineId, providerId, source, query]);
+    const scopeRef = React.useRef(scopeKey);
+    scopeRef.current = scopeKey;
+    const controlsRef = React.useRef(params);
+    controlsRef.current = params;
     const [candidates, setCandidates] = React.useState<readonly DirectBrowseCandidate[]>([]);
     const [nextCursor, setNextCursor] = React.useState<string | null>(null);
     const [loading, setLoading] = React.useState(false);
@@ -79,143 +113,167 @@ export function useDirectBrowseCandidates(params: Readonly<{
     const [searchAugmenting, setSearchAugmenting] = React.useState(false);
     const [searchIncomplete, setSearchIncomplete] = React.useState(false);
     const [refreshRequired, setRefreshRequired] = React.useState(false);
-    const appendPendingRef = React.useRef(false);
     const [error, setError] = React.useState<string | null>(null);
     const [canDeleteCandidates, setCanDeleteCandidates] = React.useState(false);
+    const [settledVersion, setSettledVersion] = React.useState(0);
+    const pagesRef = React.useRef<readonly CandidatePage[]>([]);
+    const refreshRequiredRef = React.useRef(false);
+    const generationRef = React.useRef(0);
+    const observationSequenceRef = React.useRef(0);
+    const appliedObservationScopeRef = React.useRef(params.observationScope);
+    const flightRef = React.useRef<{ promise: Promise<void> } | null>(null);
 
-    const loadGenerationRef = React.useRef(0);
-
-    // 每次首段加载拥有独立代次，避免切换来源或刷新后的旧响应覆盖当前视图。
-    const loadCandidates = React.useCallback(async (opts?: Readonly<{ cursor?: string | null; append?: boolean; preserve?: boolean }>) => {
-        if (!machineId || !providerId || !source) return;
-
+    /** 同一前台范围请求共享 Promise；身份切换、后台边界和成功删除作废旧回包。 */
+    const loadCandidates = React.useCallback((opts?: Readonly<{ append?: boolean; automatic?: boolean }>): Promise<void> => {
+        const controls = controlsRef.current;
+        if (!machineId || !providerId || !source || scopeRef.current !== scopeKey) return Promise.resolve();
+        if (controls.observationScope && !controls.observationScope.isCurrent()) return Promise.resolve();
+        if (controls.actionPending || controls.isActionPending?.()) return Promise.resolve();
+        if (opts?.automatic && controls.autoRefreshEnabled !== true) return Promise.resolve();
+        if (flightRef.current) return flightRef.current.promise;
+        const oldPages = pagesRef.current;
         const append = opts?.append === true;
-        const preserve = opts?.preserve === true;
-        if (!append) {
-            loadGenerationRef.current += 1;
-            appendPendingRef.current = false;
-            setLoadingMore(false);
-        }
-        const currentGeneration = loadGenerationRef.current;
+        const cursor = oldPages.at(-1)?.nextCursor;
+        if (append && (!cursor || refreshRequiredRef.current)) return Promise.resolve();
+        const generation = generationRef.current;
+        const observationScope = controls.observationScope;
+        const flight = { promise: Promise.resolve() };
+        flightRef.current = flight;
+        if (append) setLoadingMore(true);
+        else { setLoading(true); setError(null); }
 
-        if (append) {
-            setLoadingMore(true);
-        } else {
-            setLoading(true);
-            setSearchAugmenting(false);
-            if (!preserve) setSearchIncomplete(false);
-            setError(null);
-        }
-
-        const normalizedSearchTerm = typeof searchTerm === 'string' ? searchTerm.trim() : '';
-        const shouldStartWithFastSearch = !append && !opts?.cursor && normalizedSearchTerm.length > 0;
-        const requestCandidates = async (searchMode?: 'fast' | 'full') => {
-            const request = {
-                machineId,
-                providerId,
-                source,
-                limit: CANDIDATES_PAGE_LIMIT,
-                ...(opts?.cursor ? { cursor: opts.cursor } : {}),
-                ...(normalizedSearchTerm.length > 0 ? { searchTerm: normalizedSearchTerm } : {}),
+        /** 等待后检查身份、数据代次及原生前台边界，React 尚未重渲染也不能接收旧回包。 */
+        const isCurrent = () => scopeRef.current === scopeKey && generationRef.current === generation
+            && (!observationScope || observationScope.isCurrent());
+        /** 多页重建和完整搜索的后续请求也遵守前台及动作门禁。 */
+        const request = async (pageCursor?: string | null, searchMode?: 'fast' | 'full') => {
+            const latest = controlsRef.current;
+            if (!isCurrent() || latest.actionPending || latest.isActionPending?.()
+                || (opts?.automatic && latest.autoRefreshEnabled !== true)) return null;
+            const input = {
+                machineId, providerId, source, limit: CANDIDATES_PAGE_LIMIT,
+                ...(pageCursor ? { cursor: pageCursor } : {}),
+                ...(query ? { searchTerm: query } : {}),
                 ...(searchMode ? { searchMode } : {}),
             };
-            return serverId
-                ? machineDirectSessionsCandidatesList(request, { serverId })
-                : machineDirectSessionsCandidatesList(request);
+            const requestedAtMs = Date.now();
+            // RN/Hermes 的 performance.now 来自 steady_clock；缺失时不降级为可回拨的墙钟。
+            const requestedMonotonicMs = globalThis.performance?.now?.() ?? NaN;
+            const requestSequence = ++observationSequenceRef.current;
+            const result = await (serverId ? machineDirectSessionsCandidatesList(input, { serverId }) : machineDirectSessionsCandidatesList(input));
+            const receivedAtMs = Date.now();
+            const receivedMonotonicMs = globalThis.performance?.now?.() ?? NaN;
+            if (!result.ok) return result;
+            // 每次实际 RPC 有独立观测时间；重建窗口和复用深页均不重新盖时间戳。
+            const listObservation = { requestedAtMs, receivedAtMs, requestedMonotonicMs, receivedMonotonicMs, requestSequence, scope: observationScope };
+            return { ...result, candidates: result.candidates.map((candidate) => ({ ...candidate, listObservation })) };
         };
-        const applyResult = (result: Awaited<ReturnType<typeof machineDirectSessionsCandidatesList>>, mode: CandidateApplyMode): boolean => {
+        /** 失败保留整个旧窗口，继续使用既有错误或游标不完整提示。 */
+        const readPage = (result: Awaited<ReturnType<typeof request>>, augmentation = false): CandidatePage | null => {
+            if (!isCurrent() || !result) return null;
             if (!result.ok) {
-                if (result.refreshRequired === true) {
-                    // 失效游标不能再翻页；保留当前行和游标，等用户显式刷新。
+                if (result.refreshRequired) {
+                    refreshRequiredRef.current = true;
                     setRefreshRequired(true);
                     setError(null);
-                    return false;
-                }
-                if (mode === 'merge') {
-                    // 补充搜索失败仍保留快搜结果及其不完整标记，不转成覆盖列表的错误页。
-                    return false;
-                }
-                setError(result.error);
-                if (!append && !preserve) {
-                    setCandidates([]);
-                    setNextCursor(null);
-                    setCanDeleteCandidates(false);
-                }
-                return false;
+                } else if (!augmentation) setError(result.error);
+                return null;
             }
-
-            // 未得到完整搜索的可用首段时，继续保留快搜的同一分页依据。
-            if (mode === 'merge' && result.searchIncomplete && result.candidates.length === 0) return false;
-            const nextItems = result.candidates.map((candidate) => ({
-                remoteSessionId: candidate.remoteSessionId,
-                title: candidate.title,
-                updatedAtMs: candidate.updatedAtMs,
-                activity: candidate.activity,
-                details: candidate.details,
-            })) satisfies readonly DirectBrowseCandidate[];
-
+            if (augmentation && result.searchIncomplete && result.candidates.length === 0) return null;
+            return { candidates: result.candidates, nextCursor: result.nextCursor ?? null, incomplete: result.searchIncomplete === true };
+        };
+        /** 原游标未变时复用深页；变化时仅沿新游标重建用户已加载的页数。 */
+        const rebuildWindow = async (first: CandidatePage): Promise<readonly CandidatePage[] | null> => {
+            if (oldPages.length > 1 && oldPages[0]?.nextCursor === first.nextCursor) return [first, ...oldPages.slice(1)];
+            const pages = [first];
+            const seen = new Set<string>();
+            while (pages.length < oldPages.length && pages.at(-1)?.nextCursor) {
+                const next = pages.at(-1)!.nextCursor!;
+                seen.add(next);
+                const page = readPage(await request(next));
+                if (!page) return null;
+                if (page.nextCursor && seen.has(page.nextCursor)) {
+                    refreshRequiredRef.current = true;
+                    setRefreshRequired(true);
+                    return null;
+                }
+                pages.push(page);
+            }
+            return pages;
+        };
+        /** 一次发布完整窗口；等值行和等值数组保留引用，减少刷新造成的重绘。 */
+        const commitPages = (pages: readonly CandidatePage[], result: Awaited<ReturnType<typeof request>>) => {
+            if (!isCurrent() || !result?.ok) return;
+            pagesRef.current = pages;
+            const items = pages.reduce<readonly DirectBrowseCandidate[]>((all, page) => mergeDirectBrowseCandidates(all, page.candidates, 'append'), []);
             setCandidates((current) => {
-                if (mode !== 'replace') return mergeDirectBrowseCandidates(current, nextItems, mode);
-                return nextItems;
+                const byId = new Map(current.map((candidate) => [candidate.remoteSessionId, candidate]));
+                const reconciled = items.map((candidate) => {
+                    const previous = byId.get(candidate.remoteSessionId);
+                    return previous && stableJsonStringify(previous) === stableJsonStringify(candidate) ? previous : candidate;
+                });
+                return current.length === reconciled.length && current.every((item, index) => item === reconciled[index]) ? current : reconciled;
             });
-            setSearchIncomplete(result.searchIncomplete === true);
-            // 候选与 cursor 必须来自同一次响应；不能把 full 的列表配给 fast 的 offset。
-            setNextCursor(result.nextCursor ?? null);
+            setNextCursor(pages.at(-1)?.nextCursor ?? null);
+            setSearchIncomplete(pages.some((page) => page.incomplete));
+            refreshRequiredRef.current = false;
             setRefreshRequired(false);
             setCanDeleteCandidates(result.capabilities?.deleteCandidate === true);
             setError(null);
-            return true;
         };
-
-        try {
-            const result = await requestCandidates(shouldStartWithFastSearch ? 'fast' : undefined);
-
-            if (loadGenerationRef.current !== currentGeneration) {
-                return;
-            }
-
-            const ok = applyResult(result, append ? 'append' : 'replace');
-            if (!ok || !shouldStartWithFastSearch || !result.ok || !result.searchIncomplete) {
-                return;
-            }
-
-            setLoading(false);
-            setSearchAugmenting(true);
+        /** 快搜仍先展示可用结果；自动恢复只做快搜，周期搜索不会扫描完整历史。 */
+        const run = async () => {
             try {
-                const augmentedResult = await requestCandidates('full');
-                if (loadGenerationRef.current !== currentGeneration) {
+                const fastSearch = !append && Boolean(query);
+                const result = await request(append ? cursor : undefined, fastSearch ? 'fast' : undefined);
+                const first = readPage(result);
+                if (!first) return;
+                // 前台恢复的快搜覆盖有限，不能用其缺失项降级先前完整搜索的窗口和游标。
+                if (opts?.automatic && fastSearch && oldPages.length > 0 && first.incomplete) {
+                    setSearchIncomplete(true);
                     return;
                 }
-                applyResult(augmentedResult, 'merge');
-            } catch {
-                // 网络失败时沿用快搜结果和不完整提示；旧请求不写入新一轮搜索状态。
-            }
-        } catch (loadError) {
-            if (loadGenerationRef.current !== currentGeneration) {
-                return;
-            }
-            const message = loadError instanceof Error ? loadError.message : t('directSessions.browseFailedToLoad');
-            setError(message);
-            if (!append && !preserve) {
-                setCandidates([]);
-                setNextCursor(null);
-                setCanDeleteCandidates(false);
-            }
-        } finally {
-            if (loadGenerationRef.current === currentGeneration) {
-                if (append) {
-                    setLoadingMore(false);
-                    appendPendingRef.current = false;
-                } else {
+                const pages = append ? [...oldPages, first] : await rebuildWindow(first);
+                if (!pages || !isCurrent()) return;
+                commitPages(pages, result);
+                if (!fastSearch || !first.incomplete || (opts?.automatic && oldPages.length > 0)) return;
+                setLoading(false);
+                setSearchAugmenting(true);
+                try {
+                    const fullResult = await request(undefined, 'full');
+                    const full = readPage(fullResult, true);
+                    if (!full) return;
+                    const augmented = { ...full, candidates: mergeDirectBrowseCandidates(first.candidates, full.candidates, 'merge') };
+                    const fullPages = await rebuildWindow(augmented);
+                    if (fullPages) commitPages(fullPages, fullResult);
+                } catch {
+                    // 完整搜索失败保留快搜及不完整提示，不抹掉已得到的结果。
+                }
+            } catch (loadError) {
+                if (isCurrent()) setError(loadError instanceof Error ? loadError.message : t('directSessions.browseFailedToLoad'));
+            } finally {
+                // 删除只废弃数据代次；仍等实际请求结束再释放单飞，防止并行重启。
+                if (flightRef.current === flight) {
+                    flightRef.current = null;
                     setLoading(false);
+                    setLoadingMore(false);
                     setSearchAugmenting(false);
+                    setSettledVersion((value) => value + 1);
                 }
             }
-        }
-    }, [machineId, providerId, searchTerm, serverId, source]);
+        };
+        flight.promise = run();
+        return flight.promise;
+    }, [scopeKey]);
 
+    /** 范围改变才清空窗口；旧网络请求无法取消，但其回包和 finally 均不再生效。 */
     React.useEffect(() => {
-        // 机器、来源、筛选或实际服务器变化时清空视图，并作废旧范围的回包。
+        generationRef.current += 1;
+        flightRef.current = null;
+        // 查询和前台范围同批改变时，这次初始加载已经使用新范围，不再被恢复 effect 重启。
+        appliedObservationScopeRef.current = controlsRef.current.observationScope;
+        pagesRef.current = [];
+        refreshRequiredRef.current = false;
         setCandidates([]);
         setNextCursor(null);
         setRefreshRequired(false);
@@ -225,39 +283,56 @@ export function useDirectBrowseCandidates(params: Readonly<{
         setLoading(false);
         setLoadingMore(false);
         setCanDeleteCandidates(false);
-        appendPendingRef.current = false;
-        void loadCandidates();
-        return () => { loadGenerationRef.current += 1; };
+        if (controlsRef.current.autoRefreshEnabled !== false) {
+            void loadCandidates({ automatic: controlsRef.current.autoRefreshEnabled === true });
+        }
+        return () => { generationRef.current += 1; flightRef.current = null; };
     }, [loadCandidates]);
 
-    // 完整搜索、刷新与失效游标都不能继续追加旧分页，重复点击也只发一次。
-    const loadMore = React.useCallback(async () => {
-        if (!nextCursor || loading || loadingMore || searchAugmenting || refreshRequired || appendPendingRef.current) return;
-        appendPendingRef.current = true;
-        await loadCandidates({ cursor: nextCursor, append: true });
-    }, [loadCandidates, loading, loadingMore, searchAugmenting, refreshRequired, nextCursor]);
+    /** Android 单调时钟可能不含深睡；切换前台范围时废弃观测和旧 flight，保留分页窗口。 */
+    React.useEffect(() => {
+        if (appliedObservationScopeRef.current === params.observationScope) return;
+        appliedObservationScopeRef.current = params.observationScope;
+        generationRef.current += 1;
+        flightRef.current = null;
+        // 原行、页数和游标保持不变；原观测持有的范围已同步失效，无需重写时间或复制各页。
+        setLoading(false);
+        setLoadingMore(false);
+        setSearchAugmenting(false);
+        setSettledVersion((value) => value + 1);
+    }, [params.observationScope]);
 
-    // 同范围刷新继续显示旧行；成功后整体替换，失败不抹掉已读内容。
-    const refresh = React.useCallback(async () => {
-        await loadCandidates({ preserve: true });
-    }, [loadCandidates]);
+    /** 前台、返回、重连共同形成一个可用边沿，进行中的请求直接复用。 */
+    React.useEffect(() => {
+        if (params.autoRefreshEnabled) void loadCandidates({ automatic: true });
+    }, [params.autoRefreshEnabled, params.observationScope, loadCandidates]);
 
+    /** 动作期间新建的查询尚无窗口，释放后补上首次加载；已有窗口只恢复低频计时。 */
+    React.useEffect(() => {
+        if (!params.actionPending && pagesRef.current.length === 0 && controlsRef.current.autoRefreshEnabled !== false) {
+            void loadCandidates({ automatic: controlsRef.current.autoRefreshEnabled === true });
+        }
+    }, [params.actionPending, loadCandidates]);
+
+    /** 单次定时在上一轮结束后建立；失焦、后台、离线、动作及搜索立即停止周期调度。 */
+    React.useEffect(() => {
+        if (!params.autoRefreshEnabled || params.actionPending || query || flightRef.current) return;
+        const timeout = setTimeout(() => { void loadCandidates({ automatic: true }); }, DISCOVERY_INTERVAL_MS);
+        return () => clearTimeout(timeout);
+    }, [params.autoRefreshEnabled, params.actionPending, query, loadCandidates, loading, loadingMore, searchAugmenting, settledVersion]);
+
+    /** 翻页只追加一个有效游标页，和刷新共享进行中的请求。 */
+    const loadMore = React.useCallback(() => loadCandidates({ append: true }), [loadCandidates]);
+    /** 用户刷新保留已读窗口，只有新窗口完整成功后才替换。 */
+    const refresh = React.useCallback(() => loadCandidates(), [loadCandidates]);
+    /** 成功删除同时移除各页中的条目并作废旧回包，防止会话被旧刷新复活。 */
     const removeCandidate = React.useCallback((remoteSessionId: string) => {
+        if (scopeRef.current !== scopeKey) return;
+        generationRef.current += 1;
+        pagesRef.current = pagesRef.current.map((page) => ({ ...page, candidates: page.candidates.filter((candidate) => candidate.remoteSessionId !== remoteSessionId) }));
         setCandidates((current) => current.filter((candidate) => candidate.remoteSessionId !== remoteSessionId));
-    }, []);
+    }, [scopeKey]);
 
-    return {
-        candidates,
-        nextCursor,
-        loading,
-        loadingMore,
-        searchAugmenting,
-        searchIncomplete,
-        refreshRequired,
-        refresh,
-        error,
-        canDeleteCandidates,
-        loadMore,
-        removeCandidate,
-    } as const;
+    return { candidates, nextCursor, loading, loadingMore, searchAugmenting, searchIncomplete, refreshRequired,
+        refresh, error, canDeleteCandidates, loadMore, removeCandidate } as const;
 }

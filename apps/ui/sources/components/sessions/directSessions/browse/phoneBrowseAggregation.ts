@@ -41,16 +41,44 @@ export type PhoneBrowseRow = Readonly<{
 type PhoneBrowseProject = Readonly<{ sourceKey: string; name: string; rootPaths: readonly string[]; available: boolean }>;
 const LIFECYCLE_MAX_AGE_MS = 900_000;
 
-/** 列表只接受已验证的桌面生命周期；离线、过期或缺失绝不以活跃时间补成运行或完成。 */
-export function readPhoneCandidateLifecycle(candidate: DirectBrowseCandidate, online: boolean, nowMs: number): CodexLifecycleV1 {
+/** 只用本进程单调时钟计龄，保守包含请求等待；无有效单调观测时不能退回墙钟续龄。 */
+function readPhoneCandidateObservation(candidate: DirectBrowseCandidate, monotonicNowMs: number) {
+    const observation = candidate.listObservation;
+    // 原生后台边界使整批旧观测失效，即使 React 尚未提交或单调时钟在深睡中停止。
+    if (observation?.scope && !observation.scope.isCurrent()) return null;
+    const requested = observation?.requestedMonotonicMs;
+    const received = observation?.receivedMonotonicMs;
+    if (!Number.isFinite(monotonicNowMs) || typeof requested !== 'number' || typeof received !== 'number'
+        || !Number.isFinite(requested) || !Number.isFinite(received)
+        || requested < 0 || received < requested || monotonicNowMs < received) return null;
+    return { elapsedMs: monotonicNowMs - requested };
+}
+
+/** 电脑事件仅和同次检查时间相减；缓存过期用手机单调经过时长，不能比较两端墙钟。 */
+export function readPhoneCandidateLifecycle(candidate: DirectBrowseCandidate, online: boolean, nowMs: number,
+    monotonicNowMs = globalThis.performance?.now?.() ?? NaN): CodexLifecycleV1 {
     const parsed = CodexLifecycleV1Schema.safeParse(candidate.details?.codexLifecycle);
     const unknown: CodexLifecycleV1 = { v: 1, state: 'unknown', eventAtMs: null, checkedAtMs: nowMs };
     if (!online || !parsed.success) return unknown;
+    const observation = readPhoneCandidateObservation(candidate, monotonicNowMs);
+    if (!observation || observation.elapsedMs > LIFECYCLE_MAX_AGE_MS) return unknown;
     const fact = parsed.data;
-    if (fact.checkedAtMs > nowMs || nowMs - fact.checkedAtMs > LIFECYCLE_MAX_AGE_MS) return unknown;
-    if (fact.eventAtMs !== null && fact.eventAtMs > nowMs) return unknown;
-    if (fact.state === 'running' && (fact.eventAtMs === null || nowMs - fact.eventAtMs > LIFECYCLE_MAX_AGE_MS)) return unknown;
+    // 协议已校验 eventAt <= checkedAt；running 还需要检查当时年龄加本机缓存年龄。
+    if (fact.state === 'running' && (fact.eventAtMs === null
+        || fact.checkedAtMs - fact.eventAtMs + observation.elapsedMs > LIFECYCLE_MAX_AGE_MS)) return unknown;
     return fact;
+}
+
+/** 用同一候选的 LIST 检查时间换算更新时间；无参照时保留有效原值，不误判电脑领先为未来。 */
+function readPhoneCandidateUpdatedAt(candidate: DirectBrowseCandidate): number | null {
+    if (!Number.isFinite(candidate.updatedAtMs) || candidate.updatedAtMs <= 0) return null;
+    const parsed = CodexLifecycleV1Schema.safeParse(candidate.details?.codexLifecycle);
+    const observation = candidate.listObservation;
+    if (!parsed.success || !observation || !Number.isFinite(observation.requestedAtMs)
+        || !Number.isFinite(observation.receivedAtMs) || observation.requestedAtMs < 0
+        || observation.receivedAtMs < observation.requestedAtMs) return candidate.updatedAtMs;
+    if (candidate.updatedAtMs > parsed.data.checkedAtMs) return null;
+    return observation.requestedAtMs + candidate.updatedAtMs - parsed.data.checkedAtMs;
 }
 
 /** 项目范围只来自已验证的电脑项目；缺失或失效项目不退回整台电脑。 */
@@ -71,6 +99,8 @@ export function aggregatePhoneBrowseSources(input: Readonly<{
     projectRequired?: boolean;
     project?: PhoneBrowseProject | null;
 }>) {
+    // 同一次聚合使用同一个单调时刻，所有行跨越过期边界的依据一致。
+    const monotonicNowMs = globalThis.performance?.now?.() ?? NaN;
     const rowsByIdentity = new Map<string, PhoneBrowseRow>();
     const loadMoreSources: PhoneBrowseSnapshot[] = [];
     const refreshSources: PhoneBrowseSnapshot[] = [];
@@ -95,21 +125,23 @@ export function aggregatePhoneBrowseSources(input: Readonly<{
         for (const candidate of snapshot.candidates) {
             if (input.projectRequired && !input.project) continue;
             if (input.project && !belongsToPhoneProject(candidate, source, input.project)) continue;
-            const lifecycle = readPhoneCandidateLifecycle(candidate, source.online, input.nowMs);
+            const lifecycle = readPhoneCandidateLifecycle(candidate, source.online, input.nowMs, monotonicNowMs);
             if (lifecycle.state === 'unknown' || lifecycle.state === 'failed' || lifecycle.state === 'cancelled') hasUnclassified = true;
             if (input.phase && lifecycle.state !== input.phase) continue;
             const extras = resolveDirectBrowseLinkEnsureRequestExtras({ providerId: 'codex', source: source.source, candidate });
             const candidateSource = extras.source as DirectSessionsSource | undefined;
             const effectiveSource = shouldUseCandidateSource(source.source, candidateSource) ? candidateSource! : source.source;
             const key = buildPhoneSessionIdentity({ ...input, machineId: source.machineId, source: effectiveSource, remoteSessionId: candidate.remoteSessionId });
-            const updatedAtMs = Number.isFinite(candidate.updatedAtMs) && candidate.updatedAtMs > 0 && candidate.updatedAtMs <= input.nowMs ? candidate.updatedAtMs : null;
+            const updatedAtMs = readPhoneCandidateUpdatedAt(candidate);
             const row: PhoneBrowseRow = {
                 key, ownerKey: source.key, candidate, snapshot, lifecycle,
                 sourceLabel: input.project?.name ? `${source.machineLabel} · ${input.project.name}` : source.machineLabel,
-                timeMs: lifecycle.eventAtMs ?? updatedAtMs,
+                timeMs: updatedAtMs,
             };
             const previous = rowsByIdentity.get(key);
-            if (!previous || lifecycle.checkedAtMs > previous.lifecycle.checkedAtMs) rowsByIdentity.set(key, row);
+            // 重叠来源优先采用最新更新的候选；相同更新时间才比较事实检查时间。
+            if (!previous || (row.timeMs ?? 0) > (previous.timeMs ?? 0)
+                || (row.timeMs === previous.timeMs && lifecycle.checkedAtMs > previous.lifecycle.checkedAtMs)) rowsByIdentity.set(key, row);
         }
     }
     // 时间只用于排序及显示，完全不参与状态分类；相同时间使用完整身份稳定排序。
