@@ -58,6 +58,7 @@
     "@types/uuid": "^9.0.8",
     "dotenv-cli": "^8.0.0",
     "esbuild": "^0.27.2",
+    "socket.io-client": "^4.8.1",
     "ts-node": "^10.9.2",
     "@typescript/native": "npm:typescript@7.0.2",
     "typescript": "5.9.3",

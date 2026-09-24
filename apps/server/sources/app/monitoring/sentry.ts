@@ -1,11 +1,13 @@
 import * as Sentry from "@sentry/node";
 import { createRequire } from "node:module";
-import type { Integration } from "@sentry/core";
-import type { Log } from "@sentry/core";
+import type { Log } from "@sentry/node";
 
 import { parseOptionalBooleanEnv } from "@/config/env";
 import { redactSentryEvent, redactSentryLog } from "./sentryLogRedaction";
 import { redactPublicShareCapabilityUrl } from "@happier-dev/protocol";
+
+// 从当前 Node SDK 推导集成类型，避免误用提升到根目录的另一版 core 类型。
+type Integration = ReturnType<typeof Sentry.getDefaultIntegrations>[number];
 
 type ServerSentryConfig = {
     dsn: string;

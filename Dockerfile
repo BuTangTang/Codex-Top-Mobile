@@ -279,6 +279,86 @@ COPY --from=docs-builder /repo/apps/docs /repo/apps/docs
 EXPOSE 3000
 CMD ["yarn", "--cwd", "apps/docs", "start"]
 
+# Codex Top 专用服务端安装闭包：使用 BuildKit/buildx 的 --target codex-top-server。
+# 独立于全工作区 deps-debian；UI/CLI 仅留布局识别清单，禁止带入客户端源码或依赖。
+FROM node:${NODE_VERSION} AS codex-top-server-deps
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /repo
+ENV REDISMS_DISABLE_POSTINSTALL=1
+ENV YARN_CACHE_FOLDER=/tmp/.yarn-cache
+ENV HAPPIER_INSTALL_SCOPE=server,agents,cli-common,protocol,release-runtime,privacy-kit
+COPY package.json yarn.lock ./
+COPY apps/server/package.json apps/server/
+COPY packages/agents/package.json packages/agents/
+COPY packages/cli-common/package.json packages/cli-common/
+COPY packages/protocol/package.json packages/protocol/
+COPY packages/release-runtime/package.json packages/release-runtime/
+COPY packages/privacy-kit/package.json packages/privacy-kit/
+COPY apps/ui/package.json apps/ui/
+COPY apps/cli/package.json apps/cli/
+COPY scripts/codextop/prepareServerWorkspace.mjs scripts/codextop/
+COPY scripts/postinstall scripts/postinstall
+COPY scripts/workspaces scripts/workspaces
+COPY apps/stack/scripts/utils apps/stack/scripts/utils
+COPY scripts/pipeline/expo/eas-postinstall.mjs scripts/pipeline/expo/
+COPY scripts/ci/yarn-install-with-retry.sh /usr/local/bin/yarn-install-with-retry
+RUN chmod +x /usr/local/bin/yarn-install-with-retry
+# 必须先裁剪 workspaces；INSTALL_SCOPE 仅控制生命周期，不能替代依赖闭包裁剪。
+RUN --mount=type=cache,target=/tmp/.yarn-cache,sharing=locked \
+    node scripts/codextop/prepareServerWorkspace.mjs /repo \
+    && yarn config set registry https://registry.npmjs.org/ \
+    && yarn-install-with-retry --frozen-lockfile --ignore-engines --network-timeout 600000 --prefer-offline --non-interactive
+
+FROM codex-top-server-deps AS codex-top-server-builder
+ARG HAPPIER_EMBEDDED_POLICY_ENV=preview
+ENV HAPPIER_EMBEDDED_POLICY_ENV=$HAPPIER_EMBEDDED_POLICY_ENV
+ENV HAPPIER_BUILD_DB_PROVIDERS=sqlite
+COPY .github/feature-policy .github/feature-policy
+COPY apps/server apps/server
+COPY packages/agents packages/agents
+COPY packages/cli-common packages/cli-common
+COPY packages/protocol packages/protocol
+COPY packages/release-runtime packages/release-runtime
+COPY packages/privacy-kit packages/privacy-kit
+# 原 prebuild 负责共享包闭包和 Prisma 默认+SQLite client，继续使用同一个构建 owner。
+RUN yarn workspace @happier-dev/server build
+
+FROM node:${NODE_VERSION} AS codex-top-server
+WORKDIR /repo
+ARG SENTRY_RELEASE=""
+# 当前服务没有本地音视频处理调用；只保留维护与就绪检查依赖，并容忍有限的源连接失败。
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends -o APT::Keep-Downloaded-Packages=false python3 curl \
+    && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
+ENV PORT=3005
+ENV RUN_MIGRATIONS=1
+ENV SENTRY_RELEASE=$SENTRY_RELEASE
+ENV HAPPIER_RELEASE_SOURCE_SHA=$SENTRY_RELEASE
+ENV HAPPIER_SERVER_FLAVOR=light
+ENV HAPPIER_DB_PROVIDER=sqlite
+ENV HAPPIER_SERVER_LIGHT_DATA_DIR=/data
+ENV HAPPIER_SQLITE_AUTO_MIGRATE=1
+COPY --from=codex-top-server-builder --chown=node:node /repo/package.json /repo/yarn.lock /repo/
+COPY --from=codex-top-server-builder --chown=node:node /repo/node_modules /repo/node_modules
+COPY --from=codex-top-server-builder --chown=node:node /repo/apps/server /repo/apps/server
+COPY --from=codex-top-server-builder --chown=node:node /repo/packages/agents /repo/packages/agents
+COPY --from=codex-top-server-builder --chown=node:node /repo/packages/cli-common /repo/packages/cli-common
+COPY --from=codex-top-server-builder --chown=node:node /repo/packages/protocol /repo/packages/protocol
+COPY --from=codex-top-server-builder --chown=node:node /repo/packages/release-runtime /repo/packages/release-runtime
+COPY --from=codex-top-server-builder --chown=node:node /repo/packages/privacy-kit /repo/packages/privacy-kit
+# 保留原迁移/启动与管理员受限 stdin 开户脚本，不改为上游下载包或单文件运行时。
+COPY --from=codex-top-server-builder /repo/apps/server/scripts/run-server.sh /usr/local/bin/run-server
+RUN chmod +x /usr/local/bin/run-server \
+    && mkdir -p /data && chown node:node /data
+USER node
+EXPOSE 3005
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["curl", "--fail", "--silent", "http://127.0.0.1:3005/ready"]
+CMD ["run-server"]
+
 # Server
 FROM deps-debian AS server-builder
 ARG HAPPIER_EMBEDDED_POLICY_ENV=preview
