@@ -1,0 +1,95 @@
+{
+  "name": "@happier-dev/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./tools/v2": {
+      "types": "./dist/tools/v2/index.d.ts",
+      "default": "./dist/tools/v2/index.js"
+    },
+    "./spawnSession": {
+      "types": "./dist/spawnSession.d.ts",
+      "default": "./dist/spawnSession.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc.d.ts",
+      "default": "./dist/rpc.js"
+    },
+    "./rpcErrors": {
+      "types": "./dist/rpcErrors.d.ts",
+      "default": "./dist/rpcErrors.js"
+    },
+    "./checklists": {
+      "types": "./dist/checklists.d.ts",
+      "default": "./dist/checklists.js"
+    },
+    "./installables": {
+      "types": "./dist/installables.d.ts",
+      "default": "./dist/installables.js"
+    },
+    "./installablesPolicy": {
+      "types": "./dist/installablesPolicy.d.ts",
+      "default": "./dist/installablesPolicy.js"
+    },
+    "./testing/accountScopedCipherFixtures": {
+      "types": "./dist/testing/accountScopedCipherFixtures.d.ts",
+      "default": "./dist/testing/accountScopedCipherFixtures.js"
+    },
+    "./capabilities": {
+      "types": "./dist/capabilities.d.ts",
+      "default": "./dist/capabilities.js"
+    },
+    "./socketRpc": {
+      "types": "./dist/socketRpc.d.ts",
+      "default": "./dist/socketRpc.js"
+    },
+    "./changes": {
+      "types": "./dist/changes.d.ts",
+      "default": "./dist/changes.js"
+    },
+    "./updates": {
+      "types": "./dist/updates.d.ts",
+      "default": "./dist/updates.js"
+    },
+    "./workspaces": {
+      "types": "./dist/workspaces/index.d.ts",
+      "default": "./dist/workspaces/index.js"
+    },
+    "./sessionFolders": {
+      "types": "./dist/sessionFolders/index.d.ts",
+      "default": "./dist/sessionFolders/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "package.json",
+    "README.md"
+  ],
+  "scripts": {
+    "tsc": "node ../../scripts/workspaces/runTypeScriptCli.mjs",
+    "build": "node scripts/generate-embedded-feature-policies.mjs && node ../../scripts/workspaces/buildTypeScriptPackageDist.mjs -p tsconfig.json",
+    "test": "node ../../node_modules/vitest/vitest.mjs run --config ../../vitest.config.ts",
+    "pretypecheck": "node scripts/generate-embedded-feature-policies.mjs",
+    "postinstall:real": "yarn -s build",
+    "postinstall": "node -e \"const fs=require('fs');const cp=require('child_process');if(/(^|[\\\\\\\\/])node_modules([\\\\\\\\/]|$)/i.test(process.cwd()))process.exit(0);try{const gate=require('../../scripts/postinstall/shouldRunPostinstall.cjs');if(!gate.shouldRunPostinstall({workspace:'protocol',scope:process.env.HAPPIER_INSTALL_SCOPE||''}))process.exit(0);}catch{}const has=(p)=>{try{return fs.existsSync(p)}catch{return false}};if(!has('tsconfig.json')||!has('../agents/tsconfig.json'))process.exit(0);const run=(cmd,args)=>cp.spawnSync(cmd,args,{stdio:'inherit'});const npmExec=process.env.npm_execpath;let r;if(npmExec){r=run(process.execPath,[npmExec,'run','-s','postinstall:real']);}else{r=run(process.platform==='win32'?'yarn.cmd':'yarn',['-s','postinstall:real']);if(r.error&&process.platform==='win32'){r=run('yarn',['-s','postinstall:real']);}}if(r.error){console.error(r.error.message);process.exit(1);}process.exit(r.status??1);\"",
+    "typecheck": "node ../../scripts/workspaces/runTypeScriptCli.mjs -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "base64-js": "^1.5.1",
+    "tweetnacl": "^1.0.3",
+    "zod": "4.3.6",
+    "zod-to-json-schema": "3.25.1"
+  },
+  "devDependencies": {
+    "@typescript/native": "npm:typescript@7.0.2",
+    "typescript": "5.9.3"
+  }
+}

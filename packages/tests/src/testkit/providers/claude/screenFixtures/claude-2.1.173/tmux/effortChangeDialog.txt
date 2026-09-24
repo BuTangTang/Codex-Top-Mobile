@@ -1,0 +1,42 @@
+  - Argent MCP rules for iOS simulator and Android emulator control
+  - Project instructions from CLAUDE.md
+  - Your memory index with project context from recent work
+
+  I'm ready to assist with tasks in this repository. What would you like me to work on?
+
+✻ Churned for 4s
+
+❯ /effort low
+  ⎿  Set effort level to low (saved as your default for new sessions): Quick, straightforward implementation
+     with minimal overhead
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with
+     extensive testing and documentation
+
+❯ reply OK again
+
+⏺ OK. Effort level set to high. Ready when you are.
+
+✻ Sautéed for 5s
+
+❯ /effort low
+  ⎿  Set effort level to low (saved as your default for new sessions): Quick, straightforward implementation
+     with minimal overhead
+
+❯ /effort
+  ⎿  Set effort level to low (saved as your default for new sessions): Quick, straightforward implementation
+     with minimal overhead
+
+❯ /model claude-sonnet-4-6
+  ⎿  Set model to Sonnet 4.6 and saved as your default for new sessions
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Change effort level?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current effort level. Switching to high means the full history gets
+   re-read on your next message.
+
+   ❯ 1. Yes, switch to high
+     2. No, go back
+

@@ -1,0 +1,155 @@
+import React from 'react';
+import { Pressable, View } from 'react-native';
+import { useRouter } from 'expo-router';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+
+import type { Automation } from '@/sync/domains/automations/automationTypes';
+import { sync } from '@/sync/sync';
+import { Modal } from '@/modal';
+import { Item } from '@/components/ui/lists/Item';
+import { ItemGroup } from '@/components/ui/lists/ItemGroup';
+import { Switch } from '@/components/ui/forms/Switch';
+import { navigateWithBlurOnWeb } from '@/utils/platform/deferOnWeb';
+import { ignoreNextRowPress } from '@/utils/ui/ignoreNextRowPress';
+import { t } from '@/text';
+import { formatAutomationNextRun, formatAutomationScheduleLabel } from './automationListFormatting';
+import { Icon } from '@/components/ui/icons/Icon';
+
+type Props = Readonly<{
+    title: string;
+    automations: ReadonlyArray<Pick<Automation, 'id' | 'name' | 'enabled' | 'schedule' | 'nextRunAt'>>;
+    onOpenAutomation?: (automationId: string) => void;
+}>;
+
+const stylesheet = StyleSheet.create((theme) => ({
+    rowRight: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 10,
+    },
+    runNowButton: {
+        width: 32,
+        height: 32,
+        borderRadius: 16,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: theme.colors.surface.elevated,
+    },
+}));
+
+export const AutomationListGroup = React.memo((props: Props) => {
+    const { theme } = useUnistyles();
+    const styles = stylesheet;
+    const router = useRouter();
+    const [runNowStateById, setRunNowStateById] = React.useState<Record<string, 'idle' | 'running' | 'queued'>>({});
+    const ignoreRowPressRef = React.useRef(false);
+
+    const handleRunNow = React.useCallback(async (automationId: string) => {
+        try {
+            setRunNowStateById((prev) => ({ ...prev, [automationId]: 'running' }));
+            await sync.runAutomationNow(automationId);
+            setRunNowStateById((prev) => ({ ...prev, [automationId]: 'queued' }));
+            setTimeout(() => {
+                setRunNowStateById((prev) => {
+                    if (prev[automationId] !== 'queued') return prev;
+                    const { [automationId]: _ignored, ...rest } = prev;
+                    return rest;
+                });
+            }, 2500);
+        } catch (error) {
+            await Modal.alert(
+                t('common.error'),
+                error instanceof Error ? error.message : t('automations.detail.runFailed'),
+            );
+            setRunNowStateById((prev) => {
+                const { [automationId]: _ignored, ...rest } = prev;
+                return rest;
+            });
+        }
+    }, []);
+
+    const handleSetEnabled = React.useCallback(async (automationId: string, nextEnabled: boolean) => {
+        try {
+            if (!nextEnabled) {
+                await sync.pauseAutomation(automationId);
+            } else {
+                await sync.resumeAutomation(automationId);
+            }
+        } catch (error) {
+            await Modal.alert(
+                t('common.error'),
+                error instanceof Error ? error.message : t('automations.edit.updateFailed'),
+            );
+        }
+    }, []);
+
+    const openAutomation = React.useCallback((automationId: string) => {
+        if (props.onOpenAutomation) {
+            navigateWithBlurOnWeb(() => props.onOpenAutomation?.(automationId));
+            return;
+        }
+        navigateWithBlurOnWeb(() => router.push(`/automations/${automationId}` as any));
+    }, [props, router]);
+
+    return (
+        <ItemGroup title={props.title}>
+            {props.automations.map((automation) => {
+                const runState = runNowStateById[automation.id] ?? 'idle';
+                const subtitle = [
+                    formatAutomationScheduleLabel({ schedule: automation.schedule }),
+                    formatAutomationNextRun(automation.nextRunAt ?? null),
+                    ...(runState === 'queued' ? [t('automations.detail.runNowQueuedLine')] : []),
+                ].join('\n');
+
+                const onPress = () => {
+                    if (ignoreRowPressRef.current) {
+                        ignoreRowPressRef.current = false;
+                        return;
+                    }
+                    openAutomation(automation.id);
+                };
+
+                return (
+                    <Item
+                        key={automation.id}
+                        title={automation.name}
+                        subtitle={subtitle}
+                        subtitleLines={0}
+                        onPress={onPress}
+                        rightElement={(
+                            <View style={styles.rowRight}>
+                                <Pressable
+                                    onPressIn={() => ignoreNextRowPress(ignoreRowPressRef)}
+                                    onPress={() => void handleRunNow(automation.id)}
+                                    style={({ pressed }) => ([
+                                        styles.runNowButton,
+                                        { opacity: pressed ? 0.7 : 1 },
+                                    ])}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={t('automations.detail.runNowTitle')}
+                                >
+                                    {runState === 'running' ? (
+                                        <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+                                    ) : runState === 'queued' ? (
+                                        <Icon name="check" size={16} color={theme.colors.text.secondary} />
+                                    ) : (
+                                        <Icon name="play" size={16} color={theme.colors.text.secondary} />
+                                    )}
+                                </Pressable>
+                                <Switch
+                                    value={automation.enabled}
+                                    onValueChange={(next) => {
+                                        ignoreNextRowPress(ignoreRowPressRef);
+                                        void handleSetEnabled(automation.id, next);
+                                    }}
+                                />
+                            </View>
+                        )}
+                        showChevron={false}
+                    />
+                );
+            })}
+        </ItemGroup>
+    );
+});

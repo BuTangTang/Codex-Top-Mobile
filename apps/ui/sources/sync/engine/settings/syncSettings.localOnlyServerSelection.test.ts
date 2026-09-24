@@ -1,0 +1,1009 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { AuthCredentials } from '@/auth/storage/tokenStorage';
+import type { Encryption } from '@/sync/encryption/encryption';
+import type { Settings } from '@/sync/domains/settings/settings';
+import { invalidateAccountEncryptionModeCache } from '@/sync/api/account/apiAccountEncryptionMode';
+import { openAccountScopedBlobCiphertext, sealAccountScopedBlobCiphertext } from '@happier-dev/protocol';
+
+function createBaseMockSettings(): Record<string, unknown> {
+    return {
+        analyticsOptOut: false,
+        commandPaletteEnabled: false,
+        keyboardShortcutsV2Enabled: false,
+        keyboardSingleKeyShortcutsEnabled: false,
+        keyboardShortcutOverridesV1: {},
+        keyboardShortcutDisabledCommandIdsV1: [],
+        claudeLocalPermissionBridgeEnabled: true,
+        terminalConnectLegacySecretExportEnabled: false,
+        crashReportsOptOut: false,
+        experiments: true,
+        sessionListDensity: 'comfortable',
+        notificationsSettingsV1: {
+            v: 1,
+            pushEnabled: true,
+            ready: true,
+            permissionRequest: true,
+            userActionRequest: true,
+            foregroundBehavior: 'banner',
+        },
+        notificationChannelsV1: [
+            {
+                v: 1,
+                id: 'builtin:expo_push',
+                kind: 'expo_push',
+                enabled: true,
+                topics: {
+                    ready: true,
+                    permissionRequest: true,
+                    userActionRequest: true,
+                },
+                readyIncludeMessageText: true,
+            },
+        ],
+        sessionHandoffDefaultsV1: {
+            v: 1,
+            workspaceTransferEnabled: true,
+            conflictPolicy: 'create_sibling_copy',
+            includeIgnoredMode: 'exclude',
+            ignoredIncludeGlobs: [],
+            directTargetMode: 'keep_direct',
+        },
+        preferredLanguage: null,
+    };
+}
+
+const mocks = vi.hoisted(() => {
+    const callSequence: string[] = [];
+    const settingsParse = vi.fn((value: unknown) => {
+        const record =
+            value && typeof value === 'object' && !Array.isArray(value)
+                ? (value as Record<string, unknown>)
+                : {};
+        return {
+            ...createBaseMockSettings(),
+            ...record,
+        };
+    });
+
+    return {
+        serverFetch: vi.fn(),
+        loadPendingSettings: vi.fn(() => ({})),
+        loadPendingAccountSettings: vi.fn(() => ({})),
+        loadAccountSettings: vi.fn(() => ({ settings: createBaseMockSettings(), version: 1 })),
+        callSequence,
+        tracking: {
+            capture: vi.fn((..._args: unknown[]) => {
+                callSequence.push('capture');
+            }),
+            identify: vi.fn((..._args: unknown[]) => {
+                callSequence.push('identify');
+            }),
+            flush: vi.fn((..._args: unknown[]) => {
+                callSequence.push('flush');
+                return Promise.resolve();
+            }),
+            optOut: vi.fn((..._args: unknown[]) => {
+                callSequence.push('optOut');
+            }),
+            optIn: vi.fn((..._args: unknown[]) => {
+                callSequence.push('optIn');
+            }),
+        },
+        applySettingsFn: vi.fn((base: Record<string, unknown>, delta: Record<string, unknown>) => ({
+            ...base,
+            ...delta,
+        })),
+        settingsParse,
+        storageState: {
+            settings: createBaseMockSettings(),
+            settingsVersion: 9,
+            settingsScope: { serverId: 'server-a', accountId: 'account-a' },
+            applySettings: vi.fn(),
+            replaceSettings: vi.fn(),
+            applySettingsForScope: vi.fn(),
+            replaceSettingsForScope: vi.fn(),
+            applySettingsLocal: vi.fn(),
+        },
+    };
+});
+
+vi.mock('@/track', () => ({
+    tracking: mocks.tracking,
+    getTrackingAnonymousUserId: () => 'anon-user',
+}));
+
+vi.mock('@/utils/errors/errors', () => ({
+    HappyError: class HappyError extends Error {
+        constructor(message: string) {
+            super(message);
+        }
+    },
+}));
+
+vi.mock('@/sync/domains/settings/settings', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/settings/settings')>(),
+    applySettings: mocks.applySettingsFn,
+    settingsDefaults: createBaseMockSettings(),
+    settingsParse: mocks.settingsParse,
+}));
+
+vi.mock('@/sync/domains/settings/debugSettings', () => ({
+    summarizeSettings: () => ({}),
+    summarizeSettingsDelta: () => ({}),
+    dbgSettings: () => {},
+    isSettingsSyncDebugEnabled: () => false,
+}));
+
+vi.mock('@/sync/domains/server/serverRuntime', () => ({
+    getActiveServerSnapshot: () => ({ serverUrl: 'http://127.0.0.1:3009' }),
+}));
+
+vi.mock('@/sync/domains/state/storage', async () => {
+    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+    return createStorageModuleStub({
+    storage: {
+        getState: () => mocks.storageState,
+    },
+});
+});
+
+vi.mock('@/sync/domains/state/persistence', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/sync/domains/state/persistence')>(),
+    loadPendingSettings: mocks.loadPendingSettings,
+    loadSettings: () => ({ settings: createBaseMockSettings(), version: 9 }),
+    loadLocalSettings: () => ({}),
+    loadPurchases: () => ({}),
+    loadProfile: () => ({}),
+    loadThemePreference: () => 'adaptive',
+    loadLocalPetSourcesBySourceKey: () => ({}),
+    loadSessionDrafts: () => ({}),
+    loadSessionReviewCommentsDrafts: () => ({}),
+    loadWorkspaceReviewCommentsDrafts: () => ({}),
+    loadSessionActionDrafts: () => ({}),
+    loadNewSessionDraft: () => null,
+    loadSessionPermissionModes: () => ({}),
+    loadSessionPermissionModeUpdatedAts: () => ({}),
+    loadSessionLastViewed: () => ({}),
+    loadSessionModelModes: () => ({}),
+    loadSessionModelModeUpdatedAts: () => ({}),
+    loadSessionMaterializedMaxSeqById: () => ({}),
+    loadChangesCursor: () => null,
+    loadLastChangesCursorByAccountId: () => ({}),
+    loadDeviceAnalyticsId: () => null,
+    saveSettings: vi.fn(),
+    saveLocalSettings: vi.fn(),
+    savePurchases: vi.fn(),
+    saveProfile: vi.fn(),
+    saveLocalPetSourcesBySourceKey: vi.fn(),
+    saveSessionDrafts: vi.fn(),
+    saveSessionReviewCommentsDrafts: vi.fn(),
+    saveWorkspaceReviewCommentsDrafts: vi.fn(),
+    saveSessionActionDrafts: vi.fn(),
+    saveNewSessionDraft: vi.fn(),
+    clearNewSessionDraft: vi.fn(),
+    saveSessionPermissionModes: vi.fn(),
+    saveSessionPermissionModeUpdatedAts: vi.fn(),
+    saveSessionLastViewed: vi.fn(),
+    saveSessionModelModes: vi.fn(),
+    saveSessionModelModeUpdatedAts: vi.fn(),
+    saveSessionMaterializedMaxSeqById: vi.fn(),
+    saveChangesCursor: vi.fn(),
+    pruneStaleInstanceChangesCursors: vi.fn(),
+    saveLastChangesCursorByAccountId: vi.fn(),
+    savePendingSettings: vi.fn(),
+    saveDeviceAnalyticsId: vi.fn(),
+    clearPersistence: vi.fn(),
+}));
+
+vi.mock('@/sync/domains/state/accountSettingsPersistence', () => ({
+    loadPendingAccountSettings: mocks.loadPendingAccountSettings,
+    loadAccountSettings: mocks.loadAccountSettings,
+}));
+
+vi.mock('@/sync/encryption/secretSettings', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/encryption/secretSettings')>();
+    return {
+        ...actual,
+        unsealSecretsDeep: (value: unknown) => value,
+    };
+});
+
+vi.mock('@/sync/http/client', () => ({
+    serverFetch: mocks.serverFetch,
+}));
+
+import { applySettingsLocalDelta, syncSettings } from './syncSettings';
+
+const credentials: AuthCredentials = {
+    token: 'token',
+    encryption: {
+        publicKey: 'public',
+        machineKey: 'machine',
+    },
+};
+const TEST_MACHINE_KEY = new Uint8Array(32).fill(11);
+const encryptionStub = {
+    getContentPrivateKey: () => TEST_MACHINE_KEY,
+    decryptRaw: vi.fn(async () => null),
+    encryptRaw: vi.fn(async () => 'ciphertext'),
+} as unknown as Encryption;
+
+describe('syncSettings local-only server-selection settings', () => {
+    beforeEach(() => {
+        invalidateAccountEncryptionModeCache();
+        mocks.serverFetch.mockReset();
+        mocks.loadPendingSettings.mockReset();
+        mocks.loadPendingSettings.mockReturnValue({});
+        mocks.loadPendingAccountSettings.mockReset();
+        mocks.loadPendingAccountSettings.mockReturnValue({});
+        mocks.loadAccountSettings.mockReset();
+        mocks.loadAccountSettings.mockReturnValue({ settings: createBaseMockSettings(), version: 1 });
+        mocks.callSequence.length = 0;
+        mocks.tracking.capture.mockClear();
+        mocks.tracking.identify.mockClear();
+        mocks.tracking.flush.mockClear();
+        mocks.tracking.optOut.mockClear();
+        mocks.tracking.optIn.mockClear();
+        mocks.applySettingsFn.mockClear();
+        mocks.settingsParse.mockClear();
+        mocks.storageState.settings = createBaseMockSettings();
+        mocks.storageState.applySettingsLocal.mockImplementation((delta: Record<string, unknown>) => {
+            mocks.storageState.settings = {
+                ...mocks.storageState.settings,
+                ...delta,
+            };
+        });
+        mocks.storageState.settingsVersion = 9;
+        mocks.storageState.settingsScope = { serverId: 'server-a', accountId: 'account-a' };
+        mocks.storageState.applySettings.mockReset();
+        mocks.storageState.replaceSettings.mockReset();
+        mocks.storageState.applySettingsForScope.mockReset();
+        mocks.storageState.replaceSettingsForScope.mockReset();
+        mocks.storageState.applySettingsLocal.mockReset();
+        (encryptionStub.decryptRaw as unknown as ReturnType<typeof vi.fn>).mockReset();
+        (encryptionStub.encryptRaw as unknown as ReturnType<typeof vi.fn>).mockReset();
+    });
+
+    it('does not rewrite server settings when GET ciphertext cannot be decrypted', async () => {
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: { t: 'encrypted', c: 'ciphertext' }, version: 12 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        (encryptionStub.decryptRaw as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: {},
+            clearPendingSettings: () => {},
+        });
+
+        expect(mocks.serverFetch).toHaveBeenCalledTimes(2);
+        expect(encryptionStub.encryptRaw).not.toHaveBeenCalled();
+        expect(mocks.storageState.applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: false,
+                serverSelectionGroups: undefined,
+                serverSelectionActiveTargetKind: undefined,
+                serverSelectionActiveTargetId: undefined,
+                terminalConnectLegacySecretExportEnabled: false,
+            }),
+            12,
+        );
+    });
+
+    it('does not rewrite when GET ciphertext is decryptable', async () => {
+        const ciphertext = sealAccountScopedBlobCiphertext({
+            kind: 'account_settings',
+            material: { type: 'dataKey', machineKey: TEST_MACHINE_KEY },
+            payload: { analyticsOptOut: true, claudeLocalPermissionBridgeEnabled: false },
+            randomBytes: () => new Uint8Array(24).fill(1),
+        });
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: { t: 'encrypted', c: ciphertext }, version: 4 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: {},
+            clearPendingSettings: () => {},
+        });
+
+        expect(mocks.serverFetch).toHaveBeenCalledTimes(2);
+        expect(encryptionStub.decryptRaw).not.toHaveBeenCalled();
+        expect(mocks.storageState.applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: true,
+                claudeLocalPermissionBridgeEnabled: false,
+                serverSelectionGroups: undefined,
+                serverSelectionActiveTargetKind: undefined,
+                serverSelectionActiveTargetId: undefined,
+                terminalConnectLegacySecretExportEnabled: false,
+            }),
+            4,
+        );
+    });
+
+    it('preserves local server-selection settings when applying fetched settings', async () => {
+        mocks.storageState.settings = {
+            analyticsOptOut: false,
+            serverSelectionGroups: [{ id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' }],
+            serverSelectionActiveTargetKind: 'group',
+            serverSelectionActiveTargetId: 'grp-dev',
+            terminalConnectLegacySecretExportEnabled: true,
+        };
+
+        const ciphertext = sealAccountScopedBlobCiphertext({
+            kind: 'account_settings',
+            material: { type: 'dataKey', machineKey: TEST_MACHINE_KEY },
+            payload: { analyticsOptOut: true },
+            randomBytes: () => new Uint8Array(24).fill(2),
+        });
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: { t: 'encrypted', c: ciphertext }, version: 7 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: {},
+            clearPendingSettings: () => {},
+        });
+
+        expect(mocks.storageState.applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: true,
+                serverSelectionGroups: [{ id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' }],
+                serverSelectionActiveTargetKind: 'group',
+                serverSelectionActiveTargetId: 'grp-dev',
+                terminalConnectLegacySecretExportEnabled: true,
+            }),
+            7,
+        );
+    });
+
+    it('preserves pending local deltas when applying fetched server settings', async () => {
+        mocks.loadPendingSettings.mockReturnValueOnce({
+            sessionReplayEnabled: true,
+        } as any);
+
+        mocks.storageState.settings = {
+            analyticsOptOut: false,
+            sessionReplayEnabled: false,
+            terminalConnectLegacySecretExportEnabled: false,
+        };
+
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: null, version: 12 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            // Simulate an in-flight sync tick that did not observe the newest pending object reference.
+            pendingSettings: {},
+            clearPendingSettings: () => {},
+        });
+
+        expect(mocks.storageState.applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: false,
+                sessionReplayEnabled: true,
+                terminalConnectLegacySecretExportEnabled: false,
+            }),
+            12,
+        );
+    });
+
+    it('reloads pending settings for the captured scope before applying fetched settings', async () => {
+        const settingsScope = { serverId: 'server-b', accountId: 'account-b' };
+        mocks.storageState.settingsScope = settingsScope;
+        mocks.loadPendingAccountSettings.mockReturnValueOnce({
+            sessionReplayEnabled: true,
+        } as any);
+
+        mocks.storageState.settings = {
+            analyticsOptOut: false,
+            sessionReplayEnabled: false,
+            terminalConnectLegacySecretExportEnabled: false,
+        };
+
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: null, version: 4 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            settingsScope,
+            pendingSettings: {},
+            clearPendingSettings: () => {},
+        });
+
+        expect(mocks.loadPendingAccountSettings).toHaveBeenCalledWith(settingsScope);
+        expect(mocks.storageState.applySettingsForScope).toHaveBeenCalledWith(
+            settingsScope,
+            expect.objectContaining({
+                analyticsOptOut: false,
+                sessionReplayEnabled: true,
+                terminalConnectLegacySecretExportEnabled: false,
+            }),
+            4,
+        );
+        expect(mocks.storageState.applySettings).not.toHaveBeenCalled();
+        expect(mocks.loadPendingSettings).not.toHaveBeenCalled();
+    });
+
+    it('applies in-flight settings sync results only through the captured stale scope after the active scope changes', async () => {
+        const capturedScope = { serverId: 'server-a', accountId: 'account-a' };
+        const activeScope = { serverId: 'server-b', accountId: 'account-b' };
+        mocks.storageState.settingsScope = activeScope;
+        mocks.loadAccountSettings.mockReturnValue({
+            settings: {
+                analyticsOptOut: false,
+                terminalConnectLegacySecretExportEnabled: false,
+            },
+            version: 1,
+        });
+
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: null, version: 1 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ success: true, version: 2 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        const clearPendingSettings = vi.fn();
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            settingsScope: capturedScope,
+            pendingSettings: { analyticsOptOut: true },
+            clearPendingSettings,
+        });
+
+        expect(clearPendingSettings).toHaveBeenCalledTimes(1);
+        expect(mocks.storageState.applySettingsForScope).toHaveBeenCalledWith(
+            capturedScope,
+            expect.any(Object),
+            2,
+        );
+        expect(mocks.storageState.applySettings).not.toHaveBeenCalled();
+        expect(mocks.loadAccountSettings).toHaveBeenCalledWith(capturedScope);
+    });
+
+    it('does not sync server-selection settings keys to account settings payload', async () => {
+        mocks.storageState.settings = {
+            analyticsOptOut: false,
+            featureToggles: { 'zen.navigation': false },
+            serverSelectionGroups: [{ id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' }],
+            serverSelectionActiveTargetKind: 'group',
+            serverSelectionActiveTargetId: 'grp-dev',
+            terminalConnectLegacySecretExportEnabled: true,
+        };
+        mocks.storageState.settingsVersion = 10;
+
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: null, version: 10 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ success: true, version: 11 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        (encryptionStub.encryptRaw as unknown as ReturnType<typeof vi.fn>).mockResolvedValue('ciphertext');
+        const clearPendingSettings = vi.fn();
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: { featureToggles: { 'zen.navigation': true } },
+            clearPendingSettings,
+        });
+
+        expect(clearPendingSettings).toHaveBeenCalledTimes(1);
+        expect(encryptionStub.encryptRaw).not.toHaveBeenCalled();
+        const body = JSON.parse(String((mocks.serverFetch.mock.calls[2]?.[1] as RequestInit | undefined)?.body ?? 'null')) as { content?: unknown } | null;
+        expect(typeof (body as any)?.content?.c).toBe('string');
+        const opened = openAccountScopedBlobCiphertext({
+            kind: 'account_settings',
+            material: { type: 'dataKey', machineKey: TEST_MACHINE_KEY },
+            ciphertext: String((body as any)?.content?.c ?? ''),
+        });
+        expect(opened?.value && typeof opened.value === 'object').toBe(true);
+        const record = opened?.value as Record<string, unknown>;
+        expect(record.serverSelectionGroups).toBeUndefined();
+        expect(record.serverSelectionActiveTargetKind).toBeUndefined();
+        expect(record.serverSelectionActiveTargetId).toBeUndefined();
+        expect(record.terminalConnectLegacySecretExportEnabled).toBeUndefined();
+        expect(record.featureToggles).toEqual({ 'zen.navigation': true });
+    });
+
+    it('keeps local empty server-selection state when fetched server settings include legacy selection keys', async () => {
+        mocks.storageState.settings = {
+            analyticsOptOut: false,
+            serverSelectionGroups: [],
+            serverSelectionActiveTargetKind: null,
+            serverSelectionActiveTargetId: null,
+        };
+
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: { t: 'encrypted', c: 'decryptable-ciphertext' }, version: 8 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        (encryptionStub.decryptRaw as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+            analyticsOptOut: true,
+            serverSelectionGroups: [{ id: 'legacy', name: 'Legacy', serverIds: ['server-a'] }],
+            serverSelectionActiveTargetKind: 'group',
+            serverSelectionActiveTargetId: 'legacy',
+        });
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: {},
+            clearPendingSettings: () => {},
+        });
+
+        expect(mocks.storageState.applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: true,
+                serverSelectionGroups: [],
+                serverSelectionActiveTargetKind: null,
+                serverSelectionActiveTargetId: null,
+                terminalConnectLegacySecretExportEnabled: false,
+            }),
+            8,
+        );
+    });
+
+    it('clears pending settings when pending delta only contains local server-selection keys', async () => {
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: null, version: 4 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        const clearPendingSettings = vi.fn();
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: {
+                serverSelectionGroups: [
+                    { id: 'grp-dev', name: 'Dev', serverIds: ['server-a'], presentation: 'grouped' },
+                ],
+                serverSelectionActiveTargetKind: 'group',
+                serverSelectionActiveTargetId: 'grp-dev',
+            },
+            clearPendingSettings,
+        });
+
+        expect(clearPendingSettings).toHaveBeenCalledTimes(1);
+        expect(encryptionStub.encryptRaw).not.toHaveBeenCalled();
+        expect(mocks.serverFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('clears only committed pending keys after a successful flush', async () => {
+        const serverCiphertext = sealAccountScopedBlobCiphertext({
+            kind: 'account_settings',
+            material: { type: 'dataKey', machineKey: TEST_MACHINE_KEY },
+            payload: { analyticsOptOut: false },
+            randomBytes: () => new Uint8Array(24).fill(3),
+        });
+        mocks.loadPendingSettings.mockReturnValueOnce({
+            analyticsOptOut: true,
+            sessionListDensity: 'detailed',
+        } as any);
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: { t: 'encrypted', c: serverCiphertext }, version: 4 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ success: true, version: 5 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        const clearPendingSettings = vi.fn();
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: { analyticsOptOut: true },
+            clearPendingSettings,
+        });
+
+        expect(clearPendingSettings).toHaveBeenCalledWith({ sessionListDensity: 'detailed' });
+    });
+
+    it('keeps a same-key concurrent pending edit after a successful flush', async () => {
+        const serverCiphertext = sealAccountScopedBlobCiphertext({
+            kind: 'account_settings',
+            material: { type: 'dataKey', machineKey: TEST_MACHINE_KEY },
+            payload: { analyticsOptOut: false },
+            randomBytes: () => new Uint8Array(24).fill(4),
+        });
+        mocks.loadPendingSettings.mockReturnValueOnce({
+            analyticsOptOut: false,
+        } as Partial<ReturnType<typeof createBaseMockSettings>>);
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: { t: 'encrypted', c: serverCiphertext }, version: 4 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ success: true, version: 5 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        const clearPendingSettings = vi.fn();
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: { analyticsOptOut: true },
+            clearPendingSettings,
+        });
+
+        expect(clearPendingSettings).toHaveBeenCalledWith({ analyticsOptOut: false });
+    });
+
+    it('clears only matching local-only pending keys', async () => {
+        mocks.loadPendingSettings.mockReturnValueOnce({
+            lastUsedAgent: 'codex',
+            serverSelectionActiveTargetKind: 'server',
+        } as Partial<ReturnType<typeof createBaseMockSettings>>);
+        mocks.serverFetch
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ mode: 'e2ee', updatedAt: Date.now() }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            )
+            .mockResolvedValueOnce(
+                new Response(JSON.stringify({ content: null, version: 4 }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                }),
+            );
+        const clearPendingSettings = vi.fn();
+
+        await syncSettings({
+            credentials,
+            encryption: encryptionStub,
+            pendingSettings: { lastUsedAgent: 'codex' },
+            clearPendingSettings,
+        });
+
+        expect(clearPendingSettings).toHaveBeenCalledWith({ serverSelectionActiveTargetKind: 'server' });
+    });
+});
+
+describe('applySettingsLocalDelta server-selection local-only keys', () => {
+    beforeEach(() => {
+        mocks.storageState.settings = {
+            ...createBaseMockSettings(),
+            serverSelectionGroups: [],
+            serverSelectionActiveTargetKind: null,
+            serverSelectionActiveTargetId: null,
+        };
+        mocks.storageState.applySettingsLocal.mockReset();
+    });
+
+    it('applies local server-selection delta without adding pending sync keys', () => {
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                serverSelectionGroups: [
+                    { id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' },
+                ],
+                serverSelectionActiveTargetKind: 'group',
+                serverSelectionActiveTargetId: 'grp-dev',
+            },
+            settingsSecretsKey: null,
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+        });
+
+        expect(mocks.storageState.applySettingsLocal).toHaveBeenCalledTimes(1);
+        expect(setPendingSettings).not.toHaveBeenCalled();
+        expect(schedulePendingSettingsFlush).not.toHaveBeenCalled();
+    });
+
+    it('applies local terminal-connect compatibility delta without adding pending sync keys', () => {
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                terminalConnectLegacySecretExportEnabled: true,
+            },
+            settingsSecretsKey: null,
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+        });
+
+        expect(mocks.storageState.applySettingsLocal).toHaveBeenCalledTimes(1);
+        expect(setPendingSettings).not.toHaveBeenCalled();
+        expect(schedulePendingSettingsFlush).not.toHaveBeenCalled();
+    });
+
+    it('captures tracked account and derived setting changes before opting out of analytics', () => {
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                analyticsOptOut: true,
+                sessionListDensity: 'narrow',
+            },
+            settingsSecretsKey: null,
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+            source: 'ui',
+        });
+
+        expect(mocks.tracking.capture).toHaveBeenCalledWith(
+            'setting_changed',
+            expect.objectContaining({
+                setting_key: 'analyticsOptOut',
+                scope: 'account_setting',
+                identity_scope: 'person',
+                source: 'ui',
+                prev_value: false,
+                next_value: true,
+            }),
+        );
+        expect(mocks.tracking.capture).toHaveBeenCalledWith(
+            'setting_changed',
+            expect.objectContaining({
+                setting_key: 'compact_session_view_minimal',
+                scope: 'derived',
+                identity_scope: 'person',
+                source: 'ui',
+                prev_value: false,
+                next_value: true,
+            }),
+        );
+        expect(mocks.tracking.identify).toHaveBeenCalledWith('anon-user', {
+            acct_setting__analyticsOptOut: true,
+        });
+        expect(mocks.callSequence.indexOf('capture')).toBeGreaterThanOrEqual(0);
+        expect(mocks.callSequence.indexOf('identify')).toBeGreaterThanOrEqual(0);
+        expect(mocks.callSequence.indexOf('flush')).toBeGreaterThanOrEqual(0);
+        const finalOptOutIndex = mocks.callSequence.lastIndexOf('optOut');
+        expect(finalOptOutIndex).toBeGreaterThanOrEqual(0);
+        expect(mocks.callSequence.indexOf('capture')).toBeLessThan(finalOptOutIndex);
+        expect(mocks.callSequence.indexOf('identify')).toBeLessThan(finalOptOutIndex);
+        expect(mocks.callSequence.indexOf('flush')).toBeLessThan(finalOptOutIndex);
+    });
+
+    it('skips equal rebuilt object deltas without scheduling pending sync', () => {
+        mocks.storageState.settings = {
+            ...createBaseMockSettings(),
+            featureToggles: { 'zen.navigation': true },
+        };
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                featureToggles: { 'zen.navigation': true },
+            } as Partial<Settings>,
+            settingsSecretsKey: null,
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+        });
+
+        expect(mocks.storageState.applySettingsLocal).not.toHaveBeenCalled();
+        expect(setPendingSettings).not.toHaveBeenCalled();
+        expect(schedulePendingSettingsFlush).not.toHaveBeenCalled();
+    });
+
+    it('skips equal rebuilt empty array deltas without scheduling pending sync', () => {
+        mocks.storageState.settings = {
+            ...createBaseMockSettings(),
+            favoriteDirectories: [],
+        };
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                favoriteDirectories: [],
+            } as Partial<Settings>,
+            settingsSecretsKey: null,
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+        });
+
+        expect(mocks.storageState.applySettingsLocal).not.toHaveBeenCalled();
+        expect(setPendingSettings).not.toHaveBeenCalled();
+        expect(schedulePendingSettingsFlush).not.toHaveBeenCalled();
+    });
+
+    it('still schedules pending sync for a real nested object change', () => {
+        mocks.storageState.settings = {
+            ...createBaseMockSettings(),
+            featureToggles: { 'zen.navigation': false },
+        };
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                featureToggles: { 'zen.navigation': true },
+            } as Partial<Settings>,
+            settingsSecretsKey: null,
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+        });
+
+        expect(setPendingSettings).toHaveBeenCalledWith({ featureToggles: { 'zen.navigation': true } });
+        expect(schedulePendingSettingsFlush).toHaveBeenCalledTimes(1);
+    });
+
+    it('still schedules pending sync for explicit plaintext secret re-entry after sealing', () => {
+        mocks.storageState.settings = {
+            ...createBaseMockSettings(),
+            secrets: [
+                {
+                    id: 'sec1',
+                    name: 'API key',
+                    kind: 'apiKey',
+                    encryptedValue: { _isSecretValue: true, value: 'sk-test' },
+                    createdAt: 1,
+                    updatedAt: 1,
+                },
+            ],
+        };
+        const setPendingSettings = vi.fn();
+        const schedulePendingSettingsFlush = vi.fn();
+
+        applySettingsLocalDelta({
+            delta: {
+                secrets: [
+                    {
+                        id: 'sec1',
+                        name: 'API key',
+                        kind: 'apiKey',
+                        encryptedValue: { _isSecretValue: true, value: 'sk-test' },
+                        createdAt: 1,
+                        updatedAt: 2,
+                    },
+                ],
+            } as Partial<Settings>,
+            settingsSecretsKey: new Uint8Array(32).fill(5),
+            getPendingSettings: () => ({}),
+            setPendingSettings,
+            schedulePendingSettingsFlush,
+        });
+
+        expect(setPendingSettings).toHaveBeenCalledTimes(1);
+        const nextPending = setPendingSettings.mock.calls[0]?.[0] as Pick<Settings, 'secrets'>;
+        expect(nextPending.secrets?.[0]?.encryptedValue).toMatchObject({
+            _isSecretValue: true,
+            encryptedValue: expect.objectContaining({ t: 'enc-v1' }),
+        });
+        expect(schedulePendingSettingsFlush).toHaveBeenCalledTimes(1);
+    });
+
+});

@@ -1,0 +1,101 @@
+# Release assets E2E (Docker)
+
+Repeatable manual end-to-end smoke for validating:
+- `@happier-dev/stack` (`hstack`) can self-host + start a server
+- `@happier-dev/cli` (`happier`) can point at that server and pass `happier server test`
+- published Docker Hub images (`relay-server` + `dev-box`)
+
+This is meant for release validation and can run against:
+- real NPM dist-tags/versions (default)
+- locally packed tarballs (`yarn pack`) before publishing
+
+## Quick start (NPM `next`)
+
+From repo root:
+
+```bash
+./scripts/release/release-assets-e2e/run.sh
+```
+
+## Run via pipeline checks
+
+This is also wired into the pipeline checks runner:
+
+```bash
+node ./scripts/pipeline/run.mjs checks --profile release-assets
+```
+
+Defaults:
+- `HAPPIER_RELEASE_ASSETS_E2E_MODE=local`
+- `HAPPIER_RELEASE_ASSETS_E2E_MONOREPO=local` (when mode is `local`)
+- `HAPPIER_RELEASE_ASSETS_E2E_WITH_RELAY_UPGRADE=true` (upgrade existing server DB from Docker Hub image -> local build)
+
+## Local tarballs (pre-publish)
+
+```bash
+./scripts/release/release-assets-e2e/run.sh --mode=local
+```
+
+## Options
+
+- `--mode=npm|local` (default: `npm`)
+- `--stack-spec <npmSpec>` (default: `@happier-dev/stack@next`)
+- `--cli-spec <npmSpec>` (default: `@happier-dev/cli@next`)
+- `--cli-install=global|npx` (default: `global`)
+  - `global`: `npm install -g` inside the cli containers (catches packaging issues)
+  - `npx`: run via `npx -p <spec> happier ...` (useful if a dist-tag is temporarily broken for global installs)
+- `--keep` keep containers/volumes running after the run (useful for debugging)
+- `--timeout-s <seconds>` wait budget for first-time bootstrap/start (default: 1800)
+- `--monorepo=github|local` (default: `github`)
+  - `github`: hstack clones from GitHub (release-like)
+  - `local`: hstack clones from your local repo checkout mounted into Docker (read-only; includes your working tree, including uncommitted changes)
+- `--with-remote-daemon` / `--no-remote-daemon`
+  - In `--mode=local`, remote daemon smoke is enabled by default.
+  - This exercises `hstack remote daemon setup --ssh ...` against an sshd container and then starts the remote daemon.
+- `--with-remote-server` / `--no-remote-server`
+  - In `--mode=local`, remote server smoke is enabled by default.
+  - This exercises `hstack remote server setup --ssh ...` against a systemd-enabled ssh container and waits for the remote server to become healthy.
+- `--remote-server-db=postgres|sqlite` (default: `postgres`)
+  - When `postgres`, starts a Postgres container, passes `--env HAPPIER_DB_PROVIDER=postgres --env DATABASE_URL=...` to remote server setup, and verifies both a live server connection and at least one completed Prisma migration.
+- `--remote-installer=shim|official`
+  - `shim` (default in `--mode=local`): remote host overrides `curl https://happier.dev/install` to install from tarballs mounted at `/packs` (`cli.tgz` / `stack.tgz`).
+    - In `--mode=local` these tarballs come from `npm pack` on your working tree.
+    - In `--mode=npm` these tarballs come from `npm pack <spec>` (useful when the official installer is temporarily broken).
+  - `official` (default in `--mode=npm`): remote host uses the real installer at `https://happier.dev/install`.
+- `--remote-auth-mode=reuse-cli|bootstrap` (default: `reuse-cli`)
+  - `reuse-cli`: authenticates the remote daemon onto the exact same account as the already-authenticated `cli` smoke machine (uses its home volume).
+  - `bootstrap`: remote daemon smoke creates a separate local approver identity specifically to approve the remote machine pairing.
+- `--with-docker-images` / `--no-docker-images` (default: `off`)
+  - When enabled, also validates the published Docker Hub images:
+    - `happierdev/relay-server:<channel>` runs with SQLite by default and can be configured for Postgres.
+    - `happierdev/dev-box:<channel>` runs `happier` in a “preinstalled” mode against the relay server.
+- `--docker-channel=preview|stable` (default: `preview`)
+- `--docker-images-db=sqlite|postgres|both` (default: `both`)
+- `--with-relay-upgrade` / `--no-relay-upgrade` (default: `off`)
+  - Runs an upgrade test for `happierdev/relay-server:<channel>`:
+    - start the Docker Hub image (`from`)
+    - create real auth data in the DB (via `/v1/auth`)
+    - restart with a locally-built relay-server image from your current checkout (`to`)
+    - verify the old token still works after the upgrade
+- `--relay-upgrade-from-channel=preview|stable` (default: `--docker-channel` value)
+- `--relay-upgrade-db=sqlite|postgres|both` (default: `both`)
+
+## What it does
+
+1) Starts container `stack` and runs:
+- `hstack setup --profile=selfhost --non-interactive ... --no-start-now`
+- phase 1: `hstack start --no-daemon --no-ui --no-browser` (bring up server for auth bootstrap)
+- non-interactive auth bootstrap (creates an account via `/v1/auth`, then runs `happier auth request/approve/wait` to write credentials)
+- phase 2: `hstack start --no-browser` (server + UI + daemon)
+
+2) Runs container `cli` and validates:
+- `happier server set --server-url http://stack:3005 ...`
+- non-interactive auth bootstrap + `GET /v1/account/profile`
+- `happier server test` (probes `GET /v1/version`)
+- `happier daemon start` + `happier daemon status`
+
+If something fails, re-run with `--keep` and inspect logs:
+
+```bash
+docker compose -f ./scripts/release/release-assets-e2e/compose.yml logs -f stack
+```

@@ -1,0 +1,229 @@
+import { z } from "zod";
+
+import { checkSessionAccess, requireAccessLevel } from "@/app/share/accessControl";
+import { markSessionParticipantsChanged } from "@/app/session/changeTracking/markSessionParticipantsChanged";
+import { buildUpdateSessionUpdate, eventRouter } from "@/app/events/eventRouter";
+import { inTx } from "@/storage/inTx";
+import { didSessionActivityBadgeContributionChange } from "@/app/activity/accountActivityBadge";
+import { refreshSessionParticipantBadgePushes } from "@/app/activity/refreshAccountActivityBadgePushes";
+import { writeSessionRuntimeActivityProjectionInTx } from "@/app/session/runtimeActivity/writeProjection";
+import { randomKeyNaked } from "@/utils/keys/randomKeyNaked";
+import { type Fastify } from "../../types";
+
+export function registerSessionArchiveRoutes(app: Fastify) {
+    app.post("/v2/sessions/:sessionId/archive", {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({ sessionId: z.string() }),
+            response: {
+                200: z.object({ success: z.literal(true), archivedAt: z.number() }),
+                403: z.object({ error: z.literal("Forbidden") }),
+                404: z.object({ error: z.literal("Session not found") }),
+                409: z.object({ error: z.literal("session-active") }),
+            },
+        },
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+
+        const access = await checkSessionAccess(userId, sessionId);
+        if (!access || !requireAccessLevel(access, "admin")) {
+            return reply.code(403).send({ error: "Forbidden" });
+        }
+
+        const res = await inTx(async (tx) => {
+            const session = await tx.session.findUnique({
+                where: { id: sessionId },
+                select: {
+                    id: true,
+                    seq: true,
+                    pendingCount: true,
+                    pendingBlockedCount: true,
+                    lastViewedSessionSeq: true,
+                    pendingPermissionRequestCount: true,
+                    pendingUserActionRequestCount: true,
+                    active: true,
+                    archivedAt: true,
+                    runtimeActivityState: true,
+                    runtimeActivityActiveCount: true,
+                    runtimeActivityObservedAt: true,
+                    runtimeActivityRevision: true,
+                },
+            });
+            if (!session) {
+                return { ok: false as const, error: "not-found" as const };
+            }
+            if (session.active) {
+                return { ok: false as const, error: "session-active" as const };
+            }
+
+            const activityResult = await writeSessionRuntimeActivityProjectionInTx({
+                tx,
+                sessionId,
+                completeSnapshot: { state: "unknown", activeCount: 0 },
+            });
+            if (activityResult.status === "rejected") {
+                return { ok: false as const, error: "not-found" as const };
+            }
+            const updated = await tx.session.update({
+                where: { id: sessionId },
+                data: { archivedAt: new Date() },
+                select: { archivedAt: true },
+            });
+            const runtimeActivityProjection = activityResult.status === "applied"
+                ? {
+                    runtimeActivityState: activityResult.projection.state,
+                    runtimeActivityRevision: activityResult.projection.revision,
+                    runtimeActivityActiveCount: activityResult.projection.activeCount,
+                    runtimeActivityObservedAt: activityResult.projection.observedAt,
+                }
+                : {};
+
+            const participantCursors = await markSessionParticipantsChanged({ tx, sessionId });
+
+            const archivedAt = updated.archivedAt?.getTime();
+            if (!archivedAt) {
+                return { ok: false as const, error: "not-found" as const };
+            }
+            return {
+                ok: true as const,
+                archivedAt,
+                participantCursors,
+                badgeAttentionChanged: didSessionActivityBadgeContributionChange(session, {
+                    ...session,
+                    archivedAt: new Date(archivedAt),
+                    ...runtimeActivityProjection,
+                }),
+                runtimeActivityProjection,
+            };
+        });
+
+        if (!res.ok) {
+            if (res.error === "not-found") return reply.code(404).send({ error: "Session not found" });
+            if (res.error === "session-active") return reply.code(409).send({ error: "session-active" });
+            return reply.code(404).send({ error: "Session not found" });
+        }
+
+        await refreshSessionParticipantBadgePushes({
+            badgeAttentionChanged: res.badgeAttentionChanged,
+            participantCursors: res.participantCursors,
+        });
+        await Promise.all(res.participantCursors.map(async ({ accountId, cursor }) => {
+            const payload = buildUpdateSessionUpdate(
+                sessionId,
+                cursor,
+                randomKeyNaked(12),
+                undefined,
+                undefined,
+                { archivedAt: res.archivedAt, ...res.runtimeActivityProjection },
+            );
+            eventRouter.emitUpdate({
+                userId: accountId,
+                payload,
+                recipientFilter: { type: "all-interested-in-session", sessionId },
+            });
+        }));
+        return reply.send({ success: true, archivedAt: res.archivedAt });
+    });
+
+    app.post("/v2/sessions/:sessionId/unarchive", {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({ sessionId: z.string() }),
+            response: {
+                200: z.object({ success: z.literal(true), archivedAt: z.null() }),
+                403: z.object({ error: z.literal("Forbidden") }),
+                404: z.object({ error: z.literal("Session not found") }),
+            },
+        },
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+
+        const access = await checkSessionAccess(userId, sessionId);
+        if (!access || !requireAccessLevel(access, "admin")) {
+            return reply.code(403).send({ error: "Forbidden" });
+        }
+
+        const res = await inTx(async (tx) => {
+            const session = await tx.session.findUnique({
+                where: { id: sessionId },
+                select: {
+                    id: true,
+                    seq: true,
+                    pendingCount: true,
+                    pendingBlockedCount: true,
+                    lastViewedSessionSeq: true,
+                    pendingPermissionRequestCount: true,
+                    pendingUserActionRequestCount: true,
+                    active: true,
+                    archivedAt: true,
+                },
+            });
+            if (!session) {
+                return { ok: false as const };
+            }
+            if (session.archivedAt === null) {
+                return {
+                    ok: true as const,
+                    participantCursors: [],
+                    badgeAttentionChanged: false,
+                };
+            }
+
+            const transitioned = await tx.session.updateMany({
+                where: { id: sessionId, archivedAt: session.archivedAt },
+                data: { archivedAt: null },
+            });
+            if (transitioned.count !== 1) {
+                const current = await tx.session.findUnique({
+                    where: { id: sessionId },
+                    select: { archivedAt: true },
+                });
+                if (!current) return { ok: false as const };
+                if (current.archivedAt === null) {
+                    return {
+                        ok: true as const,
+                        participantCursors: [],
+                        badgeAttentionChanged: false,
+                    };
+                }
+                throw new Error("Concurrent session unarchive did not converge");
+            }
+            const participantCursors = await markSessionParticipantsChanged({ tx, sessionId });
+            return {
+                ok: true as const,
+                participantCursors,
+                badgeAttentionChanged: didSessionActivityBadgeContributionChange(session, {
+                    ...session,
+                    archivedAt: null,
+                }),
+            };
+        });
+
+        if (!res.ok) {
+            return reply.code(404).send({ error: "Session not found" });
+        }
+
+        await refreshSessionParticipantBadgePushes({
+            badgeAttentionChanged: res.badgeAttentionChanged,
+            participantCursors: res.participantCursors,
+        });
+        await Promise.all(res.participantCursors.map(async ({ accountId, cursor }) => {
+            const payload = buildUpdateSessionUpdate(
+                sessionId,
+                cursor,
+                randomKeyNaked(12),
+                undefined,
+                undefined,
+                { archivedAt: null },
+            );
+            eventRouter.emitUpdate({
+                userId: accountId,
+                payload,
+                recipientFilter: { type: "all-interested-in-session", sessionId },
+            });
+        }));
+        return reply.send({ success: true, archivedAt: null });
+    });
+}

@@ -1,0 +1,156 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import { verifyReactNativeEnrichedMarkdownPatch } from './verifyReactNativeEnrichedMarkdownPatch.mjs';
+import { repairReactNativeEnrichedMarkdownPatch } from './repairReactNativeEnrichedMarkdownPatch.mjs';
+
+const UI_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const PARSER_CACHE_DELETE_MARKER = 'parseCache.delete(cacheKey)';
+const EXPECTED_PARSER_CACHE_DELETE_OCCURRENCES = 4;
+
+function resolveInstalledPackageDir() {
+    try {
+        return path.dirname(createRequire(import.meta.url).resolve('react-native-enriched-markdown/package.json'));
+    } catch {
+        return path.join(UI_DIR, 'node_modules', 'react-native-enriched-markdown');
+    }
+}
+
+const INSTALLED_PACKAGE_DIR = resolveInstalledPackageDir();
+
+test('accepts the installed enriched-markdown patch after a document parse error', (t) => {
+    if (!fs.existsSync(INSTALLED_PACKAGE_DIR)) {
+        t.skip('react-native-enriched-markdown is not installed');
+        return;
+    }
+
+    assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir: INSTALLED_PACKAGE_DIR }), true);
+});
+
+test('DISCRIMINATES: losing one parser cache-cleanup branch fails verification', (t) => {
+    if (!fs.existsSync(INSTALLED_PACKAGE_DIR)) {
+        t.skip('react-native-enriched-markdown is not installed');
+        return;
+    }
+
+    const packageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enriched-markdown-patch-'));
+    t.after(() => fs.rmSync(packageDir, { recursive: true, force: true }));
+    fs.cpSync(INSTALLED_PACKAGE_DIR, packageDir, { recursive: true });
+
+    const parserPath = path.join(packageDir, 'lib', 'module', 'web', 'parseMarkdown.js');
+    const original = fs.readFileSync(parserPath, 'utf8');
+    assert.equal(
+        original.split(PARSER_CACHE_DELETE_MARKER).length - 1,
+        EXPECTED_PARSER_CACHE_DELETE_OCCURRENCES,
+        'the mutation basis must match the current patched parser',
+    );
+    const mutated = original.replace(
+        PARSER_CACHE_DELETE_MARKER,
+        'parseCache.delete(/* dropped cleanup branch */ cacheKey)',
+    );
+    assert.notEqual(mutated, original, 'the mutation must change the parser bytes');
+    fs.writeFileSync(parserPath, mutated, 'utf8');
+
+    assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir }), false);
+});
+
+test('DISCRIMINATES: restoring the obsolete global cache reset fails verification', (t) => {
+    if (!fs.existsSync(INSTALLED_PACKAGE_DIR)) {
+        t.skip('react-native-enriched-markdown is not installed');
+        return;
+    }
+
+    const packageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enriched-markdown-patch-'));
+    t.after(() => fs.rmSync(packageDir, { recursive: true, force: true }));
+    fs.cpSync(INSTALLED_PACKAGE_DIR, packageDir, { recursive: true });
+
+    const parserPath = path.join(packageDir, 'lib', 'module', 'web', 'parseMarkdown.js');
+    const original = fs.readFileSync(parserPath, 'utf8');
+    const mutated = original.replace(
+        '    throw error;',
+        '    parseCache.clear();\n    throw error;',
+    );
+    assert.notEqual(mutated, original, 'the mutation must change the parser bytes');
+    fs.writeFileSync(parserPath, mutated, 'utf8');
+
+    assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir }), false);
+});
+
+for (const scenario of ['missing streaming module', 'stale streaming renderer', 'stale native renderer ownership']) {
+    const repairable = scenario !== 'stale streaming renderer';
+    test(`${repairable ? 'repairs' : 'rejects incompatible'} ${scenario} when the remaining patch is already applied`, (t) => {
+        if (!fs.existsSync(INSTALLED_PACKAGE_DIR)) {
+            t.skip('react-native-enriched-markdown is not installed');
+            return;
+        }
+        assert.equal(
+            verifyReactNativeEnrichedMarkdownPatch({ packageDir: INSTALLED_PACKAGE_DIR }),
+            true,
+            'the installed package must provide a fully patched recovery fixture',
+        );
+
+        const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enriched-markdown-partial-repair-'));
+        t.after(() => fs.rmSync(fixtureDir, { recursive: true, force: true }));
+        const packageDir = path.join(fixtureDir, 'node_modules', 'react-native-enriched-markdown');
+        const fixturePatchDir = path.join(fixtureDir, 'patches');
+        fs.mkdirSync(path.dirname(packageDir), { recursive: true });
+        fs.mkdirSync(fixturePatchDir, { recursive: true });
+        fs.cpSync(INSTALLED_PACKAGE_DIR, packageDir, { recursive: true });
+        fs.copyFileSync(
+            path.join(UI_DIR, 'patches', 'react-native-enriched-markdown+0.5.0.patch'),
+            path.join(fixturePatchDir, 'react-native-enriched-markdown+0.5.0.patch'),
+        );
+        fs.writeFileSync(path.join(fixtureDir, 'package.json'), '{"name":"partial-repair-fixture","private":true}\n');
+        if (scenario === 'missing streaming module') {
+            fs.rmSync(path.join(packageDir, 'lib', 'module', 'web', 'streamingReveal.js'));
+        } else if (scenario === 'stale native renderer ownership') {
+            // A tracked patch update does not update an already installed dependency.
+            const rendererPath = path.join(packageDir, 'ios', 'renderer', 'StrongRenderer.m');
+            const current = fs.readFileSync(rendererPath, 'utf8');
+            const stale = current.replace('__weak RendererFactory *_rendererFactory;', 'RendererFactory *_rendererFactory;');
+            assert.notEqual(stale, current, 'the installed native renderer must include the ownership fix');
+            fs.writeFileSync(rendererPath, stale);
+        } else {
+            // The live mirror syncs tracked patches but excludes node_modules. Its old
+            // installed renderer still animated an overlapping old word and published
+            // a redundant async AST. Mutate each consumed build, preserving all other
+            // package hunks, to discriminate this previously accepted stale state.
+            const staleFiles = [];
+            for (const [relativePath, from, to] of [
+                ['src/web/EnrichedMarkdownText.tsx', '    if (syncAst) return;', ''],
+                ['lib/module/web/EnrichedMarkdownText.js', '    if (syncAst) return;', ''],
+                ['src/web/streamingReveal.ts', '.start <= start', '.start < end'],
+                ['lib/module/web/streamingReveal.js', '.start <= start', '.start < end'],
+            ]) {
+                const filePath = path.join(packageDir, relativePath);
+                const current = fs.readFileSync(filePath, 'utf8');
+                const stale = current.replace(from, to);
+                assert.notEqual(stale, current);
+                fs.writeFileSync(filePath, stale);
+                assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir }), false, relativePath);
+                fs.writeFileSync(filePath, current);
+                staleFiles.push([filePath, stale]);
+            }
+            for (const [filePath, stale] of staleFiles) fs.writeFileSync(filePath, stale);
+        }
+
+        assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir }), false);
+        assert.equal(
+            repairReactNativeEnrichedMarkdownPatch({
+                packageDir,
+                patchDir: fixturePatchDir,
+                patchPackageCliPath: path.join(UI_DIR, '..', '..', 'node_modules', 'patch-package', 'dist', 'index.js'),
+                label: 'test',
+            }),
+            repairable,
+        );
+        // Partial application can restore missing files, but cannot rebase an older
+        // overlapping patch. Never certify that stale installation as repaired.
+        assert.equal(verifyReactNativeEnrichedMarkdownPatch({ packageDir }), repairable);
+    });
+}

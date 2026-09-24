@@ -1,0 +1,186 @@
+import { test, expect, type Page } from '@playwright/test';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } from '../../src/testkit/uiE2e/cliTerminalConnect';
+import {
+  createSessionFromNewSessionComposer,
+  reloadCreatedSessionFromNewSessionComposer,
+} from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
+import { runCliJson } from '../../src/testkit/uiE2e/cliJson';
+import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
+import { waitForDaemonMachineIdFromCliSettings } from '../../src/testkit/uiE2e/daemonMachineId';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+test.describe('ui e2e: transcript small reconnect catch-up', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('session-transcript-catchup-small-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+  let daemon: StartedDaemon | null = null;
+
+  test.beforeAll(async () => {
+    test.setTimeout(resolveUiWebBeforeAllTimeoutMs(process.env));
+    await mkdir(cliHomeDir, { recursive: true });
+    await writeFile(resolve(join(cliHomeDir, 'AGENTS.md')), '# UI e2e fixture\n', 'utf8');
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
+      },
+    });
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...process.env,
+        EXPO_PUBLIC_DEBUG: '1',
+        EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
+        EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
+        // Large gap threshold set high so reconnect uses incremental catch-up (`afterSeq=`) instead of a tail reset snapshot.
+        EXPO_PUBLIC_HAPPIER_SYNC_TUNING_JSON: JSON.stringify({
+          messageLargeGapSeq: 100,
+          messageMaxIncrementalPagesOnResume: 3,
+          transcriptForwardPrefetchThresholdPx: 800,
+          messageCatchUpConcurrencyLimit: 1,
+          resumeConcurrencyLimit: 2,
+          bootstrapConcurrencyLimit: 3,
+          changesPageLimit: 200,
+        }),
+      },
+    });
+
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(120_000);
+    await daemon?.stop().catch(() => {});
+    await ui?.stop().catch(() => {});
+    await server?.stop().catch(() => {});
+  });
+
+  test('uses incremental afterSeq catch-up on reconnect when gap is small', async ({ page }) => {
+    test.setTimeout(540_000);
+    if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await gotoDomContentLoadedWithRetries(page, uiBaseUrl);
+
+    await ensureAccountReadyForConnect({ page, timeoutMs: 120_000 });
+
+    const testDir = resolve(join(suiteDir, 't1-reconnect-small'));
+    await mkdir(testDir, { recursive: true });
+
+    const cliLogin: StartedCliTerminalConnect = await startCliAuthLoginForTerminalConnect({
+      testDir,
+      cliHomeDir,
+      serverUrl: server.baseUrl,
+      webappUrl: uiBaseUrl,
+      env: {
+        ...process.env,
+        HOME: cliHomeDir,
+        CI: '1',
+        HAPPIER_DISABLE_CAFFEINATE: '1',
+        HAPPIER_VARIANT: 'dev',
+      },
+    });
+
+    await page.goto(cliLogin.connectUrl, { waitUntil: 'domcontentloaded' });
+    await expect(page.getByTestId('terminal-connect-approve')).toHaveCount(1, { timeout: 60_000 });
+    await page.getByTestId('terminal-connect-approve').click();
+    await cliLogin.waitForSuccess();
+    await cliLogin.stop().catch(() => {});
+
+    const fakeClaudeLogPath = resolve(join(testDir, 'fake-claude.jsonl'));
+    const fakeClaudePath = fakeClaudeFixturePath();
+
+    daemon = await startTestDaemon({
+      testDir,
+      happyHomeDir: cliHomeDir,
+      env: {
+        ...process.env,
+        HOME: cliHomeDir,
+        CI: '1',
+        HAPPIER_HOME_DIR: cliHomeDir,
+        HAPPIER_SERVER_URL: server.baseUrl,
+        HAPPIER_WEBAPP_URL: uiBaseUrl,
+        HAPPIER_DISABLE_CAFFEINATE: '1',
+        HAPPIER_VARIANT: 'dev',
+        HAPPIER_CLAUDE_PATH: fakeClaudePath,
+        HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+        HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+        HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+      },
+    });
+
+    const machineId = await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
+    const session = await createSessionFromNewSessionComposer({
+      page,
+      uiBaseUrl,
+      machineId,
+      prompt: 'hello small gap',
+      readiness: 'first-turn-reload-safe',
+    });
+    const { sessionId } = session;
+
+    await reloadCreatedSessionFromNewSessionComposer({ page, session });
+
+    const requests: Array<{ url: string; ts: number }> = [];
+    page.on('request', (req) => requests.push({ url: req.url(), ts: Date.now() }));
+
+    await expect(page.getByTestId('session-composer-input')).toHaveCount(1, { timeout: 120_000 });
+    await page.context().setOffline(true);
+    await page.waitForTimeout(500);
+
+    for (let i = 0; i < 5; i += 1) {
+      const message = `missed small gap ${i} ${run.runId}`;
+      const sendEnvelope = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: { ...process.env, HOME: cliHomeDir },
+        label: `session-send-missed-${i}`,
+        args: ['session', 'send', sessionId, message, '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(sendEnvelope.ok).toBe(true);
+      expect(sendEnvelope.kind).toBe('session_send');
+    }
+
+    const reconnectStart = Date.now();
+    await page.context().setOffline(false);
+
+    await expect
+      .poll(
+        async () => {
+          const after = requests.filter((r) => r.ts >= reconnectStart).map((r) => r.url);
+          const hasChanges = after.some((u) => u.includes('/v2/changes'));
+          const hasAfterSeq = after.some(
+            (u) => u.includes(`/v1/sessions/${sessionId}/messages?`) && u.includes('afterSeq='),
+          );
+          const hasSnapshot = after.some(
+            (u) => u.includes(`/v1/sessions/${sessionId}/messages`) && !u.includes('afterSeq='),
+          );
+          return { hasChanges, hasAfterSeq, hasSnapshot, after };
+        },
+        { timeout: 60_000 },
+      )
+      .toMatchObject({ hasChanges: true, hasAfterSeq: true, hasSnapshot: false });
+  });
+});

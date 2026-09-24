@@ -1,0 +1,66 @@
+import { describe, expect, it } from 'vitest';
+
+import type { Credentials } from '@/persistence';
+import { encryptStoredSessionPayload, resolveSessionEncryptionContextFromCredentials } from '@/session/transport/encryption/sessionEncryptionContext';
+
+import { resolveVendorResumeIdForExistingSession } from './resolveVendorResumeIdForExistingSession';
+
+describe('resolveVendorResumeIdForExistingSession', () => {
+  it('extracts vendor resume id for plaintext sessions without credentials', () => {
+    const rawSession = {
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({ flavor: 'codex', codexSessionId: 'vendor-plain-1' }),
+      dataEncryptionKey: null,
+    };
+
+    expect(resolveVendorResumeIdForExistingSession({ backendTarget: { kind: 'builtInAgent', agentId: 'codex' }, credentials: null, rawSession })).toBe('vendor-plain-1');
+  });
+
+  it('extracts vendor resume id for e2ee sessions using legacy credentials', () => {
+    const credentials: Credentials = {
+      token: 't',
+      encryption: {
+        type: 'legacy',
+        secret: new Uint8Array(32).fill(7),
+      },
+    };
+
+    const ctx = resolveSessionEncryptionContextFromCredentials(credentials);
+    const ciphertext = encryptStoredSessionPayload({
+      mode: 'e2ee',
+      ctx,
+      payload: { flavor: 'codex', codexSessionId: 'vendor-e2ee-1' },
+    });
+
+    const rawSession = {
+      encryptionMode: 'e2ee',
+      metadata: ciphertext,
+      dataEncryptionKey: null,
+    };
+
+    expect(resolveVendorResumeIdForExistingSession({ backendTarget: { kind: 'builtInAgent', agentId: 'codex' }, credentials, rawSession })).toBe('vendor-e2ee-1');
+  });
+
+  it('resolves configured ACP identity only for the exact configured backend target', () => {
+    const rawSession = {
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({
+        flavor: 'acp:misleading-flavor',
+        acpConfiguredBackendV1: { v: 1, updatedAt: 1, backendId: 'review-bot', title: 'Review Bot' },
+        customAcpSessionId: 'provider-session-1',
+      }),
+      dataEncryptionKey: null,
+    };
+
+    expect(resolveVendorResumeIdForExistingSession({
+      backendTarget: { kind: 'configuredAcpBackend', backendId: 'review-bot' },
+      credentials: null,
+      rawSession,
+    })).toBe('provider-session-1');
+    expect(resolveVendorResumeIdForExistingSession({
+      backendTarget: { kind: 'configuredAcpBackend', backendId: 'other-bot' },
+      credentials: null,
+      rawSession,
+    })).toBeNull();
+  });
+});

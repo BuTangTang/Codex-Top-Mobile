@@ -1,0 +1,141 @@
+import { ExecutionRunStatusSchema, type ExecutionRunStatus } from '@happier-dev/protocol';
+
+import type { ToolCall } from '@/sync/domains/messages/messageTypes';
+
+import type { SessionSubagentStatus } from '../types';
+
+/**
+ * Wire spellings written by older CLI lines for the same terminal outcomes. Explicit and closed:
+ * an unrecognised word is *not* a status, it falls through to the tool-call lifecycle below.
+ */
+const LEGACY_EXECUTION_RUN_STATUS_ALIASES: Readonly<Record<string, ExecutionRunStatus>> = {
+    completed: 'succeeded',
+    canceled: 'cancelled',
+    error: 'failed',
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
+}
+
+function parseJsonObject(value: string): Record<string, unknown> | null {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+    try {
+        return asRecord(JSON.parse(trimmed));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * The `SubAgentRun` tool result is a structured payload (`SubAgentRunResultV2Schema`) whose
+ * top-level `status` is written by the execution-run manager. Only that field is read.
+ *
+ * Compatibility, deliberately bounded: a result persisted as a JSON string (single top-level
+ * parse, escaped-quote tolerant) is still understood. Nothing else is inspected — no regex over
+ * prose and no walk into nested values, because a subagent writing about a status must never be
+ * able to set the run's status.
+ */
+function readExecutionRunResultRecord(result: unknown): Record<string, unknown> | null {
+    const record = asRecord(result);
+    if (record) return record;
+    if (typeof result === 'string') return parseJsonObject(result.replaceAll('\\"', '"'));
+    return null;
+}
+
+/**
+ * The status vocabulary is owned by the protocol schema, never re-declared here: a new member is
+ * accepted without a lockstep edit, and the mappings below stop compiling until it is given an
+ * explicit presentation meaning.
+ */
+export function readExecutionRunResultStatus(result: unknown): ExecutionRunStatus | null {
+    const status = readExecutionRunResultRecord(result)?.status;
+    if (typeof status !== 'string') return null;
+    const normalized = status.trim().toLowerCase();
+    const parsed = ExecutionRunStatusSchema.safeParse(normalized);
+    if (parsed.success) return parsed.data;
+    return LEGACY_EXECUTION_RUN_STATUS_ALIASES[normalized] ?? null;
+}
+
+export function mapExecutionRunStatusToSubagentStatus(status: ExecutionRunStatus): SessionSubagentStatus {
+    switch (status) {
+        case 'running':
+            return 'running';
+        case 'succeeded':
+            return 'succeeded';
+        case 'failed':
+            return 'failed';
+        case 'cancelled':
+            return 'cancelled';
+        // A timed-out run is neither a success (it produced nothing) nor a plain failure
+        // (the recovery is a larger budget, not reading an error).
+        case 'timeout':
+            return 'timedOut';
+    }
+}
+
+export function mapSubagentStatusToExecutionRunStatus(status: SessionSubagentStatus): ExecutionRunStatus | null {
+    switch (status) {
+        case 'running':
+            return 'running';
+        case 'succeeded':
+            return 'succeeded';
+        case 'failed':
+            return 'failed';
+        case 'cancelled':
+            return 'cancelled';
+        case 'timedOut':
+            return 'timeout';
+        // Not execution-run outcomes: `terminated` belongs to the Claude teammate vocabulary and
+        // `unknown` means the transcript never carried a status.
+        case 'terminated':
+        case 'unknown':
+            return null;
+    }
+}
+
+export function isTerminalSubagentStatus(status: SessionSubagentStatus): boolean {
+    return status === 'succeeded'
+        || status === 'failed'
+        || status === 'timedOut'
+        || status === 'cancelled'
+        || status === 'terminated';
+}
+
+/**
+ * A `SubAgentRun` call the parent turn interrupted leaves an abort placeholder rather than a run
+ * outcome; it is ambiguous, not failed, so external/liveness evidence may still upgrade it.
+ *
+ * Module-private on purpose. Surfaces that need this answer ask
+ * `deriveTranscriptExecutionRunStatus` instead of re-testing the marker, so the precedence between
+ * a reported status and this placeholder is decided once. When `SubAgentRunView` held its own copy,
+ * the two drifted apart on the `completed` lifecycle state and the same run rendered as finished on
+ * one surface while the store still called it open — silently, because each copy was locally
+ * plausible.
+ */
+function valueHasRequestInterruptedSignal(value: unknown, depth = 0): boolean {
+    if (depth > 5 || value == null) return false;
+    if (typeof value === 'string') return value.replaceAll('\\"', '"').toLowerCase().includes('request interrupted');
+    if (Array.isArray(value)) return value.some((item) => valueHasRequestInterruptedSignal(item, depth + 1));
+    if (typeof value === 'object') {
+        return Object.values(value as Record<string, unknown>).some((item) => valueHasRequestInterruptedSignal(item, depth + 1));
+    }
+    return false;
+}
+
+export function deriveTranscriptExecutionRunStatus(tool: ToolCall): SessionSubagentStatus {
+    const resultStatus = readExecutionRunResultStatus(tool.result);
+    if (tool.state === 'running' || resultStatus === 'running') return 'running';
+    if (resultStatus) return mapExecutionRunStatusToSubagentStatus(resultStatus);
+    // Below the reported status, above the lifecycle arms. An interrupted parent turn closes the
+    // outer call with an abort placeholder and no run outcome, and the lifecycle state it lands on
+    // is not ours to choose: `completed` carries the same placeholder as `error`, where the success
+    // arm below would turn an interruption marker into a fabricated `succeeded`.
+    if (valueHasRequestInterruptedSignal(tool.result)) return 'unknown';
+    if (tool.state === 'error') return 'failed';
+    if (tool.state === 'completed') return 'succeeded';
+    return 'unknown';
+}

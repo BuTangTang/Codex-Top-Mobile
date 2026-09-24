@@ -1,0 +1,10 @@
+Claude Code v2.1.170
+
+/permissions
+
+Permission rules
+  Allow  Bash(npm run test:*)
+  Allow  Read(./src/**)
+  Deny   Read(./.env)
+
+Press esc to close

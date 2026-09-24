@@ -1,0 +1,200 @@
+import { z } from 'zod';
+import {
+  AcpConfigOptionOverridesV1Schema,
+  AgentRuntimeDescriptorV1Schema,
+  ConnectedServiceMaterializationIdentityV1Schema,
+  PendingFirstInputV1Schema,
+  SessionInitialGoalRequestV1Schema,
+  SessionAttachMetadataIdentityPolicySchema,
+  SessionMcpSelectionV1Schema,
+  SessionSpawnSourceContextV1Schema,
+  SpawnSessionExecutionAuthorizationSchema,
+} from '@happier-dev/protocol';
+
+import { PERMISSION_MODES } from '@/api/types';
+import { CATALOG_AGENT_IDS, type CatalogAgentId } from '@/backends/types';
+import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
+import { resolveCanonicalCodexBackendMode } from './codexBackendMode';
+
+import type { SpawnSessionOptions } from './registerSessionHandlers';
+
+function asNonEmptyStringTuple<T extends string>(values: readonly T[]): [T, ...T[]] {
+  if (values.length === 0) {
+    throw new Error('Expected non-empty string tuple');
+  }
+  return values as [T, ...T[]];
+}
+
+export const SpawnSessionPermissionModeSchema = z.enum(asNonEmptyStringTuple(PERMISSION_MODES));
+const SpawnBackendTargetSchema = z.union([
+  z.object({
+    kind: z.literal('builtInAgent'),
+    agentId: z.enum(asNonEmptyStringTuple(CATALOG_AGENT_IDS as readonly CatalogAgentId[])),
+  }),
+  z.object({
+    kind: z.literal('configuredAcpBackend'),
+    backendId: z.string().trim().min(1),
+  }),
+]);
+export const SpawnSessionTerminalSchema = z.object({
+  mode: z.enum(['plain', 'tmux', 'windows_terminal', 'windows_console']).optional(),
+  tmux: z.object({
+    sessionName: z.string().optional(),
+    isolated: z.boolean().optional(),
+    tmpDir: z.union([z.string(), z.null()]).optional(),
+  }).optional(),
+});
+
+export { SpawnSessionExecutionAuthorizationSchema };
+
+const SpawnDaemonSessionRequestCompatSchema = z.object({
+  directory: z.string(),
+  machineId: z.string().trim().min(1).optional(),
+  spawnNonce: z.string().trim().min(1).optional(),
+  accountSettingsVersionHint: z.number().int().min(0).optional(),
+  pendingFirstInput: PendingFirstInputV1Schema.optional(),
+  sessionId: z.string().trim().min(1).optional(),
+  existingSessionId: z.string().trim().min(1).optional(),
+  initialTranscriptAfterSeq: z.number().int().min(0).optional(),
+  executionAuthorization: SpawnSessionExecutionAuthorizationSchema.optional(),
+  initialGoal: SessionInitialGoalRequestV1Schema.optional(),
+  attachMetadataIdentityPolicy: SessionAttachMetadataIdentityPolicySchema.optional(),
+  approvedNewDirectoryCreation: z.boolean().optional(),
+  resume: z.string().trim().min(1).optional(),
+  experimentalCodexAcp: z.boolean().optional(),
+  codexBackendMode: z.enum(['mcp', 'acp', 'appServer']).optional(),
+  agentRuntimeDescriptorV1: AgentRuntimeDescriptorV1Schema.optional(),
+  permissionMode: SpawnSessionPermissionModeSchema.optional(),
+  permissionModeUpdatedAt: z.number().int().optional(),
+  agentModeId: z.string().refine((value) => value.trim().length > 0, {
+    message: 'Agent mode ID must not be blank',
+  }).optional(),
+  agentModeUpdatedAt: z.number().int().optional(),
+  modelId: z.string().optional(),
+  modelUpdatedAt: z.number().int().optional(),
+  sessionConfigOptionOverrides: AcpConfigOptionOverridesV1Schema.optional(),
+  backendTarget: SpawnBackendTargetSchema.optional(),
+  terminal: SpawnSessionTerminalSchema.optional(),
+  windowsRemoteSessionLaunchMode: z.enum(['hidden', 'windows_terminal', 'console']).optional(),
+  windowsRemoteSessionConsole: z.enum(['hidden', 'visible']).optional(),
+  windowsTerminalWindowName: z.string().optional(),
+  profileId: z.string().optional(),
+  environmentVariables: z.record(z.string(), z.string()).optional(),
+  connectedServices: z.unknown().optional(),
+  connectedServicesUpdatedAt: z.number().int().optional(),
+  connectedServiceMaterializationIdentityV1: ConnectedServiceMaterializationIdentityV1Schema.optional(),
+  mcpSelection: SessionMcpSelectionV1Schema.optional(),
+  transcriptStorage: z.enum(['persisted', 'direct']).optional(),
+  /**
+   * Typed source recipe for a Replay-seeded child.
+   *
+   * Declared here so the machine-RPC creation ingress carries it instead of
+   * stripping it: this schema is a plain `z.object`, and an undeclared field
+   * would be dropped silently, producing an ordinary blank Session that reports
+   * success. Honouring it is required semantics — the daemon resolves the seed
+   * before creating the child and creates no child on failure.
+   */
+  sourceContext: SessionSpawnSourceContextV1Schema.optional(),
+});
+
+type SpawnDaemonSessionRequestCompat = z.output<typeof SpawnDaemonSessionRequestCompatSchema>;
+type SpawnDaemonSessionRequestOutput = Omit<SpawnDaemonSessionRequestCompat, 'experimentalCodexAcp' | 'codexBackendMode'> & {
+  codexBackendMode?: SpawnSessionOptions['codexBackendMode'];
+};
+
+export const SpawnDaemonSessionRequestSchema = SpawnDaemonSessionRequestCompatSchema.transform((request): SpawnDaemonSessionRequestOutput => {
+  const { experimentalCodexAcp: _experimentalCodexAcp, codexBackendMode, ...rest } = request;
+  const canonicalCodexBackendMode = resolveCanonicalCodexBackendMode({
+    codexBackendMode,
+    experimentalCodexAcp: _experimentalCodexAcp,
+    agentRuntimeDescriptorV1: request.agentRuntimeDescriptorV1,
+  });
+
+  return {
+    ...rest,
+    ...(canonicalCodexBackendMode ? { codexBackendMode: canonicalCodexBackendMode } : {}),
+  };
+});
+
+export type SpawnDaemonSessionRequest = z.infer<typeof SpawnDaemonSessionRequestSchema>;
+
+export function normalizeSpawnSessionDirectory(
+  directory: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const trimmed = directory.trim();
+  if (!trimmed) {
+    return '';
+  }
+  return expandHomeDirPath(trimmed, env);
+}
+
+const SPAWN_SESSION_OPTION_KEYS = [
+  'machineId',
+  'directory',
+  'spawnNonce',
+  'accountSettingsVersionHint',
+  'pendingFirstInput',
+  'sessionId',
+  'resume',
+  'codexBackendMode',
+  'agentRuntimeDescriptorV1',
+  'existingSessionId',
+  'initialTranscriptAfterSeq',
+  'executionAuthorization',
+  'initialGoal',
+  'attachMetadataIdentityPolicy',
+  'permissionMode',
+  'permissionModeUpdatedAt',
+  'agentModeId',
+  'agentModeUpdatedAt',
+  'modelId',
+  'modelUpdatedAt',
+  'sessionConfigOptionOverrides',
+  'approvedNewDirectoryCreation',
+  'backendTarget',
+  'terminal',
+  'windowsRemoteSessionLaunchMode',
+  'windowsRemoteSessionConsole',
+  'windowsTerminalWindowName',
+  'profileId',
+  'environmentVariables',
+  'connectedServices',
+  'connectedServicesUpdatedAt',
+  'connectedServiceMaterializationIdentityV1',
+  'materializationDiagnostics',
+  'mcpSelection',
+  'transcriptStorage',
+] as const satisfies readonly (keyof SpawnSessionOptions)[];
+
+type SpawnSessionOptionKey = (typeof SPAWN_SESSION_OPTION_KEYS)[number];
+
+export function pickDefinedSpawnSessionOptions(options: Partial<SpawnSessionOptions>): Partial<SpawnSessionOptions> {
+  const result: Partial<SpawnSessionOptions> = {};
+
+  for (const key of SPAWN_SESSION_OPTION_KEYS) {
+    const value = options[key];
+    if (value !== undefined) {
+      (result as Record<SpawnSessionOptionKey, unknown>)[key] = value;
+    }
+  }
+
+  return result;
+}
+
+export function mergeSpawnSessionOptions(
+  options: Partial<SpawnSessionOptions>,
+  overrides: Partial<SpawnSessionOptions> = {},
+  params: { omit?: readonly SpawnSessionOptionKey[] } = {},
+): Partial<SpawnSessionOptions> {
+  const result = pickDefinedSpawnSessionOptions(options);
+
+  for (const key of params.omit ?? []) {
+    delete result[key];
+  }
+
+  return {
+    ...result,
+    ...pickDefinedSpawnSessionOptions(overrides),
+  };
+}

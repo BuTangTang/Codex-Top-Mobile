@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    "paths": {
+      "@/*": ["../../apps/cli/src/*"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.d.ts",
+    "src/**/*.d.mts",
+    "src/**/*.d.cts",
+    "suites/**/*.ts",
+    "scripts/**/*.d.ts",
+    "scripts/**/*.d.mts",
+    "scripts/**/*.d.cts",
+    "vitest.*.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

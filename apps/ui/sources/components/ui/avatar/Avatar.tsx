@@ -1,0 +1,132 @@
+import * as React from "react";
+import { View } from "react-native";
+import { Image } from "expo-image";
+import { AgentIcon } from '@/agents/registry/AgentIcon';
+import { useSetting } from '@/sync/domains/state/storage';
+import { StyleSheet } from 'react-native-unistyles';
+import { shadowLevelStyle } from '@/shadowElevation';
+import { getGeneratedAvatarComponentForStyle } from './avatarComponentRegistry';
+import { normalizeAvatarStyleId } from './avatarStyleOptions';
+import {
+    DEFAULT_AGENT_ID,
+    resolveAgentIdFromFlavor,
+    getAgentAvatarOverlaySizes,
+} from '@/agents/catalog/catalog';
+
+interface AvatarProps {
+    id: string;
+    title?: boolean;
+    square?: boolean;
+    size?: number;
+    monochrome?: boolean;
+    flavor?: string | null;
+    imageUrl?: string | null;
+    thumbhash?: string | null;
+    hasUnreadMessages?: boolean;
+}
+
+const styles = StyleSheet.create((theme) => ({
+    container: {
+        position: 'relative',
+    },
+    flavorIcon: {
+        position: 'absolute',
+        bottom: -2,
+        right: -2,
+        backgroundColor: theme.colors.surface.base,
+        borderRadius: 100,
+        padding: 2,
+        ...shadowLevelStyle(theme.colors.shadowLevels[2]),
+    },
+    unreadBadge: {
+        position: 'absolute',
+        top: -2,
+        left: -2,
+        backgroundColor: theme.colors.text.link,
+        borderRadius: 100,
+        borderWidth: 1.5,
+        borderColor: theme.colors.surface.base,
+    },
+}));
+
+export const Avatar = React.memo((props: AvatarProps) => {
+    const { flavor, size = 48, imageUrl, thumbhash, hasUnreadMessages, ...avatarProps } = props;
+    const avatarStyle = useSetting('avatarStyle');
+    const showFlavorIcons = useSetting('showFlavorIcons');
+
+    const agentId = resolveAgentIdFromFlavor(flavor);
+
+    const unreadBadgeSize = Math.round(size * 0.4);
+    const unreadBadgeElement = hasUnreadMessages ? (
+        <View style={[styles.unreadBadge, { width: unreadBadgeSize, height: unreadBadgeSize }]} />
+    ) : null;
+
+    // Render custom image if provided
+    if (imageUrl) {
+        const imageElement = (
+            <Image
+                source={{ uri: imageUrl, thumbhash: thumbhash || undefined }}
+                placeholder={thumbhash ? { thumbhash: thumbhash } : undefined}
+                contentFit="cover"
+                style={{
+                    width: size,
+                    height: size,
+                    borderRadius: avatarProps.square ? 0 : size / 2,
+                }}
+            />
+        );
+
+        const showFlavorOverlay = Boolean(showFlavorIcons && agentId);
+        if (showFlavorOverlay || hasUnreadMessages) {
+            const iconAgentId = agentId ?? DEFAULT_AGENT_ID;
+            const { circleSize, iconSize } = getAgentAvatarOverlaySizes(iconAgentId, size);
+
+            return (
+                <View style={[styles.container, { width: size, height: size }]}>
+                    {imageElement}
+                    {showFlavorOverlay && (
+                        <View style={[styles.flavorIcon, {
+                            width: circleSize,
+                            height: circleSize,
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                        }]}>
+                            <AgentIcon agentId={iconAgentId} size={iconSize} />
+                        </View>
+                    )}
+                    {unreadBadgeElement}
+                </View>
+            );
+        }
+
+        return imageElement;
+    }
+
+    const displayAvatarStyle = normalizeAvatarStyleId(avatarStyle);
+    const AvatarComponent = getGeneratedAvatarComponentForStyle(displayAvatarStyle);
+
+    const iconAgentId = agentId ?? DEFAULT_AGENT_ID;
+    const { circleSize, iconSize } = getAgentAvatarOverlaySizes(iconAgentId, size);
+
+    if (showFlavorIcons || hasUnreadMessages) {
+        return (
+            <View style={[styles.container, { width: size, height: size }]}>
+                <AvatarComponent {...avatarProps} size={size} styleId={displayAvatarStyle} />
+                {showFlavorIcons && (
+                    <View style={[styles.flavorIcon, {
+                        width: circleSize,
+                        height: circleSize,
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                    }]}>
+                        <AgentIcon agentId={iconAgentId} size={iconSize} />
+                    </View>
+                )}
+                {unreadBadgeElement}
+            </View>
+        );
+    }
+
+    // Return avatar without wrapper when not showing flavor icons
+    return <AvatarComponent {...avatarProps} size={size} styleId={displayAvatarStyle} />;
+});

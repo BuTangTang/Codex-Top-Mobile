@@ -1,0 +1,222 @@
+/**
+ * Default Transport Handler
+ *
+ * Basic implementation of TransportHandler with reasonable defaults.
+ * Use this for agents that don't need special filtering or error handling.
+ *
+ * @module DefaultTransport
+ */
+
+import type {
+  TransportHandler,
+  ToolPattern,
+  StderrContext,
+  StderrResult,
+  ToolNameContext,
+} from './TransportHandler';
+import type { AgentMessage } from '@/agent/core';
+import { filterJsonObjectOrArrayLine } from './utils/jsonStdoutFilter';
+import { redactBugReportSensitiveText } from '@happier-dev/protocol';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
+
+/**
+ * Default timeout values (in milliseconds)
+ */
+const DEFAULT_TIMEOUTS = {
+  /** Default initialization timeout: 60 seconds */
+  init: 60_000,
+} as const;
+
+/**
+ * Default transport handler implementation.
+ *
+ * Provides:
+ * - 60s init timeout
+ * - No stdout filtering (pass through all lines)
+ * - Basic stderr logging (no special error detection)
+ * - Empty tool patterns (no special tool name extraction)
+ * - No generic tool-call deadline; provider transports may declare one
+ */
+export class DefaultTransport implements TransportHandler {
+  readonly agentName: string;
+
+  constructor(agentName: string = 'generic-acp') {
+    this.agentName = agentName;
+  }
+
+  /**
+   * Default init timeout: 60 seconds
+   */
+  getInitTimeout(): number {
+    return DEFAULT_TIMEOUTS.init;
+  }
+
+  /**
+   * Default: pass through all lines that are valid JSON objects/arrays
+   */
+  filterStdoutLine(line: string): string | null {
+    return filterJsonObjectOrArrayLine(line);
+  }
+
+  /**
+   * Default: no special stderr handling
+   */
+  handleStderr(text: string, context: StderrContext): StderrResult {
+    const trimmed = text.trim();
+    if (!trimmed) return { message: null, suppress: true };
+
+    const lower = trimmed.toLowerCase();
+    const outputFailure = classifyProviderOutputFailure(trimmed);
+
+    // During long-running investigations, keep stderr as diagnostics but avoid noisy UI errors.
+    if (context.hasActiveInvestigation) {
+      return { message: null, suppress: false };
+    }
+
+    // Rate limits are useful diagnostics and may be retried by the agent.
+    if (trimmed.includes('429') || lower.includes('rate limit') || lower.includes('rate_limit')) {
+      return { message: null, suppress: false };
+    }
+
+    // Authentication errors - surface an actionable message.
+    //
+    // Be conservative: stderr may contain unrelated text that mentions "authentication" or "API keys"
+    // (e.g. documentation snippets, prompts, or structured payloads). Prefer common error phrasing
+    // and status-code signals instead of raw substring matches.
+    if (outputFailure.authenticationError) {
+      const message: AgentMessage = {
+        type: 'status',
+        status: 'error',
+        detail: 'Authentication error. Configure your provider CLI credentials, then retry.',
+      };
+      return { message };
+    }
+
+    // Model not found - common across many ACP CLIs/providers.
+    if (lower.includes('model not found') || lower.includes('unknown model') || lower.includes('providermodelnotfounderror')) {
+      const message: AgentMessage = {
+        type: 'status',
+        status: 'error',
+        detail: 'Model not found. Check available models in your provider CLI, then retry.',
+      };
+      return { message };
+    }
+
+    const redacted = redactBugReportSensitiveText(trimmed);
+    const detail = redacted.length > 500 ? `${redacted.slice(0, 500)}…` : redacted;
+
+    const looksLikeCliInvocationError =
+      lower.startsWith('error:') ||
+      lower.includes('unknown flag') ||
+      lower.includes('unknown option') ||
+      lower.includes('unrecognized option') ||
+      lower.includes('unknown argument') ||
+      lower.includes('flag provided but not defined') ||
+      lower.includes('invalid value') ||
+      lower.includes('invalid argument') ||
+      lower.includes('unknown command');
+
+    const looksLikeNetworkError =
+      lower.includes('unable to connect') ||
+      lower.includes('connectionrefused') ||
+      lower.includes('connection refused') ||
+      lower.includes('econnrefused') ||
+      lower.includes('fetch failed') ||
+      lower.includes('network error') ||
+      lower.includes('socket hang up');
+
+    const looksLikeProviderRequestError =
+      lower.includes('invalid_request_error') ||
+      lower.includes('apierror') ||
+      lower.includes('statuscode') ||
+      lower.includes('request failed') ||
+      lower.includes('bad request') ||
+      outputFailure.providerStatusFailure;
+
+    const looksLikeStackOrException =
+      lower.includes('exception') ||
+      lower.includes('traceback') ||
+      lower.includes('stack trace');
+
+    if (looksLikeCliInvocationError || looksLikeNetworkError || looksLikeProviderRequestError || looksLikeStackOrException) {
+      const message: AgentMessage = {
+        type: 'status',
+        status: 'error',
+        detail,
+      };
+      return { message, suppress: false };
+    }
+
+    return { message: null, suppress: false };
+  }
+
+  /**
+   * Default: no special tool patterns
+   */
+  getToolPatterns(): ToolPattern[] {
+    return [];
+  }
+
+  /**
+   * Default: no investigation tools
+   */
+  isInvestigationTool(_toolCallId: string, _toolKind?: string): boolean {
+    return false;
+  }
+
+  /**
+   * Generic ACP has no provider-owned evidence that a tool is stuck. Callers
+   * remain cancellable, while providers with a real deadline override this.
+   */
+  getToolCallTimeout(_toolCallId: string, _toolKind?: string): number | null {
+    return null;
+  }
+
+  /**
+   * Default: no tool name extraction (return null)
+   */
+  extractToolNameFromId(_toolCallId: string): string | null {
+    return null;
+  }
+
+  /**
+   * Default: return original tool name (no special detection)
+   */
+  determineToolName(
+    toolName: string,
+    _toolCallId: string,
+    _input: Record<string, unknown>,
+    _context: ToolNameContext
+  ): string {
+    return toolName;
+  }
+
+  /**
+   * Default: no special pre-tool idle window (falls back to standard idle timeout handling).
+   */
+  getPreToolCallIdleTimeoutMs(): number | undefined {
+    return undefined;
+  }
+
+  /** Default: admit every provider tool update. */
+  shouldProcessToolUpdate<T extends { toolCallId?: unknown; status?: unknown }>(
+    _update: T,
+    _context: Readonly<{ source: 'tool_call' | 'tool_call_update' }>,
+  ): boolean {
+    return true;
+  }
+
+  /**
+   * Default: no provider-specific content fixups. Provider transports override this to repair
+   * payload quirks (e.g. Cursor's diff header noise) before the generic normalizer reads them.
+   */
+  sanitizeToolUpdateContent<T extends { content?: unknown }>(update: T): T {
+    return update;
+  }
+
+}
+
+/**
+ * Singleton instance for convenience
+ */
+export const defaultTransport = new DefaultTransport();

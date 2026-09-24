@@ -1,0 +1,251 @@
+import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
+import { RPC_ERROR_CODES, RPC_METHODS, SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { readRpcErrorCode } from '@happier-dev/protocol/rpcErrors';
+
+import { createRpcCallError } from '@/sync/runtime/rpcErrors';
+import { apiSocket } from '@/sync/api/session/apiSocket';
+import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
+import { recordCachedMachineRpcDirectRouteViable } from '@/sync/domains/transfers/runtime/transferRouteCache';
+import { createEphemeralServerSocketClient } from '@/sync/runtime/orchestration/serverScopedRpc/createEphemeralServerSocketClient';
+import { resolveServerScopedContext } from '@/sync/runtime/orchestration/serverScopedRpc/resolveServerScopedContext';
+import { resolveScopedMachineDataKey } from '@/sync/runtime/orchestration/serverScopedRpc/serverScopedRpcPool';
+import {
+    MACHINE_ENCRYPT_RAW_ATTRIBUTION_EVENTS,
+    measureMachineEncryptRawAttribution,
+    type MachineEncryptRawAttributionEventName,
+} from '@/sync/encryption/machineEncryption';
+import { delay } from '@/utils/timing/time';
+
+import type { ServerScopedMachineRpcParams, SocketRpcResult } from './serverScopedRpcTypes';
+import {
+    MACHINE_RPC_TIMEOUT_ERROR_CODE,
+    isMachineRpcTimeoutError,
+} from './machineRpcTimeoutError';
+
+const SCOPED_MACHINE_RPC_SESSION_WRITE_METHODS = new Set<string>([
+    RPC_METHODS.SPAWN_HAPPY_SESSION,
+    RPC_METHODS.SESSION_CONTINUE_WITH_REPLAY,
+    RPC_METHODS.SESSION_FORK,
+    RPC_METHODS.DAEMON_SESSION_GOAL_SET,
+    RPC_METHODS.DAEMON_SESSION_GOAL_CLEAR,
+    SESSION_RPC_METHODS.SESSION_ROLLBACK,
+]);
+
+function normalizeId(raw: unknown): string {
+    return String(raw ?? '').trim();
+}
+
+function resolveScopedMachineRpcEncryptRawAttributionEvent(method: string): MachineEncryptRawAttributionEventName {
+    return SCOPED_MACHINE_RPC_SESSION_WRITE_METHODS.has(method)
+        ? MACHINE_ENCRYPT_RAW_ATTRIBUTION_EVENTS.scopedRpcSessionWrite
+        : MACHINE_ENCRYPT_RAW_ATTRIBUTION_EVENTS.scopedRpcOther;
+}
+
+type MachineRpcTimeoutScope = 'active' | 'scoped';
+
+function createMachineRpcTimeoutError(params: Readonly<{
+    scope: MachineRpcTimeoutScope;
+    method: string;
+    timeoutMs: number;
+}>): Error {
+    const error = new Error(
+        `Machine RPC timed out after ${params.timeoutMs}ms while using ${params.scope} scope for ${params.method}`,
+    );
+    Object.assign(error, { code: MACHINE_RPC_TIMEOUT_ERROR_CODE });
+    return error;
+}
+
+function normalizeScopedMachineRpcEncryptedResult(value: unknown): string {
+    const unwrapped = Array.isArray(value) && value.length === 1 ? value[0] : value;
+    if (typeof unwrapped === 'string') return unwrapped;
+    throw createRpcCallError({
+        error: 'Invalid scoped machine RPC response',
+        errorCode: 'invalid_scoped_machine_rpc_response',
+    });
+}
+
+async function withMachineRpcTimeout<T>(
+    promise: Promise<T>,
+    params: Readonly<{
+        scope: MachineRpcTimeoutScope;
+        method: string;
+        timeoutMs: number;
+    }>,
+): Promise<T> {
+    if (!(params.timeoutMs > 0)) {
+        return await promise;
+    }
+    return await new Promise<T>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            reject(createMachineRpcTimeoutError(params));
+        }, params.timeoutMs);
+        promise.then(
+            (value) => {
+                clearTimeout(timeoutId);
+                resolve(value);
+            },
+            (error) => {
+                clearTimeout(timeoutId);
+                reject(error);
+            },
+        );
+    });
+}
+
+function shouldFallbackToScopedMachineRpc(error: unknown): boolean {
+    const rpcErrorCode = readRpcErrorCode(error);
+    if (rpcErrorCode === RPC_ERROR_CODES.METHOD_NOT_AVAILABLE) return true;
+    if (isMachineRpcTimeoutError(error)) return true;
+    if (!(error instanceof Error)) return false;
+    return error.message.includes('Machine encryption not found')
+        || error.message.includes('Socket not connected');
+}
+
+export async function machineRpcWithServerScope<R, A>(params: ServerScopedMachineRpcParams<A>): Promise<R> {
+    let exactIssuanceAttempted = false;
+    const onIssued = params.onIssued
+        ? () => {
+            exactIssuanceAttempted = true;
+            params.onIssued?.();
+        }
+        : undefined;
+    const runOnce = async (options?: { forceScoped?: boolean }): Promise<R> => {
+        const context = await resolveServerScopedContext({
+            machineId: params.machineId,
+            serverId: params.serverId,
+            forceScoped: options?.forceScoped === true || params.preferScoped === true,
+            timeoutMs: params.timeoutMs,
+        });
+
+        if (context.scope === 'active' && params.preferScoped !== true) {
+            let abandonedBeforeEmission = false;
+            const activeOnIssued = onIssued
+                ? () => {
+                    if (abandonedBeforeEmission) {
+                        throw new Error('Exact active machine RPC was superseded before emission');
+                    }
+                    onIssued();
+                }
+                : undefined;
+            try {
+                const result = await withMachineRpcTimeout(
+                    apiSocket.machineRPC<R, A>(
+                        context.machineId,
+                        params.method,
+                        params.payload,
+                        {
+                            timeoutMs: context.timeoutMs,
+                            ...(params.authorization ? { authorization: params.authorization } : {}),
+                            ...(activeOnIssued ? { onIssued: activeOnIssued } : {}),
+                        },
+                    ),
+                    {
+                        scope: 'active',
+                        method: params.method,
+                        timeoutMs: context.timeoutMs,
+                    },
+                );
+                const recordedServerId = normalizeId(params.serverId) || normalizeId(getActiveServerSnapshot().serverId);
+                recordCachedMachineRpcDirectRouteViable({
+                    serverId: recordedServerId,
+                    remoteMachineId: context.machineId,
+                });
+                return result;
+            } catch (error) {
+                if (exactIssuanceAttempted) {
+                    throw error;
+                }
+                if (!shouldFallbackToScopedMachineRpc(error)) {
+                    throw error;
+                }
+                // The timeout wrapper cannot cancel encryption already in progress. Fence that
+                // abandoned active promise at its immediate pre-emit callback before falling back.
+                abandonedBeforeEmission = true;
+                return await runOnce({ forceScoped: true });
+            }
+        }
+
+        if (context.scope !== 'scoped') {
+            throw new Error('Expected scoped server RPC context');
+        }
+
+        const machineDataKey = await resolveScopedMachineDataKey({
+            serverId: context.targetServerId,
+            serverUrl: context.targetServerUrl,
+            token: context.token,
+            machineId: context.machineId,
+            timeoutMs: context.timeoutMs,
+            decryptEncryptionKey: (value) => context.encryption.decryptEncryptionKey(value),
+        });
+
+        await context.encryption.initializeMachines(new Map([[context.machineId, machineDataKey]]));
+        const machineEncryption = context.encryption.getMachineEncryption(context.machineId);
+        if (!machineEncryption) {
+            throw new Error(`Machine encryption not found for ${context.machineId}`);
+        }
+
+        const socket = await createEphemeralServerSocketClient({
+            serverUrl: context.targetServerUrl,
+            token: context.token,
+            timeoutMs: context.timeoutMs,
+        });
+        try {
+            const encryptedPayload = await measureMachineEncryptRawAttribution(
+                resolveScopedMachineRpcEncryptRawAttributionEvent(params.method),
+                async () => await machineEncryption.encryptRaw(params.payload),
+            );
+            const socketEmission = socket.timeout(context.timeoutMs);
+            onIssued?.();
+            const result = await withMachineRpcTimeout(
+                socketEmission.emitWithAck(SOCKET_RPC_EVENTS.CALL, {
+                    method: `${context.machineId}:${params.method}`,
+                    params: encryptedPayload,
+                    ...(params.authorization ? { authorization: params.authorization } : {}),
+                    timeoutMs: context.timeoutMs,
+                }) as Promise<SocketRpcResult>,
+                {
+                    scope: 'scoped',
+                    method: params.method,
+                    timeoutMs: context.timeoutMs,
+                },
+            );
+
+            if (result.ok) {
+                const decoded = await machineEncryption.decryptRaw(
+                    normalizeScopedMachineRpcEncryptedResult(result.result),
+                ) as R;
+                recordCachedMachineRpcDirectRouteViable({
+                    serverId: context.targetServerId,
+                    remoteMachineId: context.machineId,
+                });
+                return decoded;
+            }
+
+            throw createRpcCallError({
+                error: typeof result.error === 'string' ? result.error : 'RPC call failed',
+                errorCode: typeof result.errorCode === 'string' ? result.errorCode : undefined,
+            });
+        } finally {
+            socket.disconnect();
+        }
+    };
+
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            return await runOnce();
+        } catch (error) {
+            lastError = error;
+            if (exactIssuanceAttempted) {
+                throw error;
+            }
+            const rpcErrorCode = readRpcErrorCode(error);
+            if (rpcErrorCode === RPC_ERROR_CODES.METHOD_NOT_AVAILABLE && attempt === 0) {
+                await delay(250);
+                continue;
+            }
+            throw error;
+        }
+    }
+    throw lastError ?? new Error('Machine RPC failed');
+}

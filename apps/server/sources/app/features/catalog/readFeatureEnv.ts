@@ -1,0 +1,527 @@
+import { parseBooleanEnv, parseIntEnv } from '../../../config/env';
+import {
+  MACHINE_TRANSFER_SERVER_ROUTED_MAX_BYTES_ENV_KEY,
+  normalizeMachineTransferServerRoutedMaxBytes,
+  PET_PACKAGE_LIMITS_V1,
+  PetsEncryptedCustomPetSyncPolicySchema,
+  type PetsEncryptedCustomPetSyncPolicy,
+} from '@happier-dev/protocol';
+import { FEATURE_ENV_KEYS } from './featureEnvSchema';
+import { resolveEffectiveWebappBaseUrl } from '../../serverUrls/effectiveServerUrls';
+
+export type AutomationsFeatureEnv = Readonly<{
+  enabled: boolean;
+}>;
+
+export type BugReportsFeatureEnv = Readonly<{
+  enabled: boolean;
+  providerUrlRaw: string | null;
+  defaultIncludeDiagnostics: boolean;
+  maxArtifactBytes: number;
+  uploadTimeoutMs: number;
+  acceptedArtifactKindsRaw: string | undefined;
+  contextWindowMs: number;
+}>;
+
+export type VoiceFeatureEnv = Readonly<{
+  enabled: boolean;
+  requireSubscription: boolean;
+}>;
+
+export type ConnectedServicesFeatureEnv = Readonly<{
+  enabled: boolean;
+  quotasEnabled: boolean;
+  accountGroupsEnabled: boolean;
+  accountFallbackEnabled: boolean;
+}>;
+
+export type ChannelBridgesFeatureEnv = Readonly<{
+  enabled: boolean;
+  telegramEnabled: boolean;
+}>;
+
+export type UpdatesFeatureEnv = Readonly<{
+  otaEnabled: boolean;
+}>;
+
+export type AttachmentsUploadsFeatureEnv = Readonly<{
+  enabled: boolean;
+}>;
+
+export type PetsFeatureEnv = Readonly<{
+  companionEnabled: boolean;
+  syncEnabled: boolean;
+  maxManifestBytes: number;
+  maxCanonicalSpritesheetBytes: number;
+  maxCanonicalPackageBytes: number;
+  maxImportedPetsPerAccount: number;
+  maxImportedPetBytesPerAccount: number;
+  encryptedCustomPetSyncPolicy: PetsEncryptedCustomPetSyncPolicy;
+}>;
+
+export type SessionHandoffFeatureEnv = Readonly<{
+  handoffEnabled: boolean;
+}>;
+
+export type SessionUsageLimitRecoveryFeatureEnv = Readonly<{
+  usageLimitRecoveryEnabled: boolean;
+}>;
+
+export type SessionAgentSwitchingFeatureEnv = Readonly<{
+  agentSwitchingEnabled: boolean;
+}>;
+
+export type SessionFoldersFeatureEnv = Readonly<{
+  foldersEnabled: boolean;
+}>;
+
+export type SessionDraftsFeatureEnv = Readonly<{
+  draftsEnabled: boolean;
+}>;
+
+export type MachineTransferFeatureEnv = Readonly<{
+  directPeerEnabled: boolean;
+  serverRoutedEnabled: boolean;
+  serverRoutedMaxBytes: number | null;
+  serverRoutedMaxActiveTransfersPerSocket: number;
+}>;
+
+export type TerminalFeatureEnv = Readonly<{
+  embeddedPtyEnabled: boolean;
+}>;
+
+export type SocialFriendsFeatureEnv = Readonly<{
+  enabled: boolean;
+  allowUsername: boolean;
+  identityProvider: string;
+}>;
+
+export type AuthFeatureEnv = Readonly<{
+  recoveryProviderResetEnabled: boolean;
+  loginPasswordEnabled: boolean;
+  loginKeyChallengeEnabled: boolean;
+  pairingDesktopQrMobileScanEnabled: boolean;
+  uiAutoRedirectEnabled: boolean;
+  uiAutoRedirectProviderId: string;
+  uiRecoveryKeyReminderEnabled: boolean;
+}>;
+
+export type AuthMtlsIdentitySource = "san_email" | "san_upn" | "subject_cn" | "fingerprint";
+export type AuthMtlsFeatureEnv = Readonly<{
+  enabled: boolean;
+  mode: "forwarded" | "direct";
+  autoProvision: boolean;
+  trustForwardedHeaders: boolean;
+  identitySource: AuthMtlsIdentitySource;
+  allowedEmailDomains: readonly string[];
+  allowedIssuers: readonly string[];
+  forwardedEmailHeader: string;
+  forwardedUpnHeader: string;
+  forwardedSubjectHeader: string;
+  forwardedFingerprintHeader: string;
+  forwardedIssuerHeader: string;
+  returnToAllowPrefixes: readonly string[];
+  claimTtlSeconds: number;
+}>;
+
+export type AuthOauthKeylessFeatureEnv = Readonly<{
+  enabled: boolean;
+  providers: readonly string[];
+  autoProvision: boolean;
+}>;
+
+export type EncryptionFeatureEnv = Readonly<{
+  storagePolicy: "required_e2ee" | "optional" | "plaintext_only";
+  allowAccountOptOut: boolean;
+  defaultAccountMode: "e2ee" | "plain";
+  plainAccountSettingsAtRest: "none" | "server_sealed";
+  plainAccountCredentialsAtRest: "none" | "server_sealed";
+}>;
+
+export type E2eeFeatureEnv = Readonly<{
+  keylessAccountsEnabled: boolean;
+}>;
+
+function parseCsvList(raw: string | undefined): string[] {
+  if (typeof raw !== "string") return [];
+  return raw
+    .split(/[,\s]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseCommaList(raw: string | undefined): string[] {
+  if (typeof raw !== "string") return [];
+  return raw
+    .split(/[,\n]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function normalizeIssuerDnLower(raw: string): string {
+  return raw
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function extractIssuerCommonName(normalizedDnLower: string): string | null {
+  const match = normalizedDnLower.match(/(?:^|,|\/)\s*cn\s*=\s*([^,\/]+)\s*(?:,|\/|$)/i);
+  const cn = match?.[1]?.trim() ?? "";
+  return cn || null;
+}
+
+function countRdnAssignments(normalizedDnLower: string): number {
+  const matches = normalizedDnLower.match(/\b[a-z][a-z0-9-]*\s*=/g);
+  return matches?.length ?? 0;
+}
+
+// Normalizes issuer allowlist entries into one of:
+// - "cn=..." for CN-only matching
+// - "dn=..." for exact DN matching (normalized)
+export function normalizeAuthMtlsIssuerValue(raw: string): string {
+  const normalized = normalizeIssuerDnLower(raw);
+  if (!normalized) return "";
+
+  // Ergonomic CN-only entries (either bare strings or "cn=...").
+  const rdnCount = countRdnAssignments(normalized);
+  const cn = extractIssuerCommonName(normalized);
+  if (!normalized.includes("=")) {
+    return `cn=${normalized}`;
+  }
+  if (rdnCount <= 1 && cn) {
+    return `cn=${cn}`;
+  }
+
+  // Treat as an exact DN entry.
+  return `dn=${normalized}`;
+}
+
+function parseIssuerAllowlist(raw: string | undefined): string[] {
+  if (typeof raw !== "string") return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+
+  // DN strings commonly contain commas; avoid splitting on commas when the input looks DN-shaped.
+  if (trimmed.includes("=")) {
+    // Allow multiple DN entries via newline or semicolon separation.
+    return trimmed
+      .split(/[;\n]+/g)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  // Otherwise treat as a standard CSV/whitespace list of CN values.
+  // CN strings commonly include spaces; split on comma/newline only.
+  return parseCommaList(trimmed);
+}
+
+export function readAutomationsFeatureEnv(env: NodeJS.ProcessEnv): AutomationsFeatureEnv {
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.automationsEnabled], true),
+  };
+}
+
+export function readBugReportsFeatureEnv(env: NodeJS.ProcessEnv): BugReportsFeatureEnv {
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.bugReportsEnabled], true),
+    providerUrlRaw:
+      typeof env[FEATURE_ENV_KEYS.bugReportsProviderUrl] === 'string'
+        ? (env[FEATURE_ENV_KEYS.bugReportsProviderUrl] ?? '').trim()
+        : null,
+    defaultIncludeDiagnostics: parseBooleanEnv(env[FEATURE_ENV_KEYS.bugReportsDefaultIncludeDiagnostics], true),
+    maxArtifactBytes: parseIntEnv(env[FEATURE_ENV_KEYS.bugReportsMaxArtifactBytes], 10 * 1024 * 1024, { min: 1024 }),
+    uploadTimeoutMs: parseIntEnv(env[FEATURE_ENV_KEYS.bugReportsUploadTimeoutMs], 120000, { min: 5000 }),
+    acceptedArtifactKindsRaw: env[FEATURE_ENV_KEYS.bugReportsAcceptedArtifactKinds],
+    contextWindowMs: parseIntEnv(env[FEATURE_ENV_KEYS.bugReportsContextWindowMs], 30 * 60 * 1000, {
+      min: 1000,
+      max: 24 * 60 * 60 * 1000,
+    }),
+  };
+}
+
+export function readVoiceFeatureEnv(env: NodeJS.ProcessEnv): VoiceFeatureEnv {
+  const isProduction = env.NODE_ENV === 'production';
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.voiceEnabled], true),
+    requireSubscription: parseBooleanEnv(env[FEATURE_ENV_KEYS.voiceRequireSubscription], isProduction),
+  };
+}
+
+export function readConnectedServicesFeatureEnv(env: NodeJS.ProcessEnv): ConnectedServicesFeatureEnv {
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesEnabled], true),
+    quotasEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesQuotasEnabled], true),
+    accountGroupsEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesAccountGroupsEnabled], true),
+    accountFallbackEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesAccountFallbackEnabled], true),
+  };
+}
+
+export function readChannelBridgesFeatureEnv(env: NodeJS.ProcessEnv): ChannelBridgesFeatureEnv {
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.channelBridgesEnabled], true),
+    telegramEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.channelBridgesTelegramEnabled], true),
+  };
+}
+
+export function readUpdatesFeatureEnv(env: NodeJS.ProcessEnv): UpdatesFeatureEnv {
+  return {
+    otaEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.updatesOtaEnabled], true),
+  };
+}
+
+export function readAttachmentsUploadsFeatureEnv(env: NodeJS.ProcessEnv): AttachmentsUploadsFeatureEnv {
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.attachmentsUploadsEnabled], true),
+  };
+}
+
+export function readPetsFeatureEnv(env: NodeJS.ProcessEnv): PetsFeatureEnv {
+  const encryptedCustomPetSyncPolicy = PetsEncryptedCustomPetSyncPolicySchema.safeParse(
+    env[FEATURE_ENV_KEYS.petsSyncEncryptedCustomPetSyncPolicy]?.trim(),
+  );
+
+  return {
+    companionEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.petsCompanionEnabled], true),
+    syncEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.petsSyncEnabled], false),
+    maxManifestBytes: parseIntEnv(env[FEATURE_ENV_KEYS.petsSyncMaxManifestBytes], PET_PACKAGE_LIMITS_V1.maxManifestBytes, { min: 1 }),
+    maxCanonicalSpritesheetBytes: parseIntEnv(
+      env[FEATURE_ENV_KEYS.petsSyncMaxCanonicalSpritesheetBytes],
+      PET_PACKAGE_LIMITS_V1.maxCanonicalSpritesheetBytes,
+      { min: 1 },
+    ),
+    maxCanonicalPackageBytes: parseIntEnv(
+      env[FEATURE_ENV_KEYS.petsSyncMaxCanonicalPackageBytes],
+      PET_PACKAGE_LIMITS_V1.maxCanonicalPackageBytes,
+      { min: 1 },
+    ),
+    maxImportedPetsPerAccount: parseIntEnv(
+      env[FEATURE_ENV_KEYS.petsSyncMaxImportedPetsPerAccount],
+      PET_PACKAGE_LIMITS_V1.maxImportedPetsPerAccount,
+      { min: 1 },
+    ),
+    maxImportedPetBytesPerAccount: parseIntEnv(
+      env[FEATURE_ENV_KEYS.petsSyncMaxImportedPetBytesPerAccount],
+      PET_PACKAGE_LIMITS_V1.maxImportedPetBytesPerAccount,
+      { min: 1 },
+    ),
+    encryptedCustomPetSyncPolicy: encryptedCustomPetSyncPolicy.success ? encryptedCustomPetSyncPolicy.data : "disabled",
+  };
+}
+
+export function readSessionHandoffFeatureEnv(env: NodeJS.ProcessEnv): SessionHandoffFeatureEnv {
+  return {
+    handoffEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.sessionsHandoffEnabled], true),
+  };
+}
+
+export function readSessionUsageLimitRecoveryFeatureEnv(env: NodeJS.ProcessEnv): SessionUsageLimitRecoveryFeatureEnv {
+  return {
+    usageLimitRecoveryEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.sessionsUsageLimitRecoveryEnabled], true),
+  };
+}
+
+export function readSessionAgentSwitchingFeatureEnv(env: NodeJS.ProcessEnv): SessionAgentSwitchingFeatureEnv {
+  return {
+    agentSwitchingEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.sessionsAgentSwitchingEnabled], true),
+  };
+}
+
+export function readSessionFoldersFeatureEnv(env: NodeJS.ProcessEnv): SessionFoldersFeatureEnv {
+  return {
+    foldersEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.sessionsFoldersEnabled], true),
+  };
+}
+
+export function readSessionDraftsFeatureEnv(env: NodeJS.ProcessEnv): SessionDraftsFeatureEnv {
+  return {
+    draftsEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.sessionsDraftsEnabled], true),
+  };
+}
+
+export function readMachineTransferFeatureEnv(env: NodeJS.ProcessEnv): MachineTransferFeatureEnv {
+  // Keep these values in sync with the CLI/server-routed transfer policy in
+  // `packages/transfers/src/policy/serverRoutedTransferPolicy.ts`.
+  const DEFAULT_SERVER_ROUTED_TRANSFER_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+  const SERVER_ROUTED_TRANSFER_MAX_BYTES_HARD_MAX = 8 * 1024 * 1024 * 1024; // 8 GiB
+
+  const configuredServerRoutedMaxBytes = normalizeMachineTransferServerRoutedMaxBytes(
+    env[FEATURE_ENV_KEYS.machinesTransferServerRoutedMaxBytes] ?? env[MACHINE_TRANSFER_SERVER_ROUTED_MAX_BYTES_ENV_KEY],
+  );
+  const resolvedServerRoutedMaxBytes = Math.min(
+    configuredServerRoutedMaxBytes ?? DEFAULT_SERVER_ROUTED_TRANSFER_MAX_BYTES,
+    SERVER_ROUTED_TRANSFER_MAX_BYTES_HARD_MAX,
+  );
+
+  return {
+    directPeerEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.machinesTransferDirectPeerEnabled], true),
+    serverRoutedEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.machinesTransferServerRoutedEnabled], true),
+    serverRoutedMaxBytes: resolvedServerRoutedMaxBytes,
+    serverRoutedMaxActiveTransfersPerSocket: parseIntEnv(
+      env[FEATURE_ENV_KEYS.machinesTransferServerRoutedMaxActiveTransfersPerSocket],
+      128,
+      { min: 1, max: 10_000 },
+    ),
+  };
+}
+
+export function readTerminalFeatureEnv(env: NodeJS.ProcessEnv): TerminalFeatureEnv {
+  return {
+    embeddedPtyEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.terminalEmbeddedPtyEnabled], true),
+  };
+}
+
+export function readSocialFriendsFeatureEnv(env: NodeJS.ProcessEnv): SocialFriendsFeatureEnv {
+  const rawIdentityProvider =
+    typeof env[FEATURE_ENV_KEYS.socialFriendsIdentityProvider] === 'string' && env[FEATURE_ENV_KEYS.socialFriendsIdentityProvider]?.trim()
+      ? env[FEATURE_ENV_KEYS.socialFriendsIdentityProvider]!.trim()
+      : 'github';
+
+  return {
+    enabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.socialFriendsEnabled], true),
+    allowUsername: parseBooleanEnv(env[FEATURE_ENV_KEYS.socialFriendsAllowUsername], true),
+    identityProvider: rawIdentityProvider,
+  };
+}
+
+export function readAuthFeatureEnv(env: NodeJS.ProcessEnv): AuthFeatureEnv {
+  const legacyRecoveryProviderResetEnabled = env.AUTH_RECOVERY_PROVIDER_RESET_ENABLED;
+  const legacyUiAutoRedirectEnabled = env.AUTH_UI_AUTO_REDIRECT;
+  const legacyUiAutoRedirectProviderId = env.AUTH_UI_AUTO_REDIRECT_PROVIDER_ID;
+  const legacyUiRecoveryKeyReminderEnabled = env.AUTH_UI_RECOVERY_KEY_REMINDER_ENABLED;
+
+  return {
+    recoveryProviderResetEnabled: parseBooleanEnv(
+      env[FEATURE_ENV_KEYS.authRecoveryProviderResetEnabled] ?? legacyRecoveryProviderResetEnabled,
+      true,
+    ),
+    loginPasswordEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.authLoginPasswordEnabled], false),
+    loginKeyChallengeEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.authLoginKeyChallengeEnabled], true),
+    pairingDesktopQrMobileScanEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.authPairingDesktopQrMobileScanEnabled], true),
+    uiAutoRedirectEnabled: parseBooleanEnv(
+      env[FEATURE_ENV_KEYS.authUiAutoRedirectEnabled] ?? legacyUiAutoRedirectEnabled,
+      false,
+    ),
+    uiAutoRedirectProviderId: (
+      env[FEATURE_ENV_KEYS.authUiAutoRedirectProviderId] ?? legacyUiAutoRedirectProviderId ?? ''
+    )
+      .trim()
+      .toLowerCase(),
+    uiRecoveryKeyReminderEnabled: parseBooleanEnv(
+      env[FEATURE_ENV_KEYS.authUiRecoveryKeyReminderEnabled] ?? legacyUiRecoveryKeyReminderEnabled,
+      true,
+    ),
+  };
+}
+
+export function readAuthMtlsFeatureEnv(env: NodeJS.ProcessEnv): AuthMtlsFeatureEnv {
+  const enabled = parseBooleanEnv(env[FEATURE_ENV_KEYS.authMtlsEnabled], false);
+  const rawMode = (env[FEATURE_ENV_KEYS.authMtlsMode] ?? "").toString().trim().toLowerCase();
+  const mode: AuthMtlsFeatureEnv["mode"] = rawMode === "direct" ? "direct" : "forwarded";
+
+  const autoProvision = parseBooleanEnv(env[FEATURE_ENV_KEYS.authMtlsAutoProvision], false);
+  const trustForwardedHeaders = parseBooleanEnv(env[FEATURE_ENV_KEYS.authMtlsTrustForwardedHeaders], false);
+
+  const rawIdentitySource = (env[FEATURE_ENV_KEYS.authMtlsIdentitySource] ?? "").toString().trim().toLowerCase();
+  const identitySource: AuthMtlsFeatureEnv["identitySource"] =
+    rawIdentitySource === "san_upn" || rawIdentitySource === "subject_cn" || rawIdentitySource === "fingerprint" || rawIdentitySource === "san_email"
+      ? (rawIdentitySource as AuthMtlsFeatureEnv["identitySource"])
+      : "san_email";
+
+  const allowedEmailDomains = Object.freeze(parseCsvList(env[FEATURE_ENV_KEYS.authMtlsAllowedEmailDomains]).map((s) => s.toLowerCase()));
+  const allowedIssuers = Object.freeze(parseIssuerAllowlist(env[FEATURE_ENV_KEYS.authMtlsAllowedIssuers]).map(normalizeAuthMtlsIssuerValue).filter(Boolean));
+
+  const forwardedEmailHeader = (env[FEATURE_ENV_KEYS.authMtlsForwardedEmailHeader] ?? "x-happier-client-cert-email")
+    .toString()
+    .trim()
+    .toLowerCase();
+  const forwardedUpnHeader = (env[FEATURE_ENV_KEYS.authMtlsForwardedUpnHeader] ?? "x-happier-client-cert-upn")
+    .toString()
+    .trim()
+    .toLowerCase();
+  const forwardedSubjectHeader = (env[FEATURE_ENV_KEYS.authMtlsForwardedSubjectHeader] ?? "x-happier-client-cert-subject")
+    .toString()
+    .trim()
+    .toLowerCase();
+  const forwardedFingerprintHeader = (env[FEATURE_ENV_KEYS.authMtlsForwardedFingerprintHeader] ?? "x-happier-client-cert-sha256")
+    .toString()
+    .trim()
+    .toLowerCase();
+  const forwardedIssuerHeader = (env[FEATURE_ENV_KEYS.authMtlsForwardedIssuerHeader] ?? "x-happier-client-cert-issuer")
+    .toString()
+    .trim()
+    .toLowerCase();
+
+  const allowPrefixesFromEnv = parseCsvList(env[FEATURE_ENV_KEYS.authMtlsReturnToAllowPrefixes]);
+  const webUrl = resolveEffectiveWebappBaseUrl(env).trim();
+  const returnToAllowPrefixes = Object.freeze(
+    (allowPrefixesFromEnv.length > 0 ? allowPrefixesFromEnv : ["happier://", webUrl])
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+
+  const claimTtlSeconds = parseIntEnv(env[FEATURE_ENV_KEYS.authMtlsClaimTtlSeconds], 60, { min: 10, max: 3600 });
+
+  return {
+    enabled,
+    mode,
+    autoProvision,
+    trustForwardedHeaders,
+    identitySource,
+    allowedEmailDomains,
+    allowedIssuers,
+    forwardedEmailHeader,
+    forwardedUpnHeader,
+    forwardedSubjectHeader,
+    forwardedFingerprintHeader,
+    forwardedIssuerHeader,
+    returnToAllowPrefixes,
+    claimTtlSeconds,
+  };
+}
+
+export function readAuthOauthKeylessFeatureEnv(env: NodeJS.ProcessEnv): AuthOauthKeylessFeatureEnv {
+  const enabled = parseBooleanEnv(env[FEATURE_ENV_KEYS.authOauthKeylessEnabled], false);
+  const providers = Object.freeze(parseCsvList(env[FEATURE_ENV_KEYS.authOauthKeylessProviders]).map((s) => s.toLowerCase()));
+  const autoProvision = parseBooleanEnv(env[FEATURE_ENV_KEYS.authOauthKeylessAutoProvision], false);
+  return {
+    enabled,
+    providers,
+    autoProvision,
+  };
+}
+
+export function readEncryptionFeatureEnv(env: NodeJS.ProcessEnv): EncryptionFeatureEnv {
+  const rawStoragePolicy = (env[FEATURE_ENV_KEYS.encryptionStoragePolicy] ?? "").toString().trim();
+  const storagePolicy: EncryptionFeatureEnv["storagePolicy"] =
+    rawStoragePolicy === "optional" || rawStoragePolicy === "plaintext_only" || rawStoragePolicy === "required_e2ee"
+      ? rawStoragePolicy
+      : "required_e2ee";
+
+  const allowAccountOptOut = parseBooleanEnv(env[FEATURE_ENV_KEYS.encryptionAllowAccountOptOut], false);
+  const rawDefaultAccountMode = (env[FEATURE_ENV_KEYS.encryptionDefaultAccountMode] ?? "").toString().trim();
+  const defaultAccountMode: EncryptionFeatureEnv["defaultAccountMode"] =
+    rawDefaultAccountMode === "plain" || rawDefaultAccountMode === "e2ee" ? rawDefaultAccountMode : "e2ee";
+
+  const rawSettingsAtRest = (env[FEATURE_ENV_KEYS.encryptionPlainAccountSettingsAtRest] ?? "").toString().trim().toLowerCase();
+  const plainAccountSettingsAtRest: EncryptionFeatureEnv["plainAccountSettingsAtRest"] =
+    rawSettingsAtRest === "none" || rawSettingsAtRest === "server_sealed" ? (rawSettingsAtRest as any) : "server_sealed";
+
+  const rawCredentialsAtRest = (env[FEATURE_ENV_KEYS.encryptionPlainAccountCredentialsAtRest] ?? "").toString().trim().toLowerCase();
+  const plainAccountCredentialsAtRest: EncryptionFeatureEnv["plainAccountCredentialsAtRest"] =
+    rawCredentialsAtRest === "none" || rawCredentialsAtRest === "server_sealed" ? (rawCredentialsAtRest as any) : "server_sealed";
+
+  return {
+    storagePolicy,
+    allowAccountOptOut,
+    defaultAccountMode,
+    plainAccountSettingsAtRest,
+    plainAccountCredentialsAtRest,
+  };
+}
+
+export function readE2eeFeatureEnv(env: NodeJS.ProcessEnv): E2eeFeatureEnv {
+  return {
+    keylessAccountsEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.e2eeKeylessAccountsEnabled], false),
+  };
+}

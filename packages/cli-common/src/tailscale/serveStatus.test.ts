@@ -1,0 +1,124 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  classifyTailscaleServeRootSlot,
+  extractTailscaleServeHttpsUrl,
+  parseTailscaleServeHttpsBaseUrlForPort,
+  tailscaleServeHttpsUrlForInternalServerUrlFromStatus,
+  tailscaleServeStatusMatchesInternalServerUrl,
+} from './serveStatus.js';
+
+describe('classifyTailscaleServeRootSlot', () => {
+  it('distinguishes an exact relay mapping from a free root slot', () => {
+    expect(classifyTailscaleServeRootSlot('', 'http://127.0.0.1:3005')).toEqual({ kind: 'free' });
+    expect(classifyTailscaleServeRootSlot([
+      'https://machine.tailnet.ts.net',
+      '|-- / proxy http://localhost:3005',
+    ].join('\n'), 'http://127.0.0.1:3005')).toMatchObject({ kind: 'exact' });
+  });
+
+  it('refuses to treat another Serve mapping as replaceable', () => {
+    expect(classifyTailscaleServeRootSlot([
+      'https://machine.tailnet.ts.net',
+      '|-- / proxy http://127.0.0.1:8080',
+    ].join('\n'), 'http://127.0.0.1:3005')).toMatchObject({ kind: 'conflict', exposure: 'serve' });
+  });
+
+  it('classifies a Funnel mapping as a conflict too', () => {
+    expect(classifyTailscaleServeRootSlot([
+      '# Funnel on:',
+      'https://machine.tailnet.ts.net',
+      '|-- / proxy http://127.0.0.1:8080',
+    ].join('\n'), 'http://127.0.0.1:3005')).toMatchObject({ kind: 'conflict', exposure: 'funnel' });
+  });
+});
+
+describe('parseTailscaleServeHttpsBaseUrlForPort', () => {
+  it('returns the https base URL for the matching proxied port when multiple sections exist', () => {
+    const status = [
+      'https://a.tailnet.ts.net',
+      '|-- / proxy http://127.0.0.1:1234',
+      '',
+      'https://b.tailnet.ts.net/',
+      '|-- / proxy http://localhost:3005',
+      '',
+    ].join('\n');
+
+    expect(parseTailscaleServeHttpsBaseUrlForPort(status, 3005)).toBe('https://b.tailnet.ts.net');
+  });
+
+  it('returns null when the requested port is not proxied', () => {
+    const status = [
+      'https://a.tailnet.ts.net',
+      '|-- / proxy http://127.0.0.1:1234',
+      '',
+    ].join('\n');
+
+    expect(parseTailscaleServeHttpsBaseUrlForPort(status, 3005)).toBeNull();
+  });
+});
+
+describe('tailscaleServeHttpsUrlForInternalServerUrlFromStatus', () => {
+  it('matches the comparable public URL for a loopback upstream by port', () => {
+    const status = [
+      'https://wrong.tailnet.ts.net',
+      '|-- / proxy http://127.0.0.1:8080',
+      '',
+      'https://relay.tailnet.ts.net',
+      '|-- / proxy http://0.0.0.0:3005',
+      '',
+    ].join('\n');
+
+    expect(tailscaleServeHttpsUrlForInternalServerUrlFromStatus(status, 'http://127.0.0.1:3005')).toBe(
+      'https://relay.tailnet.ts.net',
+    );
+  });
+});
+
+describe('extractTailscaleServeHttpsUrl', () => {
+  it('returns the first normalized https URL from serve status', () => {
+    const status = [
+      'something',
+      'https://my-machine.tailnet.ts.net/',
+      '|-- / proxy http://127.0.0.1:53545',
+      '',
+    ].join('\n');
+
+    expect(extractTailscaleServeHttpsUrl(status)).toBe('https://my-machine.tailnet.ts.net');
+  });
+});
+
+describe('tailscaleServeStatusMatchesInternalServerUrl', () => {
+  it('matches an exact internal URL', () => {
+    const status = [
+      'https://my-machine.tailnet.ts.net',
+      '|-- / proxy http://127.0.0.1:53545',
+      '',
+    ].join('\n');
+
+    expect(tailscaleServeStatusMatchesInternalServerUrl(status, 'http://127.0.0.1:53545')).toBe(true);
+  });
+
+  it('matches when serve output and the internal URL spell the loopback host differently', () => {
+    // The exact-substring fast path cannot answer this, so it exercises the
+    // proxy-line pattern. Regression guard: that pattern was previously built
+    // with doubled escapes and matched nothing.
+    const status = [
+      'https://my-machine.tailnet.ts.net',
+      '|-- / proxy http://localhost:3005',
+      '',
+    ].join('\n');
+
+    expect(tailscaleServeStatusMatchesInternalServerUrl(status, 'http://127.0.0.1:3005')).toBe(true);
+  });
+
+  it('does not match a port that merely shares a prefix', () => {
+    const status = [
+      'https://my-machine.tailnet.ts.net',
+      '|-- / proxy http://localhost:30051',
+      '',
+    ].join('\n');
+
+    expect(tailscaleServeStatusMatchesInternalServerUrl(status, 'http://127.0.0.1:3005')).toBe(false);
+  });
+});

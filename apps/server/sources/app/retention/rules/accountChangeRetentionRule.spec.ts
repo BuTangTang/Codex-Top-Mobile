@@ -1,0 +1,102 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { createDbMocks, createDbTransactionMock, installDbModuleMock } from '../../api/testkit/dbMocks';
+
+const findMany = vi.fn();
+const deleteMany = vi.fn();
+const updateMany = vi.fn();
+
+const dbMocks = createDbMocks({
+    accountChange: ["findMany", "deleteMany"],
+    account: ["updateMany"],
+} as const);
+const dbTransactionMock = createDbTransactionMock(() => dbMocks.db);
+
+dbMocks.db.accountChange.findMany.mockImplementation((...args: any[]) => findMany(...args));
+dbMocks.db.accountChange.deleteMany.mockImplementation((...args: any[]) => deleteMany(...args));
+dbMocks.db.account.updateMany.mockImplementation((...args: any[]) => updateMany(...args));
+
+installDbModuleMock({ db: dbTransactionMock.wrapDb(dbMocks.db) });
+
+describe('accountChangeRetentionRule', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        dbTransactionMock.transaction.mockClear();
+    });
+
+    it('advances changesFloor only to the highest cursor that was actually deleted', async () => {
+        findMany.mockResolvedValueOnce([
+            { accountId: 'owner-a', kind: 'session', entityId: 'a-1', cursor: 1 },
+            { accountId: 'owner-a', kind: 'session', entityId: 'a-2', cursor: 2 },
+        ]);
+        deleteMany
+            .mockResolvedValueOnce({ count: 1 })
+            .mockResolvedValueOnce({ count: 0 });
+        updateMany.mockResolvedValueOnce({ count: 1 });
+
+        const { runAccountChangeRetentionRule } = await import('./accountChangeRetentionRule');
+        const result = await runAccountChangeRetentionRule({
+            cutoff: new Date('2025-01-01T00:00:00.000Z'),
+            batchSize: 10,
+            dryRun: false,
+            maxDeletesPerRulePerRun: 10,
+        });
+
+        expect(result.deleted).toBe(1);
+        expect(deleteMany).toHaveBeenNthCalledWith(1, {
+            where: {
+                accountId: 'owner-a',
+                kind: 'session',
+                entityId: 'a-1',
+                cursor: 1,
+                changedAt: { lt: new Date('2025-01-01T00:00:00.000Z') },
+            },
+        });
+        expect(deleteMany).toHaveBeenNthCalledWith(2, {
+            where: {
+                accountId: 'owner-a',
+                kind: 'session',
+                entityId: 'a-2',
+                cursor: 2,
+                changedAt: { lt: new Date('2025-01-01T00:00:00.000Z') },
+            },
+        });
+        expect(updateMany).toHaveBeenCalledWith({
+            where: {
+                id: 'owner-a',
+                changesFloor: { lt: 1 },
+            },
+            data: {
+                changesFloor: 1,
+            },
+        });
+        expect(dbTransactionMock.transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('advances dry-run pages instead of recounting the first candidates', async () => {
+        findMany.mockResolvedValueOnce([
+            { accountId: 'owner-a', kind: 'session', entityId: 'a-11', cursor: 11 },
+            { accountId: 'owner-a', kind: 'session', entityId: 'a-12', cursor: 12 },
+        ]);
+
+        const { runAccountChangeRetentionRule } = await import('./accountChangeRetentionRule');
+        const result = await runAccountChangeRetentionRule({
+            cutoff: new Date('2025-01-01T00:00:00.000Z'),
+            batchSize: 2,
+            dryRun: true,
+            dryRunOffset: 10,
+            maxDeletesPerRulePerRun: 2,
+        });
+
+        expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+            skip: 10,
+            take: 2,
+        }));
+        expect(result).toEqual({
+            deleted: 2,
+            candidatesExamined: 2,
+            hasMore: true,
+        });
+        expect(deleteMany).not.toHaveBeenCalled();
+    });
+});

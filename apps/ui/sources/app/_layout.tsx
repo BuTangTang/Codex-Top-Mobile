@@ -1,0 +1,900 @@
+import 'react-native-quick-base64';
+import '../theme.css';
+import * as React from 'react';
+import * as SplashScreen from 'expo-splash-screen';
+import * as Fonts from 'expo-font';
+import { FontAwesome, Ionicons } from '@expo/vector-icons';
+import { usePathname, useRouter } from 'expo-router';
+import {
+    PUSH_NOTIFICATION_ACTION_IDS,
+    PUSH_NOTIFICATION_ANDROID_CHANNEL_IDS,
+    PUSH_NOTIFICATION_CATEGORY_IDS,
+} from '@happier-dev/protocol';
+import { AuthProvider, useAuth } from '@/auth/context/AuthContext';
+import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+import { initialWindowMetrics, SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SidebarNavigator } from '@/components/navigation/shell/SidebarNavigator';
+import sodium from '@/encryption/libsodium.lib';
+import { View, Platform } from 'react-native';
+import { AppPaneModalProvider } from '@/components/appShell/providers/AppPaneModalProvider';
+import { PostHogProvider } from 'posthog-react-native';
+import * as Sentry from '@sentry/react-native';
+import { tracking } from '@/track/tracking';
+import { SettingsAnalyticsRuntime } from '@/track/settingsAnalytics/SettingsAnalyticsRuntime';
+import { syncRestore } from '@/sync/sync';
+import { prepareSessionDraftPersistenceStorage } from '@/sync/ops/sessionDrafts/sessionDraftPersistenceStorage';
+import { prepareWarmCacheStorage } from '@/sync/domains/state/warmCachePersistence';
+import { storage } from '@/sync/domains/state/storage';
+import {
+    clearActiveViewingSessionsForNonSessionRoute,
+    getActiveViewingSessionId,
+} from '@/sync/domains/session/activeViewingSession';
+import { NotificationsSettingsV1Schema } from '@happier-dev/protocol';
+import { useTrackScreens } from '@/track/useTrackScreens';
+import { RealtimeProvider } from '@/realtime/RealtimeProvider';
+import { FaviconPermissionIndicator } from '@/components/web/FaviconPermissionIndicator';
+import { CommandPaletteProvider } from '@/components/appShell/commandPalette/CommandPaletteProvider';
+import { StatusBarProvider } from '@/components/ui/layout/StatusBarProvider';
+import { AppUpdateStatusTag } from '@/components/ui/feedback/AppUpdateStatusTag';
+import { monkeyPatchConsoleForRemoteLoggingForFasterAiAutoDebuggingOnlyInLocalBuilds } from '@/utils/system/remoteLogger';
+import { installBugReportConsoleCapture } from '@/utils/system/bugReportLogBuffer';
+import { configureBugReportUserActionTrail } from '@/utils/system/bugReportActionTrail';
+import { useUnistyles } from 'react-native-unistyles';
+import { AsyncLock } from '@/utils/system/lock';
+import { useWebUiFontScale } from '@/components/ui/text/useWebUiFontScale';
+import { usePierreDiffWorkerPoolWarmup } from '@/components/ui/code/diff/pierre/usePierreDiffWorkerPoolWarmup';
+import { useWebBackdropBlurPreference } from '@/components/ui/overlays/useWebBackdropBlurPreference';
+import { initializeSentryOnce, wrapWithSentryIfEnabled } from '@/utils/system/sentry';
+import { t } from '@/text';
+import { AppCrashRecoveryBoundary } from '@/components/appShell/AppCrashRecoveryBoundary';
+import { WebCryptoStartupGate } from '@/components/web/WebCryptoStartupGate';
+import { consumeRestartBugReportIntent } from '@/utils/system/restartBugReportIntent';
+import { getCurrentReactOwnerHint, getUnexpectedPrimitiveViewChildInfo } from '@/utils/system/debugUnexpectedTextNodeCapture';
+import { resolveForegroundNotificationBehavior } from '@/activity/notifications/resolveForegroundNotificationBehavior';
+import { resolveBootCredentials } from '@/boot/resolveBootCredentials';
+import { runAppBootSequence, type AppBootReadyState } from '@/boot/runAppBootSequence';
+import { installTauriMcpBridgeOnce } from '@/desktop/mcp/maybeInstallTauriMcpBridge';
+import { DesktopShellUpdateIndicatorHost } from '@/components/navigation/shell/desktopChrome/DesktopShellUpdateIndicatorHost';
+import { DesktopShellWindowControlsHost } from '@/components/navigation/shell/desktopChrome/DesktopShellWindowControlsHost';
+import { useResolvedDesktopWindowControls } from '@/components/navigation/shell/desktopChrome/useResolvedDesktopWindowControls';
+import { resolveAppShellChromeHost } from '@/components/appShell/resolveAppShellChromeHost';
+import { isDesktopPetOverlayWindowContext } from '@/components/pets/desktop/runtime/isDesktopPetOverlayWindowContext';
+import { isTauriDesktop } from '@/utils/platform/tauri';
+import { useIsTablet } from '@/utils/platform/responsive';
+import { ThemePreferenceTransitionHost } from '@/components/settings/appearance/ThemePreferenceTransitionHost';
+import { useTauriMainWindowBackgroundColor } from '@/desktop/window/useTauriMainWindowBackgroundColor';
+import { OnboardingShowcaseAutoShowMount } from '@/onboarding/showcase';
+import { DesktopBackgroundServiceCloseGuard } from '@/setup/DesktopBackgroundServiceCloseGuard';
+import { DesktopLocalSetupWarmup } from '@/setup/DesktopLocalSetupWarmup';
+import { DesktopMainContentDragSurface } from '@/components/navigation/desktopWindowChrome/DesktopMainContentDragSurface';
+import { useChromeSafeAreaInsets } from '@/components/ui/layout/useChromeSafeAreaInsets';
+import { loadExpoNotifications, type ExpoNotificationsModule } from '@/utils/platform/loadExpoNotifications';
+import { installWebFontFaces } from '@/platform/installWebFontFaces';
+import { ActionOperationRuntime } from '@/sync/domains/actionOperations/actionOperationRuntime';
+
+initializeSentryOnce();
+installTauriMcpBridgeOnce();
+
+const TERMINAL_CONNECT_ROUTE = '/terminal/connect';
+
+function isTerminalConnectWebPathname(pathname: string | null | undefined): boolean {
+    const route = String(pathname ?? '').split('?')[0]?.replace(/\/+$/, '');
+    return route === TERMINAL_CONNECT_ROUTE;
+}
+
+function shouldCaptureRnwUnexpectedTextNodeStacks(): boolean {
+    // Dev-only diagnostics: enable via `?debugRnwTextNode=1` on web.
+    // Keep this silent by default to avoid console noise.
+    if (process.env.NODE_ENV === 'production') return false;
+    if (typeof window === 'undefined') return false;
+    try {
+        const current = new URL(window.location.href);
+        const raw = (current.searchParams.get('debugRnwTextNode') ?? '').trim().toLowerCase();
+        return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+    } catch {
+        return false;
+    }
+}
+
+function shouldCrashOnRnwUnexpectedTextNode(): boolean {
+    // Dev-only diagnostics: enable via `?debugRnwTextNodeCrash=1` on web.
+    if (process.env.NODE_ENV === 'production') return false;
+    if (typeof window === 'undefined') return false;
+    try {
+        const current = new URL(window.location.href);
+        const raw = (current.searchParams.get('debugRnwTextNodeCrash') ?? '').trim().toLowerCase();
+        return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+    } catch {
+        return false;
+    }
+}
+
+function installRnwUnexpectedTextNodeStackCaptureOnce() {
+    if (typeof globalThis === 'undefined') return;
+    const g = globalThis as any;
+    if (g.__HAPPIER_RNW_TEXTNODE_STACK_CAPTURE_INSTALLED__) return;
+    g.__HAPPIER_RNW_TEXTNODE_STACK_CAPTURE_INSTALLED__ = true;
+
+    const original = console.error;
+    const seen = new Set<string>();
+    const crash = shouldCrashOnRnwUnexpectedTextNode();
+
+    console.error = (...args: any[]) => {
+        let handledUnexpectedTextNode = false;
+        let crashMessage: string | null = null;
+        try {
+            const first = args[0];
+            if (typeof first === 'string' && first.startsWith('Unexpected text node:')) {
+                handledUnexpectedTextNode = true;
+                // De-dupe per unique message to keep logs readable.
+                if (!seen.has(first)) {
+                    seen.add(first);
+                    const ownerHint = getCurrentReactOwnerHint(React);
+                    original(...args);
+                    if (ownerHint) original('[debugRnwTextNode] owner:', ownerHint);
+                    original('[debugRnwTextNode] stack:', new Error(first).stack);
+                    if (crash) {
+                        crashMessage = first;
+                    }
+                }
+            }
+        } catch {
+            // ignore
+        }
+        if (crashMessage) {
+            throw new Error(crashMessage);
+        }
+        if (handledUnexpectedTextNode) return;
+        original(...args);
+    };
+}
+
+function installReactCreateElementUnexpectedTextNodeCaptureOnce() {
+    if (typeof globalThis === 'undefined') return;
+    const g = globalThis as any;
+    if (g.__HAPPIER_REACT_CREATE_ELEMENT_TEXTNODE_CAPTURE_INSTALLED__) return;
+    g.__HAPPIER_REACT_CREATE_ELEMENT_TEXTNODE_CAPTURE_INSTALLED__ = true;
+
+    const original = React.createElement;
+    const seen = new Set<string>();
+    let logged = 0;
+
+    (React as any).createElement = (type: any, props: any, ...children: any[]) => {
+        try {
+            const rawChildren = children.length > 0 ? children : (props?.children ?? []);
+            const flat = React.Children.toArray(rawChildren as any[]);
+            const info = getUnexpectedPrimitiveViewChildInfo({
+                type,
+                props,
+                flatChildren: flat,
+            });
+            if (info && !seen.has(info.signature) && logged < 10) {
+                seen.add(info.signature);
+                logged += 1;
+
+                const ownerHint = getCurrentReactOwnerHint(React);
+                console.error('[debugRnwTextNode] element created with primitive View child', {
+                    ...info,
+                    ownerHint,
+                });
+                console.error('[debugRnwTextNode] createElement stack:', new Error('primitive child').stack);
+            }
+        } catch {
+            // ignore
+        }
+        return original(type, props, ...children);
+    };
+}
+
+function installReactJsxRuntimeUnexpectedTextNodeCaptureOnce() {
+    // React's automatic JSX runtime bypasses React.createElement, so patching createElement won't
+    // catch problematic primitives passed into <View>. In dev-only debug mode, patch jsx/jsxs.
+    if (typeof globalThis === 'undefined') return;
+    const g = globalThis as any;
+    if (g.__HAPPIER_REACT_JSX_RUNTIME_TEXTNODE_CAPTURE_INSTALLED__) return;
+    g.__HAPPIER_REACT_JSX_RUNTIME_TEXTNODE_CAPTURE_INSTALLED__ = true;
+
+    try {
+        const seen = new Set<string>();
+
+        const logIfBadChildren = (type: any, props: any) => {
+            try {
+                const flat = React.Children.toArray(props?.children ?? []);
+                const info = getUnexpectedPrimitiveViewChildInfo({
+                    type,
+                    props,
+                    flatChildren: flat,
+                });
+                if (info && !seen.has(info.signature)) {
+                    seen.add(info.signature);
+
+                    const ownerHint = getCurrentReactOwnerHint(React);
+                    console.error('[debugRnwTextNode] jsx-runtime element created with primitive View child', {
+                        ...info,
+                        ownerHint,
+                    });
+                    console.error('[debugRnwTextNode] jsx-runtime stack:', new Error('primitive child').stack);
+                }
+            } catch {
+                // ignore
+            }
+        };
+
+        const wrapJsx = (fn: any) => (type: any, props: any, key: any) => {
+            logIfBadChildren(type, props);
+            return fn(type, props, key);
+        };
+
+        // In dev, React uses jsxDEV from react/jsx-dev-runtime.
+        // Patch both modules to catch primitives passed into <View>.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const runtime = require('react/jsx-runtime');
+        if (runtime) {
+            if (typeof runtime.jsx === 'function') runtime.jsx = wrapJsx(runtime.jsx);
+            if (typeof runtime.jsxs === 'function') runtime.jsxs = wrapJsx(runtime.jsxs);
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const devRuntime = require('react/jsx-dev-runtime');
+        if (devRuntime && typeof devRuntime.jsxDEV === 'function') {
+            const original = devRuntime.jsxDEV;
+            devRuntime.jsxDEV = (type: any, props: any, key: any, isStaticChildren: any, source: any, self: any) => {
+                logIfBadChildren(type, props);
+                return original(type, props, key, isStaticChildren, source, self);
+            };
+        }
+    } catch {
+        // ignore
+    }
+}
+
+function installReactNativeViewRenderUnexpectedTextNodeCaptureOnce() {
+    if (typeof globalThis === 'undefined') return;
+    const g = globalThis as any;
+    if (g.__HAPPIER_RNW_VIEW_RENDER_TEXTNODE_CAPTURE_INSTALLED__) return;
+    g.__HAPPIER_RNW_VIEW_RENDER_TEXTNODE_CAPTURE_INSTALLED__ = true;
+
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const reactNative = require('react-native');
+        const viewCandidate = reactNative?.View;
+        if (!viewCandidate) return;
+
+        const wrapRender = (original: any) => {
+            const seen = new Set<string>();
+            return function wrappedViewRender(this: unknown, props: Record<string, unknown>, ref: unknown) {
+                try {
+                    const flatChildren = React.Children.toArray((props as any)?.children ?? []);
+                    const info = getUnexpectedPrimitiveViewChildInfo({
+                        type: viewCandidate,
+                        props,
+                        flatChildren,
+                    });
+                    if (info && !seen.has(info.signature)) {
+                        seen.add(info.signature);
+                        console.error('[debugRnwTextNode] View render primitive child', {
+                            ...info,
+                            ownerHint: getCurrentReactOwnerHint(React),
+                        });
+                        console.error('[debugRnwTextNode] View render stack:', new Error('primitive child').stack);
+                    }
+                } catch {
+                    // ignore
+                }
+                return original.call(this, props, ref);
+            };
+        };
+
+        if (typeof viewCandidate?.render === 'function') {
+            viewCandidate.render = wrapRender(viewCandidate.render);
+            return;
+        }
+
+        if (typeof viewCandidate === 'function') {
+            reactNative.View = wrapRender(viewCandidate);
+        }
+    } catch {
+        // ignore
+    }
+}
+
+function configureForegroundNotificationHandler(Notifications: ExpoNotificationsModule): void {
+    // Suppresses same-session notifications and respects the foregroundBehavior setting.
+    Notifications.setNotificationHandler({
+        handleNotification: async (notification) => {
+        const { data } = notification.request.content;
+        const notifSessionId = typeof data?.sessionId === 'string' ? data.sessionId : null;
+
+        // Same-session suppression: user already sees real-time updates.
+        if (notifSessionId && notifSessionId === getActiveViewingSessionId()) {
+            return { shouldPlaySound: false, shouldSetBadge: true, shouldShowBanner: false, shouldShowList: false };
+        }
+
+        // NotificationsSettingsV1Schema uses .catch(), so parse always succeeds.
+        const foregroundBehavior = resolveForegroundNotificationBehavior({
+            localSettings: storage.getState().localSettings,
+            accountSettings: storage.getState().settings,
+        });
+
+        switch (foregroundBehavior) {
+            case 'off':
+                return { shouldPlaySound: false, shouldSetBadge: true, shouldShowBanner: false, shouldShowList: false };
+            case 'silent':
+                return { shouldPlaySound: false, shouldSetBadge: true, shouldShowBanner: true, shouldShowList: true };
+            case 'full':
+            default:
+                return { shouldPlaySound: true, shouldSetBadge: true, shouldShowBanner: true, shouldShowList: true };
+        }
+        },
+    });
+}
+
+function configureAndroidNotificationChannels(Notifications: ExpoNotificationsModule): void {
+    if (Platform.OS !== 'android') return;
+
+    void Notifications.setNotificationChannelAsync(PUSH_NOTIFICATION_ANDROID_CHANNEL_IDS.defaultV1, {
+        name: t('notifications.channels.default'),
+        importance: Notifications.AndroidImportance.MAX,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: '#FF231F7C',
+        showBadge: true,
+    }).catch(() => {});
+
+    void Notifications.setNotificationChannelAsync(PUSH_NOTIFICATION_ANDROID_CHANNEL_IDS.permissionRequestsV1, {
+        name: t('notifications.channels.permissionRequests'),
+        importance: Notifications.AndroidImportance.MAX,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: '#FF231F7C',
+        showBadge: true,
+    }).catch(() => {});
+
+    void Notifications.setNotificationChannelAsync(PUSH_NOTIFICATION_ANDROID_CHANNEL_IDS.userActionRequestsV1, {
+        name: t('notifications.channels.userActionRequests'),
+        importance: Notifications.AndroidImportance.HIGH,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: '#FF231F7C',
+        showBadge: true,
+    }).catch(() => {});
+}
+
+function configureNotificationCategories(Notifications: ExpoNotificationsModule): void {
+    if (Platform.OS === 'web') return;
+
+    // Expo docs recommend avoiding ':' and '-' in category identifiers.
+    // Our category ids live in `@happier-dev/protocol` so the CLI push payload and app registration stay in sync.
+    void Notifications.setNotificationCategoryAsync(PUSH_NOTIFICATION_CATEGORY_IDS.permissionRequestV1, [
+        {
+            identifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            buttonTitle: t('notifications.actions.allow'),
+            options: { opensAppToForeground: true },
+        },
+        {
+            identifier: PUSH_NOTIFICATION_ACTION_IDS.permissionDenyV1,
+            buttonTitle: t('notifications.actions.deny'),
+            options: { opensAppToForeground: true, isDestructive: true },
+        },
+    ]).catch(() => {});
+
+    void Notifications.setNotificationCategoryAsync(PUSH_NOTIFICATION_CATEGORY_IDS.userActionRequestV1, [
+        {
+            identifier: PUSH_NOTIFICATION_ACTION_IDS.userActionOpenV1,
+            buttonTitle: t('notifications.actions.answer'),
+            options: { opensAppToForeground: true },
+        },
+    ]).catch(() => {});
+}
+
+void (async () => {
+    try {
+        const Notifications = await loadExpoNotifications();
+        configureForegroundNotificationHandler(Notifications);
+        configureAndroidNotificationChannels(Notifications);
+        configureNotificationCategories(Notifications);
+    } catch {
+        // Native notification modules are optional in local dev clients; startup must still render.
+    }
+})();
+
+export {
+    // Catch any errors thrown by the Layout component.
+    ErrorBoundary,
+} from 'expo-router';
+
+// Configure splash screen
+SplashScreen.setOptions({
+    fade: true,
+    duration: 300,
+})
+SplashScreen.preventAutoHideAsync();
+
+// NEVER ENABLE REMOTE LOGGING IN PRODUCTION
+// This is for local debugging with AI only
+// So AI will have all the logs easily accessible in one file for analysis
+if (!!process.env.PUBLIC_EXPO_DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING) {
+    monkeyPatchConsoleForRemoteLoggingForFasterAiAutoDebuggingOnlyInLocalBuilds()
+}
+installBugReportConsoleCapture({ maxEntries: 300 });
+configureBugReportUserActionTrail({ maxActions: 300 });
+
+if (shouldCaptureRnwUnexpectedTextNodeStacks()) {
+    installRnwUnexpectedTextNodeStackCaptureOnce();
+    installReactCreateElementUnexpectedTextNodeCaptureOnce();
+    installReactJsxRuntimeUnexpectedTextNodeCaptureOnce();
+    installReactNativeViewRenderUnexpectedTextNodeCaptureOnce();
+}
+
+// Component to apply horizontal safe area padding
+function HorizontalSafeAreaWrapper({ children }: { children: React.ReactNode }) {
+    const insets = useSafeAreaInsets();
+    return (
+        <View style={{
+            flex: 1,
+            paddingLeft: insets.left,
+            paddingRight: insets.right
+        }}>
+            {children}
+        </View>
+    );
+}
+
+function ChromeSafeAreaInsetsWarmup(): null {
+    useChromeSafeAreaInsets();
+    return null;
+}
+
+let lock = new AsyncLock();
+let loaded = false;
+let suppressFontTimeoutErrorsUntilMs = 0;
+let webFontLoadAttemptedAtMs = 0;
+
+async function loadFonts() {
+    await lock.inLock(async () => {
+        if (loaded) {
+            return;
+        }
+        loaded = true;
+        // Prefer DOM detection over Platform.OS so web builds remain resilient even if Platform.OS is
+        // surprising in some environments.
+        const isWeb = Platform.OS === 'web' || (typeof document !== 'undefined');
+
+        const isWebAutomation = isWeb &&
+            typeof navigator !== 'undefined' &&
+            (navigator as any).webdriver === true;
+
+        const isFontTimeoutSuppressionEnabled = (() => {
+            if (isWebAutomation) return true;
+            const raw = String(process.env.PUBLIC_EXPO_WEB_SUPPRESS_FONT_TIMEOUT_OVERLAY ?? '').trim().toLowerCase();
+            return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+        })();
+
+        const suppressFontTimeoutBootWindowMs =
+            Number(process.env.PUBLIC_EXPO_WEB_FONT_TIMEOUT_SUPPRESS_BOOT_WINDOW_MS) || 20_000;
+        const suppressFontTimeoutAttemptWindowMs =
+            Number(process.env.PUBLIC_EXPO_WEB_FONT_TIMEOUT_SUPPRESS_ATTEMPT_WINDOW_MS) || 60_000;
+
+        // expo-font uses FontFaceObserver on web with a hard-coded 6s timeout; in practice, timeouts
+        // can surface as uncaught errors or unhandled rejections during startup even when font files
+        // are reachable. Only suppress this signature when explicitly enabled (automation contexts by
+        // default), to avoid hiding unrelated startup errors for real users.
+        if (isWeb && isFontTimeoutSuppressionEnabled) {
+            suppressFontTimeoutErrorsUntilMs = Date.now() + suppressFontTimeoutBootWindowMs;
+        }
+
+        if (
+            isWeb &&
+            isFontTimeoutSuppressionEnabled &&
+            typeof window !== 'undefined' &&
+            typeof window.addEventListener === 'function'
+        ) {
+            // expo-font uses FontFaceObserver on web. In practice, it can emit unhandled timeout
+            // rejections in some environments (including automation), even when callers ignore the
+            // load promise. Suppress only that known FontFaceObserver timeout case.
+            window.addEventListener('unhandledrejection', (event: any) => {
+                const reason = event?.reason;
+                const message = typeof reason?.message === 'string' ? reason.message : '';
+                const stack = typeof reason?.stack === 'string' ? reason.stack : '';
+                const stackLower = stack.toLowerCase();
+                // FontFaceObserver timeouts can surface with either a useful stack, or an empty stack
+                // string (depending on environment). Suppress only this known timeout signature.
+                const inBootWindow = Date.now() < suppressFontTimeoutErrorsUntilMs;
+                const inFontAttemptWindow =
+                    webFontLoadAttemptedAtMs > 0 &&
+                    (Date.now() - webFontLoadAttemptedAtMs) < suppressFontTimeoutAttemptWindowMs;
+                const matchesFontTimeoutSignature =
+                    stackLower.includes('fontfaceobserver')
+                    || (isWebAutomation && !stack && (inBootWindow || inFontAttemptWindow));
+                if (message.includes('ms timeout exceeded') && matchesFontTimeoutSignature) {
+                    if (typeof event.preventDefault === 'function') event.preventDefault();
+                    // Prevent dev overlays (and other listeners) from surfacing this known-safe startup
+                    // timeout by stopping propagation when supported.
+                    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+                    if (typeof event.stopPropagation === 'function') event.stopPropagation();
+                }
+            });
+
+            // Some environments surface the same FontFaceObserver timeout as an uncaught error
+            // (instead of an unhandled rejection). Suppress only this known timeout signature.
+            window.addEventListener('error', (event: any) => {
+                const err = event?.error;
+                const message =
+                    (typeof err?.message === 'string' ? err.message : '') ||
+                    (typeof event?.message === 'string' ? event.message : '');
+                const stack = typeof err?.stack === 'string' ? err.stack : '';
+                const stackLower = stack.toLowerCase();
+                const inBootWindow = Date.now() < suppressFontTimeoutErrorsUntilMs;
+                const inFontAttemptWindow =
+                    webFontLoadAttemptedAtMs > 0 &&
+                    (Date.now() - webFontLoadAttemptedAtMs) < suppressFontTimeoutAttemptWindowMs;
+                const matchesFontTimeoutSignature =
+                    stackLower.includes('fontfaceobserver')
+                    || (isWebAutomation && !stack && (inBootWindow || inFontAttemptWindow));
+                if (message.includes('ms timeout exceeded') && matchesFontTimeoutSignature) {
+                    if (typeof event.preventDefault === 'function') event.preventDefault();
+                    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+                    if (typeof event.stopPropagation === 'function') event.stopPropagation();
+                }
+            });
+        }
+
+        const fontMap = {
+            // Keep existing font
+            SpaceMono: require('@/assets/fonts/SpaceMono-Regular.ttf'),
+
+            // Inter family (default typography)
+            'Inter-Regular': require('@/assets/fonts/Inter-Regular.ttf'),
+            'Inter-Italic': require('@/assets/fonts/Inter-Italic.ttf'),
+            'Inter-SemiBold': require('@/assets/fonts/Inter-SemiBold.ttf'),
+
+            // IBM Plex Mono family
+            'IBMPlexMono-Regular': require('@/assets/fonts/IBMPlexMono-Regular.ttf'),
+            'IBMPlexMono-Italic': require('@/assets/fonts/IBMPlexMono-Italic.ttf'),
+            'IBMPlexMono-SemiBold': require('@/assets/fonts/IBMPlexMono-SemiBold.ttf'),
+
+            // Bricolage Grotesque
+            'BricolageGrotesque-Bold': require('@/assets/fonts/BricolageGrotesque-Bold.ttf'),
+
+            ...FontAwesome.font,
+            ...Ionicons.font,
+        };
+
+        // On web, expo-font uses FontFaceObserver with a hard-coded ~6s timeout. In practice, this
+        // can time out (and surface as uncaught errors / unhandled rejections) even when font files
+        // are reachable. Avoid expo-font entirely on web and inject `@font-face` rules instead.
+        if (isWeb) {
+            try {
+                webFontLoadAttemptedAtMs = Date.now();
+                await installWebFontFaces(fontMap);
+            } catch {
+                // Do not surface font init issues on web.
+            }
+            return;
+        }
+
+        // Native platforms: block startup until fonts are ready.
+        await Fonts.loadAsync(fontMap);
+    });
+}
+
+function RootLayout() {
+    const { theme } = useUnistyles();
+    const isDesktopPetOverlayWindow = isDesktopPetOverlayWindowContext();
+    useWebUiFontScale();
+    useWebBackdropBlurPreference();
+    usePierreDiffWorkerPoolWarmup();
+    const background = isDesktopPetOverlayWindow ? 'transparent' : theme.colors.background.canvas;
+    const navigationTheme = React.useMemo(() => {
+        if (theme.dark) {
+            return {
+                ...DarkTheme,
+                colors: {
+                    ...DarkTheme.colors,
+                    background,
+                }
+            }
+        }
+        return {
+            ...DefaultTheme,
+            colors: {
+                ...DefaultTheme.colors,
+                background,
+            }
+        };
+    }, [background, theme.dark]);
+
+    const onRestart = React.useCallback(() => {
+        if (Platform.OS === 'web') {
+            try {
+                (globalThis as any).location?.reload?.();
+            } catch {
+                // ignore
+            }
+            return;
+        }
+
+        void import('expo-updates')
+            .then((Updates) => Updates.reloadAsync())
+            .catch(() => {});
+    }, []);
+
+    return (
+        <WebCryptoStartupGate>
+            <AppCrashRecoveryBoundary
+                onRestart={onRestart}
+                onError={(error) => {
+                    try {
+                        (Sentry as any).captureException?.(error);
+                    } catch {
+                        // ignore
+                    }
+                }}
+            >
+                <AppBoot
+                    desktopWindowBackgroundColor={background}
+                    navigationTheme={navigationTheme}
+                />
+            </AppCrashRecoveryBoundary>
+        </WebCryptoStartupGate>
+    );
+}
+
+function AppBoot(props: {
+    desktopWindowBackgroundColor: string;
+    navigationTheme: any;
+}) {
+    //
+    // Init sequence
+    //
+    const router = useRouter();
+    const pathname = usePathname();
+    const safeArea = useSafeAreaInsets();
+    const isTablet = useIsTablet();
+    const isDesktopPetOverlayWindow = isDesktopPetOverlayWindowContext();
+    useTauriMainWindowBackgroundColor(
+        props.desktopWindowBackgroundColor,
+        !isDesktopPetOverlayWindow,
+    );
+    const isTerminalConnectRoute = isTerminalConnectWebPathname(pathname);
+    const [initState, setInitState] = React.useState<AppBootReadyState | null>(null);
+    const [bootError, setBootError] = React.useState<Error | null>(null);
+    const restartBugReportCheckedRef = React.useRef(false);
+
+    React.useEffect(() => {
+        clearActiveViewingSessionsForNonSessionRoute(pathname);
+    }, [pathname]);
+
+    React.useEffect(() => {
+        let cancelled = false;
+        void runAppBootSequence({
+            loadFonts,
+            sodiumReady: sodium.ready,
+            resolveCredentials: () => resolveBootCredentials(Platform.OS),
+            prepareWarmCache: prepareWarmCacheStorage,
+            prepareSessionDrafts: prepareSessionDraftPersistenceStorage,
+            restoreSync: syncRestore,
+            onReady: (ready) => {
+                if (cancelled) return;
+                setInitState(ready);
+            },
+        }).catch((error: unknown) => {
+            if (cancelled) return;
+            setBootError(error instanceof Error ? error : new Error('Failed to initialize app storage', { cause: error }));
+            void SplashScreen.hideAsync().catch(() => {});
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [isDesktopPetOverlayWindow]);
+
+    React.useEffect(() => {
+        if (!initState) return;
+        if (restartBugReportCheckedRef.current) return;
+        restartBugReportCheckedRef.current = true;
+
+        let cancelled = false;
+        (async () => {
+            try {
+                const shouldOpenBugReport = await consumeRestartBugReportIntent();
+                if (!shouldOpenBugReport) return;
+                if (cancelled) return;
+                router.push('/settings/report-issue');
+            } catch {
+                // ignore
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [initState, router]);
+
+    React.useEffect(() => {
+        if (initState) {
+            setTimeout(() => {
+                SplashScreen.hideAsync();
+            }, 100);
+        }
+    }, [initState]);
+
+
+    // Track the screens
+    useTrackScreens()
+
+    //
+    // Not inited
+    //
+
+    if (bootError) throw bootError;
+    if (!initState) {
+        return null;
+    }
+
+    //
+    // Boot
+    //
+    let providers = (
+        <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+            <ChromeSafeAreaInsetsWarmup />
+            <KeyboardProvider>
+                <GestureHandlerRootView style={{ flex: 1 }}>
+                    {/*
+                      * `authGeneration` is 0 for every normal boot, so this key never changes and the
+                      * tree never remounts. It only advances when a keychain read that missed its boot
+                      * deadline lands afterwards, which is exactly when the auth tree has to adopt the
+                      * recovered session instead of leaving the user signed out until the next launch.
+                      */}
+                    <AuthProvider key={initState.authGeneration} initialCredentials={initState.credentials}>
+                        <ThemeProvider value={props.navigationTheme}>
+                            <StatusBarProvider />
+                            <AppPaneModalProvider>
+                                <CommandPaletteProvider>
+                                    <RealtimeProvider>
+                                        <ThemePreferenceTransitionHost>
+                                            <HorizontalSafeAreaWrapper>
+                                                <RootAppShell
+                                                    isDesktopPetOverlayWindow={isDesktopPetOverlayWindow}
+                                                    isTablet={isTablet}
+                                                    isTerminalConnectRoute={isTerminalConnectRoute}
+                                                    safeArea={safeArea}
+                                                />
+                                            </HorizontalSafeAreaWrapper>
+                                        </ThemePreferenceTransitionHost>
+                                    </RealtimeProvider>
+                                </CommandPaletteProvider>
+                            </AppPaneModalProvider>
+                        </ThemeProvider>
+                    </AuthProvider>
+                </GestureHandlerRootView>
+            </KeyboardProvider>
+        </SafeAreaProvider>
+    );
+    if (tracking) {
+        providers = (
+            <PostHogProvider client={tracking}>
+                <SettingsAnalyticsRuntime />
+                {providers}
+            </PostHogProvider>
+        );
+    }
+
+    return (
+        <>
+            <FaviconPermissionIndicator />
+            {providers}
+        </>
+    );
+}
+
+function RootAppShell(props: Readonly<{
+    isDesktopPetOverlayWindow: boolean;
+    isTablet: boolean;
+    isTerminalConnectRoute: boolean;
+    safeArea: Readonly<{ top: number; right: number; left: number }>;
+}>) {
+    const auth = useAuth();
+    const tauriDesktop = isTauriDesktop();
+    const appShellChromeHost = resolveAppShellChromeHost({
+        isAuthenticated: auth.isAuthenticated,
+        isDesktopPetOverlayWindow: props.isDesktopPetOverlayWindow,
+        isWeb: Platform.OS === 'web',
+        isTauriDesktop: tauriDesktop,
+        isTablet: props.isTablet,
+        isTerminalConnectRoute: props.isTerminalConnectRoute,
+    });
+    const sidebarShellUpdateIndicator =
+        appShellChromeHost === 'none'
+        && auth.isAuthenticated
+        && tauriDesktop
+        && props.isTablet
+        && !props.isTerminalConnectRoute
+        && !props.isDesktopPetOverlayWindow
+            ? <AppUpdateStatusTag testID="sidebar-shell-app-update-status-tag" />
+            : undefined;
+    const shouldUseRootDesktopDragSurface =
+        appShellChromeHost === 'unauth-shell'
+        || appShellChromeHost === 'narrow-desktop-fallback';
+
+    const shellContent = (
+        <View style={{ flex: 1, position: 'relative' }}>
+            <ActionOperationRuntime enabled={auth.isAuthenticated && !props.isDesktopPetOverlayWindow} />
+            {/*
+              * R5/INV4 — deliberately NOT behind `auth.isAuthenticated`. This is the app's one
+              * pre-auth mount: the moment the desktop window opens it starts acquiring the
+              * managed CLI and reading local readiness, so signing in lands on work already done.
+              * The pet overlay is a second webview of the same app and must not read a second time.
+              */}
+            <DesktopLocalSetupWarmup enabled={tauriDesktop && !props.isDesktopPetOverlayWindow} />
+            {/*
+              * The quit handoff. Mounted beside the warm-up and on the same one-webview condition:
+              * the native side hands the decision to a single webview, and the pet overlay is a
+              * second webview of the same app. Nothing is gated on auth — a computer whose
+              * background service should stop when the app closes is one whose app may be closed
+              * from anywhere in the app, signed in or not.
+              */}
+            <DesktopBackgroundServiceCloseGuard enabled={tauriDesktop && !props.isDesktopPetOverlayWindow} />
+            {!props.isDesktopPetOverlayWindow ? <OnboardingShowcaseAutoShowMount /> : null}
+            {appShellChromeHost === 'narrow-desktop-fallback' || appShellChromeHost === 'unauth-shell' ? (
+                <DesktopFallbackShellChrome safeArea={props.safeArea} />
+            ) : appShellChromeHost === 'web-top-right' ? (
+                <View
+                    pointerEvents="box-none"
+                    style={{
+                        position: 'absolute',
+                        top: props.safeArea.top + 12,
+                        right: props.safeArea.right + 16,
+                        zIndex: 10,
+                    }}
+                >
+                    <AppUpdateStatusTag testID="root-shell-app-update-status-tag" />
+                </View>
+            ) : null}
+            <View style={{ flex: 1 }}>
+                <SidebarNavigator desktopUpdateIndicator={sidebarShellUpdateIndicator} />
+            </View>
+        </View>
+    );
+
+    return (
+        <DesktopMainContentDragSurface
+            enabled={shouldUseRootDesktopDragSurface && Platform.OS === 'web' && tauriDesktop}
+            leftOffsetPx={0}
+            style={{ flex: 1 }}
+        >
+            {shellContent}
+        </DesktopMainContentDragSurface>
+    );
+}
+
+function DesktopFallbackShellChrome(props: Readonly<{
+    safeArea: Readonly<{ top: number; left: number }>;
+}>) {
+    const desktopWindowControls = useResolvedDesktopWindowControls({
+        variant: 'expanded',
+    });
+
+    return (
+        <View
+            pointerEvents="box-none"
+            style={{
+                position: 'absolute',
+                top: props.safeArea.top + 12,
+                left: props.safeArea.left + 16,
+                zIndex: 10,
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 10,
+            }}
+            testID="desktop-fallback-shell-chrome"
+        >
+            <DesktopShellWindowControlsHost>
+                {desktopWindowControls}
+            </DesktopShellWindowControlsHost>
+            <DesktopShellUpdateIndicatorHost>
+                <AppUpdateStatusTag testID="root-shell-app-update-status-tag" />
+            </DesktopShellUpdateIndicatorHost>
+        </View>
+    );
+}
+
+export default wrapWithSentryIfEnabled(RootLayout);

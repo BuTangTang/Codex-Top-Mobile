@@ -1,0 +1,221 @@
+import { test, expect, type Page } from '@playwright/test';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { gotoDomContentLoadedWithPathFallback, gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
+import { createGitRepoForPartialStagingFixture } from '../../src/testkit/uiE2e/gitRepoFixtures';
+import { spawnSessionFromDaemon } from '../../src/testkit/uiE2e/spawnSessionFromDaemon';
+import { toTestIdSafeValue } from '../../src/testkit/uiE2e/testIdSafeValue';
+import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
+import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
+import { collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+function detailsPaneLocator(page: Page) {
+  return page
+    .getByTestId('multi-pane-details-docked')
+    .or(page.getByTestId('multi-pane-details-overlay'));
+}
+
+function rightPaneLocator(page: Page) {
+  return page
+    .getByTestId('multi-pane-right-docked')
+    .or(page.getByTestId('multi-pane-right-overlay'));
+}
+
+async function enableScmWriteOperationsInSettings(page: Page, baseUrl: string) {
+  await gotoDomContentLoadedWithPathFallback(page, `${baseUrl}/settings/features`, '/settings/features', 180_000);
+  await expect(page.getByTestId('settings-feature-experiments-toggle')).toHaveCount(1, { timeout: 60_000 });
+
+  const experimentsToggle = page.getByTestId('settings-feature-experiments-toggle');
+  await experimentsToggle.click();
+
+  const scmToggle = page.getByTestId('settings-feature-toggle-scm.writeOperations');
+  await expect(scmToggle).toHaveCount(1, { timeout: 60_000 });
+  await scmToggle.click();
+}
+
+test.describe('ui e2e: SCM partial staging + commit + discard', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('session-scm-partial-staging-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+  let daemon: StartedDaemon | null = null;
+
+  test.beforeAll(async () => {
+    test.setTimeout(1_200_000);
+    await mkdir(cliHomeDir, { recursive: true });
+    await writeFile(resolve(join(cliHomeDir, 'AGENTS.md')), '# UI e2e fixture\n', 'utf8');
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
+      },
+    });
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...process.env,
+        EXPO_PUBLIC_DEBUG: '1',
+        EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
+        EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
+        HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS ?? '420000',
+      },
+    });
+
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(120_000);
+    await daemon?.stop().catch(() => {});
+    await ui?.stop().catch(() => {});
+    await server?.stop().catch(() => {});
+  });
+
+  test('stages selected lines, commits, keeps remaining changes, and supports discard/revert UI', async ({ page }) => {
+    test.setTimeout(1_200_000);
+    if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
+
+    const browserDiagnostics = collectBrowserDiagnostics({ page });
+    const testDir = resolve(join(suiteDir, 't1-partial-staging'));
+
+    let runDaemon: StartedDaemon | null = null;
+    try {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await gotoDomContentLoadedWithRetries(page, uiBaseUrl, 420_000);
+
+      await ensureAccountReadyForConnect({ page, timeoutMs: 120_000 });
+
+      await mkdir(testDir, { recursive: true });
+
+      const fakeClaudeLogPath = resolve(join(testDir, 'fake-claude.jsonl'));
+      const fakeClaudePath = fakeClaudeFixturePath();
+
+      runDaemon = await authenticateAndStartDaemon({
+        page,
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        uiBaseUrl,
+        daemonStartupTimeoutMs: 180_000,
+        extraEnv: {
+          HOME: cliHomeDir,
+          // Machine-scoped RPC must be allowed to read the repo fixture directory.
+          HAPPIER_MACHINE_RPC_WORKING_DIRECTORY: testDir,
+          HAPPIER_CLAUDE_PATH: fakeClaudePath,
+          HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+          HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+          HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+        },
+      });
+      daemon = runDaemon;
+
+      const repoDir = resolve(join(testDir, 'repo'));
+      await createGitRepoForPartialStagingFixture({ repoDir });
+
+      await enableScmWriteOperationsInSettings(page, uiBaseUrl);
+
+      const sessionId = await spawnSessionFromDaemon({ daemon: runDaemon, directory: repoDir });
+      await gotoDomContentLoadedWithPathFallback(page, `${uiBaseUrl}/session/${sessionId}?right=git`, `/session/${sessionId}`, 180_000);
+      await expect(page.getByTestId('session-composer-input')).toHaveCount(1, { timeout: 180_000 });
+
+      // Ensure right pane is open and on Source control.
+      if ((await rightPaneLocator(page).count()) === 0) {
+        await page.getByTestId('session-open-source-control').click();
+      }
+      await expect(rightPaneLocator(page)).toHaveCount(1, { timeout: 60_000 });
+
+      const rightPane = rightPaneLocator(page);
+      await expect(rightPane.getByTestId('session-rightpanel-surface-git')).toBeVisible({ timeout: 180_000 });
+
+      const twoHunksPath = 'src/two-hunks.txt';
+      const wholeFilePath = 'src/whole-file.txt';
+      const untrackedPath = 'src/untracked.txt';
+
+      const twoHunksRow = rightPane.getByTestId(`scm-change-row-${toTestIdSafeValue(twoHunksPath)}`);
+      await expect(twoHunksRow).toHaveCount(1, { timeout: 120_000 });
+
+      // Select one whole file from the SCM list. The second file will be selected partially
+      // from its details pane through the explicit line-selection mode.
+      const wholeFileToggle = rightPane.getByTestId(`scm-commit-selection-toggle-${toTestIdSafeValue(wholeFilePath)}`);
+      await rightPane.getByTestId('scm-commit-enter-selection').click();
+      await expect(wholeFileToggle).toHaveCount(1, { timeout: 60_000 });
+      await wholeFileToggle.click({ force: true });
+      await expect(rightPane.getByTestId('scm-commit-selection-summary')).toContainText(/^1\b/, { timeout: 60_000 });
+
+      // Open file details tab (pinned), enter explicit line-selection mode, and select
+      // a single line from the first hunk.
+      await twoHunksRow.focus();
+      await page.keyboard.press('Shift+Enter');
+      await expect(page.getByTestId(`session-details-tab-${toTestIdSafeValue(`file:${twoHunksPath}`)}`)).toHaveCount(1, { timeout: 60_000 });
+
+      const fileDetailsScroll = detailsPaneLocator(page).getByTestId('file-details-scroll');
+      await expect(fileDetailsScroll).toHaveCount(1, { timeout: 120_000 });
+      await expect(detailsPaneLocator(page).getByTestId('file-details-select-lines')).toHaveCount(1, { timeout: 60_000 });
+      await detailsPaneLocator(page).getByTestId('file-details-select-lines').click();
+
+      const firstHunkLine = detailsPaneLocator(page).getByText('ADDED_HUNK1_A', { exact: true }).first();
+      await expect(firstHunkLine).toHaveCount(1, { timeout: 120_000 });
+      await firstHunkLine.click({ force: true });
+
+      await expect(detailsPaneLocator(page).getByTestId('file-details-apply-selected-lines')).toHaveCount(1, { timeout: 60_000 });
+      await detailsPaneLocator(page).getByTestId('file-details-apply-selected-lines').click();
+      await expect(rightPane.getByTestId('scm-commit-selection-summary')).toContainText(/^2\b/, { timeout: 60_000 });
+
+      // Commit selected changes.
+      const commitMessage = page.getByTestId('scm-commit-message');
+      await expect(commitMessage).toHaveCount(1, { timeout: 60_000 });
+      await commitMessage.fill('test: partial staging ui-e2e');
+      const commitSubmit = page.getByTestId('scm-commit-submit');
+      await expect(commitSubmit).toHaveCount(1, { timeout: 60_000 });
+      await commitSubmit.click();
+
+      // After commit, remaining changes should persist (second hunk) and untracked file should remain.
+      await expect(rightPane.getByTestId(`scm-change-row-${toTestIdSafeValue(twoHunksPath)}`)).toHaveCount(1, { timeout: 120_000 });
+      await expect(rightPane.getByTestId(`scm-change-row-${toTestIdSafeValue(wholeFilePath)}`)).toHaveCount(0, { timeout: 120_000 });
+      await expect(rightPane.getByTestId(`scm-change-row-${toTestIdSafeValue(untrackedPath)}`)).toHaveCount(1, { timeout: 120_000 });
+
+      // Open remaining diff and verify the first hunk content is gone but the second hunk remains.
+      await twoHunksRow.focus();
+      await page.keyboard.press('Shift+Enter');
+      await expect(fileDetailsScroll).toHaveCount(1, { timeout: 120_000 });
+      await expect(detailsPaneLocator(page).getByText('ADDED_HUNK2_A')).toHaveCount(1, { timeout: 120_000 });
+      await expect(detailsPaneLocator(page).getByText('ADDED_HUNK1_A')).toHaveCount(0, { timeout: 120_000 });
+
+      // Discard remaining changes for the file.
+      const discardTwoHunks = detailsPaneLocator(page).getByTestId(`scm-discard-${toTestIdSafeValue(twoHunksPath)}`);
+      await discardTwoHunks.click();
+      await expect(page.getByTestId('web-modal-confirm')).toHaveCount(1, { timeout: 60_000 });
+      await page.getByTestId('web-modal-confirm').click();
+      await expect(rightPane.getByTestId(`scm-change-row-${toTestIdSafeValue(twoHunksPath)}`)).toHaveCount(0, { timeout: 120_000 });
+
+      // Open History and ensure we can open the latest commit diff and see the revert affordance.
+      await rightPane.getByTestId('session-rightpanel-git-subtab:history').click();
+      const firstCommit = page.locator('[data-testid^="scm-commit-entry-"]').first();
+      await expect(firstCommit).toHaveCount(1, { timeout: 120_000 });
+      await firstCommit.click();
+      await expect(detailsPaneLocator(page).getByTestId('scm-commit-details-revert')).toHaveCount(1, { timeout: 120_000 });
+    } catch (err) {
+      await test.info().attach('browser-diagnostics', {
+        body: browserDiagnostics(),
+        contentType: 'text/markdown',
+      });
+      throw err;
+    }
+  });
+});

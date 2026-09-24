@@ -1,0 +1,270 @@
+import { describe, expect, it } from 'vitest';
+
+import { AGENT_IDS } from '../types.js';
+import type { AgentId } from '../types.js';
+import {
+  getProviderCliBinaryNames,
+  getProviderCliRuntimeSpec,
+  PROVIDER_CLI_RUNTIME_SPECS,
+} from './providerCliRuntime.js';
+
+const cursorAgentId = 'cursor' as AgentId;
+
+describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
+  it('marks backend CLIs as system-first by default', () => {
+    expect(getProviderCliRuntimeSpec('codex').sourcePreferenceDefault).toBe('system-first');
+    expect(getProviderCliRuntimeSpec('gemini').sourcePreferenceDefault).toBe('system-first');
+    expect(getProviderCliRuntimeSpec('claude').sourcePreferenceDefault).toBe('system-first');
+  });
+
+  it('declares managed binary sources for binary-backed CLIs', () => {
+    expect(getProviderCliRuntimeSpec('codex')).toMatchObject({
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: {
+        kind: 'github_release_binary',
+        binaryName: 'codex',
+        githubRepo: 'openai/codex',
+        assetNameByPlatform: {
+          win32: {
+            arm64: 'codex-package-aarch64-pc-windows-msvc.tar.gz',
+            x64: 'codex-package-x86_64-pc-windows-msvc.tar.gz',
+          },
+        },
+        archiveExtractionLimits: {
+          maxFileBytes: 384 * 1024 * 1024,
+          maxExpandedBytes: 384 * 1024 * 1024,
+        },
+      },
+    });
+
+    const managedInstall = getProviderCliRuntimeSpec('codex').managedInstall;
+    expect(managedInstall?.kind).toBe('github_release_binary');
+    if (managedInstall?.kind !== 'github_release_binary') return;
+    const archiveExtractionLimits = managedInstall.archiveExtractionLimits;
+    expect(archiveExtractionLimits).toBeDefined();
+    if (!archiveExtractionLimits) return;
+
+    // Checksum-pinned OpenAI release rust-v0.147.0 contains a 298,668,336-byte
+    // Codex executable and expands to 370,442,135 bytes across the package.
+    expect(archiveExtractionLimits.maxFileBytes).toBeGreaterThan(298_668_336);
+    expect(archiveExtractionLimits.maxExpandedBytes).toBeGreaterThan(370_442_135);
+  });
+
+  it('declares managed package sources for package-backed CLIs', () => {
+    expect(getProviderCliRuntimeSpec('opencode')).toMatchObject({
+      binaryName: 'opencode',
+      alternativeBinaryNames: ['opencode2'],
+      managedInstall: {
+        kind: 'managed_package',
+        packageName: 'opencode-ai',
+        binaryName: 'opencode',
+        packageBinarySetup: { kind: 'opencode_platform_binary' },
+      },
+    });
+    expect(getProviderCliRuntimeSpec('gemini')).toMatchObject({
+      managedInstall: {
+        kind: 'managed_package',
+        packageName: '@google/gemini-cli',
+        binaryName: 'gemini',
+      },
+    });
+    expect(getProviderCliRuntimeSpec('qwen')).toMatchObject({
+      managedInstall: {
+        kind: 'managed_package',
+        packageName: '@qwen-code/qwen-code',
+        binaryName: 'qwen',
+      },
+    });
+  });
+
+  it('keeps vendor-recipe providers without managed installation metadata', () => {
+    expect(getProviderCliRuntimeSpec('claude')).toMatchObject({
+      title: 'Claude Code CLI',
+      managedInstall: null,
+      manualInstallKind: 'vendor_recipe',
+      manualInstallRecipes: {
+        darwin: [expect.objectContaining({ cmd: 'bash' })],
+      },
+      acceptsJavaScriptFileOverride: true,
+      installGuideUrl: 'https://code.claude.com/docs/en/setup',
+    });
+    expect(getProviderCliRuntimeSpec('qwen')).toMatchObject({
+      managedInstall: {
+        kind: 'managed_package',
+        packageName: '@qwen-code/qwen-code',
+        binaryName: 'qwen',
+      },
+      manualInstallKind: 'command',
+      manualInstallRecipes: null,
+    });
+  });
+
+  it('keeps upstream manual install hints on the runtime catalog for vendor-recipe providers', () => {
+    expect(JSON.stringify(getProviderCliRuntimeSpec('claude'))).toContain('claude.ai/install.sh');
+    expect(JSON.stringify(getProviderCliRuntimeSpec('kimi'))).toContain('code.kimi.com/kimi-code/install.sh');
+  });
+
+  it('keeps provider-specific setup guide links on the runtime catalog when they differ from general docs', () => {
+    expect(getProviderCliRuntimeSpec('claude').installGuideUrl).toBe('https://code.claude.com/docs/en/setup');
+    expect(getProviderCliRuntimeSpec('opencode').installGuideUrl).toBe('https://opencode.ai/docs');
+    expect(getProviderCliRuntimeSpec('kimi').installGuideUrl).toContain('moonshotai.github.io/kimi-code');
+    expect(getProviderCliRuntimeSpec('qwen').installGuideUrl).toBe('https://qwenlm.github.io/qwen-code-docs/');
+    expect(getProviderCliRuntimeSpec('pi').installGuideUrl).toBe('https://github.com/badlogic/pi-mono');
+    expect(getProviderCliRuntimeSpec('codex').installGuideUrl).toBeNull();
+    expect(getProviderCliRuntimeSpec('devin').installGuideUrl).toBe('https://docs.devin.ai/work-with-devin/devin-cli');
+  });
+
+  it('declares Devin as a system-first vendor-installed CLI', () => {
+    expect(getProviderCliRuntimeSpec('devin')).toMatchObject({
+      id: 'devin',
+      title: 'Devin CLI',
+      binaryName: 'devin',
+      knownCommandCandidates: [{ kind: 'homeBinDir', relativeDir: '.local/bin' }],
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: null,
+      manualInstallKind: 'command',
+    });
+  });
+
+  it('declares FX and Droid as system-first vendor-recipe CLIs', () => {
+    expect(getProviderCliRuntimeSpec('fx')).toMatchObject({
+      binaryName: 'fx', managedInstall: null, manualInstallKind: 'vendor_recipe',
+    });
+    expect(JSON.stringify(getProviderCliRuntimeSpec('fx').manualInstallRecipes)).toContain('fx.sh/setup.sh');
+    expect(getProviderCliRuntimeSpec('droid')).toMatchObject({
+      binaryName: 'droid', managedInstall: null, manualInstallKind: 'vendor_recipe',
+    });
+    expect(JSON.stringify(getProviderCliRuntimeSpec('droid').manualInstallRecipes)).toContain('app.factory.ai/cli');
+  });
+
+  /**
+   * Factory's published Windows installer (`https://app.factory.ai/cli/windows`, observed
+   * 2026-09-12 at CLI 0.218.1) resolves x64 / x64-baseline / arm64 from one script and copies
+   * `droid.exe` into `%USERPROFILE%\bin`, which it then appends to the user PATH.
+   */
+  it('installs and detects the official Windows Droid CLI binary', () => {
+    const droid = getProviderCliRuntimeSpec('droid');
+    expect(droid.manualInstallRecipes?.win32).toEqual([
+      {
+        cmd: 'powershell',
+        args: [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          'Invoke-RestMethod https://app.factory.ai/cli/windows | Invoke-Expression',
+        ],
+      },
+    ]);
+    expect(droid.knownCommandCandidates).toContainEqual({ kind: 'homePath', relativePath: 'bin/droid.exe' });
+  });
+
+  it('captures ordered provider CLI fallback candidates on the runtime catalog', () => {
+    expect(getProviderCliRuntimeSpec('claude').knownCommandCandidates).toEqual([
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
+      { kind: 'homeVersionedDir', relativeDir: '.local/share/claude/versions' },
+      { kind: 'homePath', relativePath: '.claude/local/cli.js' },
+      { kind: 'absolutePath', path: '/opt/homebrew/bin/claude' },
+      { kind: 'absolutePath', path: '/usr/local/bin/claude' },
+      { kind: 'absolutePath', path: '/home/linuxbrew/.linuxbrew/bin/claude' },
+      { kind: 'homePath', relativePath: '.bun/bin/claude' },
+      { kind: 'homePath', relativePath: 'AppData/Local/Claude/claude.exe' },
+      { kind: 'homeVersionedDir', relativeDir: 'AppData/Local/Claude/versions' },
+      { kind: 'homePath', relativePath: '.claude/claude.exe' },
+      { kind: 'homeVersionedDir', relativeDir: '.claude/versions' },
+      { kind: 'homePath', relativePath: '.local/bin/claude.exe' },
+    ]);
+    expect(getProviderCliRuntimeSpec('kimi').knownCommandCandidates).toEqual([
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
+    ]);
+    expect(getProviderCliRuntimeSpec('opencode').knownCommandCandidates).toEqual([
+      { kind: 'homeBinDir', relativeDir: '.opencode/bin' },
+      { kind: 'homePath', relativePath: 'AppData/Roaming/npm/opencode.cmd' },
+    ]);
+    expect(getProviderCliRuntimeSpec('codex').knownCommandCandidates).toBeNull();
+    expect(getProviderCliRuntimeSpec('grok').knownCommandCandidates).toEqual([
+      { kind: 'homeBinDir', relativeDir: '.grok/bin' },
+      { kind: 'homePath', relativePath: '.grok/bin/grok.exe' },
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
+      { kind: 'absolutePath', path: '/opt/homebrew/bin/grok' },
+      { kind: 'absolutePath', path: '/usr/local/bin/grok' },
+    ]);
+  });
+
+  it('keeps Grok on the official vendor-install contract without an agent binary fallback', () => {
+    expect(getProviderCliRuntimeSpec('grok')).toMatchObject({
+      title: 'Grok Build CLI',
+      binaryName: 'grok',
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: null,
+      manualInstallKind: 'vendor_recipe',
+      acceptsJavaScriptFileOverride: false,
+      installGuideUrl: 'https://x.ai/cli',
+    });
+    expect(getProviderCliRuntimeSpec('grok').alternativeBinaryNames).toBeUndefined();
+    expect(JSON.stringify(getProviderCliRuntimeSpec('grok').manualInstallRecipes)).toContain('x.ai/cli/install.sh');
+    expect(JSON.stringify(getProviderCliRuntimeSpec('grok').manualInstallRecipes)).toContain('x.ai/cli/install.ps1');
+  });
+
+  it('declares Cursor as a system-first CLI with identity-checked fallback candidates', () => {
+    expect(getProviderCliRuntimeSpec(cursorAgentId)).toMatchObject({
+      id: 'cursor',
+      title: 'Cursor Agent CLI',
+      binaryName: 'cursor-agent',
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: null,
+      manualInstallKind: 'vendor_recipe',
+      acceptsJavaScriptFileOverride: false,
+      installGuideUrl: 'https://cursor.com/docs/cli/installation',
+      docsUrl: 'https://cursor.com/docs/cli',
+      alternativeBinaryIdentityProbe: {
+        args: ['about', '--format', 'json'],
+        timeoutMs: 2000,
+        stdoutJsonStringField: 'cliVersion',
+      },
+      knownCommandCandidates: [
+        { kind: 'homeBinDir', relativeDir: '.local/bin' },
+        { kind: 'homeVersionedDir', relativeDir: '.local/share/cursor-agent/versions' },
+        { kind: 'homePath', relativePath: 'AppData/Local/Programs/cursor-agent/cursor-agent.exe' },
+      ],
+      alternativeBinaryNames: ['agent'],
+    });
+  });
+
+  it('filters Cursor fallback binary aliases when the fallback env var is disabled', () => {
+    expect(getProviderCliBinaryNames(cursorAgentId, {
+      HAPPIER_CURSOR_AGENT_FALLBACK_ENABLED: '0',
+    })).toEqual(['cursor-agent']);
+    expect(getProviderCliBinaryNames(cursorAgentId, {
+      HAPPIER_CURSOR_AGENT_FALLBACK_ENABLED: '1',
+    })).toEqual(['cursor-agent', 'agent']);
+  });
+
+  it('does not keep a system npm install recipe for OpenCode', () => {
+    expect(getProviderCliRuntimeSpec('opencode')).toMatchObject({
+      managedInstall: {
+        kind: 'managed_package',
+        packageName: 'opencode-ai',
+        binaryName: 'opencode',
+        packageBinarySetup: { kind: 'opencode_platform_binary' },
+      },
+      manualInstallKind: 'command',
+      manualInstallRecipes: null,
+    });
+  });
+
+  it('does not keep legacy manual install recipes for managed-install providers', () => {
+    expect(getProviderCliRuntimeSpec('codex').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('gemini').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('auggie').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('kilo').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('opencode').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('pi').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('copilot').manualInstallRecipes).toBeNull();
+    expect(getProviderCliRuntimeSpec('qwen').manualInstallRecipes).toBeNull();
+  });
+
+  it('covers every built-in provider', () => {
+    expect(Object.keys(PROVIDER_CLI_RUNTIME_SPECS).sort()).toEqual([...AGENT_IDS].sort());
+  });
+});

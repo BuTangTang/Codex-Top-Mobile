@@ -1,0 +1,799 @@
+import { z } from "zod";
+import type { PermissionMode, ModelMode } from "@/sync/domains/permissions/permissionTypes";
+import { 
+    createAgentRuntimeDescriptorV1Schema,
+    createAcpConfigOptionOverridesV1Schema,
+    createAcpSessionModeOverrideV1Schema,
+    createModelOverrideV1Schema,
+    createSessionPermissionModeSchema,
+    createSessionRollbackRangesV1Schema,
+    createSessionTerminalMetadataSchema,
+    createProviderSessionInfoV1Schema,
+    createSessionSystemSessionV1Schema,
+    createSessionWorkspaceLocationV1Schema,
+    SessionMcpSelectionRestartRequiredV1Schema,
+    SessionMcpSelectionV1Schema,
+    type PendingDeliveryBlockedReason,
+    type PendingActivationAuthorizationV1,
+    type PrimaryTurnStatusV1,
+    type SessionRuntimeActivityState,
+    type SessionMessageRole,
+    type SessionRuntimeIssueV1,
+    type SessionTurnsProjectionV1,
+    WindowsRemoteSessionLaunchModeSchema,
+    type ScmDefaultBranchPushPolicy,
+    type ScmHostingProvider,
+    type ScmPullRequestSummary,
+} from "@happier-dev/protocol";
+
+//
+// Agent states
+//
+
+const MetadataObjectSchema = z.object({
+    // Cloud/system sessions may omit these fields; treat missing/null as empty.
+    path: z.string().nullish().transform((value) => (typeof value === 'string' ? value : '')),
+    host: z.string().nullish().transform((value) => (typeof value === 'string' ? value : '')),
+    version: z.string().optional(),
+    name: z.string().optional(),
+    os: z.string().optional(),
+    profileId: z.string().nullable().optional(), // Session-scoped profile identity (non-secret)
+    summary: z.object({
+        text: z.string(),
+        updatedAt: z.number()
+    }).optional(),
+    machineId: z.string().optional(),
+    sessionWorkspaceLocationV1: createSessionWorkspaceLocationV1Schema(z).optional(),
+    handoffV1: z.object({
+        v: z.literal(1),
+        sourceMachineId: z.string(),
+        targetMachineId: z.string(),
+        providerId: z.string(),
+        sessionStorageBefore: z.enum(['direct', 'persisted']),
+        sessionStorageAfter: z.enum(['direct', 'persisted']),
+        transportStrategy: z.enum(['direct_peer', 'server_routed_stream']),
+        completedAtMs: z.number(),
+        sourceWorkspaceRootPath: z.string().optional(),
+        targetWorkspaceRootPath: z.string().optional(),
+    }).optional(),
+    claudeSessionId: z.string().optional(), // Claude Code session ID
+    codexSessionId: z.string().optional(), // Codex session/conversation ID (uuid)
+    codexBackendMode: z.enum(['mcp', 'acp', 'appServer']).optional(),
+    agentRuntimeDescriptorV1: createAgentRuntimeDescriptorV1Schema(z).optional(),
+    geminiSessionId: z.string().optional(), // Gemini ACP session ID (opaque)
+    opencodeSessionId: z.string().optional(), // OpenCode ACP session ID (opaque)
+    opencodeBackendMode: z.enum(['server', 'acp']).optional(),
+    opencodeServerBaseUrl: z.string().optional(),
+    opencodeServerBaseUrlExplicit: z.literal(true).optional(),
+    auggieSessionId: z.string().optional(), // Auggie ACP session ID (opaque)
+    qwenSessionId: z.string().optional(), // Qwen Code ACP session ID (opaque)
+    kimiSessionId: z.string().optional(), // Kimi ACP session ID (opaque)
+    kiloSessionId: z.string().optional(), // Kilo ACP session ID (opaque)
+    piSessionId: z.string().optional(), // Pi RPC session ID (opaque)
+    copilotSessionId: z.string().optional(), // Copilot ACP session ID (opaque)
+    auggieAllowIndexing: z.boolean().optional(), // Auggie indexing enablement (spawn-time)
+    tools: z.array(z.string()).optional(),
+    slashCommands: z.array(z.string()).optional(),
+    slashCommandDetails: z.array(z.object({
+        command: z.string(),
+        description: z.string().optional(),
+    })).optional(),
+    acpHistoryImportV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        remoteSessionId: z.string(),
+        importedAt: z.number(),
+        lastImportedFingerprint: z.string().optional(),
+    }).optional(),
+    providerSessionInfoV1: createProviderSessionInfoV1Schema(z).optional().catch(undefined),
+    acpSessionModesV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        currentModeId: z.string(),
+        availableModes: z.array(z.object({
+            id: z.string(),
+            name: z.string(),
+            description: z.string().optional(),
+        })),
+    }).optional(),
+    sessionModesV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        currentModeId: z.string(),
+        availableModes: z.array(z.object({
+            id: z.string(),
+            name: z.string(),
+            description: z.string().optional(),
+        })),
+    }).optional(),
+    /**
+     * ACP session models (if supported by the provider's ACP agent).
+     *
+     * NOTE: This is an UNSTABLE ACP feature and may be unsupported by some agents.
+     */
+    acpSessionModelsV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        currentModelId: z.string(),
+        availableModels: z.array(z.object({
+            id: z.string(),
+            name: z.string(),
+            description: z.string().optional(),
+            contextWindowTokens: z.number().int().positive().optional(),
+            extendedContextModelId: z.string().optional(),
+            modelOptions: z.array(z.object({
+                id: z.string(),
+                name: z.string(),
+                description: z.string().optional(),
+                category: z.string().optional(),
+                type: z.string(),
+                currentValue: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+                options: z.array(z.object({
+                    value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+                    name: z.string(),
+                    description: z.string().optional(),
+                })).optional(),
+            })).optional(),
+        })),
+    }).optional(),
+    sessionModelsV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        currentModelId: z.string(),
+        availableModels: z.array(z.object({
+            id: z.string(),
+            name: z.string(),
+            description: z.string().optional(),
+            contextWindowTokens: z.number().int().positive().optional(),
+            extendedContextModelId: z.string().optional(),
+            modelOptions: z.array(z.object({
+                id: z.string(),
+                name: z.string(),
+                description: z.string().optional(),
+                category: z.string().optional(),
+                type: z.string(),
+                currentValue: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+                options: z.array(z.object({
+                    value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+                    name: z.string(),
+                    description: z.string().optional(),
+                })).optional(),
+            })).optional(),
+        })),
+    }).optional(),
+    sessionAppliedModelV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        modelId: z.string(),
+    }).optional(),
+    /**
+     * ACP session configuration options (if supported by the provider's ACP agent).
+     */
+    acpConfigOptionsV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        configOptions: z.array(z.object({
+            id: z.string(),
+            name: z.string(),
+            description: z.string().optional(),
+            category: z.string().optional(),
+            type: z.string(),
+            currentValue: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+            options: z.array(z.object({
+                value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+                name: z.string(),
+                description: z.string().optional(),
+            })).optional(),
+        })),
+    }).optional(),
+    sessionConfigOptionsV1: z.object({
+        v: z.literal(1),
+        provider: z.string(),
+        updatedAt: z.number(),
+        configOptions: z.array(z.object({
+            id: z.string(),
+            name: z.string(),
+            description: z.string().optional(),
+            category: z.string().optional(),
+            type: z.string(),
+            currentValue: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+            options: z.array(z.object({
+                value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+                name: z.string(),
+                description: z.string().optional(),
+            })).optional(),
+        })),
+    }).optional(),
+    sessionRollbackRangesV1: createSessionRollbackRangesV1Schema(z).optional(),
+    /**
+     * Desired ACP session mode override selected by the user (UI/CLI).
+     *
+     * This is distinct from `acpSessionModesV1`:
+     * - `acpSessionModesV1` mirrors the agent-reported current state.
+     * - `acpSessionModeOverrideV1` is the user's requested mode, applied by the runner when possible.
+     */
+    acpSessionModeOverrideV1: createAcpSessionModeOverrideV1Schema(z).optional(),
+    sessionModeOverrideV1: createAcpSessionModeOverrideV1Schema(z).optional(),
+    /**
+     * Desired ACP config option overrides selected by the user (UI/CLI).
+     */
+    acpConfigOptionOverridesV1: createAcpConfigOptionOverridesV1Schema(z).optional(),
+    sessionConfigOptionOverridesV1: createAcpConfigOptionOverridesV1Schema(z).optional(),
+    acpConfiguredBackendV1: z.object({
+        v: z.literal(1),
+        updatedAt: z.number(),
+        backendId: z.string(),
+        title: z.string(),
+    }).passthrough().optional(),
+    homeDir: z.string().optional(), // User's home directory on the machine
+    happyHomeDir: z.string().optional(), // Happy configuration directory 
+    hostPid: z.number().optional(), // Process ID of the session
+    sessionLogPath: z.string().optional(), // Session-specific CLI log file path
+    terminal: createSessionTerminalMetadataSchema(z).optional(),
+    flavor: z.string().nullish(), // Session flavor/variant identifier
+    // Published by happy-cli so the app can seed permission state even before there are messages.
+    permissionMode: createSessionPermissionModeSchema(z).optional(),
+    permissionModeUpdatedAt: z.number().optional(),
+    /**
+     * Session-level model override selected by the user (UI/CLI).
+     *
+     * This mirrors the permission/mode override pattern:
+     * - Stored in session metadata for cross-device consistency
+     * - Applied to outgoing user messages via `message.meta.model` where supported
+     */
+    modelOverrideV1: createModelOverrideV1Schema(z).optional(),
+    /** Per-session overlay for the account-owned managed MCP catalog. */
+    mcpSelectionV1: SessionMcpSelectionV1Schema.optional(),
+    /** Applied baseline retained only while an active runner needs a restart. */
+    mcpSelectionRestartRequiredV1: SessionMcpSelectionRestartRequiredV1Schema.optional(),
+    /**
+     * Local-only markers for committed transcript messages that should be treated as discarded
+     * (e.g. when the user switches to terminal control and abandons unprocessed remote messages).
+     */
+    discardedCommittedMessageLocalIds: z.array(z.string()).optional(),
+    readStateV1: z.object({
+        v: z.literal(1),
+        sessionSeq: z.number(),
+        pendingActivityAt: z.number(),
+        updatedAt: z.number(),
+    }).optional(),
+    /**
+     * System/hidden sessions created for internal control planes (voice, execution carrier, etc).
+     * These should be excluded from user-facing lists by default.
+     */
+    systemSessionV1: createSessionSystemSessionV1Schema(z).optional(),
+    /**
+     * Fork lineage for a child session.
+     *
+     * Used to render a virtual ancestor transcript (read-only) without duplicating messages.
+     */
+    forkV1: z.object({
+        v: z.literal(1),
+        parentSessionId: z.string(),
+        parentCutoffSeqInclusive: z.number(),
+        createdAtMs: z.number(),
+        strategy: z.string(),
+        requestId: z.string().optional(),
+        providerHint: z.object({
+            providerId: z.string().optional(),
+            backendMode: z.string().optional(),
+            vendorSessionId: z.string().optional(),
+        }).optional(),
+    }).optional(),
+    /**
+     * Hidden replay seed applied exactly once to the first real user prompt.
+     */
+    replaySeedV1: z.object({
+        v: z.literal(1),
+        seedText: z.string(),
+        sourceSessionId: z.string(),
+        sourceCutoffSeqInclusive: z.number(),
+        createdAtMs: z.number(),
+        appliedToLocalId: z.string().optional(),
+        appliedAtMs: z.number().optional(),
+    }).optional(),
+    forkInitialPromptV1: z.object({
+        v: z.literal(1),
+        text: z.string(),
+        createdAtMs: z.number(),
+        sourceMessageId: z.string().optional(),
+        appliedAtMs: z.number().optional(),
+    }).optional(),
+    sessionInitialPromptV1: z.object({
+        v: z.literal(1),
+        text: z.string(),
+        mode: z.enum(['replace', 'append']),
+        createdAtMs: z.number(),
+        sourceMessageIds: z.array(z.string()).optional(),
+        sourceSessionId: z.string().optional(),
+    }).optional().catch(undefined),
+}).passthrough();
+
+export const MetadataSchema = z.preprocess((value) => {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    try {
+        return JSON.parse(trimmed);
+    } catch {
+        return value;
+    }
+}, MetadataObjectSchema);
+
+export type Metadata = z.infer<typeof MetadataSchema>;
+
+const AgentStateObjectSchema = z.object({
+    controlledByUser: z.boolean().nullish(),
+    localControl: z.object({
+        attached: z.boolean().nullish(),
+        topology: z.enum(['exclusive', 'shared']).nullish(),
+        remoteWritable: z.boolean().nullish(),
+        canAttach: z.boolean().nullish(),
+        canDetach: z.boolean().nullish(),
+    }).nullish(),
+    requests: z.record(z.string(), z.object({
+        tool: z.string(),
+        kind: z.string().optional(),
+        source: z.string().optional(),
+        arguments: z.any(),
+        createdAt: z.number().nullish(),
+        pushNotifiedAt: z.number().optional(),
+        /**
+         * Optional provider-provided permission suggestions for this request.
+         * (e.g. Claude Agent SDK `permission_suggestions`).
+         */
+        permissionSuggestions: z.any().optional(),
+    })).nullish(),
+    completedRequests: z.record(z.string(), z.object({
+        tool: z.string(),
+        kind: z.string().optional(),
+        source: z.string().optional(),
+        arguments: z.any(),
+        createdAt: z.number().nullish(),
+        completedAt: z.number().nullish(),
+        status: z.enum(['canceled', 'denied', 'approved']),
+        reason: z.string().nullish(),
+        mode: z.string().nullish(),
+        allowedTools: z.array(z.string()).nullish(),
+        decision: z.enum(['approved', 'approved_for_session', 'approved_execpolicy_amendment', 'denied', 'abort'])
+            .nullish()
+            .catch(undefined),
+        updatedPermissions: z.any().optional(),
+    }).passthrough()).nullish(),
+    /**
+     * Optional agent capabilities negotiated via agentState.
+     * This must be permissive for backward/forward compatibility across agent versions.
+     */
+    capabilities: z.object({
+        modelScopedConfigTombstonesV1: z.preprocess(
+            (value) => value === true ? true : undefined,
+            z.literal(true).optional(),
+        ),
+        askUserQuestionAnswersInPermission: z.boolean().optional(),
+        structuredQuestionAnswersV1Supported: z.preprocess(
+            (value) => value === true ? true : undefined,
+            z.literal(true).optional(),
+        ),
+        inFlightSteer: z.boolean().optional(),
+        inFlightSteerSupported: z.boolean().optional(),
+        inFlightSteerAvailable: z.boolean().optional(),
+        /**
+         * Why in-flight steer is unavailable (lane P, Seam A). Kept permissive (string) for
+         * forward compatibility: newer CLIs may publish reasons this UI does not know yet.
+         * Known values: 'backend_unsupported' | 'unsafe_window' | 'turn_settling'
+         * | 'user_terminal_draft' (lane X: a terminal composer draft is starving steering).
+         */
+        inFlightSteerUnavailableReason: z.string().nullish(),
+        /** Timestamp (ms) of the last steerability evaluation — staleness guard. */
+        inFlightSteerStateAt: z.number().nullish(),
+        /**
+         * Lane Q: backend can apply a steered message's config delta (permission/plan mode) to
+         * the RUNNING turn — enables the "Apply setting & steer now" affordance. Fail-closed.
+         */
+        inFlightConfigApplySupported: z.boolean().nullish(),
+        /**
+         * Provider-neutral terminal composer controls. Injectable-terminal runtimes publish these
+         * so the UI can offer explicit, user-authorized draft clearing without provider branching.
+         */
+        terminalComposerClearSupported: z.boolean().nullish(),
+        terminalComposerDraftPresent: z.boolean().nullish(),
+        sessionGoalSetSupported: z.boolean().nullish(),
+        sessionGoalClearSupported: z.boolean().nullish(),
+        pendingInputInterruptAndRunLocalId: z.string().trim().min(1).nullish(),
+        pendingInputInterruptAndRunStateAt: z.number().int().nonnegative().nullish(),
+        localPermissionBridgeInLocalMode: z.boolean().optional(),
+        permissionsInUiWhileLocal: z.boolean().optional(),
+    }).nullish(),
+}).passthrough();
+
+export const AgentStateSchema = z.preprocess((value) => {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    try {
+        return JSON.parse(trimmed);
+    } catch {
+        return value;
+    }
+}, AgentStateObjectSchema);
+
+export type AgentState = z.infer<typeof AgentStateSchema>;
+
+export interface Session {
+    id: string,
+    serverId?: string,
+    seq: number,
+    /**
+     * Session content encryption mode. Missing means legacy/unknown and should be treated as `e2ee`.
+     */
+    encryptionMode?: 'e2ee' | 'plain',
+    createdAt: number,
+    updatedAt: number,
+    meaningfulActivityAt?: number | null,
+    active: boolean,
+    activeAt: number,
+    /**
+     * Global server-side archive marker. Archived sessions should be hidden from the main list by default.
+     * Optional for mixed-version safety with older servers.
+     */
+    archivedAt?: number | null,
+    /**
+     * Server-side pending queue (V2) summary fields.
+     * Optional for mixed-version safety with older servers.
+    */
+    pendingVersion?: number,
+    pendingCount?: number,
+    pendingBlockedCount?: number,
+    pendingActivationAuthorization?: PendingActivationAuthorizationV1 | null,
+    lastViewedSessionSeq?: number | null,
+    pendingPermissionRequestCount?: number,
+    pendingUserActionRequestCount?: number,
+    pendingRequestObservedAt?: number | null,
+    latestTurnId?: string | null,
+    latestTurnStatus?: PrimaryTurnStatusV1 | null,
+    latestTurnStatusObservedAt?: number | null,
+    runtimeActivityState?: SessionRuntimeActivityState | null,
+    runtimeActivityActiveCount?: number,
+    runtimeActivityObservedAt?: number | null,
+    runtimeActivityRevision?: number | null,
+    lastRuntimeIssue?: SessionRuntimeIssueV1 | null,
+    sessionTurns?: SessionTurnsProjectionV1 | null,
+    rollbackEligibleTurnStarts?: readonly number[] | null,
+    latestReadyEventSeq?: number | null,
+    latestReadyEventAt?: number | null,
+    metadata: Metadata | null,
+    metadataVersion: number,
+    agentState: AgentState | null,
+    agentStateVersion: number,
+    thinking: boolean,
+    thinkingAt: number,
+    presence: "online" | number, // "online" when active, timestamp when last seen
+    optimisticThinkingAt?: number | null; // Local-only timestamp used for immediate "processing" UI feedback after submit
+    resumingAt?: number | null; // Local-only timestamp: set at resume initiation; cleared by post-attach activity, definitive failure, or a bounded post-acceptance fallback
+    thinkingGraceUntil?: number | null; // Local-only timestamp used to debounce thinking indicator and avoid flicker between streaming chunks
+    todos?: Array<{
+        content: string;
+        status: 'pending' | 'in_progress' | 'completed';
+        priority: 'high' | 'medium' | 'low';
+        id: string;
+    }>;
+    permissionMode?: PermissionMode | null; // Local permission mode, not synced to server
+    permissionModeUpdatedAt?: number | null; // Local timestamp to coordinate inferred (from last message) vs user-selected mode, not synced to server
+    modelMode?: ModelMode | null; // Local model mode, not synced to server
+    modelModeUpdatedAt?: number | null; // Local timestamp used to arbitrate model overrides across devices, not synced to server
+    // IMPORTANT: latestUsage is extracted from reducerState.latestUsage after message processing.
+    // We store it directly on Session to ensure it's available immediately on load.
+    // Do NOT store reducerState itself on Session - it's mutable and should only exist in SessionMessages.
+    latestUsage?: {
+        inputTokens: number;
+        outputTokens: number;
+        cacheCreation: number;
+        cacheRead: number;
+        contextSize: number;
+        contextSizeIsReported?: boolean;
+        contextWindowTokens?: number;
+        timestamp: number;
+    } | null;
+    // Sharing-related fields
+    owner?: string; // User ID of the session owner (for shared sessions)
+    ownerProfile?: {
+        id: string;
+        username: string | null;
+        firstName: string | null;
+        lastName: string | null;
+        avatar: string | null;
+    }; // Owner profile information (for shared sessions)
+    accessLevel?: 'view' | 'edit' | 'admin'; // Access level for shared sessions
+    canApprovePermissions?: boolean; // Whether the current user can approve permission prompts for this shared session
+}
+
+export type PendingDeliveryStatus =
+    | 'server_queued'
+    | 'server_delivering'
+    | 'external_handoff'
+    | 'blocked';
+
+export type { PendingDeliveryBlockedReason };
+
+export interface PendingMessage {
+    id: string;
+    localId: string | null;
+    createdAt: number;
+    updatedAt: number;
+    source?: 'local_outbound' | 'server_pending';
+    deliveryStatus?: 'queued' | 'accepted';
+    /** Exact durable-outbox authority for local outbound rows; never inferred from the active server. */
+    pendingOutboxScope?: import('@/sync/domains/scope/serverAccountScope').ServerAccountScope;
+    /** Durable local outbox operation; `cancel` must never be presented or retried as a send. */
+    pendingOutboxOperation?: 'enqueue' | 'cancel';
+    pendingOutboxQuarantineReason?: import('./pendingOutboxPersistence').PendingOutboxQuarantineReason;
+    /**
+     * Local send-acknowledgment state for optimistic (`local_outbound`) rows whose write to the
+     * server has NOT yet been confirmed. `undefined` = confirmed/normal; `unconfirmed` = the write
+     * is being retried after a stall/transient failure (spinner); `failed` = automatic retries gave
+     * up and the user must re-send (retry affordance). Confirmed rows clear this back to
+     * `undefined`; if stale local state survives hydration, a retained durable Pending projection
+     * still outranks it in the canonical visual-state resolver. This is the visible side of the
+     * durable outbox — a submitted message is always in exactly one visible state and is never
+     * silently absent.
+     */
+    sendState?: 'unconfirmed' | 'failed';
+    pendingDeliveryStatus?: PendingDeliveryStatus;
+    /** Descriptive detail for a delivering row; never an outcome or settlement authority. */
+    pendingDeliveryDetail?: import('@happier-dev/protocol').PendingDeliveryDetailV1;
+    pendingDeliveryStatusRaw?: string;
+    pendingDeliveryBlockedReason?: PendingDeliveryBlockedReason;
+    pendingDeliveryBlockedReasonRaw?: string;
+    /** Canonical action owned by the durable Pending row. Old omitted rows normalize to enqueue. */
+    requestedAction?: import('@happier-dev/protocol').PendingRequestedActionV1;
+    /** Explicit persisted action was malformed; the row remains visible but is never executable. */
+    requestedActionMalformed?: true;
+    /** Protocol-owned role for eligibility decisions; null means an older/unknown row. */
+    messageRole?: 'user' | 'non_user' | null;
+    pendingOutboxConflict?: true;
+    text: string;
+    displayText?: string;
+    pendingDecryptFailure?: { kind: 'decrypt_failed' };
+    rawRecord: any;
+}
+
+export interface DiscardedPendingMessage extends PendingMessage {
+    discardedAt: number;
+    discardedReason: string | null;
+}
+
+export interface DecryptedMessage {
+    id: string,
+    seq: number | null,
+    localId: string | null,
+    messageRole?: SessionMessageRole | null,
+    content: any,
+    createdAt: number,
+}
+
+//
+// Machine states
+//
+
+export const MachineMetadataSchema = z.object({
+    host: z.string(),
+    platform: z.string(),
+    happyCliVersion: z.string(),
+    happyHomeDir: z.string(), // Directory for Happier auth, settings, logs (usually .happy/ or .happy-dev/)
+    homeDir: z.string(), // User's home directory (matches CLI field name)
+    // Optional fields that may be added in future versions
+    username: z.string().optional(),
+    arch: z.string().optional(),
+    displayName: z.string().optional(), // Custom display name for the machine
+    windowsRemoteSessionLaunchMode: WindowsRemoteSessionLaunchModeSchema.optional(),
+    windowsRemoteSessionConsole: z.enum(['hidden', 'visible']).optional(),
+    daemonTerminalSessionAttachSupported: z.boolean().optional(),
+    daemonSessionGoalControlsSupported: z.boolean().optional(),
+    // Daemon status fields
+    daemonLastKnownStatus: z.enum(['running', 'shutting-down']).optional(),
+    daemonLastKnownPid: z.number().optional(),
+    shutdownRequestedAt: z.number().optional(),
+    shutdownSource: z.enum(['happy-app', 'happy-cli', 'os-signal', 'unknown']).optional()
+});
+
+export type MachineMetadata = z.infer<typeof MachineMetadataSchema>;
+
+export interface Machine {
+    id: string;
+    seq: number;
+    createdAt: number;
+    updatedAt: number;
+    active: boolean;
+    activeAt: number;  // Changed from lastActiveAt to activeAt for consistency
+    revokedAt?: number | null;
+    metadata: MachineMetadata | null;
+    metadataVersion: number;
+    daemonState: any | null;  // Dynamic daemon state (runtime info)
+    daemonStateVersion: number;
+    installationId?: string | null;
+    contentPublicKeyFingerprint?: string | null;
+    replacedByMachineId?: string | null;
+    replacedAt?: number | string | null;
+    replacementReason?: string | null;
+    replacementSource?: 'automatic' | 'manual' | string | null;
+    replacementActorUserId?: string | null;
+}
+
+//
+// Source Control Status
+//
+
+export interface ScmStatus {
+    isComplete?: boolean;
+    branch: string | null;
+    isDirty: boolean;
+    modifiedCount: number;
+    untrackedCount: number;
+    includedCount: number;
+    lastUpdatedAt: number;
+    // Line change statistics - separated by included vs pending
+    includedLinesAdded: number;
+    includedLinesRemoved: number;
+    pendingLinesAdded: number;
+    pendingLinesRemoved: number;
+    // Computed totals
+    linesAdded: number;      // includedLinesAdded + pendingLinesAdded
+    linesRemoved: number;    // includedLinesRemoved + pendingLinesRemoved
+    linesChanged: number;    // Total lines that were modified (added + removed)
+    // Branch tracking information (from porcelain v2)
+    upstreamBranch?: string | null; // Name of upstream branch
+    aheadCount?: number; // Commits ahead of upstream
+    behindCount?: number; // Commits behind upstream
+    stashCount?: number; // Number of stash entries
+}
+
+export type ScmEntryKind =
+    | 'modified'
+    | 'added'
+    | 'deleted'
+    | 'renamed'
+    | 'copied'
+    | 'untracked'
+    | 'conflicted';
+
+export interface ScmPathStats {
+    isComplete?: boolean;
+    includedAdded: number;
+    includedRemoved: number;
+    pendingAdded: number;
+    pendingRemoved: number;
+    isBinary: boolean;
+}
+
+export interface ScmCommitSelectionPatch {
+    path: string;
+    patch: string;
+}
+
+export interface ScmCapabilities {
+    readStatus: boolean;
+    readDiffFile: boolean;
+    readDiffCommit: boolean;
+    readLog: boolean;
+    writeInclude: boolean;
+    writeExclude: boolean;
+    writeCommit: boolean;
+    writeCommitPathSelection?: boolean;
+    writeCommitLineSelection?: boolean;
+    writeBackout: boolean;
+    writeDiscard?: boolean;
+    writeRemoteFetch: boolean;
+    writeRemotePull: boolean;
+    writeRemotePush: boolean;
+    writeRemotePublish?: boolean;
+    writeRemoteAdd?: boolean;
+    writeRemoteSetUrl?: boolean;
+    writeRemoteRemove?: boolean;
+    writeRepositoryInit?: boolean;
+    readHostingRepositoryPublishTargets?: boolean;
+    writeHostingRepositoryPublish?: boolean;
+    readBranches?: boolean;
+    writeBranchCreate?: boolean;
+    writeBranchCheckout?: boolean;
+    writeBranchMerge?: boolean;
+    writeBranchRebase?: boolean;
+    writeBranchOperationControl?: boolean;
+    readStash?: boolean;
+    writeStash?: boolean;
+    readHostingProvider?: boolean;
+    readPullRequests?: boolean;
+    writePullRequestCreate?: boolean;
+    writePullRequestCheckout?: boolean;
+    writePullRequestPrepareWorktree?: boolean;
+    writePullRequestRunStacked?: boolean;
+    defaultBranchPushPolicy?: ScmDefaultBranchPushPolicy;
+    worktreeCreate: boolean;
+    changeSetModel?: 'index' | 'working-copy';
+    supportedDiffAreas?: Array<'included' | 'pending' | 'both'>;
+    operationLabels?: {
+        commit?: string;
+        include?: string;
+        exclude?: string;
+        backout?: string;
+        fetch?: string;
+        pull?: string;
+        push?: string;
+    };
+}
+
+export interface ScmRemoteInfo {
+    name: string;
+    fetchUrl?: string;
+    pushUrl?: string;
+}
+
+export interface ScmOperationState {
+    kind: 'merge' | 'rebase';
+    sourceRef?: string | null;
+    canContinue: boolean;
+    canAbort: boolean;
+}
+
+export interface ScmWorkingEntry {
+    path: string;
+    previousPath: string | null;
+    kind: ScmEntryKind;
+    includeStatus: string;
+    pendingStatus: string;
+    hasIncludedDelta: boolean;
+    hasPendingDelta: boolean;
+    stats: ScmPathStats;
+}
+
+export interface ScmWorkingSnapshot {
+    projectKey: string;
+    fetchedAt: number;
+    repo: {
+        isRepo: boolean;
+        rootPath: string | null;
+        backendId?: 'git' | 'sapling' | null;
+        mode?: '.git' | '.sl' | null;
+        defaultBranch?: string | null;
+        worktrees?: Array<{
+            path: string;
+            branch: string | null;
+            isCurrent: boolean;
+            isMain?: boolean;
+            /** Total working-tree changes; populated when SCM enrichment was requested. */
+            changeCount?: number;
+            /** Epoch ms of the most recent activity; populated when SCM enrichment was requested. */
+            lastActivityAt?: number;
+        }>;
+        remotes?: ScmRemoteInfo[];
+    };
+    capabilities?: ScmCapabilities;
+    branch: {
+        head: string | null;
+        upstream: string | null;
+        ahead: number;
+        behind: number;
+        detached: boolean;
+    };
+    stashCount?: number;
+    operationState?: ScmOperationState | null;
+    hostingProvider?: ScmHostingProvider | null;
+    pullRequest?: ScmPullRequestSummary | null;
+    hasConflicts: boolean;
+    entries: ScmWorkingEntry[];
+    totals: {
+        isComplete?: boolean;
+        includedFiles: number;
+        pendingFiles: number;
+        untrackedFiles: number;
+        includedAdded: number;
+        includedRemoved: number;
+        pendingAdded: number;
+        pendingRemoved: number;
+    };
+}

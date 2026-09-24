@@ -1,0 +1,16 @@
+diff --git a/node_modules/@sentry/react-native/ios/RNSentryStart.m b/node_modules/@sentry/react-native/ios/RNSentryStart.m
+index db86096..db7407a 100644
+--- a/node_modules/@sentry/react-native/ios/RNSentryStart.m
++++ b/node_modules/@sentry/react-native/ios/RNSentryStart.m
+@@ -29,7 +29,10 @@ + (void)startWithOptions:(SentryOptions *)options NS_SWIFT_NAME(start(options:))
+     [SentrySDK startWithOptions:options];
+ 
+ #if SENTRY_TARGET_REPLAY_SUPPORTED
+-    [RNSentryReplay postInit];
++    // HAPPIER PATCH(sentry-replay-post-init-guard): only initialize replay when JS enabled sampling.
++    if (options.sessionReplay.sessionSampleRate > 0 || options.sessionReplay.onErrorSampleRate > 0) {
++        [RNSentryReplay postInit];
++    }
+ #endif
+ 
+     [self postDidBecomeActiveNotification];

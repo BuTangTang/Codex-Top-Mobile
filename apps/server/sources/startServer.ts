@@ -1,0 +1,358 @@
+import { startApi } from '@/app/api/api';
+import { startMetricsServer } from '@/app/monitoring/metrics';
+import { startDatabaseMetricsUpdater } from '@/app/monitoring/metrics2';
+import { auth } from '@/app/auth/auth';
+import { activityCache } from '@/app/presence/sessionCache';
+import { startTimeout } from '@/app/presence/timeout';
+import { initEncrypt } from '@/modules/encrypt';
+import { initGithub } from '@/app/auth/providers/github/webhooks';
+import { loadFiles, initFilesLocalFromEnv, initFilesS3FromEnv } from '@/storage/blob/files';
+import {
+    applySqliteRuntimePragmas,
+    createDbSqliteMaintenanceClient,
+    db,
+    getDbProviderFromEnv,
+    initDbMysql,
+    initDbPostgres,
+    initDbPglite,
+    initDbSqlite,
+    shutdownDbPglite,
+} from '@/storage/db';
+import {
+    resolveSqliteIncrementalVacuumIntervalMsFromEnv,
+    resolveSqliteIncrementalVacuumPagesFromEnv,
+    resolveSqliteWalCheckpointBusyTimeoutMsFromEnv,
+    resolveSqliteWalCheckpointIntervalMsFromEnv,
+    startSqliteIncrementalVacuumWorker,
+    startSqliteWalCheckpointWorker,
+} from '@/storage/sqliteWalCheckpoint';
+import { log } from '@/utils/logging/log';
+import { awaitShutdown, onShutdown } from '@/utils/process/shutdown';
+import {
+    applyLightDefaultEnv,
+    applyPackagedLightRuntimeSqliteDefaults,
+    ensureHandyMasterSecret,
+    resolveLightSqliteDatabaseUrl,
+} from '@/flavors/light/env';
+import { applySqliteMigrationsIfNeeded, resolveSqliteDatabaseFilePath } from '@/flavors/light/sqliteMigrations';
+import {
+    getFilesBackendFromEnv,
+    getSocketAdapterFromEnv,
+    isRedisStreamsEnabled,
+    resolveDefaultFilesBackend,
+    resolveDefaultSocketAdapter,
+} from '@/config/backends';
+import http from 'node:http';
+import { stat } from 'node:fs/promises';
+import { writeStartupReceiptFromEnvironment } from '@/app/runtime/startupReceipt';
+import { Server as SocketIOServer } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-streams-adapter';
+import { getRedisClient } from '@/storage/redis/redis';
+import { eventRouter } from '@/app/events/eventRouter';
+import { shouldConsumePresenceFromRedis, shouldEnableLocalPresenceDbFlush } from '@/app/presence/presenceMode';
+import { startPresenceRedisWorker } from '@/app/presence/presenceRedisQueue';
+import { initializeServerSentry } from '@/app/monitoring/sentry';
+import { inferAndApplyTailscaleServePublicServerUrl } from '@/app/integrations/tailscale/tailscaleServePublicUrlInference';
+import { startRetentionWorker } from '@/app/retention/runtime/startRetentionWorker';
+import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
+import { initializeServerIdentityCache } from '@/app/serverIdentity/serverIdentity';
+import { isServerFeatureEnabledForRequest } from '@/app/features/catalog/serverFeatureGate';
+
+export type ServerFlavor = 'full' | 'light';
+export type ServerRole = 'all' | 'api' | 'worker';
+
+export function getServerRoleFromEnv(env: NodeJS.ProcessEnv): ServerRole {
+    const raw = env.SERVER_ROLE?.trim();
+    if (!raw) return 'all';
+    if (raw === 'api' || raw === 'worker') return raw;
+    return 'all';
+}
+
+function shouldEnableRedisAdapterFromEnv(env: NodeJS.ProcessEnv, flavor: ServerFlavor): boolean {
+    const socketAdapter = getSocketAdapterFromEnv(env, resolveDefaultSocketAdapter(flavor));
+    return isRedisStreamsEnabled(env, socketAdapter);
+}
+
+function resolveSqliteSizeWarnBytes(env: NodeJS.ProcessEnv): number | null {
+    const raw = String(env.HAPPIER_SERVER_DB_SIZE_WARN_BYTES ?? '').trim();
+    if (!raw) return null;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+async function warnIfSqliteFileExceedsThreshold(params: Readonly<{
+    path: string;
+    label: string;
+    thresholdBytes: number;
+}>): Promise<void> {
+    const fileStat = await stat(params.path).catch((error: any) => {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    });
+    if (!fileStat || !fileStat.isFile() || fileStat.size <= params.thresholdBytes) return;
+
+    log(
+        {
+            module: 'sqlite',
+            level: 'warn',
+            path: params.path,
+            sizeBytes: fileStat.size,
+            thresholdBytes: params.thresholdBytes,
+        },
+        `SQLite ${params.label} file is larger than the configured warning threshold`,
+    );
+}
+
+async function warnIfSqliteDatabaseFilesExceedThreshold(env: NodeJS.ProcessEnv): Promise<void> {
+    const thresholdBytes = resolveSqliteSizeWarnBytes(env);
+    if (thresholdBytes === null) return;
+
+    const dbPath = resolveSqliteDatabaseFilePath(String(env.DATABASE_URL ?? '').trim());
+    if (!dbPath) return;
+
+    await warnIfSqliteFileExceedsThreshold({
+        path: dbPath,
+        label: 'database',
+        thresholdBytes,
+    });
+    await warnIfSqliteFileExceedsThreshold({
+        path: `${dbPath}-wal`,
+        label: 'WAL',
+        thresholdBytes,
+    });
+}
+
+export async function startServer(flavor: ServerFlavor): Promise<void> {
+    process.env.HAPPY_SERVER_FLAVOR = flavor;
+    process.env.HAPPIER_SERVER_FLAVOR = flavor;
+    initializeServerSentry(process.env);
+    const role = getServerRoleFromEnv(process.env);
+    const shouldEnableRedisAdapter = shouldEnableRedisAdapterFromEnv(process.env, flavor);
+    const dbProvider = getDbProviderFromEnv(process.env, flavor === 'light' ? 'sqlite' : 'postgres');
+    process.env.HAPPY_DB_PROVIDER = dbProvider;
+    process.env.HAPPIER_DB_PROVIDER = dbProvider;
+
+    const filesBackend = getFilesBackendFromEnv(process.env, resolveDefaultFilesBackend(flavor));
+    process.env.HAPPY_FILES_BACKEND = filesBackend;
+    process.env.HAPPIER_FILES_BACKEND = filesBackend;
+
+    const socketAdapter = getSocketAdapterFromEnv(process.env, resolveDefaultSocketAdapter(flavor));
+    process.env.HAPPY_SOCKET_ADAPTER = socketAdapter;
+    process.env.HAPPIER_SOCKET_ADAPTER = socketAdapter;
+
+    const shouldApplyLocalDefaults = filesBackend === 'local' || dbProvider === 'pglite' || dbProvider === 'sqlite';
+    if (shouldApplyLocalDefaults) {
+        applyLightDefaultEnv(process.env);
+        applyPackagedLightRuntimeSqliteDefaults(process.env);
+        await ensureHandyMasterSecret(process.env);
+    }
+
+    if (dbProvider === 'postgres') {
+        // initDbPostgres is synchronous (unlike other provider initializers).
+        initDbPostgres();
+    } else if (dbProvider === 'mysql') {
+        await initDbMysql();
+    } else if (dbProvider === 'pglite') {
+        await initDbPglite();
+    } else if (dbProvider === 'sqlite') {
+        if (!process.env.DATABASE_URL || !process.env.DATABASE_URL.trim()) {
+            const dataDir = expandHomeDirPath(
+                (process.env.HAPPIER_SERVER_LIGHT_DATA_DIR ?? process.env.HAPPY_SERVER_LIGHT_DATA_DIR ?? '').trim(),
+                process.env,
+            );
+            if (!dataDir) {
+                throw new Error('HAPPIER_SERVER_LIGHT_DATA_DIR (or HAPPY_SERVER_LIGHT_DATA_DIR) must be set when using sqlite without DATABASE_URL');
+            }
+            process.env.DATABASE_URL = resolveLightSqliteDatabaseUrl(dataDir);
+        }
+        const dataDir = expandHomeDirPath(
+            (process.env.HAPPY_SERVER_LIGHT_DATA_DIR ?? process.env.HAPPIER_SERVER_LIGHT_DATA_DIR ?? '').trim(),
+            process.env,
+        );
+        if (dataDir) {
+            await applySqliteMigrationsIfNeeded({ env: process.env, dataDir });
+        }
+        await warnIfSqliteDatabaseFilesExceedThreshold(process.env);
+        await initDbSqlite();
+    } else {
+        throw new Error(`Unsupported HAPPY_DB_PROVIDER/HAPPIER_DB_PROVIDER: ${dbProvider}`);
+    }
+
+    if (filesBackend === 'local') {
+        initFilesLocalFromEnv(process.env);
+    } else if (filesBackend === 's3') {
+        await initFilesS3FromEnv(process.env);
+    } else {
+        throw new Error(`Unsupported HAPPY_FILES_BACKEND/HAPPIER_FILES_BACKEND: ${String(filesBackend)}`);
+    }
+
+    const sqliteWalCheckpointIntervalMs = dbProvider === 'sqlite'
+        ? resolveSqliteWalCheckpointIntervalMsFromEnv(process.env)
+        : null;
+    const sqliteIncrementalVacuumIntervalMs = dbProvider === 'sqlite'
+        ? resolveSqliteIncrementalVacuumIntervalMsFromEnv(process.env)
+        : null;
+    const shouldStartSqliteWalCheckpointWorker =
+        sqliteWalCheckpointIntervalMs !== null && sqliteWalCheckpointIntervalMs > 0;
+    const shouldStartSqliteIncrementalVacuumWorker =
+        sqliteIncrementalVacuumIntervalMs !== null && sqliteIncrementalVacuumIntervalMs > 0;
+    const shouldStartSqliteMaintenanceClient =
+        shouldStartSqliteWalCheckpointWorker || shouldStartSqliteIncrementalVacuumWorker;
+    const sqliteWalCheckpointBusyTimeoutMs = shouldStartSqliteMaintenanceClient
+        ? resolveSqliteWalCheckpointBusyTimeoutMsFromEnv(process.env)
+        : null;
+    const sqliteIncrementalVacuumPages = shouldStartSqliteIncrementalVacuumWorker
+        ? resolveSqliteIncrementalVacuumPagesFromEnv(process.env)
+        : null;
+
+    // Storage
+    await db.$connect();
+    let sqliteWalCheckpointClient: typeof db | null = null;
+    try {
+        if (shouldStartSqliteMaintenanceClient) {
+            sqliteWalCheckpointClient = await createDbSqliteMaintenanceClient();
+            await sqliteWalCheckpointClient.$connect();
+            await applySqliteRuntimePragmas(sqliteWalCheckpointClient, {
+                ...process.env,
+                HAPPIER_SQLITE_BUSY_TIMEOUT_MS: String(sqliteWalCheckpointBusyTimeoutMs),
+                HAPPY_SQLITE_BUSY_TIMEOUT_MS: String(sqliteWalCheckpointBusyTimeoutMs),
+            });
+        }
+    } catch (error) {
+        await sqliteWalCheckpointClient?.$disconnect().catch(() => {});
+        await db.$disconnect().catch(() => {});
+        throw error;
+    }
+    // Actively checkpoint the SQLite WAL so it cannot be starved by long-lived
+    // readers and grow without bound, which slows queries until they hit the
+    // Prisma timeout.
+    let sqliteWalCheckpointWorker: ReturnType<typeof startSqliteWalCheckpointWorker> = null;
+    if (sqliteWalCheckpointClient && sqliteWalCheckpointIntervalMs !== null) {
+        sqliteWalCheckpointWorker = startSqliteWalCheckpointWorker({
+            client: sqliteWalCheckpointClient,
+            intervalMs: sqliteWalCheckpointIntervalMs,
+        });
+    }
+    let sqliteIncrementalVacuumWorker: ReturnType<typeof startSqliteIncrementalVacuumWorker> = null;
+    if (
+        sqliteWalCheckpointClient
+        && sqliteIncrementalVacuumIntervalMs !== null
+        && sqliteIncrementalVacuumPages !== null
+    ) {
+        sqliteIncrementalVacuumWorker = startSqliteIncrementalVacuumWorker({
+            client: sqliteWalCheckpointClient,
+            intervalMs: sqliteIncrementalVacuumIntervalMs,
+            pages: sqliteIncrementalVacuumPages,
+        });
+    }
+    if (dbProvider === 'pglite') {
+        // When using embedded pglite, ensure Prisma disconnect happens before stopping the socket server.
+        onShutdown('db', async () => {
+            await db.$disconnect();
+            await shutdownDbPglite();
+        });
+    } else if (dbProvider === 'sqlite') {
+        onShutdown('db', async () => {
+            await sqliteWalCheckpointWorker?.stop();
+            await sqliteIncrementalVacuumWorker?.stop();
+            try {
+                await sqliteWalCheckpointClient?.$disconnect();
+            } finally {
+                await db.$disconnect();
+            }
+        });
+    } else {
+        onShutdown('db', async () => {
+            await db.$disconnect();
+        });
+    }
+    onShutdown('keepAlive:activity-cache', async () => {
+        await activityCache.shutdown();
+    });
+    if (shouldEnableLocalPresenceDbFlush(process.env)) {
+        activityCache.enableDbFlush();
+    }
+    await initializeServerIdentityCache(process.env);
+
+    // Redis should not be a hard dependency unless explicitly enabled for scale features.
+    if (shouldEnableRedisAdapter) {
+        await getRedisClient().ping();
+    }
+    if (shouldEnableRedisAdapter && role === 'api') {
+        log(
+            { module: 'presence' },
+            'Redis adapter is enabled: durable machine-presence writes and legacy presence-stream cleanup are handled by a worker process. Ensure at least one replica runs with SERVER_ROLE=worker.',
+        );
+    }
+
+    // Initialize auth module
+    await initEncrypt();
+    await initGithub();
+    await loadFiles();
+    await auth.init();
+
+    //
+    // Start
+    //
+
+    if (role === 'worker') {
+        if (!shouldEnableRedisAdapter) {
+            throw new Error(
+                "SERVER_ROLE=worker requires Redis socket adapter enabled (set REDIS_URL and HAPPIER_SOCKET_ADAPTER=redis-streams) so worker pushes can fan out to connected API sockets",
+            );
+        }
+        // Create an emitter-only Socket.IO server wired to the Redis adapter, so background jobs can publish
+        // ephemeral/update events to rooms even though this process does not accept client connections.
+        const dummyHttpServer = http.createServer();
+        const io = new SocketIOServer(dummyHttpServer, {
+            adapter: createAdapter(getRedisClient()),
+            serveClient: false,
+            transports: ['websocket', 'polling'],
+            path: '/v1/updates',
+        });
+        eventRouter.setIo(io);
+        onShutdown('worker-socketio', async () => {
+            await io.close();
+            dummyHttpServer.close();
+        });
+
+        if (shouldConsumePresenceFromRedis(process.env)) {
+            const presenceWorker = startPresenceRedisWorker();
+            onShutdown('presence-redis-worker', async () => {
+                await presenceWorker.stop();
+            });
+        }
+    }
+
+    // Expose health + metrics in all roles (metrics server can be disabled via METRICS_ENABLED=false).
+    const metricsServerStarted = await startMetricsServer();
+
+    if (role === 'all' || role === 'api') {
+        void inferAndApplyTailscaleServePublicServerUrl(process.env);
+        await startApi();
+    }
+
+    if (role === 'all' || role === 'worker') {
+        const retentionWorker = startRetentionWorker();
+        if (retentionWorker) {
+            onShutdown('retention-worker', async () => {
+                retentionWorker.stop();
+            });
+        }
+        // SQLite intentionally uses one Prisma connection. Exact table counts can hold that
+        // sole connection long enough to starve readiness and presence transactions.
+        if (metricsServerStarted && dbProvider !== 'sqlite') {
+            startDatabaseMetricsUpdater();
+        }
+        startTimeout();
+    }
+
+    //
+    // Ready
+    //
+
+    await writeStartupReceiptFromEnvironment(process.env);
+    log('Ready');
+    await awaitShutdown();
+    log('Shutting down...');
+}

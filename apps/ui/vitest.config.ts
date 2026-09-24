@@ -1,0 +1,240 @@
+import { defineConfig } from 'vitest/config'
+import { resolve } from 'node:path'
+import { existsSync } from 'node:fs'
+
+import { resolveVitestFeatureTestExcludeGlobs } from '../../scripts/testing/featureTestGating'
+
+const maxForksEnv = Number.parseInt(process.env.VITEST_UI_MAX_FORKS ?? '', 10);
+const maxForks = Number.isFinite(maxForksEnv) && maxForksEnv > 0 ? maxForksEnv : 1;
+
+function resolveExpoNodeModuleStub(id: string, importer?: string): string | null {
+    if (
+        id === 'react-native-reanimated' ||
+        id.startsWith('react-native-reanimated/') ||
+        /(?:^|[\\/])node_modules[\\/]react-native-reanimated[\\/]/.test(id) ||
+        (id === './publicGlobals' && /(?:^|[\\/])node_modules[\\/]react-native-reanimated[\\/]lib[\\/]module[\\/]index\.js$/.test(importer ?? ''))
+    ) {
+        return resolve('./sources/dev/reactNativeReanimatedStub.ts');
+    }
+
+    if (
+        id === 'react-native-keyboard-controller' ||
+        id.startsWith('react-native-keyboard-controller/') ||
+        /(?:^|[\\/])node_modules[\\/]react-native-keyboard-controller[\\/]/.test(id)
+    ) {
+        return resolve('./sources/dev/reactNativeKeyboardControllerStub.ts');
+    }
+
+    if (id === 'expo-modules-core' || /(?:^|[\\/])node_modules[\\/](?:@[^\\/]+[\\/])?expo-modules-core[\\/]src[\\/]index\.ts$/.test(id) || /expo-modules-core[\\/]src[\\/]index\.ts$/.test(id)) {
+        return resolve('./sources/dev/expoModulesCoreStub.ts');
+    }
+
+    if (id === 'expo-constants' || /(?:^|[\\/])node_modules[\\/](?:@[^\\/]+[\\/])?expo-constants[\\/]src[\\/]Constants\.ts$/.test(id) || /expo-constants[\\/]src[\\/]Constants\.ts$/.test(id)) {
+        return resolve('./sources/dev/expoConstantsStub.ts');
+    }
+
+    return null;
+}
+
+function resolveWorkspacePackageSource(
+    id: string,
+    packageName: string,
+    packageSourceRoot: string,
+): string | null {
+    if (id === packageName) {
+        return resolve(packageSourceRoot, 'index.ts');
+    }
+
+    if (!id.startsWith(`${packageName}/`)) {
+        return null;
+    }
+
+    const subpath = id.slice(packageName.length + 1);
+    const candidates = [
+        resolve(packageSourceRoot, `${subpath}.ts`),
+        resolve(packageSourceRoot, `${subpath}.tsx`),
+        resolve(packageSourceRoot, subpath, 'index.ts'),
+        resolve(packageSourceRoot, subpath, 'index.tsx'),
+    ];
+
+    return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+function resolveProtocolWorkspaceSource(id: string): string | null {
+    return resolveWorkspacePackageSource(
+        id,
+        '@happier-dev/protocol',
+        resolve('../../packages/protocol/src'),
+    );
+}
+
+function resolveAgentsWorkspaceSource(id: string): string | null {
+    return resolveWorkspacePackageSource(
+        id,
+        '@happier-dev/agents',
+        resolve('../../packages/agents/src'),
+    );
+}
+
+function resolveConnectionSupervisorWorkspaceSource(id: string): string | null {
+    return resolveWorkspacePackageSource(
+        id,
+        '@happier-dev/connection-supervisor',
+        resolve('../../packages/connection-supervisor/src'),
+    );
+}
+
+const expoNodeModuleStubsPlugin = {
+    name: 'happier-vitest-expo-node-module-stubs',
+    enforce: 'pre' as const,
+    resolveId(id: string, importer?: string) {
+        return resolveProtocolWorkspaceSource(id)
+            ?? resolveAgentsWorkspaceSource(id)
+            ?? resolveConnectionSupervisorWorkspaceSource(id)
+            ?? resolveExpoNodeModuleStub(id, importer);
+    },
+};
+
+export default defineConfig({
+    define: {
+        __DEV__: true,
+    },
+    optimizeDeps: {
+        // Workspace packages (like `@happier-dev/protocol`) can change frequently during development.
+        // Excluding them ensures Vitest doesn't keep using stale optimized dependency caches.
+        exclude: ['@happier-dev/protocol', '@happier-dev/agents', '@happier-dev/connection-supervisor'],
+    },
+    test: {
+        // Ensure per-file module isolation so test-local `vi.mock(...)` does not leak
+        // across unrelated test files (especially important for our React Native stubs).
+        isolate: true,
+        // Work around intermittent Node 25 + worker-thread resolution failures seen in large suites.
+        // Forks are slower but much more stable for our UI runner locally.
+        pool: 'forks',
+        // Cap fork parallelism to reduce CPU contention (many tests are time-sensitive under load).
+        poolOptions: {
+            forks: {
+                maxForks,
+            },
+        },
+        // Our UI test suite is occasionally CPU-bound on developer machines / CI runners.
+        // Increase the default timeout so unrelated load doesn't cause spurious failures.
+        testTimeout: 60_000,
+        // Global setup/teardown can import and reset large module graphs. Ensure hooks have
+        // enough time even when running a single focused test file in isolation.
+        hookTimeout: 60_000,
+        globals: false,
+        environment: 'node',
+        env: {
+            HAPPIER_FEATURE_POLICY_ENV: '', NODE_ENV: 'test',
+        },
+        server: {
+            deps: {
+                inline: [/react-native-reanimated/, /react-native-keyboard-controller/],
+            },
+        },
+        setupFiles: [resolve('./sources/dev/vitestSetup.ts')],
+        include: [
+            'sources/**/*.{spec,test}.{ts,tsx}',
+            'tools/**/*.{spec,test}.{ts,tsx}',
+        ],
+        exclude: [
+            'sources/**/*.integration.test.{ts,tsx}',
+            'sources/**/*.real.integration.test.{ts,tsx}',
+            'sources/**/*.integration.spec.{ts,tsx}',
+            'sources/**/*.e2e.test.{ts,tsx}',
+            ...resolveVitestFeatureTestExcludeGlobs(),
+        ],
+        coverage: {
+            provider: 'v8',
+            reporter: ['text', 'json', 'html'],
+            exclude: [
+                'node_modules/**',
+                'dist/**',
+                '**/*.d.ts',
+                '**/*.config.*',
+                '**/mockData/**',
+            ],
+        },
+    },
+    resolve: {
+        // IMPORTANT: keep `@` after more specific `@/...` aliases (Vite resolves aliases in-order).
+        alias: [
+            // Reanimated's package exports can resolve to ESM internals with extensionless relative imports.
+            // Route all Vitest imports to the node-safe stub before Vite/Node load those internals.
+            { find: /^react-native-reanimated(?:\/.*)?$/, replacement: resolve('./sources/dev/reactNativeReanimatedStub.ts') },
+            { find: /(?:^|[\\/])node_modules[\\/]react-native-reanimated[\\/].*$/, replacement: resolve('./sources/dev/reactNativeReanimatedStub.ts') },
+            // Keyboard controller imports Reanimated internals from its implementation package.
+            { find: /^react-native-keyboard-controller(?:\/.*)?$/, replacement: resolve('./sources/dev/reactNativeKeyboardControllerStub.ts') },
+            { find: /(?:^|[\\/])node_modules[\\/]react-native-keyboard-controller[\\/].*$/, replacement: resolve('./sources/dev/reactNativeKeyboardControllerStub.ts') },
+            // masked-view publishes Flow-typed JSX in a `.js` file, which Vite's import analysis
+            // cannot parse — importing it anywhere fails the module graph before any assertion runs.
+            { find: /^@react-native-masked-view\/masked-view(?:\/.*)?$/, replacement: resolve('./sources/dev/reactNativeMaskedViewStub.tsx') },
+            { find: /(?:^|[\\/])node_modules[\\/]@react-native-masked-view[\\/]masked-view[\\/].*$/, replacement: resolve('./sources/dev/reactNativeMaskedViewStub.tsx') },
+            // Some dependencies import React Native internals (Flow syntax) via subpaths like `react-native/Libraries/...`.
+            { find: /^react-native\//, replacement: resolve('./sources/dev/reactNativeInternalStub.ts') },
+            // Vitest runs in node; avoid parsing React Native's Flow entrypoint.
+            { find: /^react-native$/, replacement: resolve('./sources/dev/reactNativeStub.ts') },
+            // Expo packages commonly depend on `expo-modules-core`, whose exports point to TS sources that import `react-native`.
+            // In node/Vitest we stub the minimal surface needed by our tests.
+            { find: /expo-modules-core\/src\/index\.ts$/, replacement: resolve('./sources/dev/expoModulesCoreStub.ts') },
+            { find: /^expo-modules-core(?:\/.*)?$/, replacement: resolve('./sources/dev/expoModulesCoreStub.ts') },
+            // `expo-constants` uses conditional exports that Vite/Vitest can't always resolve cleanly under node.
+            { find: 'expo-constants', replacement: resolve('./sources/dev/expoConstantsStub.ts') },
+            // `expo-localization` depends on Expo modules that don't exist in Vitest's node env.
+            { find: 'expo-localization', replacement: resolve('./sources/dev/expoLocalizationStub.ts') },
+            // `expo-video` uses native/web view modules that Vitest cannot parse under Node.
+            { find: 'expo-video', replacement: resolve('./sources/dev/expoVideoStub.ts') },
+            // `expo-router` pulls in RN internals via its native dev-server helpers.
+            { find: 'expo-router', replacement: resolve('./sources/dev/expoRouterStub.ts') },
+            // `react-native-gesture-handler` imports React Native internals (Flow syntax) in node.
+            { find: 'react-native-gesture-handler', replacement: resolve('./sources/dev/reactNativeGestureHandlerStub.ts') },
+            // `react-native-webview` depends on RN native modules and internals.
+            { find: /^react-native-webview$/, replacement: resolve('./sources/dev/reactNativeWebviewStub.ts') },
+            // Some dependencies accidentally pull in `expo` (which expects bundler-only runtime modules).
+            { find: /^expo$/, replacement: resolve('./sources/dev/expoStub.ts') },
+            // `expo-notifications` executes side-effectful native registration at import time.
+            { find: 'expo-notifications', replacement: resolve('./sources/dev/expoNotificationsStub.ts') },
+            // `expo-audio` is native and throws in node/Vitest.
+            { find: 'expo-audio', replacement: resolve('./sources/dev/expoAudioStub.ts') },
+            // `expo-speech` and `expo-speech-recognition` are not reliably node-safe (and are hard to mock
+            // via dynamic import paths). Route them to lightweight test stubs.
+            { find: 'expo-speech', replacement: resolve('./sources/dev/expoSpeechStub.ts') },
+            { find: 'expo-speech-recognition', replacement: resolve('./sources/dev/expoSpeechRecognitionStub.ts') },
+            // `expo-clipboard` expects native modules in node/Vitest.
+            { find: 'expo-clipboard', replacement: resolve('./sources/dev/expoClipboardStub.ts') },
+            // `expo-linear-gradient` ships JSX in its build output; stub it in node/Vitest.
+            { find: 'expo-linear-gradient', replacement: resolve('./sources/dev/expoLinearGradientStub.ts') },
+            // `react-native-device-info` is native and pulls in RN internals.
+            { find: 'react-native-device-info', replacement: resolve('./sources/dev/reactNativeDeviceInfoStub.ts') },
+            // Sentry's React Native SDK depends on native modules; stub it in node/Vitest.
+            { find: '@sentry/react-native', replacement: resolve('./sources/dev/sentryReactNativeStub.ts') },
+            // `@react-native/virtualized-lists` ships Flow sources (`import typeof`) that Node can't parse.
+            { find: /^@react-native\/virtualized-lists(\/.*)?$/, replacement: resolve('./sources/dev/reactNativeVirtualizedListsStub.ts') },
+            // Some deps import the abort-controller polyfill, which uses extensionless ESM imports that Node can't resolve.
+            { find: /^abort-controller\/polyfill$/, replacement: resolve('./sources/dev/abortControllerPolyfillStub.ts') },
+            { find: /^abort-controller\/polyfill\.mjs$/, replacement: resolve('./sources/dev/abortControllerPolyfillStub.ts') },
+            // `rn-encryption` selects a native implementation in node tests and can pull in React Native's Flow sources.
+            { find: 'rn-encryption', replacement: resolve('./sources/dev/rnEncryptionStub.ts') },
+            // RevenueCat native SDKs depend on RN native modules.
+            { find: 'react-native-purchases', replacement: resolve('./sources/dev/reactNativePurchasesStub.ts') },
+            { find: 'react-native-purchases-ui', replacement: resolve('./sources/dev/reactNativePurchasesUiStub.ts') },
+            { find: '@shopify/flash-list', replacement: resolve('./sources/dev/shopifyFlashListStub.ts') },
+            // The pure web streaming-reveal module stays REAL under the stub below: it is the
+            // shared word classifier for both streaming surfaces and its gate tests must
+            // exercise the patched package logic, not a stub.
+            { find: 'react-native-enriched-markdown/lib/module/web/streamingReveal.js', replacement: resolve('./node_modules/react-native-enriched-markdown/lib/module/web/streamingReveal.js') },
+            { find: 'react-native-enriched-markdown', replacement: resolve('./sources/dev/reactNativeEnrichedMarkdownStub.tsx') },
+            { find: 'react-native-mmkv', replacement: resolve('./sources/dev/reactNativeMmkvStub.ts') },
+            // Use libsodium-wrappers in tests instead of the RN native binding.
+            { find: '@more-tech/react-native-libsodium', replacement: 'libsodium-wrappers' },
+            // Use node-safe platform adapters in tests (avoid static expo-crypto imports).
+            { find: '@/platform/cryptoRandom', replacement: resolve('./sources/platform/cryptoRandom.node.ts') },
+            { find: '@/platform/hmacSha512', replacement: resolve('./sources/platform/hmacSha512.node.ts') },
+            { find: '@/platform/randomUUID', replacement: resolve('./sources/platform/randomUUID.node.ts') },
+            { find: '@/platform/digest', replacement: resolve('./sources/platform/digest.node.ts') },
+            { find: '@', replacement: resolve('./sources') },
+        ],
+    },
+    plugins: [expoNodeModuleStubsPlugin],
+})

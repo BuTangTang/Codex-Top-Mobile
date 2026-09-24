@@ -1,0 +1,2301 @@
+import { describe, it, expect } from 'vitest';
+import { normalizeRawMessage } from './typesRaw';
+
+/**
+ * WOLOG Content Normalization Tests
+ *
+ * These tests verify the Zod transform approach handles:
+ * 1. Hyphenated types (tool-call, tool-call-result) → Canonical (tool_use, tool_result)
+ * 2. Canonical types pass through unchanged (idempotency)
+ * 3. Unknown fields are preserved (future API compatibility)
+ * 4. Unexpected data formats are handled gracefully
+ * 5. Backwards compatibility with old CLI messages
+ * 6. Cross-agent compatibility (Claude SDK, Codex, Gemini)
+ */
+
+// Import the actual schemas from typesRaw.ts
+// Note: We're testing the schemas as black boxes through their public API
+import { RawRecordSchema } from './typesRaw';
+
+describe('Zod Transform - WOLOG Content Normalization', () => {
+
+    describe('Accepts and transforms hyphenated types', () => {
+        it('transforms tool-call to tool_use with field remapping', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool-call',
+                                callId: 'call_abc123',
+                                name: 'Bash',
+                                input: { command: 'ls -la' }
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const firstItem = (content.data as any).message.content[0];
+                      expect(firstItem.type).toBe('tool_use');
+                      if (firstItem.type === 'tool_use') {
+                          expect(firstItem.id).toBe('call_abc123');  // callId → id
+                          expect(firstItem.name).toBe('Bash');
+                        expect(firstItem.input).toEqual({ command: 'ls -la' });
+                    }
+                }
+            }
+        });
+
+        it('transforms tool-call-result to tool_result with field remapping', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool-call-result',
+                                callId: 'call_abc123',
+                                output: 'file1.txt\nfile2.txt',
+                                is_error: false
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'user') {
+                      const msgContent = (content.data as any).message.content;
+                      if (Array.isArray(msgContent) && msgContent[0].type === 'tool_result') {
+                          expect(msgContent[0].type).toBe('tool_result');
+                          expect(msgContent[0].tool_use_id).toBe('call_abc123');  // callId → tool_use_id
+                          expect(msgContent[0].content).toBe('file1.txt\nfile2.txt');  // output → content
+                        expect(msgContent[0].is_error).toBe(false);
+                    }
+                }
+            }
+        });
+
+        it('preserves unknown fields for future compatibility', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool-call',
+                                callId: 'call_xyz',
+                                name: 'Read',
+                                input: {},
+                                futureField: 'some_value',  // Unknown field
+                                metadata: { timestamp: 123 }  // Unknown nested field
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const firstItem: any = (content.data as any).message.content[0];
+                      expect(firstItem.type).toBe('tool_use');
+                      expect(firstItem.id).toBe('call_xyz');
+                      // Verify unknown fields are preserved
+                      expect(firstItem.futureField).toBe('some_value');
+                    expect(firstItem.metadata).toEqual({ timestamp: 123 });
+                }
+            }
+        });
+
+        it('preserves provider-emitted sidechainId on agent output records', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        uuid: 'test-uuid',
+                        isSidechain: true,
+                        sidechainId: 'tool_task_1',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{ type: 'text', text: 'Hello from sidechain' }],
+                        },
+                    },
+                },
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'output') {
+                    expect((content.data as any).sidechainId).toBe('tool_task_1');
+                    expect((content.data as any).isSidechain).toBe(true);
+                }
+            }
+        });
+    });
+
+    describe('Accepts canonical underscore types without transformation (idempotency)', () => {
+        it('passes through tool_use unchanged', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool_use',
+                                id: 'call_123',
+                                name: 'Write',
+                                input: { file_path: '/test.txt' }
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const firstItem = (content.data as any).message.content[0];
+                      expect(firstItem.type).toBe('tool_use');
+                      if (firstItem.type === 'tool_use') {
+                          expect(firstItem.id).toBe('call_123');
+                          expect(firstItem.name).toBe('Write');
+                    }
+                }
+            }
+        });
+
+        it('passes through tool_result unchanged', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool_result',
+                                tool_use_id: 'call_123',
+                                content: 'Success',
+                                is_error: false
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'user') {
+                      const msgContent = (content.data as any).message.content;
+                      if (Array.isArray(msgContent) && msgContent[0].type === 'tool_result') {
+                          expect(msgContent[0].type).toBe('tool_result');
+                          expect(msgContent[0].tool_use_id).toBe('call_123');
+                          expect(msgContent[0].content).toBe('Success');
+                    }
+                }
+            }
+        });
+
+        it('passes through text content unchanged', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'text',
+                                text: 'Hello world'
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const firstItem = (content.data as any).message.content[0];
+                      expect(firstItem.type).toBe('text');
+                      if (firstItem.type === 'text') {
+                          expect(firstItem.text).toBe('Hello world');
+                      }
+                }
+            }
+        });
+    });
+
+    describe('Accepts unknown content types (forward compatibility)', () => {
+        it('keeps unknown content blocks instead of dropping the entire message', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'unknown-type',
+                                data: 'some data'
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'output' && content.data.type === 'assistant') {
+                    const firstItem = (content.data as any).message.content[0];
+                    expect(firstItem.type).toBe('unknown-type');
+                    expect(firstItem.data).toBe('some data');
+                }
+            }
+        });
+    });
+
+    describe('Handles mixed hyphenated and canonical in same message', () => {
+        it('transforms mixed content array correctly', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [
+                                { type: 'text', text: 'Running command...' },
+                                { type: 'tool-call', callId: 'call_1', name: 'Bash', input: { command: 'ls' } },
+                                { type: 'tool_use', id: 'call_2', name: 'Read', input: { file_path: '/test.txt' } }
+                            ]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const items = (content.data as any).message.content;
+
+                      // Text passes through
+                      expect(items[0].type).toBe('text');
+
+                    // tool-call transformed to tool_use
+                    expect(items[1].type).toBe('tool_use');
+                    if (items[1].type === 'tool_use') {
+                        expect(items[1].id).toBe('call_1');
+                    }
+
+                    // tool_use passes through
+                    expect(items[2].type).toBe('tool_use');
+                    if (items[2].type === 'tool_use') {
+                        expect(items[2].id).toBe('call_2');
+                    }
+                }
+            }
+        });
+
+        it('handles tool results with both hyphenated and canonical', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [
+                                { type: 'tool-call-result', callId: 'call_1', output: 'result1' },
+                                { type: 'tool_result', tool_use_id: 'call_2', content: 'result2' }
+                            ]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'user') {
+                      const items = (content.data as any).message.content;
+                      if (Array.isArray(items)) {
+                          // Both normalized to tool_result
+                          expect(items[0].type).toBe('tool_result');
+                        if (items[0].type === 'tool_result') {
+                            expect(items[0].tool_use_id).toBe('call_1');
+                            expect(items[0].content).toBe('result1');
+                        }
+
+                        expect(items[1].type).toBe('tool_result');
+                        if (items[1].type === 'tool_result') {
+                            expect(items[1].tool_use_id).toBe('call_2');
+                            expect(items[1].content).toBe('result2');
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    describe('Backwards compatibility with old CLI messages', () => {
+        it('handles old CLI with canonical underscore types', () => {
+            const oldCliMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [
+                                { type: 'tool_use', id: 'call_old', name: 'Read', input: {} }
+                            ]
+                        },
+                        uuid: 'old-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(oldCliMessage);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const firstItem = (content.data as any).message.content[0];
+                      expect(firstItem.type).toBe('tool_use');
+                      if (firstItem.type === 'tool_use') {
+                          expect(firstItem.id).toBe('call_old');
+                      }
+                }
+            }
+        });
+
+        it('accepts assistant output messages without model (backwards compatibility)', () => {
+            const oldCliMessageMissingModel = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            content: [{ type: 'text', text: 'hello' }],
+                        },
+                        uuid: 'old-uuid',
+                    },
+                },
+            };
+
+            const result = RawRecordSchema.safeParse(oldCliMessageMissingModel);
+
+            expect(result.success).toBe(true);
+        });
+
+        it('normalizeRawMessage() does not drop assistant output when uuid is missing', () => {
+            const assistantMessageMissingUuid = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{ type: 'text', text: 'hello' }],
+                        },
+                        // NOTE: older producers (and some stream events) omit uuid; UI should still render.
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage(
+                'server-message-id-1',
+                null,
+                1710000000000,
+                assistantMessageMissingUuid as any,
+            );
+
+            expect(normalized).not.toBeNull();
+            if (normalized && normalized.role === 'agent') {
+                const first = normalized.content[0];
+                expect(first?.type).toBe('text');
+                expect((first as any).uuid).toBe('server-message-id-1');
+            }
+        });
+
+        it('normalizeRawMessage() preserves media-only assistant output with session media metadata', () => {
+            const mediaOnlyAssistantMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [],
+                        },
+                    },
+                },
+                meta: {
+                    happier: {
+                        kind: 'session_media.v1',
+                        payload: {
+                            media: [
+                                {
+                                    id: 'media-1',
+                                    role: 'output',
+                                    category: 'generated',
+                                    mediaKind: 'image',
+                                    name: 'generated.png',
+                                    path: '.happier/uploads/generated/m1/generated.png',
+                                    mimeType: 'image/png',
+                                    sizeBytes: 10,
+                                    origin: { source: 'provider-generated' },
+                                },
+                            ],
+                        },
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage(
+                'server-message-id-media',
+                null,
+                1710000000000,
+                mediaOnlyAssistantMessage as any,
+            );
+
+            expect(normalized).not.toBeNull();
+            if (normalized && normalized.role === 'agent') {
+                expect(normalized.content).toEqual([
+                    {
+                        type: 'text',
+                        text: '',
+                        uuid: 'server-message-id-media',
+                        parentUUID: null,
+                    },
+                ]);
+            }
+        });
+
+        it('normalizeRawMessage() preserves unavailable-media-only assistant output', () => {
+            const normalized = normalizeRawMessage(
+                'server-message-id-media-unavailable',
+                null,
+                1710000000000,
+                {
+                    role: 'agent',
+                    content: {
+                        type: 'output',
+                        data: {
+                            type: 'assistant',
+                            message: { role: 'assistant', model: 'cursor', content: [] },
+                        },
+                    },
+                    meta: {
+                        happier: {
+                            kind: 'session_media.v1',
+                            payload: {
+                                media: [],
+                                unavailable: [{
+                                    id: 'd'.repeat(64),
+                                    role: 'output',
+                                    category: 'generated',
+                                    mediaKind: 'image',
+                                    code: 'provider_file_unavailable',
+                                    origin: { source: 'provider-generated' },
+                                }],
+                            },
+                        },
+                    },
+                } as any,
+            );
+
+            expect(normalized).not.toBeNull();
+        });
+    });
+
+    describe('Codex/Gemini messages use native hyphenated schema (no transformation)', () => {
+        it('accepts Codex tool-call messages via codex schema path', () => {
+            const codexMessage = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'tool-call',
+                        callId: 'codex_1',
+                        name: 'Bash',
+                        input: { command: 'pwd' },
+                        id: 'codex-id-1'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(codexMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'codex' && content.data.type === 'tool-call') {
+                    // Codex path keeps hyphenated types as-is
+                    expect(content.data.type).toBe('tool-call');
+                    expect(content.data.callId).toBe('codex_1');
+                }
+            }
+        });
+
+        it('accepts Codex tool-call-result messages via codex schema path', () => {
+            const codexMessage = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'tool-call-result',
+                        callId: 'codex_result_1',
+                        output: 'command output',
+                        id: 'codex-id-2'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(codexMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'codex' && content.data.type === 'tool-call-result') {
+                    // Codex path keeps hyphenated types as-is
+                    expect(content.data.type).toBe('tool-call-result');
+                    expect(content.data.callId).toBe('codex_result_1');
+                    expect(content.data.output).toBe('command output');
+                }
+            }
+        });
+
+        it('accepts Codex token_count messages via codex schema path (so they are not dropped)', () => {
+            const codexMessage = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'token_count',
+                        input_tokens: 1,
+                        output_tokens: 2,
+                        total_tokens: 3,
+                        id: 'codex-id-3',
+                    },
+                },
+            };
+
+            const result = RawRecordSchema.safeParse(codexMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'codex') {
+                    expect(content.data.type).toBe('token_count');
+                }
+            }
+        });
+
+        it('normalizeRawMessage() converts Codex token_count into usage-only agent telemetry', () => {
+            const raw = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'token_count',
+                        tokens: {
+                            input: 120,
+                            output: 40,
+                            cache_read: 30,
+                            cache_creation: 10,
+                            total: 200,
+                        },
+                        id: 'codex-token-count-1',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-codex-token-count', null, 1000, raw);
+
+            expect(normalized).not.toBeNull();
+            expect(normalized).toMatchObject({
+                id: 'msg-codex-token-count',
+                role: 'agent',
+                isSidechain: false,
+                content: [],
+                usage: {
+                    input_tokens: 120,
+                    output_tokens: 40,
+                    cache_read_input_tokens: 30,
+                    cache_creation_input_tokens: 10,
+                },
+            });
+        });
+
+        it('normalizeRawMessage() preserves explicit context-window telemetry from token_count messages', () => {
+            const raw = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'token_count',
+                        used: 1_200,
+                        size: 258_400,
+                        tokens: {
+                            input: 700,
+                            output: 250,
+                            cache_read: 200,
+                            total: 1_200,
+                        },
+                        id: 'codex-token-count-2',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-codex-token-count-size', null, 1000, raw);
+
+            expect(normalized).not.toBeNull();
+            expect(normalized).toMatchObject({
+                id: 'msg-codex-token-count-size',
+                role: 'agent',
+                isSidechain: false,
+                content: [],
+                usage: {
+                    input_tokens: 700,
+                    output_tokens: 250,
+                    cache_read_input_tokens: 200,
+                    context_used_tokens: 1_200,
+                    context_window_tokens: 258_400,
+                },
+            });
+        });
+    });
+
+    describe('Handles unexpected data formats gracefully', () => {
+        it('handles tool-call with both callId and id fields (prefers callId)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool-call',
+                                callId: 'primary_id',
+                                id: 'secondary_id',  // Both present
+                                name: 'Edit',
+                                input: {}
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'assistant') {
+                      const firstItem = (content.data as any).message.content[0];
+                      expect(firstItem.type).toBe('tool_use');
+                      if (firstItem.type === 'tool_use') {
+                          // Should use callId as the canonical id
+                          expect(firstItem.id).toBe('primary_id');
+                    }
+                }
+            }
+        });
+
+        it('handles tool-call-result with both output and content fields (prefers output)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool-call-result',
+                                callId: 'call_dual',
+                                output: 'primary_output',
+                                content: 'secondary_content',  // Both present
+                                is_error: false
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'user') {
+                      const msgContent = (content.data as any).message.content;
+                      if (Array.isArray(msgContent) && msgContent[0].type === 'tool_result') {
+                          // Should use output as the canonical content
+                          expect(msgContent[0].content).toBe('primary_output');
+                      }
+                }
+            }
+        });
+
+        it('handles missing optional is_error field (defaults to false)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool-call-result',
+                                callId: 'call_no_error',
+                                output: 'success'
+                                // is_error missing
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  const content = result.data.content;
+                  if (content.type === 'output' && content.data.type === 'user') {
+                      const msgContent = (content.data as any).message.content;
+                      if (Array.isArray(msgContent) && msgContent[0].type === 'tool_result') {
+                          // Should default is_error to false
+                          expect(msgContent[0].is_error).toBe(false);
+                      }
+                }
+            }
+        });
+
+        it('keeps tool-call blocks missing callId as unknown content (forward compatibility)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool-call',
+                                // callId missing!
+                                name: 'Bash',
+                                input: {}
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'output' && content.data.type === 'assistant') {
+                    const firstItem = (content.data as any).message.content[0];
+                    expect(firstItem.type).toBe('tool-call');
+                    expect(firstItem.callId).toBeUndefined();
+                }
+            }
+        });
+
+        it('keeps tool_use blocks missing id as unknown content (forward compatibility)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool_use',
+                                // id missing!
+                                name: 'Read',
+                                input: {}
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+
+            expect(result.success).toBe(true);
+            if (result.success) {
+                const content = result.data.content;
+                if (content.type === 'output' && content.data.type === 'assistant') {
+                    const firstItem = (content.data as any).message.content[0];
+                    expect(firstItem.type).toBe('tool_use');
+                    expect(firstItem.id).toBeUndefined();
+                }
+            }
+        });
+    });
+
+    describe('Integration: Complete message flow scenarios', () => {
+        it('handles real Claude SDK assistant message with tool_use', () => {
+            const realMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-sonnet-4-5-20250929',
+                            content: [
+                                { type: 'text', text: 'Let me read that file for you.' },
+                                {
+                                    type: 'tool_use',
+                                    id: 'toolu_01ABC123',
+                                    name: 'Read',
+                                    input: { file_path: '/Users/test/file.ts' }
+                                }
+                            ],
+                            usage: {
+                                input_tokens: 1000,
+                                output_tokens: 50
+                            }
+                        },
+                        uuid: 'real-assistant-uuid',
+                        parentUuid: null
+                    }
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(realMessage);
+
+            expect(result.success).toBe(true);
+              if (result.success) {
+                  expect(result.data.role).toBe('agent');
+                  expect(result.data.content.type).toBe('output');
+                  if (result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                      const content = (result.data.content.data as any).message.content;
+                      expect(content.length).toBe(2);
+                      expect(content[0].type).toBe('text');
+                      expect(content[1].type).toBe('tool_use');
+                      if (content[1].type === 'tool_use') {
+                          expect(content[1].id).toBe('toolu_01ABC123');
+                    }
+                }
+            }
+        });
+
+        it('accepts usage.service_tier null (does not drop message)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-sonnet-4-5-20250929',
+                            content: [{ type: 'text', text: 'Hello' }],
+                            usage: {
+                                input_tokens: 1,
+                                output_tokens: 1,
+                                service_tier: null,
+                            },
+                        },
+                        uuid: 'real-assistant-uuid',
+                        parentUuid: null,
+                    },
+                },
+                meta: { sentFrom: 'cli' },
+            };
+
+            const result = RawRecordSchema.safeParse(message);
+            expect(result.success).toBe(true);
+        });
+
+        it('handles real user message with tool_result', () => {
+            const realMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool_result',
+                                tool_use_id: 'toolu_01ABC123',
+                                content: 'File contents here...',
+                                is_error: false,
+                                permissions: {
+                                    date: 1736300000000,
+                                    result: 'approved',
+                                    mode: 'default'
+                                }
+                            }]
+                        },
+                        uuid: 'real-user-uuid',
+                        parentUuid: 'real-assistant-uuid',
+                        isSidechain: false
+                    }
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(realMessage);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'user') {
+                  const content = (result.data.content.data as any).message.content;
+                  if (Array.isArray(content) && content[0].type === 'tool_result') {
+                      expect(content[0].type).toBe('tool_result');
+                      expect(content[0].tool_use_id).toBe('toolu_01ABC123');
+                      expect(content[0].permissions).toBeDefined();
+                }
+            }
+        });
+
+        it('handles sidechain messages (parent_tool_use_id present)', () => {
+            const sidechainMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [
+                                { type: 'text', text: 'Sidechain response' }
+                            ]
+                        },
+                        uuid: 'sidechain-uuid',
+                        parentUuid: 'parent-uuid',
+                        isSidechain: true,
+                        parent_tool_use_id: 'toolu_parent'
+                    }
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(sidechainMessage);
+
+            expect(result.success).toBe(true);
+            if (!result.success) return;
+            if (result.data.content.type !== 'output') return;
+            const data = result.data.content.data;
+            if (data.type !== 'assistant') return;
+            expect(data.isSidechain).toBe(true);
+            expect((data as any).parent_tool_use_id).toBe('toolu_parent');
+        });
+    });
+
+    describe('Unexpected data format robustness', () => {
+        it('handles tool-call with extra unknown fields from future API', () => {
+            const futureMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-4',
+                            content: [{
+                                type: 'tool-call',
+                                callId: 'future_call',
+                                name: 'FutureTool',
+                                input: {},
+                                // Future API fields
+                                priority: 'high',
+                                timeout: 30000,
+                                metadata: { version: '2.0' }
+                            }]
+                        },
+                        uuid: 'future-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(futureMessage);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  const item: any = (result.data.content.data as any).message.content[0];
+                  expect(item.type).toBe('tool_use');
+                  // Unknown fields should be preserved
+                  expect(item.priority).toBe('high');
+                  expect(item.timeout).toBe(30000);
+                expect(item.metadata).toEqual({ version: '2.0' });
+            }
+        });
+
+        it('handles empty content array', () => {
+            const emptyMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: []  // Empty
+                        },
+                        uuid: 'empty-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(emptyMessage);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  expect((result.data.content.data as any).message.content).toEqual([]);
+              }
+          });
+
+        it('handles string content in user messages (not array)', () => {
+            const stringContentMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: 'Plain string message'  // Not an array
+                        },
+                        uuid: 'string-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(stringContentMessage);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'user') {
+                  expect((result.data.content.data as any).message.content).toBe('Plain string message');
+              }
+          });
+
+        it('handles system messages (no transformation needed)', () => {
+            const systemMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'system'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(systemMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.content.type === 'output') {
+                expect(result.data.content.data.type).toBe('system');
+            }
+        });
+
+        it('handles summary messages', () => {
+            const summaryMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'summary',
+                        summary: 'Session summary text'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(summaryMessage);
+
+            expect(result.success).toBe(true);
+            if (!result.success) return;
+            if (result.data.content.type !== 'output') return;
+            const data = result.data.content.data;
+            if (data.type !== 'summary') return;
+            expect((data as any).summary).toBe('Session summary text');
+        });
+
+        it('handles event messages (no content transformation)', () => {
+            const eventMessage = {
+                role: 'agent',
+                content: {
+                    type: 'event',
+                    id: 'event-123',
+                    data: {
+                        type: 'switch',
+                        mode: 'local'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(eventMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.content.type === 'event') {
+                expect(result.data.content.data.type).toBe('switch');
+                if (result.data.content.data.type === 'switch') {
+                    expect(result.data.content.data.mode).toBe('local');
+                }
+            }
+        });
+
+        it('normalizes connected-service account switch events with native endpoints', () => {
+            const eventMessage = {
+                role: 'agent',
+                content: {
+                    type: 'event',
+                    id: 'connected-service-account-switch:openai-codex:happier:1',
+                    data: {
+                        type: 'connected-service-account-switch',
+                        serviceId: 'openai-codex',
+                        groupId: 'happier',
+                        fromProfileId: null,
+                        toProfileId: 'team',
+                        reason: 'manual',
+                        mode: 'restart_resume',
+                    }
+                }
+            };
+
+            const normalized = normalizeRawMessage('msg-connected-service-switch', null, Date.now(), eventMessage);
+
+            expect(normalized).toMatchObject({
+                role: 'event',
+                content: {
+                    type: 'connected-service-account-switch',
+                    serviceId: 'openai-codex',
+                    groupId: 'happier',
+                    fromProfileId: null,
+                    toProfileId: 'team',
+                    reason: 'manual',
+                    mode: 'restart_resume',
+                },
+            });
+        });
+
+        it('accepts structured context compaction event messages', () => {
+            const eventMessage = {
+                role: 'agent',
+                content: {
+                    type: 'event',
+                    id: 'event-compact-123',
+                    data: {
+                        type: 'context-compaction',
+                        phase: 'started',
+                        lifecycleId: 'compact_1',
+                        provider: 'codex',
+                        trigger: 'auto',
+                        source: 'provider-event',
+                        providerEventId: 'item_1',
+                        tokenCountBefore: 1200,
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(eventMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.content.type === 'event') {
+                expect(result.data.content.data).toMatchObject({
+                    type: 'context-compaction',
+                    phase: 'started',
+                    lifecycleId: 'compact_1',
+                    provider: 'codex',
+                    trigger: 'auto',
+                    source: 'provider-event',
+                    providerEventId: 'item_1',
+                    tokenCountBefore: 1200,
+                });
+            }
+        });
+
+        it('normalizes legacy detected context compaction events as inferred completion', () => {
+            const eventMessage = {
+                role: 'agent',
+                content: {
+                    type: 'event',
+                    id: 'event-compact-detected',
+                    data: {
+                        type: 'context-compaction',
+                        phase: 'detected',
+                        source: 'transcript-inference',
+                    },
+                },
+            };
+
+            const result = RawRecordSchema.safeParse(eventMessage);
+
+            expect(result.success).toBe(true);
+            const normalized = normalizeRawMessage('msg-compact-detected', null, Date.now(), eventMessage);
+            expect(normalized).toMatchObject({
+                role: 'event',
+                content: {
+                    type: 'context-compaction',
+                    phase: 'completed',
+                    source: 'transcript-inference',
+                },
+            });
+        });
+
+        it('handles user role messages with text content', () => {
+            const userMessage = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: 'User input message'
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(userMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.role === 'user') {
+                expect(result.data.content.type).toBe('text');
+                expect(result.data.content.text).toBe('User input message');
+            }
+        });
+    });
+
+    describe('Field preservation and edge cases', () => {
+        it('preserves permissions object in tool_result', () => {
+            const messageWithPermissions = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool_result',
+                                tool_use_id: 'perm_call',
+                                content: 'result',
+                                is_error: false,
+                                permissions: {
+                                    date: 1736300000000,
+                                    result: 'approved',
+                                    mode: 'acceptEdits',
+                                    allowedTools: ['Read', 'Write'],
+                                    decision: 'approved_for_session'
+                                }
+                            }]
+                        },
+                        uuid: 'perm-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(messageWithPermissions);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'user') {
+                  const content = (result.data.content.data as any).message.content;
+                  if (Array.isArray(content) && content[0].type === 'tool_result') {
+                      expect(content[0].permissions).toBeDefined();
+                      expect(content[0].permissions?.result).toBe('approved');
+                      expect(content[0].permissions?.mode).toBe('acceptEdits');
+                    expect(content[0].permissions?.allowedTools).toEqual(['Read', 'Write']);
+                }
+            }
+        });
+
+        it('handles tool_result with array content (text blocks)', () => {
+            const messageWithArrayContent = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        message: {
+                            role: 'user',
+                            content: [{
+                                type: 'tool_result',
+                                tool_use_id: 'array_call',
+                                content: [
+                                    { type: 'text', text: 'First block' },
+                                    { type: 'text', text: 'Second block' }
+                                ],
+                                is_error: false
+                            }]
+                        },
+                        uuid: 'array-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(messageWithArrayContent);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'user') {
+                  const content = (result.data.content.data as any).message.content;
+                  if (Array.isArray(content) && content[0].type === 'tool_result') {
+                      expect(Array.isArray(content[0].content)).toBe(true);
+                      if (Array.isArray(content[0].content)) {
+                          expect(content[0].content.length).toBe(2);
+                          expect(content[0].content[0].text).toBe('First block');
+                    }
+                }
+            }
+        });
+
+        it('handles metadata fields (uuid, parentUuid, isSidechain, etc.)', () => {
+            const messageWithMetadata = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{ type: 'text', text: 'Test' }]
+                        },
+                        uuid: 'meta-uuid-123',
+                        parentUuid: 'parent-uuid-456',
+                        isSidechain: true,
+                        isCompactSummary: false,
+                        isMeta: false
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(messageWithMetadata);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.content.type === 'output') {
+                expect(result.data.content.data.uuid).toBe('meta-uuid-123');
+                expect(result.data.content.data.parentUuid).toBe('parent-uuid-456');
+                expect(result.data.content.data.isSidechain).toBe(true);
+            }
+        });
+
+        it('drops compact hook stdout assistant output at read time', () => {
+            const raw = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        uuid: 'hook-stdout',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'text',
+                                text: [
+                                    '<local-command-stdout>Compacted PreCompact [/Users/leeroy/.vibe-island/bin/vibe-island-bridge --source claude] completed successfully',
+                                    "PreCompact [python3 '/Users/leeroy/.claude/hooks/claude-island-state.py'] completed successfully",
+                                    "PostCompact [python3 '/Users/leeroy/.claude/hooks/claude-island-state.py'] completed successfully</local-command-stdout>",
+                                ].join('\n'),
+                            }],
+                        },
+                    },
+                },
+            };
+
+            expect(normalizeRawMessage('msg-compact-hook-stdout', null, Date.now(), raw)).toBeNull();
+        });
+
+        it('drops compact hook stdout user text at read time', () => {
+            const raw = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: [
+                        '<local-command-stdout>Compacted PreCompact [/Users/leeroy/.vibe-island/bin/vibe-island-bridge --source claude] completed successfully',
+                        "PreCompact [python3 '/Users/leeroy/.claude/hooks/claude-island-state.py'] completed successfully",
+                        "PostCompact [python3 '/Users/leeroy/.claude/hooks/claude-island-state.py'] completed successfully</local-command-stdout>",
+                    ].join('\n'),
+                },
+                meta: {
+                    sentFrom: 'cli',
+                    source: 'cli',
+                },
+            };
+
+            expect(normalizeRawMessage('msg-compact-hook-stdout-user', null, Date.now(), raw)).toBeNull();
+        });
+
+        it('drops Claude local command caveat and slash-command rows at read time', () => {
+            const localCommandCaveat = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'user',
+                        isMeta: true,
+                        uuid: 'local-command-caveat-1',
+                        message: {
+                            role: 'user',
+                            content: '<local-command-caveat>Generated by a local command.</local-command-caveat>',
+                        },
+                    },
+                },
+            };
+            const compactCommand = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: '<command-name>/compact</command-name>\n<command-message>compact</command-message>',
+                },
+            };
+            const modelCommand = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>',
+                },
+            };
+            const effortCommand = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: '<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args></command-args>',
+                },
+            };
+            const modelStdout = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: [
+                        '<local-command-stdout>Set model to Opus 4.8 and saved as your default for new sessions',
+                        'Additional genuine multi-line Claude local-command stdout</local-command-stdout>',
+                    ].join('\n'),
+                },
+            };
+            const plainCompactPrompt = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: '/compact',
+                },
+            };
+
+            expect(normalizeRawMessage('msg-local-command-caveat', null, Date.now(), localCommandCaveat)).toBeNull();
+            expect(normalizeRawMessage('msg-compact-command', null, Date.now(), compactCommand)).toBeNull();
+            expect(normalizeRawMessage('msg-model-command', null, Date.now(), modelCommand)).toBeNull();
+            expect(normalizeRawMessage('msg-effort-command', null, Date.now(), effortCommand)).toBeNull();
+            expect(normalizeRawMessage('msg-model-stdout', null, Date.now(), modelStdout)).toBeNull();
+            expect(normalizeRawMessage('msg-plain-compact-prompt', null, Date.now(), plainCompactPrompt)).not.toBeNull();
+        });
+    });
+
+    describe('WOLOG: Cross-agent format handling', () => {
+        it('Claude SDK (underscore) passes through unchanged', () => {
+            const claudeMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [
+                                { type: 'tool_use', id: 'claude_1', name: 'Bash', input: {} }
+                            ]
+                        },
+                        uuid: 'claude-uuid'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(claudeMessage);
+
+              expect(result.success).toBe(true);
+              // Verify underscore types remain unchanged (idempotent)
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  expect((result.data.content.data as any).message.content[0].type).toBe('tool_use');
+              }
+          });
+
+        it('Codex (hyphenated via codex path) uses native schema', () => {
+            const codexMessage = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'tool-call',
+                        callId: 'codex_tool',
+                        name: 'Read',
+                        input: {},
+                        id: 'codex-msg-id'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(codexMessage);
+
+            expect(result.success).toBe(true);
+            // Codex path keeps hyphenated types (no transformation)
+            if (result.success && result.data.content.type === 'codex') {
+                expect(result.data.content.data.type).toBe('tool-call');
+                if (result.data.content.data.type === 'tool-call') {
+                    expect(result.data.content.data.callId).toBe('codex_tool');
+                }
+            }
+        });
+
+        it('Gemini (uses codex path) works with hyphenated types', () => {
+            // Gemini uses sendCodexMessage() in CLI, so type: 'codex'
+            const geminiMessage = {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'message',
+                        message: 'Gemini reasoning output'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(geminiMessage);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'codex' && result.data.content.data.type === 'message') {
+                  expect((result.data.content.data as any).message).toBe('Gemini reasoning output');
+              }
+          });
+
+        it('handles hypothetical hyphenated types in output path (defensive)', () => {
+            // This tests the defensive nature of the transform
+            // If CLI ever sends hyphenated in output path, it should work
+            const hypotheticalMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'future-model',
+                            content: [{
+                                type: 'tool-call',  // Hyphenated in output path
+                                callId: 'defensive_test',
+                                name: 'NewTool',
+                                input: { param: 'value' }
+                            }]
+                        },
+                        uuid: 'defensive-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(hypotheticalMessage);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  // Should transform to tool_use
+                  const item = (result.data.content.data as any).message.content[0];
+                  expect(item.type).toBe('tool_use');
+                  if (item.type === 'tool_use') {
+                      expect(item.id).toBe('defensive_test');
+                  }
+            }
+        });
+    });
+
+    describe('Regression prevention: Ensure existing behavior unchanged', () => {
+        it('Zod transform produces same output as old preprocessing for canonical types', () => {
+            const canonicalMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [
+                                { type: 'text', text: 'Hello' },
+                                { type: 'tool_use', id: 'c1', name: 'Read', input: {} }
+                            ]
+                        },
+                        uuid: 'regression-test'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(canonicalMessage);
+
+              expect(result.success).toBe(true);
+              // Verify output format matches what old preprocessing would produce
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  const content = (result.data.content.data as any).message.content;
+                  expect(content[0].type).toBe('text');
+                  if (content[0].type === 'text') {
+                      expect(content[0].text).toBe('Hello');
+                  }
+                expect(content[1].type).toBe('tool_use');
+                if (content[1].type === 'tool_use') {
+                    expect(content[1].id).toBe('c1');
+                    expect(content[1].name).toBe('Read');
+                    expect(content[1].input).toEqual({});
+                }
+            }
+        });
+
+        it('Zod transform is idempotent (applying twice produces same result)', () => {
+            const message = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [
+                                { type: 'tool-call', callId: 'idem_1', name: 'Bash', input: {} }
+                            ]
+                        },
+                        uuid: 'idem-uuid'
+                    }
+                }
+            };
+
+            // Parse once
+            const firstResult = RawRecordSchema.safeParse(message);
+            expect(firstResult.success).toBe(true);
+
+            // Parse the result again (should be idempotent)
+            if (firstResult.success) {
+                const secondResult = RawRecordSchema.safeParse(firstResult.data);
+                expect(secondResult.success).toBe(true);
+
+                // Results should be identical
+                expect(JSON.stringify(secondResult.data)).toBe(JSON.stringify(firstResult.data));
+            }
+        });
+
+        it('Error messages are preserved when required discriminator fields are missing', () => {
+            const invalidMessage = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        // Missing `type` discriminator on purpose.
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'invalid-type',
+                                data: 'bad'
+                            }]
+                        },
+                        uuid: 'error-test'
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(invalidMessage);
+
+            expect(result.success).toBe(false);
+            if (!result.success) {
+                // Error should be clear and actionable
+                expect(result.error.issues.length).toBeGreaterThan(0);
+                // Should mention discriminator / union validation issue
+                const errorJson = JSON.stringify(result.error.issues);
+                expect(errorJson).toMatch(/(invalid_union|invalid_type|invalid_literal)/);
+            }
+        });
+    });
+
+    describe('Unknown field preservation (WOLOG)', () => {
+        it('preserves unknown fields in thinking content via .passthrough()', () => {
+            const thinkingWithUnknownFields = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'thinking',
+                                thinking: 'Reasoning here',
+                                signature: 'EqkCCkYICxgCKkB...',  // Unknown field
+                                futureField: 'some_value'       // Unknown field
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(thinkingWithUnknownFields);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  const thinkingContent = (result.data.content.data as any).message.content[0];
+                  if (thinkingContent.type === 'thinking') {
+                      // Verify unknown fields preserved
+                      expect((thinkingContent as any).signature).toBe('EqkCCkYICxgCKkB...');
+                      expect((thinkingContent as any).futureField).toBe('some_value');
+                  }
+            }
+        });
+
+        it('preserves unknown fields in transformed tool-call → tool_use', () => {
+            const toolCallWithUnknownFields = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool-call',
+                                callId: 'test-call',
+                                name: 'Bash',
+                                input: { command: 'ls' },
+                                metadata: { timestamp: 123 },  // Unknown field
+                                customField: 'custom_value'    // Unknown field
+                            }]
+                        },
+                        uuid: 'test-uuid'
+                    }
+                }
+            };
+
+              const result = RawRecordSchema.safeParse(toolCallWithUnknownFields);
+
+              expect(result.success).toBe(true);
+              if (result.success && result.data.content.type === 'output' && result.data.content.data.type === 'assistant') {
+                  const toolUseContent = (result.data.content.data as any).message.content[0];
+                  if (toolUseContent.type === 'tool_use') {
+                      // Verify transform preserved unknown fields
+                      expect(toolUseContent.id).toBe('test-call');
+                      expect((toolUseContent as any).metadata).toEqual({ timestamp: 123 });
+                    expect((toolUseContent as any).customField).toBe('custom_value');
+                }
+            }
+        });
+
+        it('preserves CLI metadata fields via .passthrough()', () => {
+            const messageWithMetadata = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: {
+                        type: 'assistant',
+                        message: { role: 'assistant', model: 'claude-3', content: [] },
+                        uuid: 'test-uuid',
+                        userType: 'external',      // CLI metadata
+                        cwd: '/path/to/project',   // CLI metadata
+                        sessionId: 'session-123',  // CLI metadata
+                        version: '2.1.1',          // CLI metadata
+                        gitBranch: 'main',         // CLI metadata
+                        slug: 'test-slug',         // CLI metadata
+                        requestId: 'req-123',      // CLI metadata
+                        timestamp: '2026-01-09T00:00:00.000Z'  // CLI metadata
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(messageWithMetadata);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.content.type === 'output') {
+                // Verify metadata preserved
+                expect((result.data.content.data as any).userType).toBe('external');
+                expect((result.data.content.data as any).cwd).toBe('/path/to/project');
+                expect((result.data.content.data as any).sessionId).toBe('session-123');
+            }
+        });
+
+        it('END-TO-END: preserves unknown fields through normalizeRawMessage()', () => {
+            const messageWithUnknownFields = {
+                role: 'agent' as const,
+                content: {
+                    type: 'output' as const,
+                    data: {
+                        type: 'assistant' as const,
+                        message: {
+                            role: 'assistant' as const,
+                            model: 'claude-3',
+                            content: [
+                                {
+                                    type: 'thinking' as const,
+                                    thinking: 'Extended thinking reasoning',
+                                    signature: 'EqkCCkYICxgCKkB...',  // Unknown field from Claude API
+                                    customField: 'test_value'          // Unknown field
+                                },
+                                {
+                                    type: 'text' as const,
+                                    text: 'Final response',
+                                    metadata: { timestamp: 123 }       // Unknown field
+                                }
+                            ]
+                        },
+                        uuid: 'wolog-e2e-test',
+                        userType: 'external'  // CLI metadata (unknown to schema definition)
+                    }
+                }
+            };
+
+            const normalized = normalizeRawMessage('msg-1', null, Date.now(), messageWithUnknownFields);
+
+            expect(normalized).toBeTruthy();
+            if (normalized && normalized.role === 'agent') {
+                expect(normalized.content.length).toBe(2);
+
+                // Verify thinking content preserved unknown fields
+                const thinkingItem = normalized.content[0];
+                expect(thinkingItem.type).toBe('thinking');
+                if (thinkingItem.type === 'thinking') {
+                    expect(thinkingItem.thinking).toBe('Extended thinking reasoning');
+                    expect((thinkingItem as any).signature).toBe('EqkCCkYICxgCKkB...');
+                    expect((thinkingItem as any).customField).toBe('test_value');
+                }
+
+                // Verify text content preserved unknown fields
+                const textItem = normalized.content[1];
+                expect(textItem.type).toBe('text');
+                if (textItem.type === 'text') {
+                    expect(textItem.text).toBe('Final response');
+                    expect((textItem as any).metadata).toEqual({ timestamp: 123 });
+                }
+            }
+        });
+
+        it('END-TO-END: preserves unknown fields in transformed tool-call through normalizeRawMessage()', () => {
+            const messageWithHyphenatedUnknownFields = {
+                role: 'agent' as const,
+                content: {
+                    type: 'output' as const,
+                    data: {
+                        type: 'assistant' as const,
+                        message: {
+                            role: 'assistant' as const,
+                            model: 'claude-3',
+                            content: [{
+                                type: 'tool-call' as const,
+                                callId: 'e2e-test-call',
+                                name: 'Bash',
+                                input: { command: 'ls' },
+                                executionMetadata: { server: 'remote' },  // Unknown field
+                                timestamp: 1234567890                      // Unknown field
+                            }]
+                        },
+                        uuid: 'wolog-transform-e2e'
+                    }
+                }
+            };
+
+            const normalized = normalizeRawMessage('msg-2', null, Date.now(), messageWithHyphenatedUnknownFields);
+
+            expect(normalized).toBeTruthy();
+            if (normalized && normalized.role === 'agent') {
+                const toolCallItem = normalized.content[0];
+                expect(toolCallItem.type).toBe('tool-call');
+                if (toolCallItem.type === 'tool-call') {
+                    expect(toolCallItem.id).toBe('e2e-test-call');
+                    expect(toolCallItem.name).toBe('Bash');
+                    // Verify unknown fields preserved through transformation
+                    expect((toolCallItem as any).executionMetadata).toEqual({ server: 'remote' });
+                    expect((toolCallItem as any).timestamp).toBe(1234567890);
+                }
+            }
+        });
+    });
+
+    describe('ACP tool call normalization', () => {
+        it('accepts configured ACP provider ids in raw records', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'acp:live-ui-acp-stub-preset',
+                    data: {
+                        type: 'message' as const,
+                        message: 'ACP_STUB_USAGE_UPDATE_DONE live-ui-manual-qa-20260309-1',
+                    },
+                },
+            };
+
+            const parsed = RawRecordSchema.safeParse(raw);
+            expect(parsed.success).toBe(true);
+
+            if (!parsed.success) {
+                return;
+            }
+
+            const normalized = normalizeRawMessage('msg-acp-configured-provider', null, Date.now(), parsed.data);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                expect(normalized.content[0]).toEqual({
+                    type: 'text',
+                    text: 'ACP_STUB_USAGE_UPDATE_DONE live-ui-manual-qa-20260309-1',
+                    uuid: 'msg-acp-configured-provider',
+                    parentUUID: null,
+                });
+            }
+        });
+
+        it('normalizes ACP context compaction records into transcript events', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'pi' as const,
+                    data: {
+                        type: 'context-compaction' as const,
+                        phase: 'started' as const,
+                        lifecycleId: 'compact_1',
+                        trigger: 'manual' as const,
+                        source: 'provider-event' as const,
+                        tokenCountBefore: 456,
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-acp-context-compaction', null, Date.now(), raw);
+
+            expect(normalized).toMatchObject({
+                role: 'event',
+                content: {
+                    type: 'context-compaction',
+                    phase: 'started',
+                    lifecycleId: 'compact_1',
+                    provider: 'pi',
+                    trigger: 'manual',
+                    source: 'provider-event',
+                    tokenCountBefore: 456,
+                },
+            });
+        });
+
+        it('normalizes ACP context compaction compatibility aliases to canonical fields', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'pi' as const,
+                    data: {
+                        type: 'context-compaction' as const,
+                        phase: 'detected' as const,
+                        tokensBefore: 456,
+                        tokensAfter: 123,
+                        errorMessage: 'safe preview',
+                        retrying: true,
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-acp-context-compaction-legacy', null, Date.now(), raw);
+
+            expect(normalized).toMatchObject({
+                role: 'event',
+                content: {
+                    type: 'context-compaction',
+                    phase: 'completed',
+                    provider: 'pi',
+                    source: 'transcript-inference',
+                    tokenCountBefore: 456,
+                    tokenCountAfter: 123,
+                    sanitizedErrorPreview: 'safe preview',
+                },
+            });
+            expect((normalized as any)?.content?.retrying).toBeUndefined();
+        });
+
+        it('parses ACP tool-call input when input is a JSON string', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'codex' as const,
+                    data: {
+                        type: 'tool-call' as const,
+                        callId: 'call_1',
+                        name: 'execute',
+                        input: JSON.stringify({ command: ['/bin/zsh', '-lc', 'echo hi'], cwd: '/tmp' }),
+                        id: 'acp-msg-tool-call',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-acp-tool-call', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-call');
+                if (item.type === 'tool-call') {
+                    expect(item.name).toBe('execute');
+                    expect(item.input).toEqual({ command: ['/bin/zsh', '-lc', 'echo hi'], cwd: '/tmp' });
+                }
+            }
+        });
+    });
+
+    describe('ACP tool result normalization', () => {
+        it('preserves ACP tool-result output arrays for rich renderers', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'gemini' as const,
+                    data: {
+                        type: 'tool-result' as const,
+                        callId: 'call_abc123',
+                        output: [{ type: 'text', text: 'hello' }],
+                        id: 'acp-msg-1',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-1', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-result');
+                if (item.type === 'tool-result') {
+                    expect(item.content).toEqual([{ type: 'text', text: 'hello' }]);
+                }
+            }
+        });
+
+        it('parses ACP tool-result output when output is a JSON string', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'codex' as const,
+                    data: {
+                        type: 'tool-result' as const,
+                        callId: 'call_1',
+                        output: JSON.stringify({ stdout: 'hi\n', stderr: '' }),
+                        id: 'acp-msg-tool-result',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-acp-tool-result', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-result');
+                if (item.type === 'tool-result') {
+                    expect(item.tool_use_id).toBe('call_1');
+                    expect(item.content).toEqual({ stdout: 'hi\n', stderr: '' });
+                }
+            }
+        });
+
+        it('preserves ACP tool-call-result output arrays for rich renderers', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'gemini' as const,
+                    data: {
+                        type: 'tool-call-result' as const,
+                        callId: 'call_abc123',
+                        output: [{ type: 'text', text: 'hello' }],
+                        id: 'acp-msg-2',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-2', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-result');
+                if (item.type === 'tool-result') {
+                    expect(item.content).toEqual([{ type: 'text', text: 'hello' }]);
+                }
+            }
+        });
+
+        it('normalizes ACP tool-result string output to text', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'gemini' as const,
+                    data: {
+                        type: 'tool-result' as const,
+                        callId: 'call_abc123',
+                        output: 'direct string',
+                        id: 'acp-msg-3',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-3', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-result');
+                if (item.type === 'tool-result') {
+                    expect(item.content).toBe('direct string');
+                }
+            }
+        });
+
+        it('preserves ACP tool-result object output for rich renderers', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'gemini' as const,
+                    data: {
+                        type: 'tool-result' as const,
+                        callId: 'call_abc123',
+                        output: { key: 'value' },
+                        id: 'acp-msg-4',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-4', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-result');
+                if (item.type === 'tool-result') {
+                    expect(item.content).toEqual({ key: 'value' });
+                }
+            }
+        });
+
+        it('preserves ACP tool-result null output', () => {
+            const raw = {
+                role: 'agent' as const,
+                content: {
+                    type: 'acp' as const,
+                    provider: 'gemini' as const,
+                    data: {
+                        type: 'tool-result' as const,
+                        callId: 'call_abc123',
+                        output: null,
+                        id: 'acp-msg-5',
+                    },
+                },
+            };
+
+            const normalized = normalizeRawMessage('msg-5', null, Date.now(), raw);
+            expect(normalized?.role).toBe('agent');
+            if (normalized && normalized.role === 'agent') {
+                const item = normalized.content[0];
+                expect(item.type).toBe('tool-result');
+                if (item.type === 'tool-result') {
+                    expect(item.content).toBeNull();
+                }
+            }
+        });
+    });
+});

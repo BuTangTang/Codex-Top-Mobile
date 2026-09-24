@@ -1,0 +1,164 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+/ios/
+/android/
+apps/ui/ios/
+apps/ui/android/
+packages/*/dist/
+apps/*/dist/
+
+# Native
+.kotlin/
+/packages/sherpa-native/ios/vendor/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# local caches (dev / CI)
+.tmp-home/
+.playwright-cli/
+.yarn-cache/
+.yarn-global/
+/apps/ui/.vite-node/
+
+# local build/log artifacts
+apps/stack/resume-invocations.log
+apps/stack/*.tgz
+packages/relay-server/*.tgz
+apps/server/output/
+
+# Local browser QA authentication state
+/apps/ui/p2-auth.json
+
+# macOS
+.DS_Store
+._*
+*.pem
+
+# local env files
+.env*.local
+.env
+
+# typescript
+*.tsbuildinfo
+packages/*/.tsconfig.build.*.json
+packages/protocol/src/features/embeddedFeaturePolicies.generated.ts
+
+.claude/settings.local.json
+.plan
+
+CLAUDE.local.md
+
+.dev/worktree/*
+.project/
+
+# Development planning notes (keep local, don't commit)
+notes/
+/apps/ui/ios
+
+.worktrees/
+.edison/_generated/
+.edison/_locks/
+.edison/config.local/
+.edison/session/
+.project/logs/
+.project/archive/
+.project/.session-id
+.project/sessions/_tx/
+.project/sessions/_locks/
+.project/qa/evidence-snapshots/
+.project/qa/locks/
+.project/qa/score-history/
+.happier/local/
+.argent/
+.vscode/mcp.json
+/output
+/apps/ui/.agent-device/
+/onboarding-remote-*.png
+
+# Claude Code cache
+.claude/cache/
+
+# Android build artifacts
+packages/*/android/build/
+packages/*/android/.cxx/
+/.tmp
+/packages/tests/playwright-report/
+/packages/tests/test-results/
+_.env.pipeline.local
+_.env.pipeline.production.local
+
+# Local node version file (keep local)
+.nvmrc
+
+# Local package-manager/runtime artifacts
+/package-lock.json
+/eas.json
+**/.happier/
+
+# Local probe/debug scratch files
+/apps/cli/tmp-*
+/apps/cli/.tmp.hstack-cli-build-source.*/
+/*.trace/
+/.fallow/
+/.reviews/
+/.antigravitycli/
+/subagents/dev-plugin-projection-runtime-closure/
+
+# Local QA screenshots
+/authoring-qa-*.png
+/authenticated-*-connected-services.png
+/claude-session-*-error.png
+/codex-usage-limit-*.png
+/connected-services-*.png
+/full-audit-*.log
+/full-audit-*.png
+/lane-*-console-warnings.txt
+/markdown-reveal-qa-*.png
+/happier-session-qa.png
+/opencode-auth-picker-*.png
+/permission-refinement-*.png
+/pets-stack-welcome.png
+/runtime-status-session-before-reload.png
+/transcript-anchor-qa-*
+/ui-postfix-review-snapshot.md
+/.codex-tmp
+/apps/stack/output
+
+/packages/cli-common/.dist*
+/.playwright-mcp
+/.clawpatch
+/apply_fix.py
+/apps/cli/.restore.*
+/apps/cli/.runner-snapshots/
+/apps/cli/package.yaml
+/evidence/
+/liveqa_*.mjs
+
+# One-off UI icon migration scratch scripts (maintained generators and mappings stay tracked)
+/apps/ui/scripts/icons/codemod*.mjs
+/apps/ui/scripts/icons/fix*.mjs
+/apps/ui/scripts/icons/inventory.mjs
+/apps/ui/scripts/icons/migrate.mjs
+/apps/ui/scripts/icons/scanner.mjs
+/apps/ui/scripts/icons/snapSizes.mjs
+/apps/website/.playwright-mcp

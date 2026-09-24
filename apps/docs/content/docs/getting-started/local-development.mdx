@@ -1,0 +1,77 @@
+---
+title: Local development
+description: Run server + UI locally while iterating.
+---
+
+## Preferred: `hstack` (recommended)
+
+If you’re developing Happier in this monorepo, the supported workflow is to run everything via `hstack`
+so ports, auth, DB, caches, and runtime state are isolated per stack.
+
+Start with:
+
+- [Setup](/hstack/setup)
+- [Development workflow](/hstack/development)
+- [Quickstarts](/hstack/quickstarts)
+
+### One-time setup
+
+```bash
+hstack setup-from-source --profile=dev
+```
+
+### Run a dev stack (pinned to the canonical `dev/` checkout)
+
+```bash
+hstack stack new dev
+hstack stack wt dev -- use dev
+```
+
+Interactive development (preferred):
+
+```bash
+hstack tui stack dev dev
+# mobile dev-client + QR:
+hstack tui stack dev dev --mobile
+```
+
+If you can’t use the TUI (non-interactive terminals / CI), run:
+
+```bash
+hstack stack dev dev
+```
+
+## Legacy/manual (not stack-scoped)
+
+If you’re not using `hstack`, these commands can be useful, but they are **not stack-scoped**
+(they share ports/auth/caches with your machine and can be harder to run in parallel).
+
+```bash
+yarn install
+```
+
+Then run the server:
+
+- Full flavor:
+```bash
+yarn --cwd apps/server dev
+```
+
+- Light flavor:
+```bash
+yarn --cwd apps/server dev:light
+```
+
+## App (web UI)
+
+The app can run as Expo web locally:
+
+```bash
+yarn --cwd apps/ui web
+```
+
+## Website
+
+```bash
+yarn --cwd apps/website dev
+```

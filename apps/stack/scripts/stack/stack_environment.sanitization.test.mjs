@@ -1,0 +1,214 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { withStackEnv } from './stack_environment.mjs';
+
+async function withTempStackEnvFixture(fn) {
+  const tmp = await mkdtemp(join(tmpdir(), 'hstack-stack-env-sanitize-'));
+  const storageDir = join(tmp, 'storage');
+  const stackName = 'sanitize';
+  const stackDir = join(storageDir, stackName);
+
+  await mkdir(stackDir, { recursive: true });
+  await writeFile(
+    join(stackDir, 'env'),
+    [
+      'HAPPIER_STACK_REPO_DIR=/tmp/happier',
+      `HAPPIER_STACK_CLI_HOME_DIR=${join(storageDir, stackName, 'cli')}`,
+      'HAPPIER_STACK_SERVER_PORT=3555',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const previousStorageDir = process.env.HAPPIER_STACK_STORAGE_DIR;
+  process.env.HAPPIER_STACK_STORAGE_DIR = storageDir;
+
+  try {
+    await fn({ stackName, storageDir });
+  } finally {
+    if (typeof previousStorageDir === 'undefined') {
+      delete process.env.HAPPIER_STACK_STORAGE_DIR;
+    } else {
+      process.env.HAPPIER_STACK_STORAGE_DIR = previousStorageDir;
+    }
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+test('withStackEnv clears leaked unprefixed server/home env vars from caller scope', async () => {
+  await withTempStackEnvFixture(async ({ stackName }) => {
+    const previousServerUrl = process.env.HAPPIER_SERVER_URL;
+    const previousPublicServerUrl = process.env.HAPPIER_PUBLIC_SERVER_URL;
+    const previousWebappUrl = process.env.HAPPIER_WEBAPP_URL;
+    const previousHomeDir = process.env.HAPPIER_HOME_DIR;
+    const previousAppEnv = process.env.APP_ENV;
+    const previousExpoUpdatesChannel = process.env.EXPO_UPDATES_CHANNEL;
+    const previousExpoPublicFeaturePolicy = process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV;
+    const previousExpoPublicBuildFeaturesAllow = process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_ALLOW;
+    const previousExpoPublicBuildFeaturesDeny = process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+    const previousFeaturePolicyEnv = process.env.HAPPIER_FEATURE_POLICY_ENV;
+    const previousEmbeddedPolicyEnv = process.env.HAPPIER_EMBEDDED_POLICY_ENV;
+    const previousBuildFeaturesAllow = process.env.HAPPIER_BUILD_FEATURES_ALLOW;
+    const previousBuildFeaturesDeny = process.env.HAPPIER_BUILD_FEATURES_DENY;
+
+    process.env.HAPPIER_SERVER_URL = 'http://stale.localhost:9999';
+    process.env.HAPPIER_PUBLIC_SERVER_URL = 'http://stale.localhost:9999';
+    process.env.HAPPIER_WEBAPP_URL = 'http://stale.localhost:9999';
+    process.env.HAPPIER_HOME_DIR = '/tmp/stale-home';
+    process.env.APP_ENV = 'preview';
+    process.env.EXPO_UPDATES_CHANNEL = 'preview';
+    process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV = 'preview';
+    process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_ALLOW = 'voice';
+    process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY = 'automations';
+    process.env.HAPPIER_FEATURE_POLICY_ENV = 'preview';
+    process.env.HAPPIER_EMBEDDED_POLICY_ENV = 'preview';
+    process.env.HAPPIER_BUILD_FEATURES_DENY = 'automations';
+    process.env.HAPPIER_BUILD_FEATURES_ALLOW = 'voice';
+
+    try {
+      await withStackEnv({
+        stackName,
+        fn: async ({ env }) => {
+          assert.equal(env.HAPPIER_SERVER_URL, undefined);
+          assert.equal(env.HAPPIER_PUBLIC_SERVER_URL, undefined);
+          assert.equal(env.HAPPIER_WEBAPP_URL, undefined);
+          assert.equal(env.HAPPIER_HOME_DIR, undefined);
+          assert.equal(env.APP_ENV, undefined);
+          assert.equal(env.EXPO_UPDATES_CHANNEL, undefined);
+          assert.equal(env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV, undefined);
+          assert.equal(env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY, undefined);
+          assert.equal(env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_ALLOW, undefined);
+          assert.equal(env.HAPPIER_FEATURE_POLICY_ENV, undefined);
+          assert.equal(env.HAPPIER_EMBEDDED_POLICY_ENV, undefined);
+          assert.equal(env.HAPPIER_BUILD_FEATURES_DENY, undefined);
+          assert.equal(env.HAPPIER_BUILD_FEATURES_ALLOW, undefined);
+        },
+      });
+    } finally {
+      if (typeof previousServerUrl === 'undefined') delete process.env.HAPPIER_SERVER_URL;
+      else process.env.HAPPIER_SERVER_URL = previousServerUrl;
+      if (typeof previousPublicServerUrl === 'undefined') delete process.env.HAPPIER_PUBLIC_SERVER_URL;
+      else process.env.HAPPIER_PUBLIC_SERVER_URL = previousPublicServerUrl;
+      if (typeof previousWebappUrl === 'undefined') delete process.env.HAPPIER_WEBAPP_URL;
+      else process.env.HAPPIER_WEBAPP_URL = previousWebappUrl;
+      if (typeof previousHomeDir === 'undefined') delete process.env.HAPPIER_HOME_DIR;
+      else process.env.HAPPIER_HOME_DIR = previousHomeDir;
+      if (typeof previousAppEnv === 'undefined') delete process.env.APP_ENV;
+      else process.env.APP_ENV = previousAppEnv;
+      if (typeof previousExpoUpdatesChannel === 'undefined') delete process.env.EXPO_UPDATES_CHANNEL;
+      else process.env.EXPO_UPDATES_CHANNEL = previousExpoUpdatesChannel;
+      if (typeof previousExpoPublicFeaturePolicy === 'undefined') delete process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV;
+      else process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV = previousExpoPublicFeaturePolicy;
+      if (typeof previousExpoPublicBuildFeaturesAllow === 'undefined') delete process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_ALLOW;
+      else process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_ALLOW = previousExpoPublicBuildFeaturesAllow;
+      if (typeof previousExpoPublicBuildFeaturesDeny === 'undefined') delete process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+      else process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY = previousExpoPublicBuildFeaturesDeny;
+      if (typeof previousFeaturePolicyEnv === 'undefined') delete process.env.HAPPIER_FEATURE_POLICY_ENV;
+      else process.env.HAPPIER_FEATURE_POLICY_ENV = previousFeaturePolicyEnv;
+      if (typeof previousEmbeddedPolicyEnv === 'undefined') delete process.env.HAPPIER_EMBEDDED_POLICY_ENV;
+      else process.env.HAPPIER_EMBEDDED_POLICY_ENV = previousEmbeddedPolicyEnv;
+      if (typeof previousBuildFeaturesAllow === 'undefined') delete process.env.HAPPIER_BUILD_FEATURES_ALLOW;
+      else process.env.HAPPIER_BUILD_FEATURES_ALLOW = previousBuildFeaturesAllow;
+      if (typeof previousBuildFeaturesDeny === 'undefined') delete process.env.HAPPIER_BUILD_FEATURES_DENY;
+      else process.env.HAPPIER_BUILD_FEATURES_DENY = previousBuildFeaturesDeny;
+    }
+  });
+});
+
+test('withStackEnv preserves explicit local stack runtime override env vars from caller scope', async () => {
+  await withTempStackEnvFixture(async ({ stackName }) => {
+    const previousCliBuild = process.env.HAPPIER_STACK_CLI_BUILD;
+    const previousSkipRefreshDeps = process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS;
+    const previousExpoExportMaxWorkers = process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS;
+
+    process.env.HAPPIER_STACK_CLI_BUILD = '0';
+    process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS = '1';
+    process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS = '2';
+
+    try {
+      await withStackEnv({
+        stackName,
+        fn: async ({ env }) => {
+          assert.equal(env.HAPPIER_STACK_CLI_BUILD, '0');
+          assert.equal(env.HAPPIER_STACK_SKIP_REFRESH_DEPS, '1');
+          assert.equal(env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS, '2');
+        },
+      });
+    } finally {
+      if (typeof previousCliBuild === 'undefined') delete process.env.HAPPIER_STACK_CLI_BUILD;
+      else process.env.HAPPIER_STACK_CLI_BUILD = previousCliBuild;
+      if (typeof previousSkipRefreshDeps === 'undefined') delete process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS;
+      else process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS = previousSkipRefreshDeps;
+      if (typeof previousExpoExportMaxWorkers === 'undefined') delete process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS;
+      else process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS = previousExpoExportMaxWorkers;
+    }
+  });
+});
+
+test('withStackEnv replaces a foreign daemon lifecycle scope with the selected stack scope', async () => {
+  await withTempStackEnvFixture(async ({ stackName }) => {
+    const previousActiveServerId = process.env.HAPPIER_ACTIVE_SERVER_ID;
+    const previousLifecycleScopeId = process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID;
+    process.env.HAPPIER_ACTIVE_SERVER_ID = 'stack_other__id_default';
+    process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID = 'stack_other__id_default';
+
+    try {
+      await withStackEnv({
+        stackName,
+        reconcileDaemonRuntimeState: false,
+        fn: async ({ env }) => {
+          assert.equal(env.HAPPIER_ACTIVE_SERVER_ID, 'stack_sanitize__id_default');
+          assert.equal(env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID, 'stack_sanitize__id_default');
+        },
+      });
+    } finally {
+      if (typeof previousActiveServerId === 'undefined') delete process.env.HAPPIER_ACTIVE_SERVER_ID;
+      else process.env.HAPPIER_ACTIVE_SERVER_ID = previousActiveServerId;
+      if (typeof previousLifecycleScopeId === 'undefined') delete process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID;
+      else process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID = previousLifecycleScopeId;
+    }
+  });
+});
+
+test('withStackEnv does not carry a foreign stack Expo port allocation into the selected stack', async () => {
+  await withTempStackEnvFixture(async ({ stackName, storageDir }) => {
+    const keys = [
+      'HAPPIER_STACK_STACK',
+      'HAPPIER_STACK_ENV_FILE',
+      'HAPPIER_STACK_EXPO_DEV_PORT',
+      'HAPPIER_STACK_EXPO_DEV_PORT_STRATEGY',
+      'HAPPIER_STACK_EXPO_DEV_PORT_BASE',
+      'HAPPIER_STACK_EXPO_DEV_PORT_RANGE',
+    ];
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+
+    process.env.HAPPIER_STACK_STACK = 'source-stack';
+    process.env.HAPPIER_STACK_ENV_FILE = join(storageDir, 'source-stack', 'env');
+    process.env.HAPPIER_STACK_EXPO_DEV_PORT = '18829';
+    process.env.HAPPIER_STACK_EXPO_DEV_PORT_STRATEGY = 'stable';
+    process.env.HAPPIER_STACK_EXPO_DEV_PORT_BASE = '18081';
+    process.env.HAPPIER_STACK_EXPO_DEV_PORT_RANGE = '2000';
+
+    try {
+      await withStackEnv({
+        stackName,
+        fn: async ({ env }) => {
+          assert.equal(env.HAPPIER_STACK_STACK, stackName);
+          assert.equal(env.HAPPIER_STACK_EXPO_DEV_PORT, undefined);
+          assert.equal(env.HAPPIER_STACK_EXPO_DEV_PORT_STRATEGY, undefined);
+          assert.equal(env.HAPPIER_STACK_EXPO_DEV_PORT_BASE, undefined);
+          assert.equal(env.HAPPIER_STACK_EXPO_DEV_PORT_RANGE, undefined);
+        },
+      });
+    } finally {
+      for (const key of keys) {
+        if (typeof previous[key] === 'undefined') delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
+});

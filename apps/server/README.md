@@ -1,0 +1,421 @@
+# Happier Server
+
+Minimal backend for open-source end-to-end encrypted Claude Code clients.
+
+## What is Happier?
+
+Happier Server is the synchronization backbone for secure Claude Code clients. It enables multiple devices to share encrypted conversations while maintaining complete privacy - the server never sees your messages, only encrypted blobs it cannot read.
+
+## Features
+
+- 🔐 **Zero Knowledge** - The server stores encrypted data but has no ability to decrypt it
+- 🎯 **Minimal Surface** - Only essential features for secure sync, nothing more
+- 🕵️ **Privacy First** - No analytics, no tracking, no data mining
+- 📖 **Open Source** - Transparent implementation you can audit and self-host
+- 🔑 **Cryptographic Auth** - No passwords stored, only public key signatures
+- ⚡ **Real-time Sync** - WebSocket-based synchronization across all your devices
+- 📱 **Multi-device** - Seamless session management across phones, tablets, and computers
+- 🤝 **Session Sharing** - Collaborate on conversations with granular access control
+- 🔔 **Push Notifications** - Notify when Claude Code finishes tasks or needs permissions (encrypted, we can't see the content)
+- 🌐 **Distributed Ready** - Built to scale horizontally when needed
+
+## How It Works
+
+Your Claude Code clients generate encryption keys locally and use Happier Server as a secure relay. Messages are end-to-end encrypted before leaving your device. The server's job is simple: store encrypted blobs and sync them between your devices in real-time.
+
+### Session Sharing
+
+Happier Server supports secure collaboration through two sharing methods:
+
+**Direct Sharing**: Share sessions with specific users by username, with three access levels:
+- **View**: Read-only access to messages
+- **Edit**: Can send messages but cannot manage sharing
+- **Admin**: Full access including sharing management
+
+**Public Links**: Generate shareable URLs for broader access:
+- Always read-only for security
+- Optional expiration dates and usage limits
+- Consent-based access logging (IP/UA only logged with explicit consent)
+
+All sharing maintains end-to-end encryption - encrypted data keys are distributed to authorized users, and the server never sees unencrypted content.
+
+## Hosting
+
+**You don't need to self-host!** Our hosted Happier Server at `api.happier.dev` is just as secure as running your own. Since all data is end-to-end encrypted before it reaches our servers, we literally cannot read your messages even if we wanted to. The encryption happens on your device, and only you have the keys.
+
+That said, Happier Server is open source and self-hostable if you prefer running your own infrastructure. The security model is identical whether you use our servers or your own.
+
+## Server flavors
+
+Happier Server supports two flavors that share the same API + internal logic. Flavors are **presets** (defaults); you can override individual backends via env vars.
+
+- **full** (default, recommended for production): defaults to Postgres, Redis-capable realtime, and S3/Minio-compatible public file storage.
+- **light** (recommended for self-hosting/testing): defaults to SQLite, in-memory realtime, and local public file storage served under `GET /files/*`.
+
+The database provider is independent of these presets. `HAPPIER_DB_PROVIDER=postgres|mysql|pglite|sqlite` is supported under either preset; PostgreSQL and MySQL require `DATABASE_URL`, while PGlite and SQLite use the local data-directory settings by default.
+
+## Required environment (full flavor)
+
+For the complete runtime environment-variable reference (including advanced/internal toggles and legacy aliases), see:
+
+- `apps/docs/content/docs/deployment/env.mdx`
+- canonical template: `apps/server/.env.example`
+
+The full flavor expects these env vars to be set:
+
+- `HAPPIER_DB_PROVIDER` (optional, defaults to `postgres`). Supported: `postgres`, `mysql`, `pglite`, `sqlite`.
+- `DATABASE_URL`, for example:
+  - Postgres: `postgresql://user:pass@db.example.com:5432/happy?sslmode=require`
+  - MySQL 8.0.16+: `mysql://user:pass@db.example.com:3306/happy`
+- `HANDY_MASTER_SECRET` (used to derive auth/encryption secrets)
+- Public file storage:
+  - Choose a backend via `HAPPIER_FILES_BACKEND=local|s3` (default: `s3` in full flavor, `local` in light flavor)
+  - If `HAPPIER_FILES_BACKEND=local` (filesystem-backed public files), the server stores files under `~/.happier/server-light/files` by default.
+    - Override the directory with `HAPPIER_SERVER_LIGHT_FILES_DIR=/absolute/path`.
+    - Files are served by the API under `GET /files/*` (same public route used by light flavor).
+    - Ensure the server process has read/write permissions for the selected directory.
+  - If `HAPPIER_FILES_BACKEND=s3` (S3/Minio), configure:
+    - `S3_HOST`
+    - `S3_PORT` (optional)
+    - `S3_USE_SSL` (`true`/`false`, defaults to `true`)
+    - `S3_BUCKET`
+    - `S3_PUBLIC_URL` (base URL used to build file URLs)
+    - `S3_ACCESS_KEY`
+    - `S3_SECRET_KEY`
+
+Optional (recommended for multi-core / multi-replica):
+
+- `REDIS_URL` + `HAPPIER_SOCKET_ADAPTER=redis-streams`
+
+### Bug report feature controls
+
+Happier clients read bug-report settings from `GET /v1/features`. Configure these env vars to control behavior:
+
+- `HAPPIER_FEATURE_BUG_REPORTS__ENABLED` (default `1`)
+- `HAPPIER_FEATURE_BUG_REPORTS__PROVIDER_URL` (default `https://reports.happier.dev`)
+  - If set to an invalid URL, provider submission is disabled (`providerUrl=null`) instead of failing open.
+- `HAPPIER_FEATURE_BUG_REPORTS__DEFAULT_INCLUDE_DIAGNOSTICS` (default `1`)
+- `HAPPIER_FEATURE_BUG_REPORTS__MAX_ARTIFACT_BYTES` (default `10485760`)
+- `HAPPIER_FEATURE_BUG_REPORTS__UPLOAD_TIMEOUT_MS` (default `120000`)
+- `HAPPIER_FEATURE_BUG_REPORTS__CONTEXT_WINDOW_MS` (default `1800000`; min `1000`, max `86400000`)
+- `HAPPIER_FEATURE_BUG_REPORTS__ACCEPTED_ARTIFACT_KINDS` (comma-separated allowlist)
+
+Server diagnostics (used by bug reports when enabled):
+
+- `HAPPIER_BUG_REPORTS_SERVER_DIAGNOSTICS_ENABLED` (default `0`)
+- `HAPPIER_BUG_REPORTS_SERVER_DIAGNOSTICS_ACCESS_MODE` (default `owner`, allowed: `authenticated`, `owner`)
+- `HAPPIER_SERVER_OWNER_USER_IDS` (comma-separated account ids allowed for owner-only server features)
+- `HAPPIER_BUG_REPORTS_SERVER_LOG_PATH` (optional explicit path; fallback uses `HAPPIER_SELF_HOST_LOG_DIR/server.log`)
+- `HAPPIER_BUG_REPORTS_SERVER_LOG_MAX_BYTES` (default `262144`, max tail bytes read per snapshot request)
+- `HAPPIER_DIAGNOSTICS_BUG_REPORT_SNAPSHOT_RATE_LIMIT_MAX` (default `30`)
+- `HAPPIER_DIAGNOSTICS_BUG_REPORT_SNAPSHOT_RATE_LIMIT_WINDOW` (default `1 minute`)
+
+To fully disable server log exfiltration for self-hosted deployments:
+
+1. Keep `HAPPIER_BUG_REPORTS_SERVER_DIAGNOSTICS_ENABLED=0`.
+2. Remove `server` from `HAPPIER_FEATURE_BUG_REPORTS__ACCEPTED_ARTIFACT_KINDS`.
+
+For shared multi-user servers, keep diagnostics enabled with owner-only access (default):
+
+1. Keep `HAPPIER_BUG_REPORTS_SERVER_DIAGNOSTICS_ACCESS_MODE=owner` (or leave unset).
+2. Set `HAPPIER_SERVER_OWNER_USER_IDS=<owner-id-1>,<owner-id-2>`.
+
+If `HAPPIER_BUG_REPORTS_SERVER_DIAGNOSTICS_ACCESS_MODE=owner` and `HAPPIER_SERVER_OWNER_USER_IDS` is not set, the diagnostics endpoint returns `403` by design.
+
+`HAPPIER_SERVER_OWNER_USER_IDS` uses Happier account ids (owners can copy theirs from Settings → Account in the app).
+
+### Example `.env` (full flavor, production)
+
+```bash
+# Required: DB
+# HAPPIER_DB_PROVIDER=postgres  # default
+DATABASE_URL=postgresql://happy:happy@127.0.0.1:5432/happy?sslmode=require
+HANDY_MASTER_SECRET=change-me-to-a-long-random-string
+
+# Required: public file storage (S3 / Minio)
+HAPPIER_FILES_BACKEND=s3
+S3_HOST=127.0.0.1
+S3_PORT=9000
+S3_USE_SSL=false
+S3_BUCKET=happy-public
+S3_PUBLIC_URL=http://127.0.0.1:9000/happy-public
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+
+# Optional: enable multi-replica Socket.IO fanout + cluster RPC routing
+# (required if you run more than one API replica)
+REDIS_URL=redis://127.0.0.1:6379
+HAPPIER_SOCKET_ADAPTER=redis-streams
+
+# Optional: process role when scaling (unset => "all")
+# SERVER_ROLE=api
+# SERVER_ROLE=worker
+
+# Optional: ports
+PORT=3005
+METRICS_ENABLED=true
+METRICS_PORT=9090
+
+# Optional: instance id for logs/registry
+# HAPPIER_INSTANCE_ID=api-1
+```
+
+### Example `.env` (light flavor, self-hosting)
+
+```bash
+# Optional: where light flavor stores its local data (DB + files + secrets).
+# If unset, defaults to ~/.happy/server-light
+HAPPIER_SERVER_LIGHT_DATA_DIR=/var/lib/happy/server-light
+
+# Optional: DB provider for light flavor (defaults to SQLite)
+# HAPPIER_DB_PROVIDER=sqlite
+# HAPPIER_DB_PROVIDER=pglite
+
+# Optional: ports
+PORT=3005
+METRICS_PORT=9090
+
+# Optional: you can set this for a stable secret (otherwise light will generate+persist one).
+# HANDY_MASTER_SECRET=change-me-to-a-long-random-string
+```
+
+### PGlite TLS note
+
+The light flavor runs an embedded Postgres-compatible server (`pglite-socket`) bound to `127.0.0.1` and **does not support TLS**. Happy Server automatically connects to it with `sslmode=disable`.
+
+This is specific to the PGlite provider under either preset. If your external Postgres requires TLS, keep using a normal `postgresql://...` `DATABASE_URL` (the server will not force-disable TLS for real Postgres URLs).
+
+Light DB version pairing note:
+
+- This repo is tested with `@electric-sql/pglite@0.3.15` + `@electric-sql/pglite-socket@0.0.20` (see `yarn.lock`).
+- If you change these versions, run `yarn --cwd packages/happy-server migrate:light:deploy` and `yarn --cwd packages/happy-server start:light` as a smoke check.
+
+## Production scaling (multi-core / multi-replica)
+
+Happy Server scales by running **multiple API processes** (one Node.js process uses one CPU core effectively for JS work). To scale safely with Socket.IO, you must use a shared adapter and a load balancer configuration that keeps long-lived websocket sessions stable.
+
+### Roles (API vs worker)
+
+The server can run in three modes:
+
+- `SERVER_ROLE` unset → **all** (default): runs API + realtime + background loops in a single process (simple deployments / dev).
+- `SERVER_ROLE=api`: runs HTTP + Socket.IO (accepts client connections) + metrics server.
+- `SERVER_ROLE=worker`: runs background loops (timeouts, DB metrics updater) and publishes realtime events via Redis adapter; does **not** accept client connections.
+
+Recommended production topology:
+
+- **N× API replicas** with `SERVER_ROLE=api`
+- **1× worker replica** with `SERVER_ROLE=worker`
+
+### Redis adapter (required when running >1 API)
+
+When running more than one API process/replica, enable the Socket.IO Redis Streams adapter:
+
+- `REDIS_URL=redis://...`
+- `HAPPIER_SOCKET_ADAPTER=redis-streams`
+
+To explicitly disable it (single-process mode), leave it unset or set:
+
+- `HAPPIER_SOCKET_ADAPTER=memory`
+
+This enables:
+
+- room-based fanout for `update` / `ephemeral` events
+- cluster-aware Socket.IO RPC routing (method registry stored in Redis)
+
+Presence stream (when Redis adapter is enabled):
+
+- `HAPPY_PRESENCE_STREAM_MAXLEN` (default: `100000`)
+  - uses Redis `XADD ... MAXLEN ~ N` trimming for the `presence:alive:v1` stream to prevent unbounded growth
+  - set to `0` to disable trimming (not recommended in production)
+
+Important:
+
+- When you run `SERVER_ROLE=api` with the Redis adapter enabled, durable presence is **published** by API processes but **consumed** (and written to the DB) by a `SERVER_ROLE=worker` process. If you do not run a worker replica, durable presence updates will not be persisted.
+
+### Example: multi-process on one host
+
+For a quick local production-like test (requires Redis):
+
+```bash
+# Worker (no HTTP server; publishes events via Redis adapter; runs background loops)
+SERVER_ROLE=worker HAPPIER_SOCKET_ADAPTER=redis-streams REDIS_URL=redis://127.0.0.1:6379 METRICS_PORT=0 yarn start
+
+# API replicas (different PORTs on the same host; put a load balancer in front in real deployments)
+SERVER_ROLE=api HAPPIER_SOCKET_ADAPTER=redis-streams REDIS_URL=redis://127.0.0.1:6379 PORT=3005 METRICS_PORT=0 yarn start
+SERVER_ROLE=api HAPPIER_SOCKET_ADAPTER=redis-streams REDIS_URL=redis://127.0.0.1:6379 PORT=3006 METRICS_PORT=0 yarn start
+```
+
+### Sticky sessions (required for websocket load balancing)
+
+If you run multiple API replicas behind a load balancer/ingress, you must configure **sticky sessions** so a given websocket client keeps talking to the same API pod/process after the initial upgrade. Without stickiness, reconnects and long-poll fallbacks can flap between replicas and degrade realtime behavior.
+
+### DB connection pool sizing
+
+With multiple API processes, total Postgres connections become roughly:
+
+`(N_api + N_worker) × prisma_pool_size`
+
+To avoid exhausting Postgres connections:
+
+- pick a Postgres `max_connections` target (or pooler capacity),
+- budget connections per process,
+- keep per-process pools conservative (especially for websocket-heavy API processes).
+
+Prisma pooling is typically configured via the database connection string / driver settings. A common pattern is to append a per-process limit (for example `connection_limit=<n>`) to `DATABASE_URL`, or to point `DATABASE_URL` at a pooler (PgBouncer) and keep the app-side pool small.
+
+### Operational tips
+
+- Set `HAPPIER_INSTANCE_ID` to something stable per process/pod for debugging (for example, Kubernetes `metadata.uid`). If unset, it is generated automatically at runtime.
+- If you run API + worker processes on the same host, ensure their `PORT`/`METRICS_PORT` values do not conflict.
+- To disable the metrics server (for example in some local multi-process setups), set `METRICS_ENABLED=false`. To avoid conflicts while keeping it enabled, set `METRICS_PORT=0` (random free port) or choose distinct ports per process.
+
+### Choosing a flavor
+
+- **full**: run `yarn start` (uses `sources/main.ts` → `startServer('full')`)
+- **light**: run `yarn start:light` (uses `sources/main.light.ts` → `startServer('light')`)
+
+For local development, `yarn dev:light` is the easiest entrypoint for the light flavor (it creates the local dirs and runs `prisma migrate deploy` against embedded Postgres (PGlite) before starting).
+
+### Local development
+
+#### Prerequisites
+
+- Node.js + Yarn
+- Docker (required only for the full flavor local deps)
+
+#### Full flavor (Postgres + Redis + S3/Minio)
+
+This repo includes convenience scripts to start Postgres/Redis/Minio via Docker and then run migrations.
+
+```bash
+yarn install
+
+# Start dependencies
+yarn db
+yarn redis
+yarn s3
+yarn s3:init
+
+# Apply migrations (uses `.env.dev`)
+yarn migrate
+
+# Start the server (loads `.env.dev`)
+PORT=3005 yarn dev
+```
+
+Verify:
+
+```bash
+curl http://127.0.0.1:3005/health
+curl http://127.0.0.1:3005/ready
+```
+
+Notes:
+
+- If port `3005` is already in use, choose another: `PORT=3007 ...`.
+- `yarn dev` does **not** kill anything by default. You can force-kills whatever is listening on the port by using: `PORT=3005 yarn dev -- --kill-port` (or `yarn dev:kill-port`).
+- `yarn start` is production-style (it expects env vars already set in your environment).
+- Minio cleanup: `yarn s3:down`.
+
+#### Light flavor (SQLite + local files)
+
+*The light flavor does not require Docker.* By default it uses SQLite persisted on disk and serves public files from disk under `GET /files/*`.
+
+```bash
+yarn install
+
+# Runs light migrations for the selected provider before starting (SQLite by default)
+PORT=3005 yarn dev:light
+
+# Optional: run the light flavor against embedded Postgres (PGlite):
+HAPPIER_DB_PROVIDER=pglite PORT=3005 yarn dev:light
+```
+
+Verify:
+
+```bash
+curl http://127.0.0.1:3005/health
+curl http://127.0.0.1:3005/ready
+```
+
+Notes:
+
+- `yarn dev:light` runs migrations for the selected light DB provider before starting.
+- If you want a clean slate for local dev/testing, delete the light data dir (default: `~/.happy/server-light`) or point the light flavor at a fresh dir via `HAPPIER_SERVER_LIGHT_DATA_DIR=/tmp/happy-server-light`.
+
+### Prisma schema (providers)
+
+- `prisma/schema.prisma` is the single source of truth for the data model.
+- Provider-specific schemas are generated from it via `yarn schema:sync`:
+  - SQLite: `prisma/sqlite/schema.prisma`
+  - MySQL: `prisma/mysql/schema.prisma`
+
+Migrations are provider-specific:
+
+- Postgres (and embedded Postgres via PGlite):
+  - migrations: `prisma/migrations/*`
+  - deploy: `yarn prisma migrate deploy` (or `yarn migrate:light:deploy` for embedded PGlite)
+- SQLite:
+  - migrations: `prisma/sqlite/migrations/*`
+  - deploy: `yarn migrate:sqlite:deploy` (expects `DATABASE_URL=file:...`)
+- MySQL 8.0.16+:
+  - migrations: `prisma/mysql/migrations/*`
+  - deploy: `yarn migrate:mysql:deploy`
+
+DB portability contract suite:
+
+- Spec location: `sources/storage/dbcontract/portability.dbcontract.spec.ts`
+- Run only contract tests (not the full server suite):
+  - Preferred local (Docker-provisioned):
+    - Postgres: `yarn test:server:db-contract:postgres:docker` (repo root)
+    - MySQL: `yarn test:server:db-contract:mysql:docker` (repo root)
+  - Direct package command (existing DB URL):
+    - Postgres: `HAPPIER_DB_PROVIDER=postgres DATABASE_URL=postgresql://... yarn test:server:db-contract`
+    - MySQL: `HAPPIER_DB_PROVIDER=mysql DATABASE_URL=mysql://... yarn test:server:db-contract`
+
+Light flavor note (SQLite vs PGlite):
+
+- The default light DB is SQLite for maximum stability in local/self-host environments.
+- Embedded Postgres (PGlite) is supported by setting `HAPPIER_DB_PROVIDER=pglite`.
+- There is no built-in automatic migration between SQLite and PGlite databases; treat them as separate backends and migrate data explicitly if needed.
+
+### Schema changes (developer workflow)
+
+When you change the data model:
+
+1. Edit `prisma/schema.prisma`
+2. Create/update the migration:
+   - `yarn migrate --name <name>` (writes to `prisma/migrations/*`)
+3. Validate:
+   - `yarn test`
+   - Smoke test both flavors (`yarn dev` and `yarn dev:light`)
+
+No-data-loss guidelines:
+
+- Prefer “expand/contract”: add new columns/tables, backfill, switch code, and only remove old fields in a major version (or never).
+- Be careful with renames. If you only need to rename the Prisma Client API, prefer `@map` / `@@map`.
+
+Light defaults (when env vars are missing):
+
+- data dir: `~/.happy/server-light`
+- sqlite db file: `~/.happy/server-light/happier-server-light.sqlite`
+- pglite db dir (when `HAPPIER_DB_PROVIDER=pglite`): `~/.happy/server-light/pglite`
+- public files: `~/.happy/server-light/files/*`
+- `HANDY_MASTER_SECRET` is generated (once) and persisted to `~/.happy/server-light/handy-master-secret.txt`
+
+### Serve UI (optional, any flavor)
+
+You can serve a prebuilt web UI bundle (static directory) from the server process. This is opt-in and does not affect the full flavor unless enabled.
+
+- `HAPPY_SERVER_UI_DIR=/absolute/path/to/ui-build`
+- `HAPPY_SERVER_UI_PREFIX=/` (default) or `/ui`
+
+Notes:
+
+- If `HAPPY_SERVER_UI_PREFIX=/`, the server serves the UI at `/` and uses an SPA fallback for unknown `GET` routes (it does **not** fallback for API paths like `/v1/*` or `/files/*`).
+- If `HAPPY_SERVER_UI_PREFIX=/ui`, the UI is served under `/ui` and the server keeps its default `/` route.
+
+## License
+
+MIT - Use it, modify it, deploy it anywhere.

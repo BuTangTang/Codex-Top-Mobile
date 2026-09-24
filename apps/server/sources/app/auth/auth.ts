@@ -1,0 +1,375 @@
+import * as privacyKit from "privacy-kit";
+import { createHash } from "node:crypto";
+import { log } from "@/utils/logging/log";
+import { LRUTtlMap } from "@/utils/collections/lru";
+import {
+    isOAuthStateUnavailableError,
+    OAuthStateUnavailableError,
+} from "./oauthStateErrors";
+
+interface TokenGeneratorLike {
+    new: (payload: any) => Promise<string>;
+    publicKey: Uint8Array | number[];
+}
+
+interface TokenVerifierLike {
+    verify: (token: string) => Promise<any>;
+}
+
+// Persistent tokens have no expiry. Retain this read-only compatibility window until an
+// explicit token epoch or forced re-auth retires tokens issued by privacy-kit 0.0.25 on Bun.
+const LEGACY_BUN_SEED_CANDIDATE_COUNT = 64;
+
+interface AuthTokens {
+    generator: TokenGeneratorLike;
+    verifier: TokenVerifierLike;
+}
+
+interface OAuthStateTokens {
+    oauthStateVerifier: TokenVerifierLike;
+    oauthStateGenerator: TokenGeneratorLike;
+}
+
+type OAuthStatePayload = Readonly<{
+    flow: "connect" | "auth";
+    provider: string;
+    sid?: string | null;
+    userId?: string | null;
+    publicKey?: string | null;
+    proofHash?: string | null;
+}>;
+
+class AuthModule {
+    private tokenCache: LRUTtlMap<string, { userId: string; extras?: any }> | null = null;
+    private tokens: AuthTokens | null = null;
+    private oauthStateTokens: OAuthStateTokens | null = null;
+    private oauthStateTokensInitPromise: Promise<OAuthStateTokens> | null = null;
+
+    private resolveAuthTokenCacheTtlMsFromEnv(env: NodeJS.ProcessEnv): number {
+        const raw = (env.AUTH_TOKEN_CACHE_TTL_SECONDS ?? "").toString().trim();
+        const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+        const seconds = Number.isFinite(parsed) && parsed > 0 ? parsed : 600;
+        const clampedSeconds = Math.max(1, Math.min(86_400, seconds));
+        return clampedSeconds * 1000;
+    }
+
+    private resolveAuthTokenCacheMaxEntriesFromEnv(env: NodeJS.ProcessEnv): number {
+        const raw = (env.AUTH_TOKEN_CACHE_MAX_ENTRIES ?? "").toString().trim();
+        const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+        const maxEntries = Number.isFinite(parsed) && parsed >= 0 ? parsed : 4096;
+        return Math.max(0, Math.min(200_000, maxEntries));
+    }
+    
+    private resolveOauthStateTtlMsFromEnv(env: NodeJS.ProcessEnv): number {
+        const raw = (env.OAUTH_STATE_TTL_SECONDS ?? "").toString().trim();
+        const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+        const seconds = Number.isFinite(parsed) && parsed > 0 ? parsed : 600;
+        const clampedSeconds = Math.max(60, Math.min(3600, seconds));
+        return clampedSeconds * 1000;
+    }
+
+    private requireMasterSecret(env: NodeJS.ProcessEnv): string {
+        const masterSecret = (env.HANDY_MASTER_SECRET ?? "").toString().trim();
+        if (!masterSecret) {
+            throw new Error("HANDY_MASTER_SECRET is required");
+        }
+        return masterSecret;
+    }
+
+    private deriveLegacyBunSeedCandidate(masterSecret: string, attempt: number): string {
+        if (attempt === 0) {
+            return masterSecret;
+        }
+        return createHash("sha256")
+            .update(`happier-auth-seed-v1:${attempt}:${masterSecret}`)
+            .digest("base64url");
+    }
+
+    private async createPersistentAuthTokens(masterSecret: string): Promise<AuthTokens> {
+        const generator = await privacyKit.createPersistentTokenGenerator({
+            service: "handy",
+            seed: masterSecret,
+        });
+        const primaryVerifier = await privacyKit.createPersistentTokenVerifier({
+            service: "handy",
+            publicKey: Uint8Array.from(generator.publicKey),
+        });
+
+        const legacySeedCandidates = Array.from(
+            { length: LEGACY_BUN_SEED_CANDIDATE_COUNT },
+            (_, attempt) => this.deriveLegacyBunSeedCandidate(masterSecret, attempt),
+        );
+        const legacyKey =
+            await privacyKit.resolveLegacyBunStandardBase64PersistentTokenPublicKey({
+                service: "handy",
+                seedCandidates: legacySeedCandidates,
+            });
+
+        if (!legacyKey || legacyKey.candidateIndex === 0) {
+            return { generator, verifier: primaryVerifier };
+        }
+
+        const legacyVerifier = await privacyKit.createPersistentTokenVerifier({
+            service: "handy",
+            publicKey: legacyKey.publicKey,
+        });
+        log(
+            { module: "auth", level: "warn" },
+            `Historical Bun auth-token verification enabled (attempt=${legacyKey.candidateIndex})`,
+        );
+
+        return {
+            generator,
+            verifier: {
+                verify: async (token: string) =>
+                    (await primaryVerifier.verify(token)) ?? (await legacyVerifier.verify(token)),
+            },
+        };
+    }
+
+    private async getOauthStateTokens(): Promise<OAuthStateTokens> {
+        if (this.oauthStateTokens) {
+            return this.oauthStateTokens;
+        }
+        if (this.oauthStateTokensInitPromise) {
+            return await this.oauthStateTokensInitPromise;
+        }
+        const masterSecret = this.requireMasterSecret(process.env);
+        const oauthStateTtlMs = this.resolveOauthStateTtlMsFromEnv(process.env);
+        this.oauthStateTokensInitPromise = (async () => {
+            try {
+                const oauthStateGenerator = await privacyKit.createEphemeralTokenGenerator({
+                    service: "happier-oauth-state",
+                    seed: masterSecret,
+                    ttl: oauthStateTtlMs,
+                });
+                const oauthStateVerifier = await privacyKit.createEphemeralTokenVerifier({
+                    service: "happier-oauth-state",
+                    publicKey: Uint8Array.from(oauthStateGenerator.publicKey),
+                });
+                return { oauthStateGenerator, oauthStateVerifier };
+            } catch (error) {
+                const errorName =
+                    error && typeof error === "object" && "name" in error
+                        ? String(error.name)
+                        : "unknown";
+                log(
+                    { module: "auth", level: "warn" },
+                    `OAuth state backend unavailable (ephemeral token init failed; error=${errorName})`
+                );
+                throw new OAuthStateUnavailableError();
+            }
+        })();
+
+        try {
+            this.oauthStateTokens = await this.oauthStateTokensInitPromise;
+            return this.oauthStateTokens;
+        } finally {
+            this.oauthStateTokensInitPromise = null;
+        }
+    }
+
+    async init(): Promise<void> {
+        if (this.tokens) {
+            return; // Already initialized
+        }
+        
+        log({ module: 'auth' }, 'Initializing auth module...');
+        
+        const masterSecret = this.requireMasterSecret(process.env);
+
+        this.tokens = await this.createPersistentAuthTokens(masterSecret);
+
+        const tokenCacheMaxEntries = this.resolveAuthTokenCacheMaxEntriesFromEnv(process.env);
+        if (tokenCacheMaxEntries > 0) {
+            const tokenCacheTtlMs = this.resolveAuthTokenCacheTtlMsFromEnv(process.env);
+            this.tokenCache = new LRUTtlMap({
+                maxSize: tokenCacheMaxEntries,
+                ttlMs: tokenCacheTtlMs,
+            });
+        } else {
+            this.tokenCache = null;
+        }
+        
+        log({ module: 'auth' }, 'Auth module initialized');
+    }
+    
+    async createToken(userId: string, extras?: any): Promise<string> {
+        if (!this.tokens) {
+            throw new Error('Auth module not initialized');
+        }
+        
+        const payload: any = { user: userId };
+        if (extras) {
+            payload.extras = extras;
+        }
+        
+        const token = await this.tokens.generator.new(payload);
+
+        // Cache the token to avoid repeated verifier work for hot tokens.
+        this.tokenCache?.set(token, { userId, extras });
+        
+        return token;
+    }
+
+    async verifyToken(token: string): Promise<{ userId: string; extras?: any } | null> {
+        // Check cache first
+        const cached = this.tokenCache?.get(token);
+        if (cached) {
+            return {
+                userId: cached.userId,
+                extras: cached.extras
+            };
+        }
+        
+        // Cache miss - verify token
+        if (!this.tokens) {
+            throw new Error('Auth module not initialized');
+        }
+        
+        try {
+            const verified = await this.tokens.verifier.verify(token);
+            if (!verified) {
+                return null;
+            }
+            
+            const userId = verified.user as string;
+            const extras = verified.extras;
+
+            this.tokenCache?.set(token, { userId, extras });
+            
+            return { userId, extras };
+            
+        } catch (error) {
+            log({ module: 'auth', level: 'error' }, `Token verification failed: ${error}`);
+            return null;
+        }
+    }
+    
+    invalidateUserTokens(userId: string): void {
+        // Remove all tokens for a specific user. This is expensive but rarely needed.
+        if (!this.tokenCache) {
+            return;
+        }
+
+        const tokensToDelete: string[] = [];
+        for (const [token, entry] of this.tokenCache.entries()) {
+            if (entry.userId === userId) {
+                tokensToDelete.push(token);
+            }
+        }
+        for (const token of tokensToDelete) {
+            this.tokenCache.delete(token);
+        }
+        
+        log({ module: 'auth' }, `Invalidated tokens for user: ${userId}`);
+    }
+    
+    invalidateToken(token: string): void {
+        this.tokenCache?.delete(token);
+    }
+    
+    getCacheStats(): { size: number; oldestEntry: number | null } {
+        if (!this.tokenCache || this.tokenCache.size === 0) {
+            return { size: 0, oldestEntry: null };
+        }
+
+        return {
+            size: this.tokenCache.size,
+            oldestEntry: this.tokenCache.peekOldestAccessedAt()
+        };
+    }
+    
+    async createOauthStateToken(payload: OAuthStatePayload): Promise<string> {
+        if (!this.tokens) {
+            throw new Error("Auth module not initialized");
+        }
+        const oauthStateTokens = await this.getOauthStateTokens();
+
+        const provider = payload.provider?.toString().trim().toLowerCase() ?? "";
+        if (!provider) {
+            throw new Error("Invalid OAuth provider");
+        }
+
+        const flow = payload.flow;
+        if (flow !== "auth" && flow !== "connect") {
+            throw new Error(`Invalid OAuth flow: ${String(flow)}`);
+        }
+        const sid = payload.sid?.toString().trim() || null;
+        const userId = payload.userId?.toString().trim() || null;
+        const publicKey = payload.publicKey?.toString().trim() || null;
+        const proofHash = payload.proofHash?.toString().trim() || null;
+
+        return await oauthStateTokens.oauthStateGenerator.new({
+            user: "oauth-state",
+            extras: {
+                provider,
+                flow,
+                sid,
+                userId,
+                publicKey,
+                proofHash,
+            },
+        });
+    }
+
+    async verifyOauthStateToken(token: string): Promise<{
+        flow: "connect" | "auth";
+        provider: string;
+        sid: string | null;
+        userId: string | null;
+        publicKey: string | null;
+        proofHash: string | null;
+    } | null> {
+        if (!this.tokens) {
+            throw new Error("Auth module not initialized");
+        }
+
+        try {
+            const oauthStateTokens = await this.getOauthStateTokens();
+            const verified: any = await oauthStateTokens.oauthStateVerifier.verify(token);
+            if (!verified) {
+                return null;
+            }
+
+            if (verified.user !== "oauth-state") return null;
+            const extras = verified.extras ?? {};
+            const provider = typeof extras.provider === "string" ? extras.provider.trim().toLowerCase() : "";
+            const flow = extras.flow === "auth" ? "auth" : extras.flow === "connect" ? "connect" : null;
+            if (!provider || !flow) return null;
+
+            return {
+                flow,
+                provider,
+                sid: typeof extras.sid === "string" && extras.sid.trim() ? extras.sid.trim() : null,
+                userId: typeof extras.userId === "string" && extras.userId.trim() ? extras.userId.trim() : null,
+                publicKey:
+                    typeof extras.publicKey === "string" && extras.publicKey.trim()
+                        ? extras.publicKey.trim()
+                        : null,
+                proofHash:
+                    typeof extras.proofHash === "string" && extras.proofHash.trim()
+                        ? extras.proofHash.trim()
+                        : null,
+            };
+        } catch (error) {
+            if (isOAuthStateUnavailableError(error)) {
+                return null;
+            }
+            // Avoid logging the raw token or verifier error payloads (which can include sensitive details).
+            log({ module: "auth", level: "error" }, "OAuth state token verification failed");
+            return null;
+        }
+    }
+
+    // Cleanup old entries (optional - can be called periodically)
+    cleanup(): void {
+        this.tokenCache?.pruneExpired();
+
+        const stats = this.getCacheStats();
+        log({ module: 'auth' }, `Token cache size: ${stats.size} entries`);
+    }
+}
+
+// Global instance
+export const auth = new AuthModule();

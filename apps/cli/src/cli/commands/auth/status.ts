@@ -1,0 +1,114 @@
+import { createServerUrlComparableKey } from '@happier-dev/protocol';
+import { readSettings } from '@/persistence';
+import chalk from 'chalk';
+import os from 'node:os';
+
+import { resolveActiveServerAuthReadiness } from '@/auth/resolveActiveServerAuthReadiness';
+import { configuration } from '@/configuration';
+import { checkIfDaemonRunningAndCleanupStaleState } from '@/daemon/controlClient';
+import { printJsonEnvelope, wantsJson } from '@/cli/output/jsonEnvelope';
+import { applyServerSelectionFromArgs } from '@/server/serverSelection';
+
+/** 返回原服务器验证结果；密码账号附非秘密显示名，不输出解密材料。 */
+export async function handleAuthStatus(argv: string[] = []): Promise<void> {
+  const args = await applyServerSelectionFromArgs(argv);
+  const json = wantsJson(args);
+  const readiness = await resolveActiveServerAuthReadiness();
+  const credentials = readiness.credentials;
+
+  if (json && !credentials) {
+    await printJsonEnvelope({ ok: false, kind: 'auth_status', error: { code: 'not_authenticated' } });
+    return;
+  }
+
+  if (!json) {
+    console.log(chalk.bold('\nAuthentication Status\n'));
+  }
+
+  if (!credentials) {
+    console.log(chalk.red('✗ Not authenticated'));
+    console.log(chalk.gray('  Run "happier auth login" to authenticate'));
+    return;
+  }
+
+  if (readiness.unusableReason === 'credentials-rejected') {
+    if (json) {
+      await printJsonEnvelope({ ok: false, kind: 'auth_status', error: { code: 'not_authenticated' } });
+      return;
+    }
+
+    console.log(chalk.red('✗ Not authenticated'));
+    console.log(chalk.gray('  Stored credentials were rejected by the selected relay'));
+    console.log(chalk.gray('  Run "happier auth login --force" to authenticate again'));
+    return;
+  }
+
+  if (readiness.credentialState === 'unknown') {
+    if (json) {
+      await printJsonEnvelope({
+        ok: false,
+        kind: 'auth_status',
+        error: {
+          code: 'auth_unavailable',
+          message: 'The selected relay did not answer; stored credentials were kept.',
+          machineRegistered: readiness.machineRegistered,
+          ...(readiness.machineRegistered && readiness.machineId ? { machineId: readiness.machineId } : {}),
+        },
+      });
+      return;
+    }
+
+    console.log(chalk.yellow('⚠️  Authentication could not be verified because the selected relay did not answer'));
+    console.log(chalk.gray('  Stored credentials were kept unchanged. Retry when the relay is available.'));
+    return;
+  }
+
+  const { machineId, machineRegistered, validatedAccountId } = readiness;
+  const bound = (await readSettings()).passwordAccountBinding;
+  const loginName = bound?.accountId === validatedAccountId && bound.serverKey === createServerUrlComparableKey(configuration.serverUrl) ? bound.loginName : undefined;
+
+  let daemonRunning = false;
+  try {
+    daemonRunning = await checkIfDaemonRunningAndCleanupStaleState();
+  } catch {
+    daemonRunning = false;
+  }
+
+  if (json) {
+    await printJsonEnvelope({
+      ok: true,
+      kind: 'auth_status',
+      data: {
+        authenticated: true,
+        ...(loginName ? { loginName } : {}),
+        ...(validatedAccountId ? { accountId: validatedAccountId } : {}),
+        encryption: { type: credentials.encryption.type },
+        machineRegistered,
+        ...(machineRegistered && machineId ? { machineId } : {}),
+        host: os.hostname(),
+        happyHomeDir: configuration.happyHomeDir,
+        daemonRunning,
+      },
+    });
+    return;
+  }
+
+  console.log(chalk.green('✓ Authenticated'));
+
+  if (machineRegistered) {
+    console.log(chalk.green('✓ Machine registered'));
+    console.log(chalk.gray(`  Machine ID: ${machineId}`));
+    console.log(chalk.gray(`  Host: ${os.hostname()}`));
+  } else {
+    console.log(chalk.yellow('⚠️  Machine not registered'));
+    console.log(chalk.gray('  Run "happier auth login --force" to fix this'));
+  }
+
+  console.log(chalk.gray(`\n  Data directory: ${configuration.happyHomeDir}`));
+
+  if (daemonRunning) {
+    console.log(chalk.green('✓ Daemon running'));
+  } else {
+    console.log(chalk.gray('✗ Daemon not running'));
+  }
+}

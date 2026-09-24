@@ -1,0 +1,236 @@
+import { describe, expect, it } from 'vitest';
+
+import { AGENT_IDS } from './types.js';
+import type { AgentId } from './types.js';
+import { AGENT_MODEL_CONFIG, getAgentModelConfig, getAgentStaticModels } from './models.js';
+import { CURRENT_FLAGSHIP_CLAUDE_MODEL_ID } from './providers/claude/flagshipModel.js';
+
+const cursorAgentId = 'cursor' as AgentId;
+
+describe('agent model config', () => {
+  it('covers every canonical agent', () => {
+    expect(Object.keys(AGENT_MODEL_CONFIG).sort()).toEqual([...AGENT_IDS].sort());
+    for (const agentId of AGENT_IDS) {
+      expect(getAgentModelConfig(agentId)).toBeDefined();
+    }
+  });
+
+  it('keeps the flagship Claude default pointing at a real catalog model', () => {
+    const claudeModels = getAgentStaticModels('claude');
+    expect(claudeModels.some((model) => model.id === CURRENT_FLAGSHIP_CLAUDE_MODEL_ID)).toBe(true);
+  });
+
+  it('uses the same name and description contract for static models as dynamic models', () => {
+    const claude = getAgentModelConfig('claude');
+    const gemini = getAgentModelConfig('gemini');
+    const claudeModels = getAgentStaticModels('claude');
+    const geminiModels = getAgentStaticModels('gemini');
+
+    expect(claude.staticModels?.find((model) => model.id === 'claude-sonnet-5')).toMatchObject({
+      id: 'claude-sonnet-5',
+      name: 'Sonnet 5',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'reasoning_effort',
+          currentValue: 'high',
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: 'xhigh' }),
+            expect.objectContaining({ value: 'max' }),
+          ]),
+        }),
+      ]),
+    });
+    expect(claude.staticModels?.find((model) => model.id === 'claude-fable-5')).toMatchObject({
+      id: 'claude-fable-5',
+      name: 'Fable 5',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'reasoning_effort',
+          currentValue: 'high',
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: 'xhigh' }),
+            expect.objectContaining({ value: 'max' }),
+          ]),
+        }),
+      ]),
+    });
+    expect(claude.staticModels?.find((model) => model.id === 'claude-opus-5')).toMatchObject({
+      id: 'claude-opus-5',
+      name: 'Opus 5',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'reasoning_effort',
+          currentValue: 'high',
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: 'xhigh' }),
+            expect.objectContaining({ value: 'max' }),
+          ]),
+        }),
+      ]),
+    });
+    expect(claude.staticModels?.find((model) => model.id === 'claude-opus-4-8')).toMatchObject({
+      id: 'claude-opus-4-8',
+      name: 'Opus 4.8',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'reasoning_effort',
+          currentValue: 'high',
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: 'xhigh' }),
+          ]),
+        }),
+      ]),
+    });
+    expect(claude.staticModels?.find((model) => model.id === 'claude-opus-4-7')).toMatchObject({
+      id: 'claude-opus-4-7',
+      name: 'Opus 4.7',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'reasoning_effort',
+          currentValue: 'xhigh',
+        }),
+      ]),
+    });
+    expect(gemini.staticModels?.find((model) => model.id === 'gemini-3.1-pro-preview')).toMatchObject({
+      id: 'gemini-3.1-pro-preview',
+      name: 'Gemini 3.1 Pro Preview',
+      description: expect.any(String),
+    });
+    expect(gemini.staticModels?.find((model) => model.id === 'auto')).toMatchObject({
+      id: 'auto',
+      name: 'Auto',
+      description: expect.any(String),
+    });
+    expect(claude.staticModels?.map((model) => model.id)).toEqual(claude.allowedModes);
+    expect(gemini.staticModels?.map((model) => model.id)).toEqual(gemini.allowedModes);
+    expect(claudeModels[0]).toMatchObject({
+      id: 'claude-opus-5',
+      name: 'Opus 5',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+    });
+    expect(geminiModels[0]?.name).toBe('Auto');
+  });
+
+  it('adds an Ultracode boolean model option only to xhigh-capable Claude models', () => {
+    const claudeModels = getAgentStaticModels('claude');
+    const optionIdsFor = (modelId: string): string[] =>
+      claudeModels.find((model) => model.id === modelId)?.modelOptions?.map((option) => option.id) ?? [];
+
+    for (const modelId of ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7']) {
+      expect(optionIdsFor(modelId)).toContain('ultracode');
+      const ultracode = claudeModels
+        .find((model) => model.id === modelId)?.modelOptions?.find((option) => option.id === 'ultracode');
+      expect(ultracode).toMatchObject({
+        id: 'ultracode',
+        name: 'Ultracode',
+        type: 'boolean',
+        currentValue: 'false',
+      });
+    }
+
+    for (const modelId of ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-5']) {
+      expect(optionIdsFor(modelId)).not.toContain('ultracode');
+    }
+  });
+
+  it('declares the [1m] extended-context variant only on 1M opt-in Claude models', () => {
+    const claudeModels = getAgentStaticModels('claude');
+    const variantFor = (modelId: string): string | undefined =>
+      claudeModels.find((model) => model.id === modelId)?.extendedContextModelId;
+
+    expect(variantFor('claude-sonnet-4-6')).toBe('claude-sonnet-4-6[1m]');
+    expect(variantFor('claude-opus-4-6')).toBe('claude-opus-4-6[1m]');
+    // Always-1M on the API: no opt-in toggle surfaced.
+    expect(variantFor('claude-opus-5')).toBeUndefined();
+    expect(variantFor('claude-sonnet-5')).toBeUndefined();
+    expect(variantFor('claude-fable-5')).toBeUndefined();
+    expect(variantFor('claude-opus-4-8')).toBeUndefined();
+    expect(variantFor('claude-opus-4-7')).toBeUndefined();
+    expect(variantFor('claude-haiku-4-5')).toBeUndefined();
+  });
+
+  it('does not ship named static Codex models because Codex model truth is dynamic', () => {
+    const codex = getAgentModelConfig('codex');
+    const codexModels = getAgentStaticModels('codex');
+
+    expect(codex.supportsSelection).toBe(true);
+    expect(codex.dynamicProbe).toBe('auto');
+    expect(codex.staticModels).toBeUndefined();
+    expect(codex.allowedModes).toEqual(['default']);
+    expect(codexModels).toEqual([{ id: 'default', name: 'default' }]);
+  });
+
+  it('uses only provider-advertised Grok models without inventing a static fallback', () => {
+    const grok = getAgentModelConfig('grok');
+    const grokModels = getAgentStaticModels('grok');
+
+    expect(grok.supportsSelection).toBe(true);
+    expect(grok.supportsFreeform).toBe(false);
+    expect(grok.acpApplyBehavior).toBe('set_model');
+    expect(grok.acpModelConfigOptionId).toBeUndefined();
+    expect(grok.defaultMode).toBe('default');
+    expect(grok.allowedModes).toEqual([]);
+    expect(grok.staticModels).toBeUndefined();
+    expect(grokModels).toEqual([]);
+  });
+
+  it('treats Cursor models as dynamic ACP/CLI controls without freeform fallback', () => {
+    expect(getAgentModelConfig(cursorAgentId)).toMatchObject({
+      supportsSelection: true,
+      supportsFreeform: false,
+      nonAcpApplyScope: 'next_prompt',
+      acpModelConfigOptionId: 'model',
+      acpModelSetMethod: 'config_option',
+      dynamicProbe: 'auto',
+      defaultMode: 'default',
+      allowedModes: ['default'],
+    });
+  });
+
+  it('treats Kimi models as dynamically probed ACP controls', () => {
+    const kimi = getAgentModelConfig('kimi');
+    expect(kimi).toMatchObject({
+      supportsSelection: true,
+      supportsFreeform: false,
+      nonAcpApplyScope: 'next_prompt',
+      acpApplyBehavior: 'set_model',
+      acpModelConfigOptionId: 'model',
+      acpModelSetMethod: 'config_option',
+      dynamicProbe: 'auto',
+      defaultMode: 'default',
+      allowedModes: ['default'],
+    });
+  });
+
+  it('treats Qwen models as dynamically probed ACP controls', () => {
+    expect(getAgentModelConfig('qwen')).toMatchObject({
+      supportsSelection: true,
+      supportsFreeform: false,
+      nonAcpApplyScope: 'next_prompt',
+      acpModelConfigOptionId: 'model',
+      dynamicProbe: 'auto',
+      defaultMode: 'default',
+      allowedModes: ['default'],
+    });
+  });
+
+  it('restricts Kilo model selection to its advertised ACP catalog', () => {
+    expect(getAgentModelConfig('kilo')).toMatchObject({
+      supportsSelection: true,
+      supportsFreeform: false,
+      acpModelConfigOptionId: 'model',
+      dynamicProbe: 'auto',
+    });
+  });
+});

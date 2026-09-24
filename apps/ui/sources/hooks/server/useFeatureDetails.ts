@@ -1,0 +1,88 @@
+import * as React from 'react';
+import type { FeatureId, FeaturesResponse as ServerFeatures } from '@happier-dev/protocol';
+
+import {
+    useServerFeaturesMainSelectionSnapshot,
+    useServerFeaturesRuntimeSnapshot,
+    useServerFeaturesSnapshotForServerId,
+} from '@/sync/domains/features/featureDecisionRuntime';
+import { resolveFeatureDecisionSnapshotStrategy } from '@/sync/domains/features/featureDecisionProbeStrategy';
+import { useEffectiveServerSelection } from '@/hooks/server/useEffectiveServerSelection';
+import type { FeatureScopeParams } from './featureScope';
+import { useFeatureLocalPolicySettings } from './useFeatureLocalPolicySettings';
+
+export type FeatureDetailsScopeParams = FeatureScopeParams;
+
+type FeatureDetailsParams<T> = Readonly<{
+    featureId: FeatureId;
+    fallback: T;
+    select: (features: ServerFeatures) => T;
+    scope?: FeatureDetailsScopeParams;
+    aggregate?: (values: ReadonlyArray<T>) => T;
+}>;
+
+export function useFeatureDetails<T>(params: FeatureDetailsParams<T>): T {
+    const settings = useFeatureLocalPolicySettings();
+    const selection = useEffectiveServerSelection();
+    const scopeKind = params.scope?.scopeKind ?? 'main_selection';
+    const snapshotStrategy = resolveFeatureDecisionSnapshotStrategy({
+        featureId: params.featureId,
+        settings,
+        scopeKind,
+        hasMainSelectionServerIds: selection.serverIds.length > 0,
+    });
+
+    const runtimeSnapshot = useServerFeaturesRuntimeSnapshot({
+        enabled: snapshotStrategy.runtimeEnabled,
+    });
+
+    const spawnServerId = params.scope && params.scope.scopeKind === 'spawn'
+        ? params.scope.serverId
+        : null;
+    const spawnSnapshot = useServerFeaturesSnapshotForServerId(
+        spawnServerId,
+        { enabled: snapshotStrategy.spawnEnabled },
+    );
+
+    const mainSelectionSnapshot = useServerFeaturesMainSelectionSnapshot(
+        selection.serverIds,
+        { enabled: snapshotStrategy.mainSelectionEnabled },
+    );
+
+    return React.useMemo(() => {
+        if (scopeKind === 'spawn') {
+            if (spawnSnapshot.status !== 'ready') return params.fallback;
+            return params.select(spawnSnapshot.features);
+        }
+
+        if (scopeKind === 'runtime' || (scopeKind === 'main_selection' && selection.serverIds.length === 0)) {
+            if (runtimeSnapshot.status !== 'ready') return params.fallback;
+            return params.select(runtimeSnapshot.features);
+        }
+
+        if (mainSelectionSnapshot.status !== 'ready') return params.fallback;
+
+        const values: T[] = [];
+        for (const serverId of mainSelectionSnapshot.serverIds) {
+            const snap = mainSelectionSnapshot.snapshotsByServerId[serverId];
+            if (!snap || snap.status !== 'ready') return params.fallback;
+            values.push(params.select(snap.features));
+        }
+
+        if (values.length === 0) return params.fallback;
+        if (params.aggregate) return params.aggregate(values);
+
+        const first = values[0] as T;
+        for (let i = 1; i < values.length; i += 1) {
+            if (!Object.is(first, values[i])) return params.fallback;
+        }
+        return first;
+    }, [
+        mainSelectionSnapshot,
+        params,
+        runtimeSnapshot,
+        scopeKind,
+        selection.serverIds.length,
+        spawnSnapshot,
+    ]);
+}

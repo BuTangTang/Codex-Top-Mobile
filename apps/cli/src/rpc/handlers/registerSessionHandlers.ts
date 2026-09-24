@@ -1,0 +1,335 @@
+import type { TerminalSpawnOptions } from '@/terminal/runtime/terminalConfig';
+import type { PermissionMode } from '@/api/types';
+import type { RpcHandlerRegistrar } from '@/api/rpc/types';
+import type { Metadata } from '@/api/types';
+import type { SessionAttachFilePayload } from '@/agent/runtime/sessionAttachPayload';
+import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
+import type { CodexBackendMode } from '@happier-dev/agents';
+import { configuration } from '@/configuration';
+import {
+    AcpConfigOptionOverridesV1,
+    type AgentRuntimeDescriptorV1,
+    BackendTargetRefV1,
+    type ConnectedServiceMaterializationIdentityV1,
+    type SessionInitialGoalRequestV1,
+    type SessionAttachMetadataIdentityPolicy,
+    SessionMcpSelectionV1,
+    SpawnSessionErrorCode,
+    type SpawnSessionErrorDetail,
+} from '@happier-dev/protocol';
+export { SPAWN_SESSION_ERROR_CODES } from '@happier-dev/protocol';
+export type { SpawnSessionErrorCode, SpawnSessionErrorDetail } from '@happier-dev/protocol';
+export { resolveCanonicalCodexBackendMode } from './codexBackendMode';
+import { registerCapabilitiesHandlers } from './capabilities';
+import { registerPreviewEnvHandler } from './previewEnv';
+import { registerBashHandler } from './bash';
+import { TransferSessionStore } from '@/transfers/core/transferSessionStore';
+import { resolveSessionRpcTransferMaxBytes } from '@/transfers/policy/sessionRpcTransferPolicy';
+import { registerSessionTransferRpcHandlers } from '@/transfers/rpc/registerSessionTransferRpcHandlers';
+import { createTransferPathAllowanceRegistry } from '@/transfers/targets/createTransferPathAllowanceRegistry';
+import { registerRipgrepHandler } from './ripgrep';
+import { registerDifftasticHandler } from './difftastic';
+import {
+    registerSessionUserMessageSendHandler,
+    type ExplicitUserRecoveryDecision,
+    type SessionUserMessageEnqueueResult,
+} from './sessionUserMessageSend';
+import { registerSessionPendingQueueWakeHandlers } from './sessionPendingQueueWake';
+import { registerSessionControlHandlers, type SessionRuntimeControls } from './sessionControls';
+import {
+    type FilesystemAccessPolicy,
+    resolveFilesystemPolicyDefaultDirectory,
+} from './fileSystem/accessPolicy/filesystemAccessPolicy';
+import type { PendingFirstInput } from '@/daemon/spawn/pendingFirstInput';
+
+/*
+ * Spawn Session Options and Result
+ * This rpc type is used by the daemon, all other RPCs here are for sessions
+ */
+
+export interface SpawnSessionOptions {
+    machineId?: string;
+    directory: string;
+    /**
+     * Daemon-only spawn idempotency salt.
+     *
+     * When set, the daemon treats the spawn request as unique for the purposes of spawn request
+     * coalescing (prevents returning a recent success session id for rapid consecutive spawns).
+     *
+     * This must not be forwarded into the spawned session process (it is not an environment variable).
+     */
+    spawnNonce?: string;
+    accountSettingsVersionHint?: number;
+    /** Internal producer custody promoted to canonical Pending only after the real session exists. */
+    pendingFirstInput?: PendingFirstInput;
+    sessionId?: string;
+    /**
+     * Resume an existing agent session by id (vendor resume).
+     *
+     * Upstream intent: Claude (`--resume <sessionId>`).
+     * If resume is requested for an unsupported agent, the daemon should return an error
+     * rather than silently spawning a fresh session.
+     */
+    resume?: string;
+    /**
+     * Legacy compatibility for older boundaries that still send the ACP toggle.
+     * Prefer codexBackendMode for new spawn/resume callers.
+     */
+    experimentalCodexAcp?: boolean;
+    codexBackendMode?: CodexBackendMode;
+    agentRuntimeDescriptorV1?: AgentRuntimeDescriptorV1;
+    /**
+     * Existing Happy session ID to reconnect to (for inactive session resume).
+     * When set, the CLI will connect to this session instead of creating a new one.
+     */
+    existingSessionId?: string;
+    /**
+     * Internal-only attach payload for a pre-resolved existing Happy session.
+     *
+     * This is used by daemon refresh flows that must avoid refetching the session after
+     * the old runner has already been stopped.
+     */
+    existingSessionAttachPayload?: SessionAttachFilePayload;
+    /**
+     * Existing-session attach cursor for wake-after-send resume.
+     *
+     * When a UI first commits a wake prompt to the Happier transcript and then asks the daemon
+     * to resume the stopped runner, the child must catch up after this seq so the new prompt is
+     * delivered once without replaying older turns.
+     */
+    initialTranscriptAfterSeq?: number;
+    executionAuthorization?: import('@happier-dev/protocol').SpawnSessionExecutionAuthorization;
+    /**
+     * Optional native goal to apply immediately after provider attach/resume and before
+     * pending queue replay.
+     */
+    initialGoal?: SessionInitialGoalRequestV1;
+    /**
+     * Optional attach-only metadata identity policy.
+     * Preserve current persisted machine identity for normal attaches, but allow runtime replacement
+     * for cross-machine handoff cutover.
+     */
+    attachMetadataIdentityPolicy?: SessionAttachMetadataIdentityPolicy;
+    /**
+     * Optional: explicit permission mode to publish at startup (seed or override).
+     * When omitted, the runner preserves existing metadata.permissionMode.
+     */
+    permissionMode?: PermissionMode;
+    /**
+     * Optional timestamp for permissionMode (ms). Used to order explicit UI selections across devices.
+     */
+    permissionModeUpdatedAt?: number;
+    /**
+     * Optional: ACP/static agent mode override to seed at startup (spawn/resume attach).
+     */
+    agentModeId?: string;
+    agentModeUpdatedAt?: number;
+    /**
+     * Optional: session-wide model override to seed at startup (spawn/resume attach).
+     *
+     * When set, the spawned CLI process will publish `metadata.modelOverrideV1` so the model choice
+     * follows the session across devices.
+     */
+    modelId?: string;
+    modelUpdatedAt?: number;
+    sessionConfigOptionOverrides?: AcpConfigOptionOverridesV1;
+    approvedNewDirectoryCreation?: boolean;
+    backendTarget?: BackendTargetRefV1;
+    /**
+     * Daemon/runtime terminal configuration for the spawned session (non-secret).
+     * Preferred over legacy TMUX_* env vars.
+     */
+    terminal?: TerminalSpawnOptions;
+    /**
+     * Windows-only: how a daemon-spawned *remote* session should be hosted locally on the Windows machine.
+     *
+     * - `hidden` (default): no visible terminal window.
+     * - `windows_terminal`: open a tab in the configured shared Windows Terminal window.
+     * - `console`: open a standard Windows console window.
+     *
+     * Note: this is intentionally scoped to daemon-spawned remote sessions and does not affect tool subprocesses.
+     */
+    windowsRemoteSessionLaunchMode?: 'hidden' | 'windows_terminal' | 'console';
+    windowsRemoteSessionConsole?: 'hidden' | 'visible';
+    /**
+     * Windows Terminal named window target for `windows_terminal` mode. The daemon
+     * normalizes empty/reserved names and lets local env override this value.
+     */
+    windowsTerminalWindowName?: string;
+    /**
+     * Session-scoped profile identity for display/debugging across devices.
+     * This is NOT the profile content; actual runtime behavior is still driven
+     * by environmentVariables passed for this spawn.
+     *
+     * Empty string is allowed and means "no profile".
+     */
+    profileId?: string;
+    /**
+     * Arbitrary environment variables for the spawned session.
+     *
+     * The GUI builds these from a profile (env var list + tmux settings) and may include
+     * provider-specific keys like:
+     * - ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL
+     * - OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+     * - AZURE_OPENAI_* / TOGETHER_*
+     * - TMUX_SESSION_NAME / TMUX_TMPDIR
+     */
+    environmentVariables?: Record<string, string>;
+
+    /**
+     * Optional: per-session bindings to Happier Connected Services profiles.
+     *
+     * This payload must NOT include secrets. The daemon uses it to fetch sealed credentials from the cloud
+     * and decrypt/materialize them locally for the provider runtime.
+     */
+    connectedServices?: unknown;
+    /**
+     * Optional timestamp for connectedServices. Used to order explicit native/connected
+     * binding changes against persisted session metadata during resume/respawn.
+     */
+    connectedServicesUpdatedAt?: number;
+    /**
+     * Stable identity for connected-service materialization homes. This is shared
+     * across spawn, respawn, reconnect, refresh, and metadata-only re-entry paths.
+     */
+    connectedServiceMaterializationIdentityV1?: ConnectedServiceMaterializationIdentityV1;
+    /**
+     * Daemon-tracked materialization diagnostics from connected-service auth resolution.
+     * Internal-only: this never comes from RPC transport payloads.
+     */
+    materializationDiagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
+    /**
+     * Optional per-session MCP selection overlay for Happier-managed MCP servers.
+     * This is stored in session metadata and applied at runner startup.
+     */
+    mcpSelection?: SessionMcpSelectionV1;
+
+    /**
+     * Controls whether the session transcript is committed to Happier server storage ("persisted")
+     * or treated as provider-backed only ("direct").
+     *
+     * When set to "direct", the daemon will signal the spawned runner to suppress transcript commits.
+     */
+    transcriptStorage?: 'persisted' | 'direct';
+}
+export type SpawnSessionResult =
+    | {
+        type: 'success';
+        sessionId?: string;
+        spawnNonce?: string;
+        sessionIdStatus?: 'available' | 'pending';
+        /** True only when this daemon accepted the request's pending first input. */
+        pendingFirstInputAccepted?: boolean;
+        /**
+         * Canonical daemon disposition for callers that must distinguish a runner
+         * accepted by this request from a live runner that merely predated it.
+         * Older producers omit this field; ownership-sensitive callers must treat
+         * omission as ambiguous rather than inferring ownership.
+         */
+        runnerAcceptance?: 'newly_accepted' | 'same_request_runner' | 'preexisting_or_adopted';
+    }
+    | { type: 'requestToApproveDirectoryCreation'; directory: string }
+    | { type: 'error'; errorCode: SpawnSessionErrorCode; errorMessage: string; errorDetail?: SpawnSessionErrorDetail };
+
+/**
+ * In-process-only acceptance hook for handoff custody. The canonical daemon spawn
+ * owner invokes it after ruling out adoption, while still inside spawn
+ * serialization, and before any runner launch can become observable.
+ */
+export type SpawnSessionRunnerAcceptanceHooks = Readonly<{
+    onBeforeRunnerLaunchAccepted: () => Promise<void>;
+}>;
+
+export type SessionHandlersRegistration = Readonly<{
+    transferSessionStore: TransferSessionStore;
+    dispose: () => Promise<void>;
+}>;
+
+/**
+ * Register all session RPC handlers with the daemon
+ */
+export function registerSessionHandlers(
+    rpcHandlerManager: RpcHandlerRegistrar,
+    workingDirectory: string,
+    opts?: Readonly<{
+        getSessionMetadata?: () => Metadata | null;
+        updateSessionMetadata?: (handler: (metadata: Metadata) => Metadata) => Promise<void> | void;
+        updateSessionMetadataWithResult?: <TResult>(handler: (metadata: Metadata) => Readonly<{
+            metadata: Metadata;
+            result: TResult;
+        }>) => Promise<TResult> | TResult;
+        enqueueSessionUserMessage?: ((request: {
+            text: string;
+            localId?: string;
+            meta: Record<string, unknown>;
+        }) => Promise<SessionUserMessageEnqueueResult> | SessionUserMessageEnqueueResult) | null;
+        revalidateExplicitUserRequest?: ((request: {
+            localId: string;
+        }) => Promise<ExplicitUserRecoveryDecision> | ExplicitUserRecoveryDecision) | null;
+        setAdditionalAllowedReadDirs?: (dirs: string[]) => void;
+        setAdditionalAllowedWriteDirs?: (dirs: string[]) => void;
+        accessPolicy?: FilesystemAccessPolicy;
+        sessionRuntimeControls?: SessionRuntimeControls | null;
+        /** QAE-1: daemon-side propagation for successful wait-resume cancels. */
+        notifyUsageLimitWaitResumeCancelled?: ((request: Readonly<{
+            sessionId: string;
+            attemptId: string;
+        }>) => Promise<unknown> | unknown) | null;
+    }>,
+): SessionHandlersRegistration {
+    const pathAllowanceRegistry = createTransferPathAllowanceRegistry({
+        onReadDirsChange: (dirs) => {
+            opts?.setAdditionalAllowedReadDirs?.([...dirs]);
+        },
+        onWriteDirsChange: (dirs) => {
+            opts?.setAdditionalAllowedWriteDirs?.([...dirs]);
+        },
+    });
+    const transferStore = new TransferSessionStore({ ttlMs: configuration.filesTransferSessionTtlMs });
+    const sessionRpcTransferMaxBytes = resolveSessionRpcTransferMaxBytes();
+
+    const accessPolicy = opts?.accessPolicy ?? { kind: 'osUser' };
+    const effectiveWorkingDirectory = resolveFilesystemPolicyDefaultDirectory({
+        defaultDirectory: workingDirectory,
+        accessPolicy,
+    });
+
+    registerBashHandler(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
+    // Checklist-based machine capability registry (replaces legacy detect-cli / detect-capabilities / dep-status).
+    registerCapabilitiesHandlers(rpcHandlerManager);
+    registerPreviewEnvHandler(rpcHandlerManager);
+    registerSessionTransferRpcHandlers(rpcHandlerManager, {
+        workingDirectory: effectiveWorkingDirectory,
+        accessPolicy,
+        store: transferStore,
+        getAdditionalAllowedReadDirs: () => [...pathAllowanceRegistry.getAdditionalAllowedReadDirs()],
+        getAdditionalAllowedWriteDirs: () => [...pathAllowanceRegistry.getAdditionalAllowedWriteDirs()],
+        sessionRpcTransferMaxBytes,
+        attachmentUpload: {
+            pathAllowanceRegistry,
+        },
+    });
+    registerRipgrepHandler(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
+    registerDifftasticHandler(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
+    registerSessionUserMessageSendHandler(rpcHandlerManager, {
+        workingDirectory: effectiveWorkingDirectory,
+        enqueueSessionUserMessage: opts?.enqueueSessionUserMessage ?? null,
+        revalidateExplicitUserRequest: opts?.revalidateExplicitUserRequest ?? null,
+        sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
+    });
+    registerSessionPendingQueueWakeHandlers(rpcHandlerManager, {
+        sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
+    });
+    registerSessionControlHandlers(rpcHandlerManager, {
+        getSessionMetadata: opts?.getSessionMetadata ?? null,
+        updateSessionMetadata: opts?.updateSessionMetadata ?? null,
+        updateSessionMetadataWithResult: opts?.updateSessionMetadataWithResult ?? null,
+        sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
+        notifyUsageLimitWaitResumeCancelled: opts?.notifyUsageLimitWaitResumeCancelled ?? null,
+    });
+
+    return {
+        transferSessionStore: transferStore,
+        dispose: () => transferStore.dispose(),
+    };
+}

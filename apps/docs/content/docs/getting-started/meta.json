@@ -1,0 +1,10 @@
+{
+  "title": "Start here",
+  "pages": [
+    "index",
+    "get-the-apps",
+    "onboarding",
+    "check-your-setup",
+    "local-development"
+  ]
+}

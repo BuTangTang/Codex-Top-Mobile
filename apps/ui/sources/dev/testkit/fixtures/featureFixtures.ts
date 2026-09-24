@@ -1,0 +1,509 @@
+import {
+    DEFAULT_PETS_CAPABILITIES,
+    DEFAULT_SESSION_CAPABILITIES,
+    type FeaturesResponse as RootLayoutFeatures,
+} from '@happier-dev/protocol';
+
+type RootLayoutFeaturesOverrides = Omit<Partial<RootLayoutFeatures>, 'features' | 'capabilities'> & Readonly<{
+    features?: Omit<
+        Partial<RootLayoutFeatures['features']>,
+        | 'attachments'
+        | 'channelBridges'
+        | 'automations'
+        | 'pets'
+        | 'connectedServices'
+        | 'updates'
+        | 'sharing'
+        | 'session'
+        | 'sessions'
+        | 'machines'
+        | 'terminal'
+        | 'voice'
+        | 'social'
+        | 'auth'
+        | 'encryption'
+        | 'e2ee'
+    > &
+        Readonly<{
+            attachments?: Partial<RootLayoutFeatures['features']['attachments']>;
+            channelBridges?: Partial<RootLayoutFeatures['features']['channelBridges']>;
+            automations?: Partial<RootLayoutFeatures['features']['automations']>;
+            pets?: Partial<RootLayoutFeatures['features']['pets']>;
+            connectedServices?: Partial<RootLayoutFeatures['features']['connectedServices']>;
+            updates?: Partial<RootLayoutFeatures['features']['updates']>;
+            sharing?: Partial<RootLayoutFeatures['features']['sharing']>;
+            session?: Partial<RootLayoutFeatures['features']['session']>;
+            sessions?: Partial<RootLayoutFeatures['features']['sessions']>;
+            machines?: Partial<RootLayoutFeatures['features']['machines']>;
+            terminal?: Partial<RootLayoutFeatures['features']['terminal']>;
+            voice?: Partial<RootLayoutFeatures['features']['voice']>;
+            social?: Partial<RootLayoutFeatures['features']['social']>;
+            auth?: Partial<RootLayoutFeatures['features']['auth']>;
+            encryption?: Partial<RootLayoutFeatures['features']['encryption']>;
+            e2ee?: Partial<RootLayoutFeatures['features']['e2ee']>;
+        }>;
+    capabilities?: Omit<Partial<RootLayoutFeatures['capabilities']>, 'oauth' | 'social' | 'auth' | 'encryption' | 'pets' | 'sharing'> &
+        Readonly<{
+            oauth?: Partial<RootLayoutFeatures['capabilities']['oauth']>;
+            social?: Partial<RootLayoutFeatures['capabilities']['social']>;
+            auth?: Partial<RootLayoutFeatures['capabilities']['auth']>;
+            encryption?: Partial<RootLayoutFeatures['capabilities']['encryption']>;
+            pets?: Partial<RootLayoutFeatures['capabilities']['pets']>;
+            sharing?: Partial<RootLayoutFeatures['capabilities']['sharing']>;
+        }>;
+}>;
+
+const BASE_ROOT_LAYOUT_FEATURES: RootLayoutFeatures = {
+    features: {
+        bugReports: { enabled: true },
+        e2ee: {
+            keylessAccounts: { enabled: false },
+        },
+        encryption: {
+            plaintextStorage: { enabled: false },
+            accountOptOut: { enabled: false },
+        },
+        attachments: {
+            uploads: { enabled: true },
+        },
+        session: {
+            media: {
+                generated: { enabled: false },
+            },
+        },
+        pets: {
+            companion: { enabled: false },
+            sync: { enabled: false },
+        },
+        channelBridges: {
+            enabled: true,
+            telegram: { enabled: true },
+        },
+        automations: {
+            enabled: true,
+        },
+        connectedServices: {
+            enabled: true,
+            quotas: { enabled: true },
+            subscription: { enabled: false },
+            accountGroups: { enabled: false },
+            accountFallback: { enabled: false },
+            autoQuotaReset: { enabled: false },
+            autoDisablePlanInvalid: { enabled: false },
+            poolQuotaLimitSelection: { enabled: false },
+        },
+        updates: {
+            ota: { enabled: true },
+        },
+        sharing: {
+            session: { enabled: true },
+            public: { enabled: true },
+            contentKeys: { enabled: true },
+            pendingQueueV2: { enabled: false },
+            pendingDeliveryState: { enabled: false },
+        },
+        sessions: {
+            enabled: false,
+            drafts: {
+                enabled: false,
+            },
+            agentSwitching: {
+                enabled: false,
+            },
+            folders: {
+                enabled: false,
+            },
+            usageLimitRecovery: {
+                enabled: false,
+            },
+            handoff: {
+                enabled: false,
+            },
+        },
+        machines: {
+            enabled: false,
+            transfer: {
+                enabled: false,
+                directPeer: {
+                    enabled: false,
+                },
+                serverRouted: {
+                    enabled: false,
+                },
+            },
+        },
+        terminal: {
+            embeddedPty: { enabled: false },
+        },
+        voice: { enabled: false, happierVoice: { enabled: false } },
+        social: {
+            friends: {
+                enabled: true,
+            },
+        },
+        auth: {
+            recovery: {
+                providerReset: { enabled: false },
+            },
+            mtls: { enabled: false },
+            login: {
+                keyChallenge: { enabled: true },
+            },
+            pairing: {
+                desktopQrMobileScan: { enabled: true },
+            },
+            ui: {
+                recoveryKeyReminder: { enabled: true },
+            },
+        },
+    },
+    capabilities: {
+        connectedServices: { credentialDelete: { revisionGuard: false } },
+        bugReports: {
+            providerUrl: 'https://reports.happier.dev',
+            defaultIncludeDiagnostics: true,
+            maxArtifactBytes: 10 * 1024 * 1024,
+            acceptedArtifactKinds: ['ui-mobile', 'daemon', 'server', 'cli'],
+            uploadTimeoutMs: 20_000,
+            contextWindowMs: 30 * 60 * 1_000,
+        },
+        voice: { configured: false, provider: null, requested: false, disabledByBuildPolicy: false },
+        pets: DEFAULT_PETS_CAPABILITIES,
+        sharing: {
+            pendingQueueV2: {
+                deliveryState: false,
+                deliveryBlockedReason: false,
+            },
+        },
+        encryption: {
+            storagePolicy: 'required_e2ee',
+            allowAccountOptOut: false,
+            defaultAccountMode: 'e2ee',
+            plainAccountSettingsAtRest: 'server_sealed',
+            plainAccountCredentialsAtRest: 'server_sealed',
+        },
+        machines: {
+            transfer: {
+                serverRouted: {
+                    maxBytes: null,
+                },
+            },
+        },
+        server: {},
+        serverIdentity: { serverIdentityId: null },
+        social: {
+            friends: {
+                allowUsername: false,
+                requiredIdentityProviderId: 'github',
+            },
+        },
+        oauth: { providers: { github: { enabled: true, configured: true } } },
+        session: DEFAULT_SESSION_CAPABILITIES,
+        auth: {
+            methods: [],
+            signup: { methods: [{ id: 'anonymous', enabled: true }] },
+            login: { methods: [{ id: 'key_challenge', enabled: true }], requiredProviders: [] },
+            recovery: {
+                providerReset: { providers: [] },
+            },
+            mtls: {
+                mode: 'forwarded',
+                autoProvision: false,
+                identitySource: 'san_email',
+                policy: {
+                    trustForwardedHeaders: false,
+                    issuerAllowlist: { enabled: false, count: 0 },
+                    emailDomainAllowlist: { enabled: false, count: 0 },
+                },
+            },
+            ui: {
+                autoRedirect: { enabled: false, providerId: null },
+            },
+            providers: {
+                github: {
+                    enabled: true,
+                    configured: true,
+                    restrictions: { usersAllowlist: false, orgsAllowlist: false, orgMatch: 'any' },
+                    offboarding: { enabled: false, intervalSeconds: 600, mode: 'per-request-cache', source: 'oauth_user_token' },
+                },
+            },
+            misconfig: [],
+        },
+    },
+};
+
+export function createRootLayoutFeaturesResponse(overrides?: RootLayoutFeaturesOverrides): RootLayoutFeatures {
+    const next = overrides ?? {};
+    const nextFeatures: NonNullable<RootLayoutFeaturesOverrides['features']> = next.features ?? {};
+    const nextCapabilities: NonNullable<RootLayoutFeaturesOverrides['capabilities']> = next.capabilities ?? {};
+
+    const nextAuth: Partial<RootLayoutFeatures['features']['auth']> = nextFeatures.auth ?? {};
+    const nextSocial: Partial<RootLayoutFeatures['features']['social']> = nextFeatures.social ?? {};
+    const nextSharing: Partial<RootLayoutFeatures['features']['sharing']> = nextFeatures.sharing ?? {};
+    const nextSession: Partial<RootLayoutFeatures['features']['session']> = nextFeatures.session ?? {};
+    const nextSessionMedia: Partial<RootLayoutFeatures['features']['session']['media']> = nextSession.media ?? {};
+    const nextSessions: Partial<RootLayoutFeatures['features']['sessions']> = nextFeatures.sessions ?? {};
+    const nextMachines: Partial<RootLayoutFeatures['features']['machines']> = nextFeatures.machines ?? {};
+    const nextTerminal: Partial<RootLayoutFeatures['features']['terminal']> = nextFeatures.terminal ?? {};
+    const nextAttachments: Partial<RootLayoutFeatures['features']['attachments']> = nextFeatures.attachments ?? {};
+    const nextChannelBridges: Partial<RootLayoutFeatures['features']['channelBridges']> = nextFeatures.channelBridges ?? {};
+    const nextEncryption: Partial<RootLayoutFeatures['features']['encryption']> = nextFeatures.encryption ?? {};
+    const nextE2ee: Partial<RootLayoutFeatures['features']['e2ee']> = nextFeatures.e2ee ?? {};
+    const nextConnectedServices: Partial<RootLayoutFeatures['features']['connectedServices']> =
+        nextFeatures.connectedServices ?? {};
+    const nextUpdates: Partial<RootLayoutFeatures['features']['updates']> = nextFeatures.updates ?? {};
+    const nextAutomations: Partial<RootLayoutFeatures['features']['automations']> = nextFeatures.automations ?? {};
+    const nextPets: Partial<RootLayoutFeatures['features']['pets']> = nextFeatures.pets ?? {};
+
+    const nextCapabilitiesAuth: Partial<RootLayoutFeatures['capabilities']['auth']> = nextCapabilities.auth ?? {};
+    const nextCapabilitiesSocial: Partial<RootLayoutFeatures['capabilities']['social']> = nextCapabilities.social ?? {};
+    const nextCapabilitiesOauth: Partial<RootLayoutFeatures['capabilities']['oauth']> = nextCapabilities.oauth ?? {};
+    const nextCapabilitiesEncryption: Partial<RootLayoutFeatures['capabilities']['encryption']> =
+        nextCapabilities.encryption ?? {};
+    const nextCapabilitiesPets: Partial<RootLayoutFeatures['capabilities']['pets']> = nextCapabilities.pets ?? {};
+    const nextCapabilitiesSharing: Partial<RootLayoutFeatures['capabilities']['sharing']> = nextCapabilities.sharing ?? {};
+    const nextCapabilitiesAuthRecovery: Partial<RootLayoutFeatures['capabilities']['auth']['recovery']> =
+        nextCapabilitiesAuth.recovery ?? {};
+    const nextCapabilitiesAuthUi: Partial<RootLayoutFeatures['capabilities']['auth']['ui']> =
+        nextCapabilitiesAuth.ui ?? {};
+
+    return {
+        features: {
+            ...BASE_ROOT_LAYOUT_FEATURES.features,
+            ...nextFeatures,
+            e2ee: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.e2ee,
+                ...nextE2ee,
+                keylessAccounts: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.e2ee.keylessAccounts,
+                    ...(nextE2ee.keylessAccounts ?? {}),
+                },
+            },
+            encryption: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.encryption,
+                ...nextEncryption,
+                plaintextStorage: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.encryption.plaintextStorage,
+                    ...(nextEncryption.plaintextStorage ?? {}),
+                },
+                accountOptOut: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.encryption.accountOptOut,
+                    ...(nextEncryption.accountOptOut ?? {}),
+                },
+            },
+            attachments: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.attachments,
+                ...nextAttachments,
+            },
+            session: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.session,
+                ...nextSession,
+                media: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.session.media,
+                    ...nextSessionMedia,
+                    generated: {
+                        ...BASE_ROOT_LAYOUT_FEATURES.features.session.media.generated,
+                        ...(nextSessionMedia.generated ?? {}),
+                    },
+                },
+            },
+            channelBridges: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.channelBridges,
+                ...nextChannelBridges,
+                telegram: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.channelBridges.telegram,
+                    ...(nextChannelBridges.telegram ?? {}),
+                },
+            },
+            sharing: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.sharing,
+                ...nextSharing,
+            },
+            sessions: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.sessions,
+                ...nextSessions,
+                folders: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.sessions.folders,
+                    ...(nextSessions.folders ?? {}),
+                },
+                handoff: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.sessions.handoff,
+                    ...(nextSessions.handoff ?? {}),
+                },
+            },
+            machines: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.machines,
+                ...nextMachines,
+                transfer: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.machines.transfer,
+                    ...(nextMachines.transfer ?? {}),
+                    directPeer: {
+                        ...BASE_ROOT_LAYOUT_FEATURES.features.machines.transfer.directPeer,
+                        ...(nextMachines.transfer?.directPeer ?? {}),
+                    },
+                    serverRouted: {
+                        ...BASE_ROOT_LAYOUT_FEATURES.features.machines.transfer.serverRouted,
+                        ...(nextMachines.transfer?.serverRouted ?? {}),
+                    },
+                },
+            },
+            terminal: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.terminal,
+                ...nextTerminal,
+            },
+            voice: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.voice,
+                ...(nextFeatures.voice ?? {}),
+            },
+            automations: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.automations,
+                ...nextAutomations,
+            },
+            pets: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.pets,
+                ...nextPets,
+                companion: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.pets.companion,
+                    ...(nextPets.companion ?? {}),
+                },
+                sync: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.pets.sync,
+                    ...(nextPets.sync ?? {}),
+                },
+            },
+            connectedServices: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.connectedServices,
+                ...nextConnectedServices,
+                quotas: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.connectedServices.quotas,
+                    ...(nextConnectedServices.quotas ?? {}),
+                },
+            },
+            updates: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.updates,
+                ...nextUpdates,
+                ota: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.updates.ota,
+                    ...(nextUpdates.ota ?? {}),
+                },
+            },
+            social: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.social,
+                ...nextSocial,
+                friends: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.social.friends,
+                    ...(nextSocial.friends ?? {}),
+                },
+            },
+            auth: {
+                ...BASE_ROOT_LAYOUT_FEATURES.features.auth,
+                ...nextAuth,
+                recovery: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.auth.recovery,
+                    ...(nextAuth.recovery ?? {}),
+                },
+                mtls: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.auth.mtls,
+                    ...(nextAuth.mtls ?? {}),
+                },
+                login: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.auth.login,
+                    ...(nextAuth.login ?? {}),
+                    keyChallenge: {
+                        ...BASE_ROOT_LAYOUT_FEATURES.features.auth.login.keyChallenge,
+                        ...(nextAuth.login?.keyChallenge ?? {}),
+                    },
+                },
+                ui: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.features.auth.ui,
+                    ...(nextAuth.ui ?? {}),
+                },
+            },
+        },
+        capabilities: {
+            ...BASE_ROOT_LAYOUT_FEATURES.capabilities,
+            ...nextCapabilities,
+            voice: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.voice,
+                ...(nextCapabilities.voice ?? {}),
+            },
+            pets: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.pets,
+                ...nextCapabilitiesPets,
+                limits: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.pets.limits,
+                    ...(nextCapabilitiesPets.limits ?? {}),
+                },
+            },
+            encryption: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.encryption,
+                ...nextCapabilitiesEncryption,
+            },
+            social: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.social,
+                ...nextCapabilitiesSocial,
+                friends: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.social.friends,
+                    ...(nextCapabilitiesSocial.friends ?? {}),
+                },
+            },
+            sharing: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.sharing,
+                ...nextCapabilitiesSharing,
+                pendingQueueV2: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.sharing.pendingQueueV2,
+                    ...(nextCapabilitiesSharing.pendingQueueV2 ?? {}),
+                },
+            },
+            oauth: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.oauth,
+                ...nextCapabilitiesOauth,
+                providers: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.oauth.providers,
+                    ...(nextCapabilitiesOauth.providers ?? {}),
+                },
+            },
+            auth: {
+                ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth,
+                ...nextCapabilitiesAuth,
+                signup: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.signup,
+                    ...(nextCapabilitiesAuth.signup ?? {}),
+                },
+                login: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.login,
+                    ...(nextCapabilitiesAuth.login ?? {}),
+                },
+                recovery: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.recovery,
+                    ...nextCapabilitiesAuthRecovery,
+                    providerReset: {
+                        ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.recovery.providerReset,
+                        ...(nextCapabilitiesAuthRecovery.providerReset ?? {}),
+                    },
+                },
+                ui: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.ui,
+                    ...nextCapabilitiesAuthUi,
+                    autoRedirect: {
+                        ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.ui.autoRedirect,
+                        ...(nextCapabilitiesAuthUi.autoRedirect ?? {}),
+                    },
+                },
+                providers: {
+                    ...BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.providers,
+                    ...(nextCapabilitiesAuth.providers ?? {}),
+                },
+                misconfig: nextCapabilitiesAuth.misconfig ?? BASE_ROOT_LAYOUT_FEATURES.capabilities.auth.misconfig,
+            },
+        },
+    };
+}
+
+export function createOkFetchResponse<T>(payload: T): Promise<Response> {
+    const response = {
+        ok: true,
+        json: async () => payload,
+    };
+    return Promise.resolve(response as Response);
+}

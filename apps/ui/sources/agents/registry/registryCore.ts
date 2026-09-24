@@ -1,0 +1,280 @@
+import type { ModelMode } from '@/sync/domains/permissions/permissionTypes';
+import type { TranslationKey, TranslationKeyNoParams } from '@/text';
+import type { Href } from 'expo-router';
+import type { ConnectedServiceId } from '@happier-dev/protocol';
+
+import {
+    AGENT_IDS as SHARED_AGENT_IDS,
+    DEFAULT_AGENT_ID,
+    resolveAgentIdFromFlavor as resolveAgentIdFromFlavorShared,
+    type AgentCore as SharedAgentCore,
+    type AgentId,
+    type AgentModelConfig,
+    type AgentSessionStorage,
+    type AgentToolsDelivery,
+    type AgentToolsSupportLevel,
+    type VendorResumeIdField,
+} from '@happier-dev/agents';
+
+import { CLAUDE_CORE } from '@/agents/providers/claude/core';
+import { CODEX_CORE } from '@/agents/providers/codex/core';
+import { OPENCODE_CORE } from '@/agents/providers/opencode/core';
+import { GEMINI_CORE } from '@/agents/providers/gemini/core';
+import { AUGGIE_CORE } from '@/agents/providers/auggie/core';
+import { QWEN_CORE } from '@/agents/providers/qwen/core';
+import { KIMI_CORE } from '@/agents/providers/kimi/core';
+import { KILO_CORE } from '@/agents/providers/kilo/core';
+import { KIRO_CORE } from '@/agents/providers/kiro/core';
+import { DEVIN_CORE } from '@/agents/providers/devin/core';
+import { CUSTOM_ACP_CORE } from '@/agents/providers/customAcp/core';
+import { PI_CORE } from '@/agents/providers/pi/core';
+import { COPILOT_CORE } from '@/agents/providers/copilot/core';
+import { CURSOR_CORE } from '@/agents/providers/cursor/core';
+import { GROK_CORE } from '@/agents/providers/grok/core';
+import { AGY_CORE } from '@/agents/providers/agy/core';
+import { FX_CORE } from '@/agents/providers/fx/core';
+import { DROID_CORE } from '@/agents/providers/droid/core';
+
+export type { AgentId };
+
+export type PermissionModeGroupId = 'claude' | 'codexLike';
+export type PermissionPromptProtocol = 'claude' | 'codexDecision';
+
+export type MachineLoginKey = string;
+
+export type AgentCoreConfig = Readonly<{
+    id: AgentId;
+    /**
+     * Translation key for the agent display name in UI.
+     * (Resolved via `t(...)` in UI modules.)
+     */
+    displayNameKey: TranslationKey;
+    /**
+     * Translation key for the agent subtitle in profile/session pickers.
+     */
+    subtitleKey: TranslationKey;
+    /**
+     * Translation key prefix for permission mode labels/badges.
+     * Examples:
+     * - Claude: `agentInput.permissionMode.*`
+     * - Codex: `agentInput.codexPermissionMode.*`
+     * - Gemini: `agentInput.geminiPermissionMode.*`
+     */
+    permissionModeI18nPrefix: string;
+    availability: Readonly<{
+        /**
+         * Whether this backend should be marked as experimental in UI surfaces.
+         */
+        experimental: boolean;
+    }>;
+    /**
+     * Shared Happier Connected Services compatibility from `@happier-dev/agents`.
+     */
+    connectedServices: SharedAgentCore['connectedServices'];
+    uiConnectedService: Readonly<{
+        /**
+         * UI presentation metadata for the service backing this agent.
+         * When null, the agent has no account-level OAuth connection surface in the UI.
+         */
+        serviceId: ConnectedServiceId | null;
+        /**
+         * Human-friendly label shown in account settings and provider surfaces.
+         * (This is intentionally not i18n'd yet; can be moved to translations later.)
+         */
+        label: string;
+        /**
+         * Optional app route used to connect the service.
+         */
+        connectRoute: Href | null;
+    }>;
+    flavorAliases: readonly string[];
+    cli: Readonly<{
+        /**
+         * The shell command name used for CLI detection (and for UX copy).
+         * Example: `command -v <detectKey>`.
+         */
+        detectKey: string;
+        /**
+         * Profile-level machine-login identifier used when `profile.authMode=machineLogin`.
+         * Resolved against `profile.requiresMachineLoginTargetKey` when the profile is saved.
+         */
+        machineLoginKey: MachineLoginKey;
+        /**
+         * Optional UX metadata for "CLI not detected" banners.
+         */
+        installBanner: Readonly<{
+            /**
+             * When "command", show `newSession.cliBanners.installCommand` with `installCommand`.
+             * When "ifAvailable", show `newSession.cliBanners.installCliIfAvailable` with the CLI name.
+             */
+            installKind: 'command' | 'ifAvailable';
+            installCommand?: string;
+            guideUrl?: string;
+        }>;
+        /**
+         * Canonical agent id passed to daemon RPCs (spawn/resume).
+         * Keep this stable; do not use aliases here.
+         */
+        spawnAgent: AgentId;
+    }>;
+    permissions: Readonly<{
+        modeGroup: PermissionModeGroupId;
+        promptProtocol: PermissionPromptProtocol;
+    }>;
+    sessionModes: Readonly<{
+        /**
+         * How (if at all) ACP session modes should be treated for this agent.
+         *
+         * - none: do not surface ACP session modes as a first-class control in UI
+         * - acpPolicyPresets: ACP modes exist, but represent approval/sandbox presets (not plan/build)
+         * - acpAgentModes: ACP modes represent agent-level modes (e.g. plan/build) and should be user-controllable
+         * - staticAgentModes: provider-native modes (e.g. Claude plan/build) that should be user-controllable
+         */
+        kind: 'none' | 'acpPolicyPresets' | 'acpAgentModes' | 'staticAgentModes';
+        /**
+         * Static mode options used when kind === 'staticAgentModes'.
+         * `id: 'default'` represents "no override" / provider default.
+         */
+        staticOptions?: ReadonlyArray<Readonly<{
+            id: string;
+            nameKey: TranslationKeyNoParams;
+            descriptionKey?: TranslationKeyNoParams;
+        }>>;
+    }>;
+    /**
+     * Model selection capabilities and static suggestions.
+     *
+     * Source of truth lives in `@happier-dev/agents` so CLI + UI don’t drift.
+     * UI may still prefer dynamic ACP lists (`metadata.acpSessionModelsV1`) when present.
+     */
+    model: AgentModelConfig;
+    resume: Readonly<{
+        /**
+         * Field in session metadata containing the vendor resume id, if supported.
+         */
+        vendorResumeIdField: VendorResumeIdField | null;
+        /**
+         * Translation keys for showing/copying the vendor resume id in the session info UI.
+         * When null, the UI should not render a resume id row for this agent.
+         */
+        uiVendorResumeIdLabelKey: TranslationKey | null;
+        uiVendorResumeIdCopiedKey: TranslationKey | null;
+        /**
+         * Whether this agent can be resumed from UI in principle.
+         * (May still be gated by experiments in higher-level helpers.)
+         */
+        supportsVendorResume: boolean;
+        /**
+         * When true, vendor-resume support is considered experimental and must be enabled explicitly
+         * by callers (e.g. via feature flags / experiments).
+         */
+        experimental: boolean;
+    }>;
+    localControl?: Readonly<{
+        /**
+         * When true, this agent supports a terminal-driven "local control" mode
+         * that can be mirrored in the UI and switched to/from remote mode.
+         */
+        supported: boolean;
+        /**
+         * `exclusive`: local terminal owns the turn and remote input should switch or queue.
+         * `shared`: local terminal is only an attached client; remote UI remains writable.
+         */
+        topology?: 'exclusive' | 'shared';
+        /**
+         * Attachment mechanism used by terminal attach flows.
+         */
+        attachStrategy?: 'tmux' | 'provider_attach' | 'unsupported';
+    }>;
+    toolRendering: Readonly<{
+        /**
+         * When true, unknown tools should be hidden/minimal to avoid noisy internal tools.
+         */
+        hideUnknownToolsByDefault: boolean;
+    }>;
+    tools: Readonly<{
+        delivery: AgentToolsDelivery;
+        support: AgentToolsSupportLevel;
+    }>;
+    sessionStorage: AgentSessionStorage;
+    ui: Readonly<{
+        /**
+         * Icon used in agent picker UIs (Ionicons name).
+         * Kept here as a string so it remains Node-safe (tests can import it).
+         */
+        agentPickerIconName: string;
+        /**
+         * Optional font size scale used for CLI glyph renderers (dingbat-based).
+         */
+        cliGlyphScale: number;
+        /**
+         * Optional font size scale used for profile compatibility glyph renderers.
+         */
+        profileCompatibilityGlyphScale: number;
+    }>;
+}>;
+
+export const AGENTS_CORE = Object.freeze({
+    claude: CLAUDE_CORE,
+    codex: CODEX_CORE,
+    opencode: OPENCODE_CORE,
+    gemini: GEMINI_CORE,
+    auggie: AUGGIE_CORE,
+    qwen: QWEN_CORE,
+    kimi: KIMI_CORE,
+    kilo: KILO_CORE,
+    kiro: KIRO_CORE,
+    devin: DEVIN_CORE,
+    customAcp: CUSTOM_ACP_CORE,
+    pi: PI_CORE,
+    copilot: COPILOT_CORE,
+    cursor: CURSOR_CORE,
+    grok: GROK_CORE,
+    fx: FX_CORE,
+    droid: DROID_CORE,
+    agy: AGY_CORE,
+}) satisfies Readonly<Record<string, AgentCoreConfig>>;
+
+export const AGENT_IDS = Object.freeze(
+    Object.keys(AGENTS_CORE) as AgentId[],
+);
+
+export { DEFAULT_AGENT_ID };
+
+export function isAgentId(value: unknown): value is AgentId {
+    return typeof value === 'string' && (AGENT_IDS as readonly string[]).includes(value);
+}
+
+export function getAgentCore(id: AgentId): AgentCoreConfig {
+    const core = (AGENTS_CORE as Partial<Record<AgentId, AgentCoreConfig>>)[id];
+    if (!core) {
+        throw new Error(`Unsupported UI agent core: ${id}`);
+    }
+    return core;
+}
+
+export function resolveAgentIdFromFlavor(flavor: string | null | undefined): AgentId | null {
+    const resolved = resolveAgentIdFromFlavorShared(flavor);
+    return resolved && (SHARED_AGENT_IDS as readonly string[]).includes(resolved) && isAgentId(resolved) ? resolved : null;
+}
+
+export function resolveAgentIdFromCliDetectKey(detectKey: string | null | undefined): AgentId | null {
+    if (typeof detectKey !== 'string') return null;
+    const normalized = detectKey.trim().toLowerCase();
+    if (!normalized) return null;
+    for (const id of AGENT_IDS) {
+        if (AGENTS_CORE[id].cli.detectKey === normalized) return id;
+    }
+    return null;
+}
+
+export function resolveAgentIdFromConnectedServiceId(serviceId: string | null | undefined): AgentId | null {
+    if (typeof serviceId !== 'string') return null;
+    const normalized = serviceId.trim().toLowerCase();
+    if (!normalized) return null;
+    for (const id of AGENT_IDS) {
+        const supportedServiceIds = AGENTS_CORE[id].connectedServices?.supportedServiceIds ?? [];
+        if (supportedServiceIds.some((svc) => typeof svc === 'string' && svc.toLowerCase() === normalized)) return id;
+    }
+    return null;
+}

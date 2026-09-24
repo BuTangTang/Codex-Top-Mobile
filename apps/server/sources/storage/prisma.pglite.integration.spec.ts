@@ -1,0 +1,105 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { applyEnvValues } from "@/testkit/env";
+import { initDbPglite, shutdownDbPglite } from "./prisma";
+import { acquirePgliteDirLock } from "./locks/pgliteLock";
+
+const createdDirs: string[] = [];
+
+async function createHarnessDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "happier-prisma-pglite-"));
+    createdDirs.push(dir);
+    return dir;
+}
+
+async function safeShutdownPglite(): Promise<void> {
+    await shutdownDbPglite().catch(() => {});
+}
+
+describe("storage/prisma initDbPglite", () => {
+    afterEach(async () => {
+        await safeShutdownPglite();
+        applyEnvValues({
+            HAPPY_SERVER_LIGHT_DB_DIR: undefined,
+            HAPPY_SERVER_LIGHT_DATA_DIR: undefined,
+            HAPPIER_SERVER_LIGHT_DB_DIR: undefined,
+            HAPPIER_SERVER_LIGHT_DATA_DIR: undefined,
+            HOME: undefined,
+        });
+        while (createdDirs.length > 0) {
+            const dir = createdDirs.pop();
+            if (!dir) continue;
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects re-entrant init attempts while initialization is in progress", async () => {
+        const root = await createHarnessDir();
+        applyEnvValues({ HAPPY_SERVER_LIGHT_DATA_DIR: root });
+
+        const first = initDbPglite();
+        const second = initDbPglite();
+        const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+
+        expect(firstResult.status).toBe("fulfilled");
+        expect(secondResult.status).toBe("rejected");
+        expect(String((secondResult as PromiseRejectedResult).reason?.message ?? (secondResult as PromiseRejectedResult).reason)).toMatch(
+            /initialization is already in progress/i,
+        );
+    }, 30_000);
+
+    it("releases the pglite directory lock on shutdown", async () => {
+        const root = await createHarnessDir();
+        const dbDir = join(root, "pglite");
+        applyEnvValues({ HAPPY_SERVER_LIGHT_DATA_DIR: root });
+
+        await initDbPglite();
+        await shutdownDbPglite();
+
+        const release = await acquirePgliteDirLock(dbDir, { purpose: "test-after-shutdown" });
+        await release();
+    }, 30_000);
+
+    it("does not keep partial initialization state when lock acquisition fails", async () => {
+        const root = await createHarnessDir();
+        const dbDir = join(root, "pglite");
+        applyEnvValues({ HAPPY_SERVER_LIGHT_DATA_DIR: root });
+
+        const release = await acquirePgliteDirLock(dbDir, { purpose: "external-lock" });
+        await expect(initDbPglite()).rejects.toThrow(/already in use/i);
+        await release();
+
+        await expect(initDbPglite()).resolves.toBeUndefined();
+        await expect(shutdownDbPglite()).resolves.toBeUndefined();
+    }, 30_000);
+
+    it("accepts HAPPIER_ prefixed light data dir env var", async () => {
+        const root = await createHarnessDir();
+        const dbDir = join(root, "pglite");
+        applyEnvValues({ HAPPIER_SERVER_LIGHT_DATA_DIR: root });
+
+        await expect(initDbPglite()).resolves.toBeUndefined();
+        await shutdownDbPglite();
+
+        const release = await acquirePgliteDirLock(dbDir, { purpose: "test-happier-prefix-after-shutdown" });
+        await release();
+    }, 30_000);
+
+    it("expands ~/ light data dir env vars against HOME", async () => {
+        const homeDir = await createHarnessDir();
+        const dbDir = join(homeDir, "light-data", "pglite");
+        applyEnvValues({
+            HOME: homeDir,
+            HAPPY_SERVER_LIGHT_DATA_DIR: "~/light-data",
+        });
+
+        await expect(initDbPglite()).resolves.toBeUndefined();
+        await shutdownDbPglite();
+
+        const release = await acquirePgliteDirLock(dbDir, { purpose: "test-tilde-home-after-shutdown" });
+        await release();
+    }, 30_000);
+});

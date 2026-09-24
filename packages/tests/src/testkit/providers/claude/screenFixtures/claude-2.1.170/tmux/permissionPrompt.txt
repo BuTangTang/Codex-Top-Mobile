@@ -1,0 +1,9 @@
+Claude Code v2.1.170
+
+Bash(rm -rf build)
+  Remove the build directory
+
+Do you want to proceed?
+  1. Yes
+  2. Yes, and don't ask again for rm commands
+  3. No, tell Claude what to do differently

@@ -1,0 +1,508 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { runNodeCapture } from './testkit/stack_script_command_testkit.mjs';
+import { createStackHappierCliCommandFixture } from './testkit/stack_happier_cli_command_testkit.mjs';
+import { createRuntimeSnapshotFixture } from './testkit/runtime_snapshot_testkit.mjs';
+import { buildStubHappierServerSetSource } from './testkit/core/stub_happier_cli_server_set.mjs';
+import { buildStackStableScopeId } from './utils/auth/stable_scope_id.mjs';
+
+const scriptsDir = dirname(fileURLToPath(import.meta.url));
+const rootDir = dirname(scriptsDir);
+
+const SERVER_SET_CALL_LOG_FILE_NAME = '.hstack-test-server-set-calls.ndjson';
+
+function buildStubHappyCliScript({ message, ignoreServerSet = false }) {
+  return [
+      `const args = process.argv.slice(2);`,
+      buildStubHappierServerSetSource({ ignoreServerSet, callLogFileName: SERVER_SET_CALL_LOG_FILE_NAME }),
+      `console.log(JSON.stringify({`,
+      `  message: ${JSON.stringify(message)},`,
+      `  args,`,
+      `  stack: process.env.HAPPIER_STACK_STACK || null,`,
+      `  envFile: process.env.HAPPIER_STACK_ENV_FILE || null,`,
+      `  homeDir: process.env.HAPPIER_HOME_DIR || null,`,
+      `  serverUrl: process.env.HAPPIER_SERVER_URL || null,`,
+      `  webappUrl: process.env.HAPPIER_WEBAPP_URL || null,`,
+      `  activeServerId: process.env.HAPPIER_ACTIVE_SERVER_ID || null,`,
+      `}));`,
+    ].join('\n');
+}
+
+function buildFailingStubHappyCliScript({ errorMessage }) {
+  return `if (process.env.HAPPIER_CLI_DIST_INTEGRITY_PROBE === 'daemon-command') process.exit(0);\nconsole.error(${JSON.stringify(errorMessage)});\nprocess.exit(1);\n`;
+}
+
+async function createHappyStackFixture(
+  t,
+  {
+    prefix,
+    stackName = 'exp-test',
+    serverPort,
+    stubType = 'success',
+    message = 'hello',
+    errorMessage = 'stub failure',
+    includePinnedServerPortInEnvFile = true,
+    runtimeOwnerPid = null,
+    runtimeServerPid = null,
+    stackCliSettings = null,
+  } = {}
+) {
+  const fixture = await createStackHappierCliCommandFixture(t, {
+    prefix,
+    stackName,
+    serverPort,
+    distIndexScript:
+      stubType === 'failing'
+        ? buildFailingStubHappyCliScript({ errorMessage })
+        : buildStubHappyCliScript({
+            message,
+            ignoreServerSet: stubType === 'legacy-ignore-server-set',
+          }),
+  });
+  if (!includePinnedServerPortInEnvFile) {
+    await fixture.writeStackEnv({ port: '' });
+  }
+
+  const resolvedStackCliSettings = typeof stackCliSettings === 'function'
+    ? stackCliSettings({ serverPort: fixture.serverPort })
+    : stackCliSettings;
+  if (resolvedStackCliSettings) {
+    await mkdir(join(fixture.storageDir, stackName, 'cli'), { recursive: true });
+    await writeFile(
+      join(fixture.storageDir, stackName, 'cli', 'settings.json'),
+      JSON.stringify(resolvedStackCliSettings, null, 2) + '\n',
+      'utf-8',
+    );
+  }
+
+  if (runtimeOwnerPid !== null || runtimeServerPid !== null) {
+    await writeFile(
+      join(fixture.storageDir, stackName, 'stack.runtime.json'),
+      JSON.stringify(
+        {
+          version: 1,
+          stackName,
+          ephemeral: true,
+          ownerPid: runtimeOwnerPid,
+          ports: { server: fixture.serverPort },
+          processes: { serverPid: runtimeServerPid },
+        },
+        null,
+        2
+      ) + '\n',
+      'utf-8'
+    );
+  }
+
+  return {
+    stackName: fixture.stackName,
+    serverPort: fixture.serverPort,
+    storageDir: fixture.storageDir,
+    baseEnv: fixture.baseEnv,
+  };
+}
+
+test('hstack stack happier <name> runs CLI under that stack env', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-',
+    message: 'hello',
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'hello');
+  assert.equal(out.stack, fixture.stackName);
+  assert.ok(String(out.envFile).endsWith(`/${fixture.stackName}/env`), `expected envFile to end with /${fixture.stackName}/env, got: ${out.envFile}`);
+  assert.equal(out.homeDir, join(fixture.storageDir, fixture.stackName, 'cli'));
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+});
+
+test('hstack stack happier <name> overrides pre-set HAPPIER_* env vars with stack-scoped values', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-override-',
+    message: 'override',
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName], {
+    cwd: rootDir,
+    env: {
+      ...fixture.baseEnv,
+      HAPPIER_HOME_DIR: join(fixture.storageDir, 'wrong', 'cli'),
+      HAPPIER_SERVER_URL: 'http://127.0.0.1:3005',
+      HAPPIER_WEBAPP_URL: 'http://wrong-webapp.example.test',
+    },
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'override');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.homeDir, join(fixture.storageDir, fixture.stackName, 'cli'));
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+});
+
+test('hstack stack happier <name> ignores stale cloud settings defaults and keeps stack-local server urls', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-ignore-settings-',
+    message: 'ignore-settings-defaults',
+    stackCliSettings: {
+      schemaVersion: 6,
+      onboardingCompleted: false,
+      activeServerId: 'cloud',
+      servers: {
+        cloud: {
+          id: 'cloud',
+          name: 'Happier Cloud',
+          serverUrl: 'https://api.happier.dev',
+          webappUrl: 'https://app.happier.dev',
+          createdAt: 0,
+          updatedAt: 0,
+          lastUsedAt: 0,
+        },
+      },
+    },
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'ignore-settings-defaults');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.homeDir, join(fixture.storageDir, fixture.stackName, 'cli'));
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+  assert.equal(out.webappUrl, `http://localhost:${fixture.serverPort}`);
+});
+
+test('hstack stack happier <name> delegates stack profile reconciliation to the selected CLI runtime', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-seed-settings-',
+    message: 'seed-settings',
+    stackCliSettings: {
+      schemaVersion: 6,
+      onboardingCompleted: false,
+      activeServerId: 'cloud',
+      servers: {
+        cloud: {
+          id: 'cloud',
+          name: 'Happier Cloud',
+          serverUrl: 'https://api.happier.dev',
+          webappUrl: 'https://app.happier.dev',
+          createdAt: 0,
+          updatedAt: 0,
+          lastUsedAt: 0,
+        },
+      },
+    },
+  });
+
+  const settingsPath = join(fixture.storageDir, fixture.stackName, 'cli', 'settings.json');
+  const serverSetCallsPath = join(fixture.storageDir, fixture.stackName, 'cli', SERVER_SET_CALL_LOG_FILE_NAME);
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'seed-settings');
+  assert.ok(out.activeServerId, 'expected wrapper to export HAPPIER_ACTIVE_SERVER_ID');
+
+  const serverSetCalls = (await readFile(serverSetCallsPath, 'utf-8')).trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(serverSetCalls, [[
+    'server',
+    'set',
+    '--server-id',
+    out.activeServerId,
+    '--server-url',
+    `http://127.0.0.1:${fixture.serverPort}`,
+    '--local-server-url',
+    `http://127.0.0.1:${fixture.serverPort}`,
+    '--webapp-url',
+    `http://localhost:${fixture.serverPort}`,
+    '--migrate-matching-profile-state',
+    '--json',
+  ]]);
+
+  const settings = JSON.parse(await readFile(settingsPath, 'utf-8'));
+  assert.equal(settings.activeServerId, out.activeServerId, 'the selected CLI must own the reconciled active profile');
+  assert.equal(settings.servers[out.activeServerId].serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+  // The CLI collapses a local URL equal to the relay URL; only the relay URL is persisted.
+  assert.equal(settings.servers[out.activeServerId].localServerUrl, undefined);
+  assert.equal(settings.servers[out.activeServerId].webappUrl, `http://localhost:${fixture.serverPort}`);
+});
+
+test('hstack stack happier <name> rejects a CLI that exits successfully without reconciling the stack profile', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-legacy-server-set-',
+    message: 'must-not-run',
+    stubType: 'legacy-ignore-server-set',
+    stackCliSettings: {
+      schemaVersion: 6,
+      onboardingCompleted: false,
+      activeServerId: 'cloud',
+      servers: {
+        cloud: {
+          id: 'cloud',
+          name: 'Happier Cloud',
+          serverUrl: 'https://api.happier.dev',
+          webappUrl: 'https://app.happier.dev',
+          createdAt: 0,
+          updatedAt: 0,
+          lastUsedAt: 0,
+        },
+      },
+    },
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+
+  assert.notEqual(res.code, 0, `expected reconciliation verification to fail\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.match(res.stderr, /did not apply the requested stack relay profile/i);
+  assert.doesNotMatch(res.stdout, /must-not-run/);
+});
+
+test('hstack stack happier <name> uses stack.runtime.json ports when env file does not pin HAPPIER_STACK_SERVER_PORT', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-runtime-ports-',
+    message: 'runtime-ports',
+    includePinnedServerPortInEnvFile: false,
+    // Simulate a stale owner pid but a still-running server process.
+    runtimeOwnerPid: 999999,
+    runtimeServerPid: process.pid,
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'runtime-ports');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+});
+
+test('hstack stack happier <name> forwards wrapper runtime flags to happier.mjs', async (t) => {
+  const fixture = await createRuntimeSnapshotFixture(t, {
+    stackName: 'runtime-wrapper-passthrough',
+    cliEntrypoint: 'cli/happier.mjs',
+    cliSource: 'process.stdout.write("SNAPSHOT WRAPPER HELP\\n");\n',
+  });
+
+  const res = await runNodeCapture(
+    [join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName, '--runtime', '--', '--help'],
+    {
+      cwd: rootDir,
+      env: {
+        ...process.env,
+        HAPPIER_STACK_STORAGE_DIR: fixture.storageDir,
+        HAPPIER_STACK_CLI_ROOT_DISABLE: '1',
+        HAPPIER_STACK_REPO_DIR: fixture.root,
+      },
+    },
+  );
+
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.match(res.stdout, /SNAPSHOT WRAPPER HELP/);
+});
+
+test('hstack happier (HAPPIER_STACK_STACK set) uses stack.runtime.json ports when env file does not pin HAPPIER_STACK_SERVER_PORT', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-happy-runtime-ports-',
+    message: 'runtime-ports-env',
+    includePinnedServerPortInEnvFile: false,
+    // Simulate a stale owner pid but a still-running server process.
+    runtimeOwnerPid: 999999,
+    runtimeServerPid: process.pid,
+  });
+
+  const env = {
+    ...fixture.baseEnv,
+    HAPPIER_STACK_STACK: fixture.stackName,
+    HAPPIER_STACK_ENV_FILE: join(fixture.storageDir, fixture.stackName, 'env'),
+    HAPPIER_STACK_RUNTIME_MODE: 'source',
+  };
+  delete env.HAPPIER_STACK_SERVER_PORT_BASE;
+  delete env.HAPPIER_STACK_SERVER_PORT_RANGE;
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'happier.mjs')], {
+    cwd: rootDir,
+    env,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'runtime-ports-env');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+  assert.equal(out.webappUrl, `http://localhost:${fixture.serverPort}`);
+});
+
+test('hstack happier keeps the stable scope when another settings profile matches the stack URL', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-explicit-stack-scope-',
+    message: 'explicit-stack-scope',
+    stackCliSettings: ({ serverPort }) => ({
+      schemaVersion: 6,
+      onboardingCompleted: true,
+      activeServerId: 'stack-local',
+      servers: {
+        'stack-local': {
+          id: 'stack-local',
+          name: 'Stack Local',
+          serverUrl: `http://127.0.0.1:${serverPort}`,
+          webappUrl: `http://localhost:${serverPort}`,
+          createdAt: 0,
+          updatedAt: 0,
+          lastUsedAt: 0,
+        },
+      },
+    }),
+  });
+
+  const env = {
+    ...fixture.baseEnv,
+    HAPPIER_STACK_STACK: fixture.stackName,
+    HAPPIER_STACK_RUNTIME_MODE: 'source',
+  };
+  delete env.HAPPIER_STACK_ENV_FILE;
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'happier.mjs')], {
+    cwd: rootDir,
+    env,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'explicit-stack-scope');
+  assert.equal(out.stack, fixture.stackName);
+  assert.ok(String(out.envFile).endsWith(`/${fixture.stackName}/env`), `expected envFile to end with /${fixture.stackName}/env, got: ${out.envFile}`);
+  assert.equal(out.homeDir, join(fixture.storageDir, fixture.stackName, 'cli'));
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+  assert.equal(out.webappUrl, `http://localhost:${fixture.serverPort}`);
+  assert.equal(
+    out.activeServerId,
+    buildStackStableScopeId({ stackName: fixture.stackName, cliIdentity: 'default' }),
+  );
+});
+
+test('hstack stack happier <name> --identity=<name> uses identity-scoped HAPPIER_HOME_DIR', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-identity-',
+    message: 'identity',
+  });
+  const identity = 'account-a';
+
+  const res = await runNodeCapture(
+    [join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName, `--identity=${identity}`],
+    { cwd: rootDir, env: fixture.baseEnv }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'identity');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.homeDir, join(fixture.storageDir, fixture.stackName, 'cli-identities', identity));
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+});
+
+test('hstack <stack> happier ... shorthand runs CLI under that stack env', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happy-stacks-stack-happy-',
+    message: 'shorthand',
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), fixture.stackName, 'happier'], { cwd: rootDir, env: fixture.baseEnv });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'shorthand');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.serverUrl, `http://127.0.0.1:${fixture.serverPort}`);
+});
+
+test('hstack stack happier <name> does not print wrapper stack traces on CLI failure', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happy-stacks-stack-happy-fail-',
+    stubType: 'failing',
+    errorMessage: 'stub failure',
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', 'happier', fixture.stackName, 'attach', 'abc'], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+  assert.equal(res.code, 1, `expected exit 1, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+  assert.ok(res.stderr.includes('stub failure'), `expected stderr to include stub failure, got:\n${res.stderr}`);
+  assert.ok(!res.stderr.includes('[happier] failed:'), `expected no [happier] failed stack trace, got:\n${res.stderr}`);
+  assert.ok(!res.stderr.includes('[stack] failed:'), `expected no [stack] failed stack trace, got:\n${res.stderr}`);
+  assert.ok(!res.stderr.includes('node:internal'), `expected no node:internal stack trace, got:\n${res.stderr}`);
+});
+
+test('hstack stack <name> happier ... stack-name-first shorthand works', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-happy-name-first-',
+    message: 'name-first',
+  });
+
+  const res = await runNodeCapture([join(rootDir, 'bin', 'hstack.mjs'), 'stack', fixture.stackName, 'happier'], {
+    cwd: rootDir,
+    env: fixture.baseEnv,
+  });
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'name-first');
+  assert.equal(out.stack, fixture.stackName);
+});
+
+test('hstack stack bug-report <name> forwards bug-report command under stack env', async (t) => {
+  const fixture = await createHappyStackFixture(t, {
+    prefix: 'happier-stack-stack-bug-report-',
+    message: 'bug-report-alias',
+  });
+
+  const res = await runNodeCapture(
+    [
+      join(rootDir, 'bin', 'hstack.mjs'),
+      'stack',
+      'bug-report',
+      fixture.stackName,
+      '--',
+      '--title',
+      'CLI bug',
+      '--summary',
+      'summary',
+      '--current-behavior',
+      'current',
+      '--expected-behavior',
+      'expected',
+      '--accept-privacy-notice',
+      '--no-include-diagnostics',
+    ],
+    { cwd: rootDir, env: fixture.baseEnv }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.message, 'bug-report-alias');
+  assert.equal(out.stack, fixture.stackName);
+  assert.equal(out.args[0], 'bug-report');
+});

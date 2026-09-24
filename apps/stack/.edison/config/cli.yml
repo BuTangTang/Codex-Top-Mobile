@@ -1,0 +1,28 @@
+cli:
+  # Fail-closed wrapper enforcement (recommended for LLM/agent workflows).
+  #
+  # This project requires the hstack wrapper so that:
+  # - stack-scoped env vars are loaded correctly
+  # - evidence fingerprinting includes the stack’s actual repo checkout
+  # - agents don’t accidentally run outside the enforced stack/worktree context
+  wrapper:
+    enabled: true
+    env_var: HAPPIER_STACK_EDISON_WRAPPER
+    value: "1"
+    message: |
+      hstack: do not run `edison ...` directly in this repo.
+
+      Fix:
+        hstack edison -- <edison args...>
+
+      Stack-scoped (recommended for tasks/evidence/validation):
+        hstack edison --stack=<stack> -- <edison args...>
+
+      Helpful reads:
+        hstack edison -- read START_hstack_NEW_SESSION --type start
+        hstack edison -- read START_PLAN_FEATURE --type start
+        hstack edison -- read START_VALIDATE_TASK --type start
+
+      Tip:
+        If you pass a task id or QA id, `hstack edison` can infer the stack from frontmatter:
+          hstack edison -- evidence capture <task-id>

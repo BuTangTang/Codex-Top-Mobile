@@ -1,0 +1,457 @@
+import type { AgentState } from '@/api/types';
+import { updateAgentStateBestEffort } from '@/api/session/sessionWritesBestEffort';
+import { resolveAgentRequestKind } from '@/agent/permissions/requestKind';
+import {
+    applyAgentStateRequestPushNotifiedAt,
+    clonePlainObjectToNullProto,
+    cloneStringKeyedRecordToNullProto,
+} from '@/api/session/agentStateRecords';
+import {
+    getSessionNotificationAgentDisplayName,
+    getSessionNotificationTitle,
+} from '@/agent/runtime/readyNotificationContext';
+import { PermissionRequestPushNotifier } from '@/settings/notifications/permissionRequestPushNotifier';
+import type { PermissionRequestPushSender } from '@/agent/permissions/BasePermissionHandler';
+import type { AccountSettings } from '@happier-dev/protocol';
+import {
+    CLAUDE_LOCAL_PERMISSION_BRIDGE_REQUEST_SOURCE,
+    CLAUDE_LOCAL_PERMISSION_BRIDGE_STOPPED_REASON,
+    isAgentStateRequestCoveredByCompletedRequests,
+} from '@happier-dev/agents';
+import { normalizeAskUserQuestionInputForPublication } from '@/agent/questions/normalizeAskUserQuestionInput';
+
+type AgentStateRequestEntry = NonNullable<AgentState['requests']>[string];
+type AgentStateCompletedEntry = NonNullable<AgentState['completedRequests']>[string];
+
+const PENDING_REQUEST_COVERAGE_OPTIONS = {
+    equivalentSources: [CLAUDE_LOCAL_PERMISSION_BRIDGE_REQUEST_SOURCE],
+    equivalentCompletedStatuses: ['canceled'],
+    equivalentCompletedReasons: [CLAUDE_LOCAL_PERMISSION_BRIDGE_STOPPED_REASON],
+} as const;
+
+const PERMISSION_RESPONSE_CLAIM_V1 = 'permissionResponseClaimV1';
+
+function hasOwnProperty(value: unknown, key: string): value is Record<string, unknown> {
+    return !!value
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && Object.prototype.hasOwnProperty.call(value, key);
+}
+
+export function hasPermissionResponseClaimV1(value: unknown): value is Record<typeof PERMISSION_RESPONSE_CLAIM_V1, unknown> {
+    return hasOwnProperty(value, PERMISSION_RESPONSE_CLAIM_V1);
+}
+
+export type AgentStateOutstandingRequest = Readonly<{
+    requestId: string;
+    toolName: string;
+    toolInput: unknown;
+    createdAt: number;
+    kind?: string;
+    source?: string;
+    permissionSuggestions?: unknown;
+}>;
+
+type SessionLike = Readonly<{
+    sessionId: string;
+    updateAgentState: (updater: (state: AgentState) => AgentState) => Promise<void> | void;
+    getAgentStateSnapshot?: () => AgentState | null | undefined;
+    getMetadataSnapshot?: () => unknown;
+}>;
+
+export class AgentStateRequestStore {
+    private session: SessionLike;
+    private readonly logPrefix: string;
+    private readonly pushSender: PermissionRequestPushSender | null;
+    private readonly getAccountSettings: () => AccountSettings | null;
+    private readonly getAccountSettingsSecretsReadKeys: () => ReadonlyArray<Uint8Array | null | undefined>;
+    private permissionRequestPushNotifier: PermissionRequestPushNotifier | null = null;
+
+    constructor(params: Readonly<{
+        session: SessionLike;
+        logPrefix: string;
+        pushSender?: PermissionRequestPushSender | null;
+        getAccountSettings?: (() => AccountSettings | null) | null;
+        getAccountSettingsSecretsReadKeys?: (() => ReadonlyArray<Uint8Array | null | undefined>) | null;
+    }>) {
+        this.session = params.session;
+        this.logPrefix = params.logPrefix;
+        this.pushSender = params.pushSender ?? null;
+        this.getAccountSettings = typeof params.getAccountSettings === 'function' ? params.getAccountSettings : (() => null);
+        this.getAccountSettingsSecretsReadKeys =
+            typeof params.getAccountSettingsSecretsReadKeys === 'function' ? params.getAccountSettingsSecretsReadKeys : (() => []);
+    }
+
+    updateSession(session: SessionLike): void {
+        this.session = session;
+        this.permissionRequestPushNotifier?.dispose();
+        this.permissionRequestPushNotifier = null;
+    }
+
+    hasOutstandingRequest(requestId: string): boolean {
+        return this.readOutstandingRequest(requestId) !== null;
+    }
+
+    isOutstandingRequestClaimed(requestId: string): boolean {
+        const entry = this.session.getAgentStateSnapshot?.()?.requests?.[requestId];
+        return hasPermissionResponseClaimV1(entry);
+    }
+
+    readOutstandingRequest(requestId: string): AgentStateOutstandingRequest | null {
+        const entry = this.session.getAgentStateSnapshot?.()?.requests?.[requestId];
+        if (!entry) return null;
+
+        const extendedEntry = entry as AgentStateRequestEntry & {
+            source?: unknown;
+            permissionSuggestions?: unknown;
+        };
+
+        return {
+            requestId,
+            toolName: entry.tool,
+            toolInput: entry.arguments,
+            createdAt: entry.createdAt,
+            ...(typeof entry.kind === 'string' ? { kind: entry.kind } : {}),
+            ...(typeof extendedEntry.source === 'string' ? { source: extendedEntry.source } : {}),
+            ...(typeof extendedEntry.permissionSuggestions !== 'undefined'
+                ? { permissionSuggestions: extendedEntry.permissionSuggestions }
+                : {}),
+        };
+    }
+
+    publishRequest(params: Readonly<{
+        requestId: string;
+        toolName: string;
+        toolInput: unknown;
+        createdAt: number;
+        kind?: string;
+        source?: string;
+        permissionSuggestions?: unknown[] | null;
+        replaceCompletedRequest?: boolean;
+        /** Persist the request but suppress push rendering when its input contains private context. */
+        notifyPush?: boolean;
+        updateState?: (state: AgentState) => AgentState;
+    }>): void {
+        const normalizedToolInput = normalizeAskUserQuestionInputForPublication(params.toolName, params.toolInput);
+        const wasClaimedBeforePublication = this.isOutstandingRequestClaimed(params.requestId);
+        updateAgentStateBestEffort(
+            this.session,
+            (currentState) => {
+                const requests = cloneStringKeyedRecordToNullProto<AgentStateRequestEntry>(currentState.requests);
+                const completedRequests = cloneStringKeyedRecordToNullProto<AgentStateCompletedEntry>(currentState.completedRequests);
+                const existingRequest = currentState.requests?.[params.requestId];
+                if (params.replaceCompletedRequest) {
+                    delete completedRequests[params.requestId];
+                }
+                const entry = Object.create(null) as AgentStateRequestEntry & { source?: string; permissionSuggestions?: unknown[] };
+                entry.tool = params.toolName;
+                entry.kind = params.kind ?? resolveAgentRequestKind(params.toolName);
+                entry.arguments = normalizedToolInput;
+                entry.createdAt = params.createdAt;
+                if (typeof params.source === 'string') {
+                    entry.source = params.source;
+                }
+                if (Array.isArray(params.permissionSuggestions) && params.permissionSuggestions.length > 0) {
+                    entry.permissionSuggestions = params.permissionSuggestions;
+                }
+                if (hasPermissionResponseClaimV1(existingRequest)) {
+                    (entry as Record<string, unknown>)[PERMISSION_RESPONSE_CLAIM_V1] = existingRequest[PERMISSION_RESPONSE_CLAIM_V1];
+                }
+                if (isAgentStateRequestCoveredByCompletedRequests({
+                    requestId: params.requestId,
+                    request: entry,
+                    completedRequests,
+                    options: PENDING_REQUEST_COVERAGE_OPTIONS,
+                })) {
+                    return typeof params.updateState === 'function' ? params.updateState(currentState) : currentState;
+                }
+                requests[params.requestId] = entry;
+
+                const nextState: AgentState = {
+                    ...currentState,
+                    requests,
+                    completedRequests,
+                };
+                return typeof params.updateState === 'function' ? params.updateState(nextState) : nextState;
+            },
+            this.logPrefix,
+            'publish_request',
+        );
+
+        if (params.notifyPush !== false && !wasClaimedBeforePublication) {
+            this.notifyPermissionRequestPushBestEffort({
+                permissionId: params.requestId,
+                toolName: params.toolName,
+                toolInput: normalizedToolInput,
+                createdAtMs: params.createdAt,
+            });
+        }
+    }
+
+    completeRequest(params: Readonly<{
+        requestId: string;
+        status: string;
+        decision?: string;
+        reason?: string;
+        mode?: string;
+        allowedTools?: readonly string[] | undefined;
+        updatedPermissions?: unknown;
+        extraCompletedFields?: Readonly<Record<string, unknown>> | null;
+        fallback?: Readonly<{ toolName: string; toolInput: unknown; createdAt: number; kind?: string; source?: string }> | null;
+        updateState?: (state: AgentState) => AgentState;
+    }>): Promise<void> {
+        let completedRequest = false;
+        const completion = updateAgentStateBestEffort(
+            this.session,
+            (currentState) => {
+                const requests = cloneStringKeyedRecordToNullProto(currentState.requests);
+                const existing = requests[params.requestId] as unknown;
+                if (!existing && !params.fallback) {
+                    return currentState;
+                }
+                if (hasPermissionResponseClaimV1(existing)) {
+                    return currentState;
+                }
+                delete requests[params.requestId];
+
+                const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
+                const completedEntry = clonePlainObjectToNullProto(existing) ?? Object.create(null);
+
+                if (!existing && params.fallback) {
+                    completedEntry.tool = params.fallback.toolName;
+                    completedEntry.arguments = params.fallback.toolInput;
+                    completedEntry.createdAt = params.fallback.createdAt;
+                    if (typeof params.fallback.kind === 'string') completedEntry.kind = params.fallback.kind;
+                    if (typeof params.fallback.source === 'string') completedEntry.source = params.fallback.source;
+                }
+
+                if (typeof completedEntry.kind !== 'string') {
+                    const toolName =
+                        typeof completedEntry.tool === 'string'
+                            ? completedEntry.tool
+                            : params.fallback?.toolName;
+                    if (toolName) {
+                        completedEntry.kind = resolveAgentRequestKind(toolName);
+                    }
+                }
+
+                completedEntry.completedAt = Date.now();
+                completedEntry.status = params.status;
+                if (typeof params.decision === 'string') completedEntry.decision = params.decision;
+                if (typeof params.reason === 'string' && params.reason.length > 0) completedEntry.reason = params.reason;
+                if (typeof params.mode === 'string') completedEntry.mode = params.mode;
+                if (Array.isArray(params.allowedTools) && params.allowedTools.length > 0) {
+                    completedEntry.allowedTools = [...params.allowedTools];
+                }
+                if (typeof params.updatedPermissions !== 'undefined') {
+                    completedEntry.updatedPermissions = params.updatedPermissions;
+                }
+                if (params.extraCompletedFields && typeof params.extraCompletedFields === 'object' && !Array.isArray(params.extraCompletedFields)) {
+                    const extra = clonePlainObjectToNullProto(params.extraCompletedFields) ?? Object.create(null);
+                    for (const [key, value] of Object.entries(extra)) {
+                        if (!key) continue;
+                        completedEntry[key] = value;
+                    }
+                }
+
+                completedRequests[params.requestId] = completedEntry as AgentStateCompletedEntry;
+                for (const [id, request] of Object.entries(requests)) {
+                    if (id === params.requestId) continue;
+                    if (!isAgentStateRequestCoveredByCompletedRequests({
+                        requestId: id,
+                        request,
+                        completedRequests: {
+                            [params.requestId]: completedEntry,
+                        },
+                        options: PENDING_REQUEST_COVERAGE_OPTIONS,
+                    })) continue;
+
+                    delete requests[id];
+                    const equivalentCompleted = clonePlainObjectToNullProto(request) ?? Object.create(null);
+                    equivalentCompleted.completedAt = completedEntry.completedAt;
+                    equivalentCompleted.status = completedEntry.status;
+                    if (typeof completedEntry.reason === 'string') equivalentCompleted.reason = completedEntry.reason;
+                    if (typeof completedEntry.decision === 'string') equivalentCompleted.decision = completedEntry.decision;
+                    completedRequests[id] = equivalentCompleted as AgentStateCompletedEntry;
+                    this.markPermissionRequestCompletedBestEffort(id);
+                }
+
+                const nextState: AgentState = {
+                    ...currentState,
+                    requests,
+                    completedRequests,
+                };
+                completedRequest = true;
+                return typeof params.updateState === 'function' ? params.updateState(nextState) : nextState;
+            },
+            this.logPrefix,
+            'complete_request',
+        );
+
+        return completion.then(() => {
+            if (completedRequest) {
+                this.markPermissionRequestCompletedBestEffort(params.requestId);
+            }
+        });
+    }
+
+    recordCompletedRequest(params: Readonly<{
+        requestId: string;
+        toolName: string;
+        toolInput: unknown;
+        status: string;
+        decision?: string;
+        allowedTools?: readonly string[] | undefined;
+        updatedPermissions?: unknown;
+        extraCompletedFields?: Readonly<Record<string, unknown>> | null;
+        createdAt?: number | null;
+        kind?: string;
+        source?: string;
+        reason?: string;
+    }>): void {
+        let recordedCompletion = false;
+        void updateAgentStateBestEffort(
+            this.session,
+            (currentState) => {
+                if (hasPermissionResponseClaimV1(currentState.requests?.[params.requestId])) {
+                    return currentState;
+                }
+                const completedRequests = cloneStringKeyedRecordToNullProto<AgentStateCompletedEntry>(currentState.completedRequests);
+                const entry = Object.create(null) as AgentStateCompletedEntry & { source?: string; reason?: string };
+                entry.tool = params.toolName;
+                entry.kind = params.kind ?? resolveAgentRequestKind(params.toolName);
+                entry.arguments = params.toolInput;
+                entry.createdAt = typeof params.createdAt === 'number' ? params.createdAt : Date.now();
+                entry.completedAt = Date.now();
+                entry.status = params.status as AgentStateCompletedEntry['status'];
+                if (typeof params.decision === 'string') entry.decision = params.decision as AgentStateCompletedEntry['decision'];
+                if (typeof params.source === 'string') entry.source = params.source;
+                if (typeof params.reason === 'string' && params.reason.length > 0) entry.reason = params.reason;
+                if (Array.isArray(params.allowedTools) && params.allowedTools.length > 0) {
+                    entry.allowedTools = [...params.allowedTools];
+                }
+                if (typeof params.updatedPermissions !== 'undefined') {
+                    entry.updatedPermissions = params.updatedPermissions;
+                }
+                if (params.extraCompletedFields && typeof params.extraCompletedFields === 'object' && !Array.isArray(params.extraCompletedFields)) {
+                    const extra = clonePlainObjectToNullProto(params.extraCompletedFields) ?? Object.create(null);
+                    const mutableEntry = entry as Record<string, unknown>;
+                    for (const [key, value] of Object.entries(extra)) {
+                        if (!key) continue;
+                        mutableEntry[key] = value;
+                    }
+                }
+                completedRequests[params.requestId] = entry;
+                recordedCompletion = true;
+                return { ...currentState, completedRequests } satisfies AgentState;
+            },
+            this.logPrefix,
+            'record_completed_request',
+        ).then(() => {
+            if (recordedCompletion) {
+                this.markPermissionRequestCompletedBestEffort(params.requestId);
+            }
+        });
+    }
+
+    cancelAllRequests(params: Readonly<{ reason: string; decision?: string }>): void {
+        updateAgentStateBestEffort(
+            this.session,
+            (currentState) => {
+                const pendingRequests = cloneStringKeyedRecordToNullProto(currentState.requests);
+                const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
+                const now = Date.now();
+
+                for (const [id, request] of Object.entries(pendingRequests)) {
+                    if (hasPermissionResponseClaimV1(request)) continue;
+                    const entry = clonePlainObjectToNullProto(request) ?? Object.create(null);
+                    entry.completedAt = now;
+                    entry.status = 'canceled';
+                    entry.reason = params.reason;
+                    if (typeof params.decision === 'string' && params.decision.length > 0) {
+                        entry.decision = params.decision;
+                    }
+                    completedRequests[id] = entry as AgentStateCompletedEntry;
+                    delete pendingRequests[id];
+                    this.markPermissionRequestCompletedBestEffort(id);
+                }
+
+                return {
+                    ...currentState,
+                    requests: pendingRequests,
+                    completedRequests,
+                };
+            },
+            this.logPrefix,
+            'cancel_all_requests',
+        );
+    }
+
+    dispose(): void {
+        this.permissionRequestPushNotifier?.dispose();
+        this.permissionRequestPushNotifier = null;
+    }
+
+    notifyPermissionRequestPushBestEffort(params: Readonly<{
+        permissionId: string;
+        toolName: string;
+        toolInput: unknown;
+        createdAtMs?: number;
+    }>): void {
+        const notifier = this.getOrCreatePermissionRequestPushNotifier();
+        if (!notifier) return;
+
+        try {
+            const snapshot = this.session.getAgentStateSnapshot?.() ?? null;
+            const existing = snapshot?.requests?.[params.permissionId];
+            const notifiedAt = typeof existing?.pushNotifiedAt === 'number' ? existing.pushNotifiedAt : null;
+            if (typeof notifiedAt === 'number' && Number.isFinite(notifiedAt) && notifiedAt > 0) {
+                notifier.markAlreadyNotified(params.permissionId);
+                return;
+            }
+        } catch {
+            // ignore
+        }
+
+        notifier.notify({
+            permissionId: params.permissionId,
+            toolName: params.toolName,
+            toolInput: params.toolInput,
+            requestKind: resolveAgentRequestKind(params.toolName),
+            ...(typeof params.createdAtMs === 'number' ? { createdAtMs: params.createdAtMs } : {}),
+        });
+    }
+
+    markPermissionRequestCompletedBestEffort(permissionId: string): void {
+        try {
+            this.permissionRequestPushNotifier?.markCompleted(permissionId);
+        } catch {
+            // ignore
+        }
+    }
+
+    private getOrCreatePermissionRequestPushNotifier(): PermissionRequestPushNotifier | null {
+        if (!this.pushSender) return null;
+        if (this.permissionRequestPushNotifier) return this.permissionRequestPushNotifier;
+
+        this.permissionRequestPushNotifier = new PermissionRequestPushNotifier({
+            pushSender: this.pushSender,
+            getSettings: () => this.getAccountSettings(),
+            getSettingsSecretsReadKeys: () => this.getAccountSettingsSecretsReadKeys(),
+            getSessionTitle: () => getSessionNotificationTitle(this.session.getMetadataSnapshot?.bind(this.session)) ?? this.session.sessionId,
+            getAgentDisplayName: () => getSessionNotificationAgentDisplayName(this.session.getMetadataSnapshot?.bind(this.session)),
+            sessionId: this.session.sessionId,
+            logPrefix: this.logPrefix,
+            onNotifiedAt: (permissionId, notifiedAtMs) => {
+                updateAgentStateBestEffort(
+                    this.session,
+                    (currentState) => applyAgentStateRequestPushNotifiedAt({ state: currentState, permissionId, notifiedAtMs }),
+                    this.logPrefix,
+                    'permission_request_push_notified_at',
+                );
+            },
+        });
+
+        return this.permissionRequestPushNotifier;
+    }
+}

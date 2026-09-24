@@ -1,0 +1,201 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act } from 'react-test-renderer';
+
+import { renderHook } from '@/dev/testkit';
+import { buildServerFeaturesResponse, stubServerFeaturesFetch, stubServerFeaturesFetchFailure } from './serverFeaturesTestUtils';
+import { renderHookAndCollectValues } from './serverFeatureHookHarness.testHelpers';
+import { resetServerFeaturesClientForTests, getServerFeaturesSnapshot } from '@/sync/api/capabilities/serverFeaturesClient';
+import { upsertServerProfile, setActiveServerId } from '@/sync/domains/server/serverProfiles';
+import { getStorage } from '@/sync/domains/state/storage';
+import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
+import type { FeatureDecisionScopeParams } from './useFeatureDecision';
+
+const initialStorageState = getStorage().getState();
+
+beforeEach(() => {
+    resetServerFeaturesClientForTests();
+    getStorage().setState(initialStorageState, true);
+});
+
+afterEach(() => {
+    vi.unstubAllGlobals();
+});
+
+describe('useFeatureDecision', () => {
+    it('fails closed for main selection when servers disagree (mixed scope support)', async () => {
+        const serverA = upsertServerProfile({ serverUrl: 'https://a.example', name: 'A', source: 'manual' });
+        const serverB = upsertServerProfile({ serverUrl: 'https://b.example', name: 'B', source: 'manual' });
+        setActiveServerId(serverA.id, { scope: 'device' });
+
+        getStorage().getState().applySettingsLocal({
+            experiments: true,
+            featureToggles: { automations: true },
+            serverSelectionGroups: [
+                {
+                    id: 'grp-main',
+                    name: 'Main',
+                    serverIds: [serverA.id, serverB.id],
+                    presentation: 'grouped',
+                },
+            ],
+            serverSelectionActiveTargetKind: 'group',
+            serverSelectionActiveTargetId: 'grp-main',
+        });
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: any) => {
+                const href = String(url ?? '');
+                if (href.includes('a.example')) {
+                    return { ok: true, json: async () => buildServerFeaturesResponse({ automationsEnabled: true }) };
+                }
+                if (href.includes('b.example')) {
+                    return { ok: true, json: async () => buildServerFeaturesResponse({ automationsEnabled: false }) };
+                }
+                return { ok: true, json: async () => buildServerFeaturesResponse({ automationsEnabled: true }) };
+            }) as any,
+        );
+
+        await getServerFeaturesSnapshot({ serverId: serverA.id, force: true });
+        await getServerFeaturesSnapshot({ serverId: serverB.id, force: true });
+
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+        const seen = await renderHookAndCollectValues(() => useFeatureDecision('automations'));
+
+        expect(seen.at(-1)?.state).toBe('unsupported');
+        expect(seen.at(-1)?.blockedBy).toBe('scope');
+        expect(seen.at(-1)?.blockerCode).toBe('mixed_scope_support');
+        expect(seen.at(-1)?.scope.scopeKind).toBe('main_selection');
+    }, 30_000);
+
+    it('returns enabled decision when the feature is available', async () => {
+        stubServerFeaturesFetch({ voiceEnabled: true });
+
+        getStorage().getState().applySettingsLocal({ experiments: true, featureToggles: { voice: true } });
+
+        await getServerFeaturesSnapshot({ serverId: getActiveServerSnapshot().serverId, force: true });
+
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+        const seen = await renderHookAndCollectValues(() => useFeatureDecision('voice'));
+
+        expect(seen.at(-1)?.state).toBe('enabled');
+        expect(seen.at(-1)?.blockedBy).toBeNull();
+    }, 30_000);
+
+    it('uses the runtime feature snapshot for spawn scope before a target server is selected', async () => {
+        stubServerFeaturesFetch({ connectedServicesEnabled: true });
+
+        getStorage().getState().applySettingsLocal({
+            experiments: true,
+            featureToggles: { connectedServices: true },
+        });
+
+        await getServerFeaturesSnapshot({ force: true });
+
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+        const seen = await renderHookAndCollectValues(() =>
+            useFeatureDecision('connectedServices', { scopeKind: 'spawn', serverId: null })
+        );
+
+        expect(seen.at(-1)?.state).toBe('enabled');
+        expect(seen.at(-1)?.scope.scopeKind).toBe('spawn');
+    }, 30_000);
+
+    it('does not rerender local-only decisions for unrelated settings writes', async () => {
+        getStorage().getState().applySettingsLocal({
+            experiments: true,
+            featureToggles: { 'zen.navigation': true },
+            showLineNumbers: false,
+        });
+
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+        let renders = 0;
+        const hook = await renderHook(() => {
+            renders += 1;
+            return useFeatureDecision('zen.navigation');
+        });
+
+        expect(hook.getCurrent()?.state).toBe('enabled');
+        const rendersBeforeUnrelatedSettingsWrite = renders;
+
+        await act(async () => {
+            getStorage().getState().applySettingsLocal({ showLineNumbers: true });
+        });
+
+        expect(renders).toBe(rendersBeforeUnrelatedSettingsWrite);
+        await hook.unmount();
+    });
+
+    it('keeps hook order stable when the scope changes between renders', async () => {
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+
+        getStorage().getState().applySettingsLocal({
+            experiments: true,
+            featureToggles: { 'execution.runs': true },
+        });
+
+        const initialProps: Readonly<{ scope?: FeatureDecisionScopeParams }> = { scope: undefined };
+
+        const hook = await renderHook(
+            ({ scope }: Readonly<{ scope?: FeatureDecisionScopeParams }>) => useFeatureDecision('execution.runs', scope),
+            {
+                // Start at the default (main selection) scope, then change scopes across rerenders.
+                // This would have crashed with the audit-reported conditional-hook implementation.
+                initialProps,
+            },
+        );
+
+        expect(hook.getCurrent()?.state).toBe('enabled');
+
+        await expect(hook.rerender({ scope: { scopeKind: 'runtime' } })).resolves.toMatchObject({
+            state: 'enabled',
+        });
+
+        await expect(hook.rerender({ scope: { scopeKind: 'spawn', serverId: 'test-spawn-server' } })).resolves.toMatchObject({
+            state: 'enabled',
+        });
+
+        await expect(hook.rerender({ scope: { scopeKind: 'main_selection' } })).resolves.toMatchObject({
+            state: 'enabled',
+        });
+
+        await expect(hook.rerender({ scope: { scopeKind: 'runtime' } })).resolves.toMatchObject({
+            state: 'enabled',
+        });
+    });
+
+    it('returns unsupported when the features endpoint is missing', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => ({
+                ok: false,
+                status: 404,
+                json: async () => ({}),
+            })) as any,
+        );
+
+        getStorage().getState().applySettingsLocal({ experiments: true, featureToggles: { voice: true } });
+
+        await getServerFeaturesSnapshot({ serverId: getActiveServerSnapshot().serverId, force: true });
+
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+        const seen = await renderHookAndCollectValues(() => useFeatureDecision('voice'));
+
+        expect(seen.at(-1)?.state).toBe('unsupported');
+        expect(seen.at(-1)?.blockerCode).toBe('endpoint_missing');
+    }, 30_000);
+
+    it('returns unknown when probing features fails', async () => {
+        stubServerFeaturesFetchFailure();
+
+        getStorage().getState().applySettingsLocal({ experiments: true, featureToggles: { voice: true } });
+
+        await getServerFeaturesSnapshot({ serverId: getActiveServerSnapshot().serverId, force: true });
+
+        const { useFeatureDecision } = await import('./useFeatureDecision');
+        const seen = await renderHookAndCollectValues(() => useFeatureDecision('voice'));
+
+        expect(seen.at(-1)?.state).toBe('unknown');
+        expect(seen.at(-1)?.blockerCode).toBe('probe_failed');
+    }, 30_000);
+});

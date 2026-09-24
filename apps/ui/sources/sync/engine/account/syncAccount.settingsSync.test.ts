@@ -1,0 +1,185 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+
+import { profileDefaults } from '@/sync/domains/profiles/profile';
+import { createAccountSettingsScope } from '@/sync/domains/settings/scope/accountSettingsScope';
+import { sealAccountScopedBlobCiphertext } from '@happier-dev/protocol';
+
+vi.mock('expo-constants', () => ({
+    default: {},
+}));
+
+vi.mock('expo-notifications', () => ({
+    getPermissionsAsync: vi.fn(),
+    requestPermissionsAsync: vi.fn(),
+    getExpoPushTokenAsync: vi.fn(),
+}));
+
+vi.mock('@/sync/encryption/secretSettings', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/encryption/secretSettings')>();
+    return {
+        ...actual,
+        deriveSettingsSecretsKey: async () => new Uint8Array(32).fill(9),
+        sealSecretsDeep: (value: unknown) => value,
+    };
+});
+
+const settingsState: { current: Record<string, unknown> } = {
+    current: {
+        lastUsedAgent: 'codex',
+        serverSelectionGroups: [
+            { id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' },
+        ],
+        serverSelectionActiveTargetKind: 'group',
+        serverSelectionActiveTargetId: 'grp-dev',
+    },
+};
+
+describe('handleUpdateAccountSocketUpdate settings merge', () => {
+    beforeEach(() => {
+        settingsState.current = {
+            lastUsedAgent: 'codex',
+            serverSelectionGroups: [
+                { id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' },
+            ],
+            serverSelectionActiveTargetKind: 'group',
+            serverSelectionActiveTargetId: 'grp-dev',
+        };
+    });
+
+    it('preserves local server-selection keys when applying account socket settings updates', async () => {
+        const { handleUpdateAccountSocketUpdate } = await import('./syncAccount');
+
+        const applyProfile = vi.fn();
+        const applySettings = vi.fn();
+        const machineKey = new Uint8Array(32).fill(7);
+        const ciphertext = sealAccountScopedBlobCiphertext({
+            kind: 'account_settings',
+            material: { type: 'dataKey', machineKey },
+            payload: { analyticsOptOut: true },
+            randomBytes: () => new Uint8Array(24).fill(1),
+        });
+        const encryption = {
+            getContentPrivateKey: () => machineKey,
+            decryptRaw: vi.fn().mockResolvedValue({
+                analyticsOptOut: true,
+            }),
+        } as any;
+
+        await handleUpdateAccountSocketUpdate({
+            accountUpdate: {
+                settings: {
+                    value: ciphertext,
+                    version: 7,
+                },
+            },
+            updateCreatedAt: 123,
+            currentProfile: { ...profileDefaults },
+            encryption,
+            applyProfile,
+            applySettings,
+            getLocalSettings: () => settingsState.current,
+            log: { log: vi.fn() },
+        });
+
+        expect(encryption.decryptRaw).not.toHaveBeenCalled();
+        expect(applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: true,
+                lastUsedAgent: 'codex',
+                serverSelectionGroups: [
+                    { id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' },
+                ],
+                serverSelectionActiveTargetKind: 'group',
+                serverSelectionActiveTargetId: 'grp-dev',
+            }),
+            7,
+        );
+    });
+
+    it('applies account socket settings updates through the captured settings scope when provided', async () => {
+        const { handleUpdateAccountSocketUpdate } = await import('./syncAccount');
+
+        const settingsScope = createAccountSettingsScope('server-a', 'account-a');
+        expect(settingsScope).not.toBeNull();
+        const applyProfile = vi.fn();
+        const applySettings = vi.fn();
+        const applySettingsForScope = vi.fn();
+        const machineKey = new Uint8Array(32).fill(7);
+        const encryption = {
+            getContentPrivateKey: () => machineKey,
+            decryptRaw: vi.fn(),
+        } as any;
+
+        await handleUpdateAccountSocketUpdate({
+            accountUpdate: {
+                settingsV2: {
+                    content: { t: 'plain', v: { analyticsOptOut: true } },
+                    version: 3,
+                },
+            },
+            updateCreatedAt: 123,
+            currentProfile: { ...profileDefaults },
+            encryption,
+            settingsScope,
+            applyProfile,
+            applySettings,
+            applySettingsForScope,
+            getLocalSettings: () => settingsState.current,
+            log: { log: vi.fn() },
+        });
+
+        expect(applySettings).not.toHaveBeenCalled();
+        expect(applySettingsForScope).toHaveBeenCalledWith(
+            settingsScope,
+            expect.objectContaining({
+                analyticsOptOut: true,
+                lastUsedAgent: 'codex',
+                serverSelectionGroups: [
+                    { id: 'grp-dev', name: 'Dev', serverIds: ['server-a', 'server-b'], presentation: 'grouped' },
+                ],
+            }),
+            3,
+        );
+    });
+
+    it('overlays pending server-backed settings when applying socket settings updates', async () => {
+        const { handleUpdateAccountSocketUpdate } = await import('./syncAccount');
+
+        const applyProfile = vi.fn();
+        const applySettings = vi.fn();
+        const machineKey = new Uint8Array(32).fill(7);
+        const encryption = {
+            getContentPrivateKey: () => machineKey,
+            decryptRaw: vi.fn(),
+        } as any;
+
+        await handleUpdateAccountSocketUpdate({
+            accountUpdate: {
+                settingsV2: {
+                    content: { t: 'plain', v: { analyticsOptOut: false, sessionListDensity: 'cozy' } },
+                    version: 4,
+                },
+            },
+            updateCreatedAt: 123,
+            currentProfile: { ...profileDefaults },
+            encryption,
+            applyProfile,
+            applySettings,
+            getLocalSettings: () => settingsState.current,
+            getPendingSettings: () => ({
+                analyticsOptOut: true,
+                sessionListDensity: 'detailed',
+            }),
+            log: { log: vi.fn() },
+        });
+
+        expect(applySettings).toHaveBeenCalledWith(
+            expect.objectContaining({
+                analyticsOptOut: true,
+                sessionListDensity: 'detailed',
+                serverSelectionActiveTargetKind: 'group',
+            }),
+            4,
+        );
+    });
+});

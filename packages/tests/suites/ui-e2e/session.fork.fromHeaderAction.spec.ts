@@ -1,0 +1,149 @@
+import { test, expect, type Page } from '@playwright/test';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import {
+  createSessionFromNewSessionComposer,
+  reloadCreatedSessionFromNewSessionComposer,
+} from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
+import { selectSessionForkStrategy } from '../../src/testkit/uiE2e/selectSessionForkStrategy';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
+import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
+import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
+import { ensureSessionReplayForkEnabled } from '../../src/testkit/uiE2e/ensureSessionReplayForkEnabled';
+import { waitForDaemonMachineIdFromCliSettings } from '../../src/testkit/uiE2e/daemonMachineId';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+function parseSessionIdFromUrl(url: string): string {
+  const pathname = new URL(url).pathname;
+  const parts = pathname.split('/').filter(Boolean);
+  const sessionId = parts[0] === 'session' ? parts[1] : null;
+  if (!sessionId) {
+    throw new Error(`failed to parse session id from url: ${url}`);
+  }
+  return sessionId;
+}
+
+test.describe('ui e2e: session fork from header action menu', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('session-fork-from-header-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+  let daemon: StartedDaemon | null = null;
+
+  test.beforeAll(async () => {
+    test.setTimeout(resolveUiWebBeforeAllTimeoutMs(process.env));
+    await mkdir(cliHomeDir, { recursive: true });
+    await writeFile(resolve(join(cliHomeDir, 'AGENTS.md')), '# UI e2e fixture\n', 'utf8');
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
+      },
+    });
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...process.env,
+        EXPO_PUBLIC_DEBUG: '1',
+        EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
+        EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
+      },
+    });
+
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(120_000);
+    await daemon?.stop().catch(() => {});
+    await ui?.stop().catch(() => {});
+    await server?.stop().catch(() => {});
+  });
+
+  test('forks conversation and navigates to the child session', async ({ page }) => {
+    test.setTimeout(540_000);
+    if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await gotoDomContentLoadedWithRetries(page, uiBaseUrl);
+
+    await ensureAccountReadyForConnect({ page, timeoutMs: 120_000 });
+
+    const testDir = resolve(join(suiteDir, 't1-fork-header'));
+    await mkdir(testDir, { recursive: true });
+    const fakeClaudeLogPath = resolve(join(testDir, 'fake-claude.jsonl'));
+    const fakeClaudePath = fakeClaudeFixturePath();
+
+    daemon = await authenticateAndStartDaemon({
+      page,
+      testDir,
+      cliHomeDir,
+      serverUrl: server.baseUrl,
+      uiBaseUrl,
+      extraEnv: {
+        ...process.env,
+        HOME: cliHomeDir,
+        HAPPIER_CLAUDE_PATH: fakeClaudePath,
+        HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+        HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+        HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+        HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'transcript-activity-feed',
+      },
+    });
+
+    const machineId = await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
+    const parentPrompt = `fork-header-parent-1 ${run.runId}`;
+    const parentSession = await createSessionFromNewSessionComposer({
+      page,
+      uiBaseUrl,
+      machineId,
+      prompt: parentPrompt,
+    });
+    const { sessionId: parentSessionId } = parentSession;
+
+    // This scenario emits enough activity rows to virtualize the original prompt out of the DOM.
+    // Wait on the terminal turn marker before reloading instead of treating prompt visibility as
+    // persistence evidence.
+    await expect(page.getByText(/FAKE_TRANSCRIPT_ACTIVITY_FEED_DONE_1/)).toHaveCount(1, { timeout: 180_000 });
+    await ensureSessionReplayForkEnabled({ page, uiBaseUrl });
+    await reloadCreatedSessionFromNewSessionComposer({ page, session: parentSession });
+    await expect(page.getByText(/FAKE_TRANSCRIPT_ACTIVITY_FEED_DONE_1/)).toHaveCount(1, { timeout: 180_000 });
+
+    await page.getByLabel('Open session actions').click();
+    await expect(page.getByRole('button', { name: /Fork session/i })).toHaveCount(1, { timeout: 60_000 });
+    await page.getByRole('button', { name: /Fork session/i }).click();
+    await selectSessionForkStrategy(page, 'replay');
+
+    // Expect to navigate to a different /session/<id>
+    const start = Date.now();
+    let childSessionId: string | null = null;
+    while (Date.now() - start < 120_000) {
+      const url = page.url();
+      if (url.includes(`/session/`) && !url.includes(`/session/${parentSessionId}`)) {
+        childSessionId = parseSessionIdFromUrl(url);
+        if (childSessionId && childSessionId !== parentSessionId) break;
+      }
+      await page.waitForTimeout(250);
+    }
+
+    if (!childSessionId) throw new Error(`Timed out waiting for fork navigation (url=${page.url()})`);
+
+    const transcript = page.getByTestId('transcript-chat-list');
+    await expect(transcript.locator(`[data-testid=\"transcript-fork-divider:${parentSessionId}:${childSessionId}\"]`)).toHaveCount(1, { timeout: 120_000 });
+  });
+});

@@ -1,0 +1,64 @@
+import * as React from 'react';
+import { Pressable } from 'react-native';
+import { useUnistyles } from 'react-native-unistyles';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+
+import { t } from '@/text';
+import { useWorkspaceFileTransfers } from '@/hooks/session/files/useWorkspaceFileTransfers';
+import { Icon } from '@/components/ui/icons/Icon';
+
+export const FileDownloadButton = React.memo((props: Readonly<{
+    sessionId: string;
+    path: string;
+    asZip?: boolean;
+    testID?: string;
+}>) => {
+    const { theme } = useUnistyles();
+
+    const transfers = useWorkspaceFileTransfers({
+        sessionId: props.sessionId,
+    });
+
+    const busy = transfers.downloadState.status === 'downloading';
+    const disabled = busy;
+
+    return (
+        <Pressable
+            testID={props.testID}
+            accessibilityRole="button"
+            accessibilityLabel={t('files.repositoryTree.actions.download')}
+            disabled={disabled}
+            onPress={(event) => {
+                event?.stopPropagation?.();
+                void (async () => {
+                    const res = await transfers.startDownload({ path: props.path, asZip: props.asZip === true });
+                    if (!res.ok) {
+                        try {
+                            const { Modal } = await import('@/modal');
+                            Modal.alert(t('common.error'), res.error);
+                        } catch {
+                            // Best-effort only.
+                        }
+                    }
+                })();
+            }}
+            style={({ pressed }) => ({
+                width: 28,
+                height: 28,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: theme.colors.border.default,
+                backgroundColor: theme.colors.surface.base,
+                alignItems: 'center',
+                justifyContent: 'center',
+                opacity: disabled ? 0.55 : pressed ? 0.78 : 1,
+            })}
+        >
+            {busy ? (
+                <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+            ) : (
+                <Icon name="download" size={14} color={theme.colors.text.secondary} />
+            )}
+        </Pressable>
+    );
+});

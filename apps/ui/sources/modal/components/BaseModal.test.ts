@@ -1,0 +1,469 @@
+import React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import { act } from 'react-test-renderer';
+import { useModalPortalTarget } from '@/modal/portal/ModalPortalTarget';
+import { renderScreen } from '@/dev/testkit';
+import { installModalComponentCommonModuleMocks } from './modalComponentTestHelpers';
+
+const reactActEnvironment = globalThis as typeof globalThis & {
+    IS_REACT_ACT_ENVIRONMENT?: boolean;
+};
+
+reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+
+const localSettingState = vi.hoisted(() => ({
+    uiBackdropBlurEnabled: true,
+}));
+
+const nativeEnvironmentState = vi.hoisted(() => ({
+    keyboard: { isVisible: false, height: 0 },
+    safeArea: { top: 0, right: 0, bottom: 0, left: 0 },
+}));
+
+vi.mock('@/sync/domains/state/storage', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/domains/state/storage')>();
+    return {
+        ...actual,
+        useLocalSetting: ((name: string) => {
+            if (name === 'uiBackdropBlurEnabled') {
+                return localSettingState.uiBackdropBlurEnabled;
+            }
+            return null;
+        }) as typeof import('@/sync/domains/state/storage')['useLocalSetting'],
+    };
+});
+
+function createRadixHostComponent(tagName: string) {
+    return (props: Record<string, unknown>) => {
+        const { children, ...rest } = props as Record<string, unknown> & { children?: React.ReactNode };
+        return React.createElement(tagName, rest, children);
+    };
+}
+
+vi.mock('@/utils/web/radixCjs', () => {
+    return {
+        requireRadixDialog: () => ({
+            Root: createRadixHostComponent('DialogRoot'),
+            Portal: createRadixHostComponent('DialogPortal'),
+            Overlay: createRadixHostComponent('DialogOverlay'),
+            Content: createRadixHostComponent('DialogContent'),
+            Title: createRadixHostComponent('DialogTitle'),
+        }),
+        requireRadixDismissableLayer: () => ({
+            Branch: createRadixHostComponent('DismissableLayerBranch'),
+            DismissableLayerBranch: createRadixHostComponent('DismissableLayerBranch'),
+        }),
+    };
+});
+
+vi.mock('@/components/ui/keyboardAvoidance', () => ({
+    KeyboardAwareModalFrame: (props: Record<string, unknown> & { children?: React.ReactNode }) =>
+        React.createElement('KeyboardAwareModalFrame', props, props.children),
+}));
+
+vi.mock('react-native-safe-area-context', async () => {
+    const { createSafeAreaContextMock } = await import('@/dev/testkit/mocks/nativeEnvironment');
+    return createSafeAreaContextMock(nativeEnvironmentState);
+});
+
+installModalComponentCommonModuleMocks({
+    text: async () => {
+        const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+        return createTextModuleMock({ translate: (key: string) => key });
+    },
+});
+
+async function renderBaseModalScreen(
+    BaseModal: React.ComponentType<any>,
+    props: Record<string, unknown> = {},
+    options?: Parameters<typeof renderScreen>[1],
+) {
+    return renderScreen(React.createElement(BaseModal, { visible: true, children: React.createElement('Child'), ...props }), options);
+}
+
+describe('BaseModal (web)', () => {
+    it('renders using Radix Dialog instead of react-native Modal', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        expect(screen.findAllByType('DialogRoot' as any).length).toBe(1);
+        expect(screen.findAllByType('RNModal' as any).length).toBe(0);
+    });
+
+    it('wraps the dialog content in a DismissableLayer Branch (so underlying Vaul/Radix layers don’t dismiss)', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        expect(screen.findAllByType('DismissableLayerBranch' as any).length).toBe(1);
+    });
+
+    it('renders a DialogTitle for accessibility', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        expect(screen.findAllByType('DialogTitle' as any).length).toBe(1);
+    });
+
+    it('suppresses Radix close autofocus so the shared focus-return policy remains authoritative', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+        const content = screen.findAllByType('DialogContent' as any)[0];
+        const preventDefault = vi.fn();
+
+        content?.props.onCloseAutoFocus({ preventDefault });
+
+        expect(preventDefault).toHaveBeenCalledTimes(1);
+    });
+
+    it('omits the overlay when showBackdrop is false', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal, { showBackdrop: false });
+
+        expect(screen.findAllByType('DialogOverlay' as any).length).toBe(0);
+    });
+
+    it('uses the themed blurred modal backdrop on web', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        const overlay = screen.findAllByType('DialogOverlay' as any)?.[0];
+        expect(overlay?.props.style).toMatchObject({
+            WebkitBackdropFilter: 'blur(2px)',
+            backdropFilter: 'blur(2px)',
+            backgroundColor: 'rgba(255, 255, 255, 0.52)',
+        });
+        expect(overlay?.props.style.opacity).toBeUndefined();
+        expect(overlay?.props.style.transition).not.toContain('opacity');
+    });
+
+    it('omits backdrop blur styles when blur is disabled in local appearance settings', async () => {
+        localSettingState.uiBackdropBlurEnabled = false;
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        const overlay = screen.findAllByType('DialogOverlay' as any)?.[0];
+        expect(overlay?.props.style.backgroundColor).toBe('rgba(255, 255, 255, 0.68)');
+        expect(overlay?.props.style.backdropFilter).toBeUndefined();
+        expect(overlay?.props.style.WebkitBackdropFilter).toBeUndefined();
+        expect(String(overlay?.props.style.transition ?? '')).not.toContain('backdrop-filter');
+        expect(String(overlay?.props.style.transition ?? '')).not.toContain('-webkit-backdrop-filter');
+
+        localSettingState.uiBackdropBlurEnabled = true;
+    });
+
+    it('keeps the web modal mounted until the shared exit animation finishes', async () => {
+        vi.useFakeTimers();
+        const { BaseModal } = await import('./BaseModal');
+        const { motionTokens } = await import('@/components/ui/motion/motionTokens');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        expect(screen.findAllByType('DialogRoot' as any).length).toBe(1);
+
+        await act(async () => {
+            screen.tree.update(React.createElement(BaseModal, {
+                visible: false,
+                children: React.createElement('Child'),
+            }));
+        });
+
+        expect(screen.findAllByType('DialogRoot' as any).length).toBe(1);
+
+        await act(async () => {
+            vi.advanceTimersByTime(motionTokens.overlay.modal.exitMs - 1);
+        });
+        expect(screen.findAllByType('DialogRoot' as any).length).toBe(1);
+
+        await act(async () => {
+            vi.advanceTimersByTime(1);
+        });
+        expect(screen.findAllByType('DialogRoot' as any).length).toBe(0);
+        vi.useRealTimers();
+    });
+
+    it('prevents outside dismissal when closeOnBackdrop is false', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const screen = await renderBaseModalScreen(BaseModal, { closeOnBackdrop: false, onClose: () => {} });
+
+        const content = screen.findAllByType('DialogContent' as any)?.[0];
+        expect(content?.props.onPointerDownOutside).toBeTypeOf('function');
+
+        const preventDefault = vi.fn();
+        content?.props.onPointerDownOutside({ preventDefault });
+        expect(preventDefault).toHaveBeenCalled();
+    });
+
+    it('dismisses when clicking the backdrop area (pointer down on the content container itself)', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const onClose = vi.fn();
+        const screen = await renderBaseModalScreen(BaseModal, { onClose });
+
+        const content = screen.findAllByType('DialogContent' as any)?.[0];
+        expect(content?.props.onClick).toBeTypeOf('function');
+
+        const target = {};
+        content?.props.onClick({ target, currentTarget: target, preventDefault: () => {}, stopPropagation: () => {} });
+
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not dismiss when clicking inside the modal content', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const onClose = vi.fn();
+        const screen = await renderBaseModalScreen(BaseModal, { onClose });
+
+        const content = screen.findAllByType('DialogContent' as any)?.[0];
+        expect(content?.props.onClick).toBeTypeOf('function');
+
+        const currentTarget = {};
+        const innerTarget = {
+            closest: vi.fn().mockReturnValue({}),
+        };
+        content?.props.onClick({ target: innerTarget, currentTarget, preventDefault: () => {}, stopPropagation: () => {} });
+
+        expect(innerTarget.closest).toHaveBeenCalledWith('[data-happy-modal-card-boundary]');
+        expect(onClose).toHaveBeenCalledTimes(0);
+    });
+
+    it('does not rely on pointerEvents=\"box-none\" on the centering container on web', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        const container = screen.findByType('KeyboardAwareModalFrame' as any);
+        expect(container.props.pointerEvents).toBe('auto');
+        expect(screen.findAllByType('KeyboardAvoidingView' as any)).toHaveLength(0);
+    });
+
+    it('does not rely on pointerEvents=\"box-none\" on the wrapper around modal children on web', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        const child = screen.findByType('Child' as any);
+        const wrapper = (child as any)?.parent;
+
+        expect(wrapper?.type).toBe('div');
+        expect(wrapper?.props['data-happy-modal-card-boundary']).toBe('');
+    });
+
+    it('dismisses when clicking the centering shell outside the modal card', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const onClose = vi.fn();
+        const screen = await renderBaseModalScreen(BaseModal, { onClose });
+
+        const content = screen.findAllByType('DialogContent' as any)?.[0];
+        expect(content?.props.onClick).toBeTypeOf('function');
+
+        const outsideTarget = {
+            closest: vi.fn().mockReturnValue(null),
+        };
+
+        content?.props.onClick({
+            target: outsideTarget,
+            currentTarget: {},
+            preventDefault: () => {},
+            stopPropagation: () => {},
+        });
+
+        expect(outsideTarget.closest).toHaveBeenCalledWith('[data-happy-modal-card-boundary]');
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('forces document.body pointer events back to auto while a web modal is visible and restores them on unmount', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const originalDocument = (globalThis as any).document;
+        const originalMutationObserver = (globalThis as any).MutationObserver;
+        const bodyStyle = { pointerEvents: 'none' };
+        type ObserverCallback = (records: unknown[], observer: unknown) => void;
+        let observerCallback: ObserverCallback | null = null;
+
+        class FakeMutationObserver {
+            constructor(callback: ObserverCallback) {
+                observerCallback = callback;
+            }
+
+            observe() {}
+
+            disconnect() {}
+        }
+
+        (globalThis as any).document = {
+            body: {
+                style: bodyStyle,
+            },
+        };
+        (globalThis as any).MutationObserver = FakeMutationObserver;
+
+        try {
+            const screen = await renderBaseModalScreen(BaseModal);
+
+            expect(bodyStyle.pointerEvents).toBe('auto');
+
+            bodyStyle.pointerEvents = 'none';
+            if (observerCallback == null) {
+                throw new Error('expected MutationObserver callback');
+            }
+            (observerCallback as (records: unknown[], observer: unknown) => void)([], {});
+            expect(bodyStyle.pointerEvents).toBe('auto');
+
+            await screen.unmount();
+
+            expect(bodyStyle.pointerEvents).toBe('none');
+        } finally {
+            (globalThis as any).document = originalDocument;
+            (globalThis as any).MutationObserver = originalMutationObserver;
+        }
+    });
+
+    it('applies zIndexBase to the overlay and content so stacked modals layer correctly', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const screen = await renderBaseModalScreen(BaseModal, { zIndexBase: 1234 });
+
+        const overlay = screen.findAllByType('DialogOverlay' as any)?.[0];
+        const content = screen.findAllByType('DialogContent' as any)?.[0];
+
+        expect(overlay?.props.style?.zIndex).toBe(1234);
+        expect(content?.props.style?.zIndex).toBe(1235);
+    });
+
+    it('provides a modal portal target to descendants (so popovers can portal inside the dialog subtree)', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const originalDocument = (globalThis as any).document;
+        const portalHostMock = {
+            nodeType: 1,
+            appendChild: vi.fn(),
+            removeChild: vi.fn(),
+        } as any;
+        const portalTargetMock = { nodeType: 1, style: {}, setAttribute: vi.fn() } as any;
+        let observedTarget: any = undefined;
+
+        function Probe() {
+            observedTarget = useModalPortalTarget();
+            return React.createElement('Probe');
+        }
+
+        (globalThis as any).document = {
+            ...(originalDocument ?? {}),
+            createElement: vi.fn(() => portalTargetMock),
+        };
+
+        try {
+            await renderBaseModalScreen(
+                BaseModal,
+                { children: React.createElement(Probe) },
+                {
+                    createNodeMock: (element: any) => {
+                        if (element?.props?.['data-happy-modal-portal-host'] !== undefined) {
+                            return portalHostMock;
+                        }
+                        return null;
+                    },
+                },
+            );
+
+            expect(observedTarget).toBe(portalTargetMock);
+            expect(portalHostMock.appendChild).toHaveBeenCalledWith(portalTargetMock);
+        } finally {
+            (globalThis as any).document = originalDocument;
+        }
+    });
+
+    it('keeps the portal target stable during transient portal-host ref cleanups while the modal stays mounted', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const originalDocument = (globalThis as any).document;
+        const portalHostMock = {
+            nodeType: 1,
+            appendChild: vi.fn(),
+            removeChild: vi.fn(),
+        } as any;
+        const portalTargetMock = { nodeType: 1, style: {}, setAttribute: vi.fn() } as any;
+        let observedTarget: any = undefined;
+
+        function Probe() {
+            observedTarget = useModalPortalTarget();
+            return React.createElement('Probe');
+        }
+
+        (globalThis as any).document = {
+            ...(originalDocument ?? {}),
+            createElement: vi.fn(() => portalTargetMock),
+        };
+
+        try {
+            const screen = await renderBaseModalScreen(
+                BaseModal,
+                { children: React.createElement(Probe) },
+                {
+                    createNodeMock: (element: any) => {
+                        if (element?.props?.['data-happy-modal-portal-host'] !== undefined) {
+                            return portalHostMock;
+                        }
+                        return null;
+                    },
+                },
+            );
+
+            const portalHost = screen.find((node) => {
+                return node.type === 'div' && node.props?.['data-happy-modal-portal-host'] !== undefined;
+            }) as any;
+
+            const initialTarget = observedTarget;
+            expect(initialTarget).toBe(portalTargetMock);
+            expect(portalHostMock.appendChild).toHaveBeenCalledWith(initialTarget);
+
+            act(() => {
+                portalHost.props.ref(null);
+            });
+
+            expect(observedTarget).toBe(initialTarget);
+            expect(portalHostMock.removeChild).toHaveBeenCalledWith(initialTarget);
+        } finally {
+            (globalThis as any).document = originalDocument;
+        }
+    });
+
+    it('keeps the portal-host ref callback stable across rerenders (avoids ref/setState loops on web)', async () => {
+        const { BaseModal } = await import('./BaseModal');
+
+        const screen = await renderBaseModalScreen(BaseModal);
+
+        const findPortalHost = () => screen.find((node) => {
+            return node.type === 'div' && node.props?.['data-happy-modal-portal-host'] !== undefined;
+        });
+
+        const host = findPortalHost() as any;
+        const initialRef = host?.props?.ref;
+        expect(typeof initialRef).toBe('function');
+
+        act(() => {
+            screen.tree.update(React.createElement(BaseModal, {
+                visible: true,
+                showBackdrop: false,
+                children: React.createElement('Child'),
+            }));
+        });
+
+        const hostAfterUpdate = findPortalHost() as any;
+        expect(hostAfterUpdate?.props?.ref).toBe(initialRef);
+    });
+
+    it('calls onClose when Radix reports onOpenChange(false)', async () => {
+        const { BaseModal } = await import('./BaseModal');
+        const onClose = vi.fn();
+        const screen = await renderBaseModalScreen(BaseModal, { onClose });
+
+        const root = screen.findByType('DialogRoot' as any);
+        expect(root?.props.onOpenChange).toBeTypeOf('function');
+
+        act(() => {
+            root?.props.onOpenChange(false);
+        });
+
+        expect(onClose).toHaveBeenCalledTimes(1);
+    });
+});

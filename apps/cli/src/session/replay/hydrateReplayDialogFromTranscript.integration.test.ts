@@ -1,0 +1,411 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createServer, type Server } from 'node:http';
+
+import { deriveBoxPublicKeyFromSeed, sealEncryptedDataKeyEnvelopeV1 } from '@happier-dev/protocol';
+import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+
+describe('hydrateReplayDialogFromTranscript (integration)', () => {
+  let server: Server | null = null;
+  let happyHomeDir = '';
+  let envScope = createEnvKeyScope(['HAPPIER_SERVER_URL', 'HAPPIER_WEBAPP_URL', 'HAPPIER_HOME_DIR']);
+
+  beforeEach(async () => {
+    envScope = createEnvKeyScope(['HAPPIER_SERVER_URL', 'HAPPIER_WEBAPP_URL', 'HAPPIER_HOME_DIR']);
+    happyHomeDir = await createTempDir('happier-cli-replay-hydrate-');
+  });
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server!.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+    server = null;
+    if (happyHomeDir) {
+      await removeTempDir(happyHomeDir);
+    }
+    envScope.restore();
+
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+  });
+
+  it('hydrates plaintext sessions without session encryption materials', async () => {
+    const sessionId = 'sess_plain_1';
+
+    const sessionRow = {
+      id: sessionId,
+      seq: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      archivedAt: null,
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({ flavor: 'claude', path: '/tmp' }),
+      metadataVersion: 0,
+      agentState: null,
+      agentStateVersion: 0,
+      pendingCount: 0,
+      pendingVersion: 0,
+      dataEncryptionKey: null,
+      share: null,
+    };
+
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+
+      if (req.method === 'GET' && url.pathname === `/v2/sessions/${sessionId}`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ session: sessionRow }));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === `/v1/sessions/${sessionId}/messages`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(
+          JSON.stringify({
+            messages: [
+              {
+                seq: 1,
+                createdAt: 1000,
+                content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'hello' } } },
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => {
+      server!.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Failed to resolve replay hydrate server address');
+
+    envScope.patch({
+      HAPPIER_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      HAPPIER_WEBAPP_URL: 'http://127.0.0.1:3000',
+      HAPPIER_HOME_DIR: happyHomeDir,
+    });
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+
+    const { hydrateReplayDialogFromTranscript } = await import('./hydrateReplayDialogFromTranscript');
+
+    const res = await hydrateReplayDialogFromTranscript({
+      credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+      previousSessionId: sessionId,
+      limit: 50,
+    });
+
+    expect(res).not.toBeNull();
+    expect(res?.dialog?.[0]?.text).toBe('hello');
+  });
+
+  it('hydrates encrypted sessions using the published session dataEncryptionKey', async () => {
+    const sessionId = 'sess_enc_1';
+
+    const dek = new Uint8Array(32).fill(3);
+    const machineKeySeed = new Uint8Array(32).fill(8);
+    const recipientPublicKey = deriveBoxPublicKeyFromSeed(machineKeySeed);
+    const envelope = sealEncryptedDataKeyEnvelopeV1({
+      dataKey: dek,
+      recipientPublicKey,
+      randomBytes: (length) => new Uint8Array(length).fill(5),
+    });
+
+    const { encodeBase64, encryptWithDataKey } = await import('@/api/encryption');
+    const dataEncryptionKeyBase64 = encodeBase64(envelope, 'base64');
+    const msgCiphertext = encodeBase64(
+      encryptWithDataKey({ role: 'user', content: { type: 'text', text: 'hello' } }, dek),
+      'base64',
+    );
+
+    const sessionRow = {
+      id: sessionId,
+      seq: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      archivedAt: null,
+      metadata: 'b64',
+      metadataVersion: 0,
+      agentState: null,
+      agentStateVersion: 0,
+      pendingCount: 0,
+      pendingVersion: 0,
+      dataEncryptionKey: dataEncryptionKeyBase64,
+      share: null,
+    };
+
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+
+      if (req.method === 'GET' && url.pathname === `/v2/sessions/${sessionId}`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ session: sessionRow }));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === `/v1/sessions/${sessionId}/messages`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(
+          JSON.stringify({
+            messages: [
+              {
+                seq: 1,
+                createdAt: 1000,
+                content: { t: 'encrypted', c: msgCiphertext },
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => {
+      server!.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Failed to resolve replay hydrate server address');
+
+    envScope.patch({
+      HAPPIER_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      HAPPIER_WEBAPP_URL: 'http://127.0.0.1:3000',
+      HAPPIER_HOME_DIR: happyHomeDir,
+    });
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+
+    const { hydrateReplayDialogFromTranscript } = await import('./hydrateReplayDialogFromTranscript');
+
+    const res = await hydrateReplayDialogFromTranscript({
+      credentials: {
+        token: 't',
+        encryption: {
+          type: 'dataKey',
+          publicKey: deriveBoxPublicKeyFromSeed(machineKeySeed),
+          machineKey: machineKeySeed,
+        },
+      },
+      previousSessionId: sessionId,
+      limit: 50,
+    });
+
+    expect(res).not.toBeNull();
+    expect(res?.dialog?.[0]?.text).toBe('hello');
+  });
+
+  it('prefers memory synopsis system records over stale transcript synopsis artifacts', async () => {
+    const sessionId = 'sess_plain_synopsis_1';
+
+    const sessionRow = {
+      id: sessionId,
+      seq: 3,
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      archivedAt: null,
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({ flavor: 'claude', path: '/tmp' }),
+      metadataVersion: 0,
+      agentState: null,
+      agentStateVersion: 0,
+      pendingCount: 0,
+      pendingVersion: 0,
+      dataEncryptionKey: null,
+      share: null,
+    };
+
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+
+      if (req.method === 'GET' && url.pathname === `/v2/sessions/${sessionId}`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ session: sessionRow }));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === `/v2/sessions/${sessionId}/system-records/latest`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({
+          record: {
+            id: 'rec_synopsis',
+            sessionId,
+            namespace: 'memory',
+            kind: 'synopsis.v1',
+            localId: 'memory:synopsis:v1:3',
+            content: {
+              t: 'plain',
+              v: { v: 1, seqTo: 3, updatedAtMs: 30, synopsis: 'SYSTEM_RECORD_SYNOPSIS' },
+            },
+            createdAt: '2026-05-20T00:00:00.000Z',
+            updatedAt: '2026-05-20T00:00:01.000Z',
+          },
+        }));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === `/v1/sessions/${sessionId}/messages`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(
+          JSON.stringify({
+            messages: [
+              {
+                seq: 1,
+                createdAt: 1000,
+                content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'hello' } } },
+              },
+              {
+                seq: 2,
+                createdAt: 2000,
+                content: {
+                  t: 'plain',
+                  v: {
+                    role: 'agent',
+                    content: { type: 'text', text: '[memory]' },
+                    meta: { happier: { kind: 'session_synopsis.v1', payload: { v: 1, seqTo: 2, updatedAtMs: 3, synopsis: 'STALE_TRANSCRIPT_SYNOPSIS' } } },
+                  },
+                },
+              },
+              {
+                seq: 3,
+                createdAt: 3000,
+                content: { t: 'plain', v: { role: 'agent', content: { type: 'text', text: 'reply' } } },
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => {
+      server!.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Failed to resolve replay hydrate server address');
+
+    envScope.patch({
+      HAPPIER_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      HAPPIER_WEBAPP_URL: 'http://127.0.0.1:3000',
+      HAPPIER_HOME_DIR: happyHomeDir,
+    });
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+
+    const { hydrateReplayDialogFromTranscript } = await import('./hydrateReplayDialogFromTranscript');
+
+    const res = await hydrateReplayDialogFromTranscript({
+      credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+      previousSessionId: sessionId,
+      limit: 50,
+    });
+
+    expect(res).not.toBeNull();
+    expect((res as any)?.synopsisText).toBe('SYSTEM_RECORD_SYNOPSIS');
+    expect(res?.dialog.map((v) => v.text)).toEqual(['hello', 'reply']);
+  });
+
+  it('respects caller max dialog limit when replaying large transcripts', async () => {
+    const sessionId = 'sess_plain_limit_1';
+
+    const sessionRow = {
+      id: sessionId,
+      seq: 220,
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      archivedAt: null,
+      encryptionMode: 'plain',
+      metadata: JSON.stringify({ flavor: 'claude', path: '/tmp' }),
+      metadataVersion: 0,
+      agentState: null,
+      agentStateVersion: 0,
+      pendingCount: 0,
+      pendingVersion: 0,
+      dataEncryptionKey: null,
+      share: null,
+    };
+
+    const messages = Array.from({ length: 220 }, (_unused, index) => ({
+      seq: index + 1,
+      createdAt: index + 1,
+      content: {
+        t: 'plain',
+        v: { role: 'user', content: { type: 'text', text: `message-${index + 1}` } },
+      },
+    }));
+
+    server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+
+      if (req.method === 'GET' && url.pathname === `/v2/sessions/${sessionId}`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ session: sessionRow }));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === `/v1/sessions/${sessionId}/messages`) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ messages }));
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => {
+      server!.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Failed to resolve replay hydrate server address');
+
+    envScope.patch({
+      HAPPIER_SERVER_URL: `http://127.0.0.1:${address.port}`,
+      HAPPIER_WEBAPP_URL: 'http://127.0.0.1:3000',
+      HAPPIER_HOME_DIR: happyHomeDir,
+    });
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+
+    const { hydrateReplayDialogFromTranscript } = await import('./hydrateReplayDialogFromTranscript');
+
+    const res = await hydrateReplayDialogFromTranscript({
+      credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+      previousSessionId: sessionId,
+      limit: 220,
+    });
+
+    expect(res).not.toBeNull();
+    expect(res?.dialog).toHaveLength(220);
+    expect(res?.dialog?.[0]?.text).toBe('message-1');
+    expect(res?.dialog?.[219]?.text).toBe('message-220');
+  });
+});

@@ -1,0 +1,659 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { SPAWN_SESSION_ERROR_CODES } from '@happier-dev/protocol';
+
+import {
+    readForkSessionRpcTimeoutMsFromEnv,
+    readSpawnSessionRpcTimeoutMsFromEnv,
+} from '../domains/session/spawn/spawnSessionRpcTimeout';
+import { storage } from '../domains/state/storage';
+
+const machineRpcWithServerScopeMock = vi.hoisted(() => vi.fn());
+const readMachineTargetForSessionMock = vi.hoisted(() => vi.fn());
+const prepareAccountSettingsForDaemonSpawnMock = vi.hoisted(() => vi.fn(async () => ({})));
+const apiRequestMock = vi.hoisted(() => vi.fn());
+
+vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({
+    machineRpcWithServerScope: machineRpcWithServerScopeMock,
+}));
+
+vi.mock('./accountSettingsDaemonSpawnPreparation', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./accountSettingsDaemonSpawnPreparation')>(),
+    prepareAccountSettingsForDaemonSpawnIfNeeded: prepareAccountSettingsForDaemonSpawnMock,
+    registerAccountSettingsDaemonSpawnPreparation: vi.fn(() => vi.fn()),
+}));
+
+vi.mock('./sessionMachineTarget', async () => {
+    const actual = await vi.importActual<typeof import('./sessionMachineTarget')>('./sessionMachineTarget');
+    return {
+        ...actual,
+        readMachineTargetForSession: readMachineTargetForSessionMock,
+        readMachineControlTargetForSession: readMachineTargetForSessionMock,
+    };
+});
+
+vi.mock('../api/session/apiSocket', () => ({
+    apiSocket: {
+        request: apiRequestMock,
+        machineRPC: vi.fn(),
+        sessionRPC: vi.fn(),
+    },
+}));
+
+const sessionsModulePromise = import('./sessions');
+
+function makeResponse(opts: Readonly<{ ok: boolean; status?: number; json?: unknown; text?: string }>): Response {
+    return {
+        ok: opts.ok,
+        status: opts.status ?? (opts.ok ? 200 : 500),
+        json: async () => opts.json ?? {},
+        text: async () => opts.text ?? '',
+    } as Response;
+}
+
+describe('sessions ops server-scoped routing', () => {
+    beforeEach(() => {
+        machineRpcWithServerScopeMock.mockReset();
+        readMachineTargetForSessionMock.mockReset();
+        prepareAccountSettingsForDaemonSpawnMock.mockReset();
+        prepareAccountSettingsForDaemonSpawnMock.mockResolvedValue({});
+        readMachineTargetForSessionMock.mockReturnValue(null);
+        apiRequestMock.mockReset();
+        storage.setState({ sessions: {}, sessionListRenderables: {} });
+    });
+
+    it('restores an archived session before issuing its resume spawn', async () => {
+        const lifecycle: string[] = [];
+        storage.setState({
+            sessions: {
+                'session-1': { id: 'session-1', archivedAt: 123 } as any,
+            },
+        });
+        apiRequestMock.mockImplementationOnce(async () => {
+            lifecycle.push('unarchive');
+            return makeResponse({ ok: true, json: { success: true, archivedAt: null } });
+        });
+        machineRpcWithServerScopeMock.mockImplementationOnce(async () => {
+            lifecycle.push('resume');
+            return { type: 'success', sessionId: 'session-1' };
+        });
+        const { resumeSession } = await sessionsModulePromise;
+
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        });
+
+        expect(result).toEqual({ type: 'success', sessionId: 'session-1' });
+        expect(apiRequestMock).toHaveBeenCalledWith('/v2/sessions/session-1/unarchive', { method: 'POST' });
+        expect(lifecycle).toEqual(['unarchive', 'resume']);
+    });
+
+    it('does not issue a resume spawn when restoring an archived session fails', async () => {
+        storage.setState({
+            sessions: {
+                'session-1': { id: 'session-1', archivedAt: 123 } as any,
+            },
+        });
+        apiRequestMock.mockResolvedValueOnce(makeResponse({
+            ok: false,
+            status: 403,
+            text: 'Forbidden',
+        }));
+        const { resumeSession } = await sessionsModulePromise;
+
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        });
+
+        expect(result).toMatchObject({
+            type: 'error',
+            errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+            errorMessage: 'Forbidden',
+        });
+        expect(machineRpcWithServerScopeMock).not.toHaveBeenCalled();
+    });
+
+    it('does not unarchive an already-unarchived session before resuming it', async () => {
+        storage.setState({
+            sessions: {
+                'session-1': { id: 'session-1', archivedAt: null } as any,
+            },
+        });
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'session-1' });
+        const { resumeSession } = await sessionsModulePromise;
+
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        });
+
+        expect(result).toEqual({ type: 'success', sessionId: 'session-1' });
+        expect(apiRequestMock).not.toHaveBeenCalled();
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('routes resume session spawn through server-scoped rpc with requested server id', async () => {
+        const armSessionResumingFallbackSpy = vi.spyOn(storage.getState(), 'armSessionResumingFallback');
+        try {
+            machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+            const { resumeSession } = await sessionsModulePromise;
+            const result = await resumeSession({
+                sessionId: 'session-1',
+                machineId: 'machine-1',
+                directory: '/tmp',
+                backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+                serverId: 'server-b',
+            } as any);
+
+            expect(result).toEqual({ type: 'success', sessionId: 'sess-1' });
+            expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+                machineId: 'machine-1',
+                method: 'spawn-happy-session',
+                serverId: 'server-b',
+            }));
+            expect(armSessionResumingFallbackSpy).toHaveBeenCalledWith('session-1');
+        } finally {
+            armSessionResumingFallbackSpy.mockRestore();
+        }
+    });
+
+    it('checks an active session runtime without presenting the session as resuming', async () => {
+        storage.setState({
+            sessions: {
+                'session-1': { id: 'session-1', active: true, archivedAt: null } as any,
+            },
+        });
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'session-1' });
+        const markSessionResumingSpy = vi.spyOn(storage.getState(), 'markSessionResuming');
+        const armSessionResumingFallbackSpy = vi.spyOn(storage.getState(), 'armSessionResumingFallback');
+        const clearSessionResumingSpy = vi.spyOn(storage.getState(), 'clearSessionResuming');
+        try {
+            const { ensureSessionRuntimeForPendingInput } = await sessionsModulePromise;
+
+            const result = await ensureSessionRuntimeForPendingInput({
+                sessionId: 'session-1',
+                machineId: 'machine-1',
+                directory: '/tmp',
+                backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            });
+
+            expect(result).toEqual({ type: 'success', sessionId: 'session-1' });
+            expect(machineRpcWithServerScopeMock).toHaveBeenCalledTimes(1);
+            expect(markSessionResumingSpy).not.toHaveBeenCalled();
+            expect(armSessionResumingFallbackSpy).not.toHaveBeenCalled();
+            expect(clearSessionResumingSpy).not.toHaveBeenCalled();
+        } finally {
+            markSessionResumingSpy.mockRestore();
+            armSessionResumingFallbackSpy.mockRestore();
+            clearSessionResumingSpy.mockRestore();
+        }
+    });
+
+    it('presents a runtime ensure as resuming when the session is known inactive', async () => {
+        storage.setState({
+            sessions: {
+                'session-1': { id: 'session-1', active: false, archivedAt: null } as any,
+            },
+        });
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'session-1' });
+        const markSessionResumingSpy = vi.spyOn(storage.getState(), 'markSessionResuming');
+        const armSessionResumingFallbackSpy = vi.spyOn(storage.getState(), 'armSessionResumingFallback');
+        try {
+            const { ensureSessionRuntimeForPendingInput } = await sessionsModulePromise;
+
+            const result = await ensureSessionRuntimeForPendingInput({
+                sessionId: 'session-1',
+                machineId: 'machine-1',
+                directory: '/tmp',
+                backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            });
+
+            expect(result).toEqual({ type: 'success', sessionId: 'session-1' });
+            expect(markSessionResumingSpy).toHaveBeenCalledWith('session-1');
+            expect(armSessionResumingFallbackSpy).toHaveBeenCalledWith('session-1');
+        } finally {
+            markSessionResumingSpy.mockRestore();
+            armSessionResumingFallbackSpy.mockRestore();
+        }
+    });
+
+    it('passes transcriptStorage through resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            transcriptStorage: 'direct',
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                transcriptStorage: 'direct',
+            }),
+        }));
+    });
+
+    it('passes attachMetadataIdentityPolicy through resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            attachMetadataIdentityPolicy: 'replace_with_runtime_identity',
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                attachMetadataIdentityPolicy: 'replace_with_runtime_identity',
+            }),
+        }));
+    });
+
+    it('prepares account settings and includes the returned version hint before resume spawn', async () => {
+        prepareAccountSettingsForDaemonSpawnMock.mockResolvedValueOnce({ accountSettingsVersionHint: 22 });
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(prepareAccountSettingsForDaemonSpawnMock).toHaveBeenCalledTimes(1);
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                accountSettingsVersionHint: 22,
+            }),
+        }));
+    });
+
+    it('does not resume-spawn when account settings scope changes during preparation', async () => {
+        prepareAccountSettingsForDaemonSpawnMock.mockRejectedValueOnce(
+            new Error('Account settings scope changed while preparing session spawn'),
+        );
+        const { resumeSession } = await sessionsModulePromise;
+
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result.type).toBe('error');
+        if (result.type !== 'error') throw new Error('expected an error result');
+        expect(result.errorCode).toBe('ACCOUNT_SCOPE_CHANGED');
+        expect(machineRpcWithServerScopeMock).not.toHaveBeenCalled();
+    });
+
+    it('does not issue machine RPC when target validation fails', async () => {
+        const { resumeSession } = await sessionsModulePromise;
+
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: '',
+            directory: '',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        });
+
+        expect(result).toMatchObject({
+            type: 'error',
+            errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST,
+        });
+        expect(machineRpcWithServerScopeMock).not.toHaveBeenCalled();
+    });
+
+    it('passes connectedServices and freshness through resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            connectedServices: {
+                v: 1,
+                bindingsByServiceId: {
+                    anthropic: {
+                        source: 'connected',
+                        profileId: 'profile-1',
+                    },
+                },
+            },
+            connectedServicesUpdatedAt: 3456,
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                connectedServices: expect.any(Object),
+                connectedServicesUpdatedAt: 3456,
+            }),
+        }));
+    });
+
+    it('passes session runtime controls through resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+            permissionMode: 'yolo',
+            permissionModeUpdatedAt: 200,
+            agentModeId: 'plan',
+            agentModeUpdatedAt: 250,
+            modelId: 'gpt-5',
+            modelUpdatedAt: 300,
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                permissionMode: 'yolo',
+                permissionModeUpdatedAt: 200,
+                agentModeId: 'plan',
+                agentModeUpdatedAt: 250,
+                modelId: 'gpt-5',
+                modelUpdatedAt: 300,
+            }),
+        }));
+    });
+
+    it('omits connectedServices for resumeSession when it is null', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            connectedServices: null,
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledTimes(1);
+        const call = machineRpcWithServerScopeMock.mock.calls[0]?.[0] as { payload?: unknown } | undefined;
+        expect(call && typeof call === 'object').toBe(true);
+        expect(call?.payload && typeof call.payload === 'object').toBe(true);
+        expect(call?.payload as Record<string, unknown>).not.toHaveProperty('connectedServices');
+    });
+
+    it('passes codexBackendMode through resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+            codexBackendMode: 'appServer',
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                codexBackendMode: 'appServer',
+            }),
+        }));
+    });
+
+    it('passes configured ACP backend backend targets through resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            payload: expect.objectContaining({
+                backendTarget: { kind: 'configuredAcpBackend', backendId: 'custom-kiro' },
+            }),
+        }));
+    });
+
+    it('prefers reachable machine target from session for resumeSession', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success' });
+        readMachineTargetForSessionMock.mockReturnValueOnce({ machineId: 'reachable-machine', basePath: '/base' });
+        const { resumeSession } = await sessionsModulePromise;
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'stale-machine',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result).toEqual({ type: 'success' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'reachable-machine',
+            method: 'spawn-happy-session',
+            serverId: 'server-b',
+            payload: expect.objectContaining({
+                directory: '/base',
+            }),
+        }));
+    });
+
+    it('uses the requested machine target for resumeSession when explicitly requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success' });
+        readMachineTargetForSessionMock.mockReturnValueOnce({ machineId: 'reachable-machine', basePath: '/base' });
+        const { resumeSession } = await sessionsModulePromise;
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'requested-machine',
+            directory: '/requested-path',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+            preferRequestedMachineTarget: true,
+        } as any);
+
+        expect(result).toEqual({ type: 'success' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'requested-machine',
+            method: 'spawn-happy-session',
+            serverId: 'server-b',
+            payload: expect.objectContaining({
+                directory: '/requested-path',
+            }),
+        }));
+    });
+
+    it('uses an extended RPC timeout for resumeSession', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result.type).toBe('success');
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledTimes(1);
+        const call = machineRpcWithServerScopeMock.mock.calls[0]?.[0] as any;
+        expect(call).toMatchObject({ timeoutMs: readSpawnSessionRpcTimeoutMsFromEnv() });
+    });
+
+    it('forwards preferScopedMachineRpc for resumeSession when requested', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ type: 'success', sessionId: 'sess-1' });
+        const { resumeSession } = await sessionsModulePromise;
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+            preferScopedMachineRpc: true,
+        } as any);
+
+        expect(result).toEqual({ type: 'success', sessionId: 'sess-1' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            method: 'spawn-happy-session',
+            serverId: 'server-b',
+            preferScoped: true,
+        }));
+    });
+
+    it('maps socket ack timeouts to SESSION_WEBHOOK_TIMEOUT for resumeSession', async () => {
+        machineRpcWithServerScopeMock.mockRejectedValueOnce(new Error('operation has timed out'));
+        const { resumeSession } = await sessionsModulePromise;
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result.type).toBe('error');
+        if (result.type !== 'error') throw new Error('expected an error result');
+        expect(result.errorCode).toBe(SPAWN_SESSION_ERROR_CODES.SESSION_WEBHOOK_TIMEOUT);
+        expect(typeof result.errorMessage).toBe('string');
+        expect(result.errorMessage.length).toBeGreaterThan(0);
+    });
+
+    it('routes session fork through server-scoped machine rpc with requested server id', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, childSessionId: 'sess-child' });
+        const { forkSession } = await sessionsModulePromise;
+        const replaySummaryRunner = {
+            v: 1,
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            modelId: 'default',
+            permissionMode: 'no_tools',
+        } as const;
+
+        const result = await forkSession({
+            machineId: 'machine-1',
+            parentSessionId: 'sess-parent',
+            forkPoint: { type: 'seq', upToSeqInclusive: 12 },
+            replaySummaryRunner,
+            replayMaxSeedChars: 55_000,
+            serverId: 'server-b',
+        } as any);
+
+        expect(result).toEqual({ ok: true, childSessionId: 'sess-child' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            method: 'session.fork',
+            serverId: 'server-b',
+            timeoutMs: readForkSessionRpcTimeoutMsFromEnv(),
+            payload: expect.objectContaining({ replaySummaryRunner, replayMaxSeedChars: 55_000 }),
+        }));
+    });
+
+    it('omits fork requestId for older daemons and preserves it for the first supporting daemon', async () => {
+        const setDaemonVersion = (version: string) => {
+            storage.setState((state) => ({
+                profileScope: { serverId: 'server-a', accountId: 'account-a' },
+                machines: {
+                    ...state.machines,
+                    'machine-1': { id: 'machine-1', daemonState: { startedWithCliVersion: version } } as any,
+                },
+                machineListByServerId: {
+                    ...state.machineListByServerId,
+                    'server-b': [{ id: 'machine-1', daemonState: { startedWithCliVersion: version } } as any],
+                },
+            }));
+        };
+        const { forkSession } = await sessionsModulePromise;
+
+        setDaemonVersion('0.2.0');
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, childSessionId: 'child-old' });
+        await forkSession({
+            machineId: 'machine-1',
+            parentSessionId: 'sess-parent',
+            forkPoint: { type: 'latest' },
+            serverId: 'server-b',
+            requestId: 'retryable-replay-attempt',
+        });
+        expect((machineRpcWithServerScopeMock.mock.calls[0]?.[0] as any).payload)
+            .not.toHaveProperty('requestId');
+
+        setDaemonVersion('0.2.10-dev.41');
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, childSessionId: 'child-new' });
+        await forkSession({
+            machineId: 'machine-1',
+            parentSessionId: 'sess-parent',
+            forkPoint: { type: 'latest' },
+            serverId: 'server-b',
+            requestId: 'retryable-replay-attempt',
+        });
+        expect((machineRpcWithServerScopeMock.mock.calls[1]?.[0] as any).payload)
+            .toHaveProperty('requestId', 'retryable-replay-attempt');
+    });
+
+    it('prefers reachable machine target from parent session for forkSession', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, childSessionId: 'sess-child' });
+        readMachineTargetForSessionMock.mockReturnValueOnce({ machineId: 'reachable-machine', basePath: '/tmp' });
+        const { forkSession } = await sessionsModulePromise;
+        const result = await forkSession({
+            machineId: 'stale-machine',
+            parentSessionId: 'sess-parent',
+            forkPoint: { type: 'latest' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result).toEqual({ ok: true, childSessionId: 'sess-child' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'reachable-machine',
+            method: 'session.fork',
+            serverId: 'server-b',
+        }));
+    });
+
+    it('maps RPC method-not-available to DAEMON_RPC_UNAVAILABLE for forkSession', async () => {
+        machineRpcWithServerScopeMock.mockRejectedValueOnce(Object.assign(new Error('RPC method not available'), { rpcErrorCode: 'RPC_METHOD_NOT_AVAILABLE' }));
+        const { forkSession } = await sessionsModulePromise;
+        const result = await forkSession({
+            machineId: 'machine-1',
+            parentSessionId: 'sess-parent',
+            forkPoint: { type: 'latest' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result.ok).toBe(false);
+        expect((result as any).errorCode).toBe('DAEMON_RPC_UNAVAILABLE');
+    });
+
+    it('maps RPC method-not-available to DAEMON_RPC_UNAVAILABLE for resumeSession', async () => {
+        machineRpcWithServerScopeMock.mockRejectedValueOnce(Object.assign(new Error('RPC method not available'), { rpcErrorCode: 'RPC_METHOD_NOT_AVAILABLE' }));
+        const { resumeSession } = await sessionsModulePromise;
+        const result = await resumeSession({
+            sessionId: 'session-1',
+            machineId: 'machine-1',
+            directory: '/tmp',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            serverId: 'server-b',
+        } as any);
+
+        expect(result.type).toBe('error');
+        expect((result as any).errorCode).toBe('DAEMON_RPC_UNAVAILABLE');
+    });
+
+});

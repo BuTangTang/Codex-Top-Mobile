@@ -1,0 +1,292 @@
+import { test, expect, type Page, type BrowserContext } from '@playwright/test';
+import { mkdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { createRunDirs } from '../../src/testkit/runDir';
+import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import {
+  gotoDomContentLoadedWithPathFallback,
+  gotoDomContentLoadedWithRetries,
+  normalizeLoopbackBaseUrl,
+} from '../../src/testkit/uiE2e/pageNavigation';
+import { runCliJson } from '../../src/testkit/uiE2e/cliJson';
+import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
+import { fetchJson } from '../../src/testkit/http';
+import { collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+async function extractPublicShareUrlFromDialog(params: Readonly<{ dialog: ReturnType<Page['getByRole']> }>): Promise<string> {
+  const locator = params.dialog.locator('text=/https?:\\/\\/[^\\s]+\\/share\\/[0-9a-f]+/i').first();
+  const raw = (await locator.innerText()).trim();
+  const match = raw.match(/https?:\/\/[^\s]+\/share\/[0-9a-f]+/i);
+  if (!match) throw new Error(`Failed to extract share URL from dialog text: ${JSON.stringify(raw)}`);
+  return match[0];
+}
+
+async function openShareInFreshContext(params: Readonly<{
+  baseContext: BrowserContext;
+  url: string;
+  onPageCreated?: (page: Page) => void;
+}>): Promise<Page> {
+  const browser = params.baseContext.browser();
+  if (!browser) throw new Error('Missing browser instance');
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  params.onPageCreated?.(page);
+  await gotoDomContentLoadedWithRetries(page, params.url, 90_000);
+  return page;
+}
+
+async function readAuthTokenFromBrowserStorage(page: Page): Promise<string> {
+  const token = await page.evaluate(() => {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith('auth_credentials')) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw) as { token?: unknown };
+        if (typeof parsed.token === 'string' && parsed.token.trim()) return parsed.token.trim();
+      } catch {
+        // Keep scanning malformed storage entries.
+      }
+    }
+    return null;
+  });
+  if (typeof token === 'string' && token.trim()) return token.trim();
+  throw new Error('Failed to read auth token from browser storage');
+}
+
+async function postPlainAgentMarkdown(params: Readonly<{
+  baseUrl: string;
+  token: string;
+  sessionId: string;
+  markdown: string;
+}>): Promise<void> {
+  const localId = `agent-markdown-boundary-${Date.now()}`;
+  const response = await fetchJson<{ didWrite?: unknown }>(`${params.baseUrl}/v2/sessions/${params.sessionId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${params.token}`,
+      'Content-Type': 'application/json',
+      'Idempotency-Key': localId,
+    },
+    body: JSON.stringify({
+      localId,
+      messageRole: 'agent',
+      content: {
+        t: 'plain',
+        v: {
+          role: 'agent',
+          content: {
+            type: 'output',
+            data: {
+              type: 'assistant',
+              uuid: localId,
+              message: {
+                content: [{ type: 'text', text: params.markdown }],
+              },
+            },
+          },
+        },
+      },
+    }),
+    timeoutMs: 20_000,
+  });
+  if (response.status !== 200 || response.data?.didWrite !== true) {
+    throw new Error(`Failed to seed plaintext agent Markdown (status=${response.status})`);
+  }
+}
+
+test.describe('ui e2e: plaintext mode + public share', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('encryption-optout-public-share-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+
+  test.beforeAll(async () => {
+    const uiWebEnv = {
+      ...process.env,
+      EXPO_PUBLIC_DEBUG: '1',
+      EXPO_PUBLIC_HAPPY_SERVER_URL: server?.baseUrl ?? '',
+      EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
+      HAPPIER_E2E_UI_WEB_MODE: 'export',
+      HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS ?? '900000',
+      HAPPIER_E2E_UI_WEB_EXPORT_FALLBACK_TO_METRO: '0',
+      HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS ?? '480000',
+    };
+    test.setTimeout(resolveUiWebBeforeAllTimeoutMs(uiWebEnv));
+    await mkdir(cliHomeDir, { recursive: true });
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        // Keep web create-account stable (binding signature is not reliably available on web).
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
+        HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
+        HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
+      },
+    });
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...uiWebEnv,
+        EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
+      },
+    });
+
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(120_000);
+    await ui?.stop().catch(() => {});
+    await server?.stop().catch(() => {});
+  });
+
+  test('toggles account to plaintext, writes a plaintext session, and opens a public link', async ({ page, context }, testInfo) => {
+    test.setTimeout(420_000);
+    if (!server || !ui) throw new Error('missing server/ui fixtures');
+    if (!uiBaseUrl) throw new Error('missing ui base url');
+
+    const testDir = resolve(join(suiteDir, 't1-plaintext-public-share'));
+    await mkdir(testDir, { recursive: true });
+
+    const diagnostics = collectBrowserDiagnostics({ page });
+
+    let daemon: StartedDaemon | null = null;
+    let thrown: unknown = null;
+    try {
+      daemon = await authenticateAndStartDaemon({
+        page,
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        uiBaseUrl,
+        extraEnv: {
+          HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+        },
+      });
+
+      await page.goto(`${uiBaseUrl}/settings/account`, { waitUntil: 'domcontentloaded' });
+      await expect(page.getByTestId('settings-account-encryption-mode-switch')).toHaveCount(1, { timeout: 120_000 });
+
+      const migrateOk = page.waitForResponse(
+        (resp) =>
+          resp.url().endsWith('/v1/account/encryption/migrate') && resp.request().method() === 'POST' && resp.status() === 200,
+        { timeout: 60_000 },
+      );
+      await page.getByTestId('settings-account-encryption-mode-switch').click();
+      const migrateResp = await migrateOk;
+      const migrateJson = (await migrateResp.json()) as { success?: unknown; mode?: unknown };
+      expect(migrateJson?.success).toBe(true);
+      expect(migrateJson?.mode).toBe('plain');
+
+      const tag = `ui-e2e-plain-${run.runId}`;
+      const message = `hello from plain ${run.runId}`;
+
+      const createEnvelope = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-create',
+        args: ['session', 'create', '--tag', tag, '--no-load-existing', '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(createEnvelope.ok).toBe(true);
+      expect(createEnvelope.kind).toBe('session_create');
+      const createdSessionId = (createEnvelope as any)?.data?.session?.id;
+      expect(typeof createdSessionId).toBe('string');
+      expect((createEnvelope as any)?.data?.session?.encryptionMode).toBe('plain');
+
+      const sessionId = String(createdSessionId);
+      const trackingPixelUrl = `https://tracking.invalid/pixel.gif?run=${encodeURIComponent(run.runId)}`;
+      const trackingPixelAlt = `tracking pixel guard ${run.runId}`;
+
+      const sendEnvelope = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-send',
+        args: ['session', 'send', sessionId, message, '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(sendEnvelope.ok).toBe(true);
+      expect(sendEnvelope.kind).toBe('session_send');
+
+      await postPlainAgentMarkdown({
+        baseUrl: server.baseUrl,
+        token: await readAuthTokenFromBrowserStorage(page),
+        sessionId,
+        markdown: `Agent-authored image boundary: ![${trackingPixelAlt}](${trackingPixelUrl})`,
+      });
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionId}`, 120_000);
+      await expect(page.getByText(message)).toHaveCount(1, { timeout: 120_000 });
+
+      await gotoDomContentLoadedWithPathFallback(
+        page,
+        `${uiBaseUrl}/session/${sessionId}/sharing`,
+        `/session/${sessionId}/sharing`,
+        120_000,
+      );
+      await expect(page.getByText('Create public link')).toHaveCount(1, { timeout: 120_000 });
+      await page.getByText('Create public link').click();
+
+      const dialog = page.getByRole('dialog');
+      await expect(dialog.getByRole('button', { name: 'Create public link' })).toHaveCount(1, { timeout: 60_000 });
+      await dialog.getByRole('button', { name: 'Create public link' }).click();
+
+      const shareUrl = await extractPublicShareUrlFromDialog({ dialog });
+      expect(shareUrl).toContain('/share/');
+
+      const trackingPixelRequests: string[] = [];
+      const sharePage = await openShareInFreshContext({
+        baseContext: context,
+        url: shareUrl,
+        onPageCreated: (freshPage) => {
+          freshPage.on('request', (request) => {
+            if (request.url().startsWith(trackingPixelUrl)) {
+              trackingPixelRequests.push(request.url());
+            }
+          });
+        },
+      });
+      await expect(sharePage.getByText('Consent required')).toHaveCount(1, { timeout: 120_000 });
+      await sharePage.getByText('Accept and view').click();
+      await expect(sharePage.getByText('Public link (read-only)')).toHaveCount(1, { timeout: 120_000 });
+      await expect(sharePage.getByText(message)).toHaveCount(1, { timeout: 120_000 });
+      await expect(sharePage.getByText(trackingPixelAlt)).toHaveCount(1, { timeout: 120_000 });
+      expect(trackingPixelRequests).toEqual([]);
+      await sharePage.context().close().catch(() => {});
+    } catch (error) {
+      thrown = error;
+      throw error;
+    } finally {
+      await daemon?.stop().catch(() => {});
+      if (thrown) {
+        await testInfo.attach('browser-diagnostics.md', { body: diagnostics(), contentType: 'text/markdown' });
+      }
+    }
+  });
+});

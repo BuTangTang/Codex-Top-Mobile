@@ -1,0 +1,920 @@
+import React from 'react';
+import { act } from 'react-test-renderer';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+    findTestInstanceByTypeContainingText,
+    invokeTestInstanceHandler,
+    pressTestInstance,
+    renderScreen,
+    standardCleanup,
+} from '@/dev/testkit';
+import { createCapturingFlatListMock } from '@/dev/testkit/mocks/flashList';
+import type { SessionOrganizationProjection } from '@/sync/domains/session/organization/types';
+import { HappyError } from '@/utils/errors/errors';
+import { installSessionShellCommonModuleMocks } from './sessionShellTestHelpers';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+let capturedRootFlatListProps: any | null = null;
+const routerPushSpy = vi.fn();
+const modalAlertSpy = vi.hoisted(() => vi.fn());
+
+let pinnedSessionKeysV1: string[] = [];
+const setPinnedSessionKeysV1 = vi.fn();
+let hideInactiveSessions = false;
+let sessionListAttentionPromotionMode: string | null = null;
+let sessionListAttentionStandingDefault = false;
+
+let sessionListGroupOrderV1: Record<string, string[]> = {};
+const setSessionListGroupOrderV1 = vi.fn();
+
+let sessionTagsV1: Record<string, string[]> = {};
+const setSessionTagsV1 = vi.fn();
+let workspaceLabelsV1: Record<string, string> = {};
+const setWorkspaceLabelsV1 = vi.fn();
+const readMachineTargetForSessionMock = vi.hoisted(() => vi.fn());
+const mockMachinesState = vi.hoisted(() => ({ current: [] as any[] }));
+const sessionOrganizationOps = vi.hoisted(() => ({
+    deleteSessionFolder: vi.fn(async () => undefined),
+    deleteSessionLabel: vi.fn(async () => undefined),
+    reorderSessionOrganization: vi.fn(async () => undefined),
+    setSessionPin: vi.fn(async () => undefined),
+    setSessionTagLabels: vi.fn(async () => undefined),
+    upsertSessionFolder: vi.fn(async () => undefined),
+    upsertSessionLabel: vi.fn(async () => undefined),
+}));
+const tokenStorageMocks = vi.hoisted(() => ({
+    getCredentialsForServerUrl: vi.fn(async () => ({ token: 'token-a', secret: 'secret-a' })),
+}));
+const flatListMock = createCapturingFlatListMock({ renderItems: true });
+let sessionOrganizationProjection: SessionOrganizationProjection | null = null;
+
+const groupKey = 'server:server_a:day:2026-02-17';
+
+const sessionA = {
+    id: 'sess_a',
+    seq: 1,
+    createdAt: 1,
+    updatedAt: 1,
+    active: false,
+    activeAt: 0,
+    metadata: null,
+    metadataVersion: 1,
+    agentState: null,
+    agentStateVersion: 1,
+    thinking: false,
+    thinkingAt: 0,
+    presence: 'offline',
+} as any;
+
+const sessionB = {
+    ...sessionA,
+    id: 'sess_b',
+} as any;
+
+const projectGroupKey = 'server:server_a:active:project:proj_a';
+
+installSessionShellCommonModuleMocks({
+    reactNative: async () => {
+        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+        return createReactNativeWebMock({
+            Platform: { OS: 'web', select: (value: any) => value.web ?? value.default },
+            TurboModuleRegistry: { get: () => ({}) },
+            FlatList: (props: any) => {
+                const element = flatListMock.module.FlatList(props);
+                capturedRootFlatListProps = flatListMock.state.props;
+                return element;
+            },
+        });
+    },
+    router: async () => {
+        const { createExpoRouterMock } = await import('@/dev/testkit/mocks/router');
+        return createExpoRouterMock({
+            pathname: '',
+            router: {
+                push: routerPushSpy,
+                replace: vi.fn(),
+                back: vi.fn(),
+                setParams: vi.fn(),
+            },
+        }).module;
+    },
+    text: async () => {
+        const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+        return createTextModuleMock({ translate: (key) => key });
+    },
+    modal: async () => (await import('@/dev/testkit/mocks/modal')).createModalModuleMock({
+        spies: { alert: modalAlertSpy },
+    }).module,
+    storage: async (importOriginal) => {
+        const { createStorageModuleMock } = await import('@/dev/testkit/mocks/storage');
+        return createStorageModuleMock({
+            importOriginal,
+            overrides: {
+                useSetting: (key: string) => {
+                    if (key === 'compactSessionView') return false;
+                    if (key === 'compactSessionViewMinimal') return false;
+                    if (key === 'sessionTagsEnabled') return true;
+                    if (key === 'hideInactiveSessions') return hideInactiveSessions;
+                    if (key === 'sessionListAttentionPromotionModeV1') return sessionListAttentionPromotionMode;
+                    if (key === 'sessionListAttentionStandingDefaultV1') return sessionListAttentionStandingDefault;
+                    return null;
+                },
+                useSessionOrganizationProjection: () => sessionOrganizationProjection,
+                useHasUnreadMessages: () => false,
+                useSession: () => null,
+                useProfile: () => ({
+                    id: 'profile-1',
+                    timestamp: 0,
+                    firstName: null,
+                    lastName: null,
+                    username: null,
+                    avatar: null,
+                    linkedProviders: [],
+                    connectedServices: [],
+                    connectedServicesV2: [],
+                    connectedServiceCredentialRevisionsV1: [],
+                }),
+                useAllMachines: () => mockMachinesState.current,
+                useMachineDisplayById: () => Object.fromEntries(mockMachinesState.current.map((machine) => [
+                    machine.id,
+                    {
+                        updatedAt: 0,
+                        active: true,
+                        activeAt: 0,
+                        revokedAt: null,
+                        metadataVersion: 1,
+                        ...machine,
+                    },
+                ])),
+                useSettingMutable: (key: string) => {
+                    if (key === 'hideInactiveSessions') return [hideInactiveSessions, vi.fn()];
+                    if (key === 'pinnedSessionKeysV1') return [pinnedSessionKeysV1, setPinnedSessionKeysV1];
+                    if (key === 'sessionListGroupOrderV1') return [sessionListGroupOrderV1, setSessionListGroupOrderV1];
+                    if (key === 'sessionTagsV1') return [sessionTagsV1, setSessionTagsV1];
+                    if (key === 'workspaceLabelsV1') return [workspaceLabelsV1, setWorkspaceLabelsV1];
+                    return [null, vi.fn()];
+                },
+            },
+        });
+    },
+});
+
+vi.mock('react-native-reanimated', () => ({
+    default: { View: (props: any) => React.createElement('Animated.View', props) },
+    Easing: {
+        bezier: () => () => 0,
+        linear: () => 0,
+    },
+    useSharedValue: (init: any) => ({ value: init }),
+    useAnimatedStyle: (fn: () => any) => fn(),
+    useAnimatedReaction: () => undefined,
+    withSpring: (value: any) => value,
+    withTiming: (value: any) => value,
+}));
+
+vi.mock('react-native-gesture-handler', async () => {
+    const { createGestureHandlerMock } = await import('@/dev/testkit/mocks/gestureHandler');
+    return createGestureHandlerMock();
+});
+
+vi.mock('react-native-worklets', () => ({
+    scheduleOnRN: (fn: (...args: any[]) => void, ...args: any[]) => fn(...args),
+}));
+
+vi.mock('react-native-safe-area-context', () => ({
+    SafeAreaInsetsContext: React.createContext({ top: 0, bottom: 0, left: 0, right: 0 }),
+    useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+}));
+
+vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
+    RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',
+}));
+
+vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
+    UpdateBanner: 'UpdateBanner',
+}));
+
+vi.mock('@/utils/sessions/sessionUtils', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/utils/sessions/sessionUtils')>(),
+    getSessionName: () => 'Session',
+    getSessionSubtitle: () => 'Subtitle',
+    formatPathRelativeToHome: (path: string) => path,
+    getSessionAvatarId: () => 'avatar',
+    useSessionStatus: () => ({
+        isConnected: true,
+        statusText: 'Connected',
+        statusColor: '#000',
+        statusDotColor: '#0f0',
+        isPulsing: false,
+    }),
+}));
+
+vi.mock('@/components/ui/avatar/Avatar', () => ({
+    Avatar: 'Avatar',
+}));
+
+vi.mock('@/components/ui/status/StatusDot', () => ({
+    StatusDot: 'StatusDot',
+}));
+
+vi.mock('@/utils/platform/responsive', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/utils/platform/responsive')>();
+    return {
+        ...actual,
+        useIsTablet: () => false,
+        getDeviceType: () => 'phone',
+    };
+});
+
+vi.mock('@/hooks/ui/useHappyAction', () => ({
+    useHappyAction: (_fn: unknown) => [false, vi.fn()],
+}));
+
+vi.mock('@/auth/storage/tokenStorage', () => ({
+    TokenStorage: {
+        getCredentialsForServerUrl: tokenStorageMocks.getCredentialsForServerUrl,
+    },
+}));
+
+vi.mock('@/sync/domains/server/serverProfiles', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/domains/server/serverProfiles')>();
+    return {
+        ...actual,
+        getServerProfileById: (serverId: string) => {
+            if (serverId !== 'server_a') return null;
+            return {
+                id: 'server_a',
+                name: 'Server A',
+                serverUrl: 'https://server-a.example',
+                createdAt: 0,
+                updatedAt: 0,
+                lastUsedAt: 0,
+            };
+        },
+    };
+});
+
+vi.mock('@/sync/ops', async (importOriginal) => {
+    const { createSyncOpsModuleMock } = await import('@/dev/testkit/mocks/syncOps');
+    return createSyncOpsModuleMock({
+        importOriginal,
+        overrides: {
+            sessionStopWithServerScope: vi.fn(async () => ({ success: true })),
+            sessionArchiveWithServerScope: vi.fn(async () => ({ success: true })),
+        },
+    });
+});
+
+vi.mock('@/sync/ops/sessionOrganization', () => sessionOrganizationOps);
+
+vi.mock('@/sync/ops/sessionMachineTarget', () => ({
+    readMachineTargetForSession: (sessionId: string) => readMachineTargetForSessionMock(sessionId),
+    readDisplayMachineTargetForSession: (params: { sessionId: string }) => readMachineTargetForSessionMock(params.sessionId),
+}));
+
+vi.mock('@/hooks/session/useNavigateToSession', () => ({
+    useNavigateToSession: () => vi.fn(),
+}));
+
+let mockAllowedServerIds: string[] = ['server_a'];
+vi.mock('@/hooks/server/useEffectiveServerSelection', () => ({
+    useEffectiveServerSelection: () => ({
+        serverIds: mockAllowedServerIds,
+    }),
+    useResolvedActiveServerSelection: () => ({
+        enabled: true,
+        presentation: 'grouped',
+        activeServerId: 'server_a',
+        allowedServerIds: mockAllowedServerIds,
+    }),
+}));
+
+let mockVisibleSessionListViewData: any[] = [
+    {
+        type: 'header',
+        title: 'Today',
+        headerKind: 'date',
+        groupKey,
+        serverId: 'server_a',
+        serverName: 'Server A',
+    },
+    {
+        type: 'session',
+        session: sessionA,
+        groupKey,
+        groupKind: 'date',
+        serverId: 'server_a',
+        serverName: 'Server A',
+    },
+    {
+        type: 'session',
+        session: sessionB,
+        groupKey,
+        groupKind: 'date',
+        serverId: 'server_a',
+        serverName: 'Server A',
+    },
+];
+
+vi.mock('@/hooks/session/useVisibleSessionListViewData', () => ({
+    useVisibleSessionListViewData: () => mockVisibleSessionListViewData,
+}));
+
+vi.mock('@/utils/system/requestReview', () => ({
+    requestReview: vi.fn(),
+}));
+
+vi.mock('@/sync/domains/server/selection/serverSelectionResolution', () => ({
+    resolveActiveServerSelectionFromRawSettings: () =>
+        ({
+            enabled: true,
+            presentation: 'grouped',
+            activeServerId: 'server_a',
+            allowedServerIds: ['server_a'],
+        }) as any,
+    getEffectiveServerSelectionFromRawSettings: () =>
+        ({
+            enabled: true,
+            presentation: 'grouped',
+            activeServerId: 'server_a',
+            allowedServerIds: ['server_a'],
+        }) as any,
+}));
+
+vi.mock('./SessionItem', () => ({
+    SessionItem: (props: any) => React.createElement('SessionItem', {
+        ...props,
+        testID: `session-list-session:${String(props.session?.id ?? 'unknown')}`,
+    }),
+}));
+
+function resetVisibleSessionListViewData(): void {
+    mockVisibleSessionListViewData = [
+        {
+            type: 'header',
+            title: 'Today',
+            headerKind: 'date',
+            groupKey,
+            serverId: 'server_a',
+            serverName: 'Server A',
+        },
+        {
+            type: 'session',
+            session: sessionA,
+            groupKey,
+            groupKind: 'date',
+            serverId: 'server_a',
+            serverName: 'Server A',
+        },
+        {
+            type: 'session',
+            session: sessionB,
+            groupKey,
+            groupKind: 'date',
+            serverId: 'server_a',
+            serverName: 'Server A',
+        },
+    ];
+}
+
+async function renderSessionsList() {
+    const { SessionsList } = await import('./SessionsList');
+    return renderScreen(<SessionsList />);
+}
+
+function findSessionItem(
+    screen: Awaited<ReturnType<typeof renderSessionsList>>,
+    sessionId: string,
+) {
+    return screen.findByTestId(`session-list-session:${sessionId}`);
+}
+
+function expectPresent<T>(value: T | null | undefined, label: string): T {
+    expect(value, label).toBeTruthy();
+    if (value == null) {
+        throw new Error(label);
+    }
+    return value;
+}
+
+function createEmptySessionOrganizationProjection(): SessionOrganizationProjection {
+    return {
+        schemaVersion: 1,
+        version: 1,
+        pinnedSessionIds: [],
+        pinsBySessionId: {},
+        foldersById: {},
+        folderAssignmentsBySessionId: {},
+        tagsById: {},
+        tagAssignmentsBySessionId: {},
+        attentionStandingsBySessionId: {},
+        orderEntriesByScopeKey: {},
+        labelsByLabelKey: {},
+    };
+}
+
+describe('SessionsList pinning + per-group ordering', () => {
+    beforeEach(() => {
+        pinnedSessionKeysV1 = [];
+        sessionListGroupOrderV1 = {};
+        sessionTagsV1 = {};
+        workspaceLabelsV1 = {};
+        setPinnedSessionKeysV1.mockClear();
+        setSessionListGroupOrderV1.mockClear();
+        setSessionTagsV1.mockClear();
+        setWorkspaceLabelsV1.mockClear();
+        Object.values(sessionOrganizationOps).forEach((spy) => spy.mockClear());
+        modalAlertSpy.mockClear();
+        tokenStorageMocks.getCredentialsForServerUrl.mockClear();
+        routerPushSpy.mockReset();
+        mockAllowedServerIds = ['server_a'];
+        capturedRootFlatListProps = null;
+        hideInactiveSessions = false;
+        sessionListAttentionPromotionMode = null;
+        sessionListAttentionStandingDefault = false;
+        readMachineTargetForSessionMock.mockReset();
+        mockMachinesState.current = [];
+        sessionOrganizationProjection = createEmptySessionOrganizationProjection();
+        resetVisibleSessionListViewData();
+    });
+
+    afterEach(() => {
+        standardCleanup();
+    });
+
+    it('carries the stored attention standing into every row model it builds', async () => {
+        sessionListAttentionPromotionMode = 'global';
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            attentionStandingsBySessionId: {
+                sess_a: { sessionId: 'sess_a', standing: true, updatedAt: 10 },
+            },
+        };
+
+        const screen = await renderSessionsList();
+
+        const standingRow = expectPresent(findSessionItem(screen, 'sess_a'), 'expected standing session row');
+        const plainRow = expectPresent(findSessionItem(screen, 'sess_b'), 'expected non-standing session row');
+
+        expect(standingRow.props.rowModel.attentionStandingEnabled).toBe(true);
+        expect(standingRow.props.rowModel.isAttentionStanding).toBe(true);
+        expect(plainRow.props.rowModel.isAttentionStanding).toBe(false);
+    });
+
+    it('dirties the virtualized row gate when an attention standing changes, exactly as a pin does', async () => {
+        // `renderItem` is pinned to one identity for the life of the list (it reads the live
+        // renderer through a ref), so `extraData` is the ONLY channel that reaches an already
+        // mounted row: FlashList's ViewHolder skips a row whose item and extraData are unchanged.
+        // Pin flips this gate; attention standing has to flip it the same way or a kept session
+        // keeps rendering its stale row model.
+        sessionListAttentionPromotionMode = 'global';
+        const { SessionsList } = await import('./SessionsList');
+        const screen = await renderScreen(<SessionsList />);
+        const baselineExtraData = expectPresent(capturedRootFlatListProps?.extraData, 'expected row extra data');
+
+        // Every organization write also republishes the visible list, so each step below refreshes
+        // the view data the way the real hook does before re-rendering the surface.
+        const republishVisibleSessionListViewData = async () => {
+            mockVisibleSessionListViewData = [...mockVisibleSessionListViewData];
+            await screen.update(<SessionsList />);
+        };
+
+        // An organization refresh that changes nothing a row presents must not invalidate every
+        // rendered row: the gate compares signatures, never the rebuilt policy/pin objects.
+        sessionOrganizationProjection = { ...createEmptySessionOrganizationProjection(), version: 2 };
+        await republishVisibleSessionListViewData();
+        expect(capturedRootFlatListProps?.extraData).toBe(baselineExtraData);
+
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            version: 3,
+            attentionStandingsBySessionId: {
+                sess_a: { sessionId: 'sess_a', standing: true, updatedAt: 10 },
+            },
+        };
+        await republishVisibleSessionListViewData();
+        const standingExtraData = expectPresent(
+            capturedRootFlatListProps?.extraData,
+            'expected row extra data after the standing landed',
+        );
+        expect(standingExtraData).not.toBe(baselineExtraData);
+
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            version: 4,
+            attentionStandingsBySessionId: {
+                sess_a: { sessionId: 'sess_a', standing: true, updatedAt: 10 },
+            },
+            pinnedSessionIds: ['sess_b'],
+            pinsBySessionId: { sess_b: { sessionId: 'sess_b', sortKey: null, pinnedAt: 1 } },
+        };
+        await republishVisibleSessionListViewData();
+        expect(capturedRootFlatListProps?.extraData).not.toBe(standingExtraData);
+    });
+
+    it('leaves every row non-standing while the attention band is off', async () => {
+        sessionListAttentionPromotionMode = 'off';
+        sessionListAttentionStandingDefault = true;
+
+        const screen = await renderSessionsList();
+
+        const row = expectPresent(findSessionItem(screen, 'sess_a'), 'expected session row');
+
+        expect(row.props.rowModel.attentionStandingEnabled).toBe(false);
+    });
+
+    it('renders the archived sessions footer on web and routes to archived sessions', async () => {
+        const screen = await renderSessionsList();
+
+        const footerPressable = expectPresent(
+            findTestInstanceByTypeContainingText(screen.root, 'Pressable', 'sessionInfo.archivedSessions'),
+            'expected archived sessions footer button',
+        );
+
+        await act(async () => {
+            pressTestInstance(footerPressable, 'expected archived sessions footer button');
+        });
+
+        expect(routerPushSpy).toHaveBeenCalledWith('/session/archived');
+    });
+
+    it('renames the footer to inactive and archived sessions when hide inactive sessions is enabled', async () => {
+        hideInactiveSessions = true;
+        const screen = await renderSessionsList();
+
+        const footerPressable = expectPresent(
+            findTestInstanceByTypeContainingText(screen.root, 'Pressable', 'sessionInfo.inactiveAndArchivedSessions'),
+            'expected inactive and archived sessions footer button',
+        );
+
+        await act(async () => {
+            pressTestInstance(footerPressable, 'expected inactive and archived sessions footer button');
+        });
+
+        expect(routerPushSpy).toHaveBeenCalledWith('/session/archived');
+    });
+
+    it('stops wheel event propagation on web so session list scrolling is not blocked by document scroll-lock listeners', async () => {
+        const screen = await renderSessionsList();
+
+        expect(screen.root).toBeTruthy();
+        expect(capturedRootFlatListProps).toBeTruthy();
+        expect(typeof capturedRootFlatListProps?.onWheel).toBe('function');
+
+        const stopPropagation = vi.fn();
+        capturedRootFlatListProps?.onWheel?.({ stopPropagation });
+        expect(stopPropagation).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes server-backed session organization tags into session items when enabled', async () => {
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            tagAssignmentsBySessionId: { sess_a: ['important'] },
+        };
+        const screen = await renderSessionsList();
+
+        const row = expectPresent(
+            findSessionItem(screen, 'sess_a'),
+            'expected sess_a session row',
+        );
+        expect(row.props.tags).toEqual(['important']);
+        expect(row.props.allKnownTags).toContain('important');
+        expect(row.props.tagsEnabled).toBe(true);
+    });
+
+    it('renders inactive date-grouped rows with updated-at activity timestamps', async () => {
+        const screen = await renderSessionsList();
+
+        const row = expectPresent(
+            findSessionItem(screen, 'sess_a'),
+            'expected sess_a session row',
+        );
+
+        expect(row.props.activityTimeMode).toBe('updatedAt');
+    });
+
+    it('keeps project-grouped rows on meaningful activity timestamps', async () => {
+        mockVisibleSessionListViewData = [
+            {
+                type: 'header',
+                title: 'Project',
+                headerKind: 'project',
+                groupKey: 'project:alpha',
+                groupKind: 'project',
+                serverId: 'server_a',
+                serverName: 'Server A',
+            },
+            {
+                type: 'session',
+                session: sessionA,
+                groupKey: 'project:alpha',
+                groupKind: 'project',
+                serverId: 'server_a',
+                serverName: 'Server A',
+            },
+        ];
+
+        const screen = await renderSessionsList();
+
+        const row = expectPresent(
+            findSessionItem(screen, 'sess_a'),
+            'expected sess_a session row',
+        );
+
+        expect(row.props.activityTimeMode).toBeUndefined();
+    });
+
+    it('writes updated session tags through the session organization ops boundary', async () => {
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            tagAssignmentsBySessionId: { sess_a: ['important'] },
+        };
+        const screen = await renderSessionsList();
+
+        const row = expectPresent(
+            findSessionItem(screen, 'sess_a'),
+            'expected sess_a session row',
+        );
+
+        await act(async () => {
+            invokeTestInstanceHandler(row, 'onSetTags', ['urgent'], 'expected sess_a session row');
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+
+        expect(setSessionTagsV1).not.toHaveBeenCalled();
+        expect(sessionOrganizationOps.setSessionTagLabels).toHaveBeenCalledTimes(1);
+        expect(sessionOrganizationOps.setSessionTagLabels).toHaveBeenCalledWith({
+            credentials: { token: 'token-a', secret: 'secret-a' },
+            serverId: 'server_a',
+            serverUrl: 'https://server-a.example',
+            sessionId: 'sess_a',
+            tags: ['urgent'],
+        });
+    });
+
+    it('shows pinned server badges only when multiple servers are selected', async () => {
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            pinnedSessionIds: ['sess_a'],
+            pinsBySessionId: {
+                sess_a: { sessionId: 'sess_a', sortKey: 'rank-a', pinnedAt: 1 },
+            },
+        };
+        const screen = await renderSessionsList();
+
+        const pinnedRow = expectPresent(
+            findSessionItem(screen, 'sess_a'),
+            'expected pinned sess_a row',
+        );
+        expect(pinnedRow.props.pinned).toBe(true);
+        expect(pinnedRow.props.showServerBadge).toBe(false);
+
+        mockAllowedServerIds = ['server_a', 'server_b'];
+        const updatedScreen = await renderSessionsList();
+
+        const pinnedRow2 = expectPresent(
+            findSessionItem(updatedScreen, 'sess_a'),
+            'expected updated pinned sess_a row',
+        );
+        expect(pinnedRow2.props.showServerBadge).toBe(true);
+    });
+
+    it('wires pin toggling through the session organization ops boundary', async () => {
+        setPinnedSessionKeysV1.mockClear();
+
+        const screen = await renderSessionsList();
+
+        const row = expectPresent(
+            findSessionItem(screen, 'sess_a'),
+            'expected sess_a session row',
+        );
+
+        await act(async () => {
+            invokeTestInstanceHandler(row, 'onTogglePinned', undefined, 'expected sess_a session row');
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+
+        expect(setPinnedSessionKeysV1).not.toHaveBeenCalled();
+        expect(sessionOrganizationOps.setSessionPin).toHaveBeenCalledTimes(1);
+        expect(sessionOrganizationOps.setSessionPin).toHaveBeenCalledWith({
+            credentials: { token: 'token-a', secret: 'secret-a' },
+            serverId: 'server_a',
+            serverUrl: 'https://server-a.example',
+            sessionId: 'sess_a',
+            pinned: true,
+            sortKey: undefined,
+        });
+    });
+
+    it('shows actionable pin errors instead of silently rolling the row back', async () => {
+        sessionOrganizationOps.setSessionPin.mockRejectedValueOnce(new HappyError(
+            'You can pin up to 1,000 sessions. Unpin another session and try again.',
+            false,
+        ));
+        const screen = await renderSessionsList();
+        const row = expectPresent(findSessionItem(screen, 'sess_a'), 'expected sess_a session row');
+
+        await act(async () => {
+            invokeTestInstanceHandler(row, 'onTogglePinned', undefined, 'expected sess_a session row');
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+
+        expect(modalAlertSpy).toHaveBeenCalledWith(
+            'common.error',
+            'You can pin up to 1,000 sessions. Unpin another session and try again.',
+        );
+    });
+
+    it('renders project headers and keeps path/machine subtitles available on project rows', async () => {
+        const sess1 = {
+            ...sessionA,
+            id: 'sess_p1',
+            active: true,
+            presence: 'online',
+            metadata: { machineId: 'm1', host: 'Mac 1', path: '/home/u/repoA', homeDir: '/home/u' },
+        } as any;
+
+        const sess2 = {
+            ...sessionA,
+            id: 'sess_p2',
+            active: true,
+            presence: 'online',
+            metadata: { machineId: 'm2', host: 'Mac 2', path: '/home/u/repoA', homeDir: '/home/u' },
+        } as any;
+
+        mockVisibleSessionListViewData = [
+            { type: 'header', title: 'Active', headerKind: 'active', serverId: 'server_a', serverName: 'Server A' },
+            {
+                type: 'header',
+                title: '~/repoA',
+                headerKind: 'project',
+                groupKey: projectGroupKey,
+                serverId: 'server_a',
+                serverName: 'Server A',
+            },
+            { type: 'session', session: sess1, groupKey: projectGroupKey, groupKind: 'project', variant: 'no-path', serverId: 'server_a', serverName: 'Server A' },
+            { type: 'session', session: sess2, groupKey: projectGroupKey, groupKind: 'project', variant: 'no-path', serverId: 'server_a', serverName: 'Server A' },
+        ];
+
+        const screen = await renderSessionsList();
+
+        expect(findTestInstanceByTypeContainingText(screen.root, 'Text', '~/repoA')).toBeTruthy();
+
+        const row1 = expectPresent(
+            findSessionItem(screen, 'sess_p1'),
+            'expected sess_p1 session row',
+        );
+        expect(row1.props.variant).toBe('no-path');
+        expect(row1.props.secondaryLineMode).toBe('status');
+        expect(row1.props.subtitleOverride).toBe('m1 · repoA');
+    });
+
+    it('derives row subtitles from reachable machine targets when session metadata is stale after handoff', async () => {
+        mockMachinesState.current = [
+            { id: 'machine-live-1', metadata: { displayName: 'Rebound workstation' } },
+            { id: 'machine-live-2', metadata: { host: 'rebound-2.local' } },
+        ];
+
+        const sess1 = {
+            ...sessionA,
+            id: 'sess_live_1',
+            active: true,
+            presence: 'online',
+            metadata: { machineId: 'machine-stale-1', host: 'Old workstation', path: '/home/u/stale-a', homeDir: '/home/u' },
+        } as any;
+
+        const sess2 = {
+            ...sessionA,
+            id: 'sess_live_2',
+            active: true,
+            presence: 'online',
+            metadata: { machineId: 'machine-stale-2', host: 'Old workstation 2', path: '/home/u/stale-b', homeDir: '/home/u' },
+        } as any;
+
+        readMachineTargetForSessionMock.mockImplementation((sessionId: string) => {
+            if (sessionId === 'sess_live_1') {
+                return { machineId: 'machine-live-1', basePath: '/home/u/live-a' };
+            }
+            if (sessionId === 'sess_live_2') {
+                return { machineId: 'machine-live-2', basePath: '/home/u/live-b' };
+            }
+            return null;
+        });
+
+        mockVisibleSessionListViewData = [
+            {
+                type: 'header',
+                title: 'Today',
+                headerKind: 'date',
+                groupKey,
+                serverId: 'server_a',
+                serverName: 'Server A',
+            },
+            { type: 'session', session: sess1, groupKey, groupKind: 'date', serverId: 'server_a', serverName: 'Server A' },
+            { type: 'session', session: sess2, groupKey, groupKind: 'date', serverId: 'server_a', serverName: 'Server A' },
+        ];
+
+        const screen = await renderSessionsList();
+
+        const row1 = expectPresent(
+            findSessionItem(screen, 'sess_live_1'),
+            'expected sess_live_1 session row',
+        );
+        const row2 = expectPresent(
+            findSessionItem(screen, 'sess_live_2'),
+            'expected sess_live_2 session row',
+        );
+
+        expect(row1.props.subtitleOverride).toContain('Rebound workstation');
+        expect(row1.props.subtitleOverride).toContain('live-a');
+        expect(row2.props.subtitleOverride).toContain('rebound-2.local');
+        expect(row2.props.subtitleOverride).toContain('live-b');
+    });
+
+    it('uses renamed workspace labels for inactive date-grouped row subtitles', async () => {
+        sessionOrganizationProjection = {
+            ...createEmptySessionOrganizationProjection(),
+            labelsByLabelKey: {
+                'server_a:workspace:wl_22e4d12c': {
+                    labelKind: 'workspace',
+                    scopeKey: 'wl_22e4d12c',
+                    display: { t: 'plain', v: { label: 'Renamed Live Workspace' } },
+                    archivedAt: null,
+                    createdAt: 1,
+                    updatedAt: 1,
+                },
+                'server_a:workspace:wl_e9fff200': {
+                    labelKind: 'workspace',
+                    scopeKey: 'wl_e9fff200',
+                    display: { t: 'plain', v: { label: 'Renamed Live Workspace' } },
+                    archivedAt: null,
+                    createdAt: 1,
+                    updatedAt: 1,
+                },
+            },
+        };
+        mockMachinesState.current = [
+            { id: 'machine-live-1', metadata: { displayName: 'Rebound workstation' } },
+            { id: 'machine-live-2', metadata: { host: 'rebound-2.local' } },
+        ];
+
+        const sess1 = {
+            ...sessionA,
+            id: 'sess_live_1',
+            active: false,
+            presence: 'offline',
+            metadata: { machineId: 'machine-stale-1', host: 'Old workstation', path: '/home/u/stale-a', homeDir: '/home/u' },
+        } as any;
+
+        const sess2 = {
+            ...sessionA,
+            id: 'sess_live_2',
+            active: false,
+            presence: 'offline',
+            metadata: { machineId: 'machine-stale-2', host: 'Old workstation 2', path: '/home/u/stale-b', homeDir: '/home/u' },
+        } as any;
+
+        readMachineTargetForSessionMock.mockImplementation((sessionId: string) => {
+            if (sessionId === 'sess_live_1') {
+                return { machineId: 'machine-live-1', basePath: '/home/u/live-a' };
+            }
+            if (sessionId === 'sess_live_2') {
+                return { machineId: 'machine-live-2', basePath: '/home/u/live-b' };
+            }
+            return null;
+        });
+
+        mockVisibleSessionListViewData = [
+            {
+                type: 'header',
+                title: '3 days ago',
+                headerKind: 'date',
+                groupKey,
+                serverId: 'server_a',
+                serverName: 'Server A',
+            },
+            { type: 'session', session: sess1, groupKey, groupKind: 'date', serverId: 'server_a', serverName: 'Server A' },
+            { type: 'session', session: sess2, groupKey, groupKind: 'date', serverId: 'server_a', serverName: 'Server A' },
+        ];
+
+        const screen = await renderSessionsList();
+
+        const row1 = expectPresent(
+            findSessionItem(screen, 'sess_live_1'),
+            'expected sess_live_1 session row',
+        );
+        const row2 = expectPresent(
+            findSessionItem(screen, 'sess_live_2'),
+            'expected sess_live_2 session row',
+        );
+
+        expect(row1.props.subtitleOverride).toBe('Rebound workstation · Renamed Live Workspace');
+        expect(row2.props.subtitleOverride).toContain('rebound-2.local');
+        expect(row2.props.subtitleOverride).toContain('live-b');
+    });
+});

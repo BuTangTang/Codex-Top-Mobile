@@ -1,0 +1,160 @@
+import * as React from 'react';
+
+import { useRouter } from 'expo-router';
+
+import { Modal } from '@/modal';
+import type { Machine } from '@/sync/domains/state/storageTypes';
+import { t } from '@/text';
+import { clearBugReportUserActionTrail, recordBugReportUserAction } from '@/utils/system/bugReportActionTrail';
+import { clearBugReportLogBuffer } from '@/utils/system/bugReportLogBuffer';
+import { clearPreRestartBugReportSnapshot } from '@/utils/system/preRestartBugReportSnapshot';
+
+import { collectBugReportDiagnosticsArtifacts } from '../bugReportDiagnostics';
+import type { BugReportsFeature } from '../bugReportFeatureDefaults';
+import { openBugReportFallbackIssueUrl, openBugReportIssueUrlSilently } from '../openBugReportFallback';
+import { submitBugReportToService } from '../bugReportServiceClient';
+import { submitBugReportFromDraft, validateBugReportDraft } from '../bugReportSubmissionFlow';
+import type { BugReportComposerSubmissionInput } from '../bugReportSubmissionFlow';
+
+export function useBugReportComposerSubmit(input: Readonly<{
+  feature: BugReportsFeature;
+  machines: Machine[];
+  route: string;
+  includeDiagnostics: boolean;
+  diagnosticsKinds: string[];
+  issueOwner: string;
+  issueRepo: string;
+  existingIssueNumber: number | null;
+  openFallbackIssue: (environment: BugReportComposerSubmissionInput['environment']) => Promise<void>;
+  collectDiagnosticsArtifacts?: typeof collectBugReportDiagnosticsArtifacts;
+  buildDraftInput: (input: Readonly<{
+    includeDiagnostics: boolean;
+    diagnosticsKinds: string[];
+  }>) => BugReportComposerSubmissionInput;
+}>): {
+  submitting: boolean;
+  handleSubmit: () => Promise<void>;
+} {
+  const router = useRouter();
+  const [submitting, setSubmitting] = React.useState(false);
+
+  const {
+    feature,
+    machines,
+    route,
+    includeDiagnostics,
+    diagnosticsKinds,
+    issueOwner,
+    issueRepo,
+    existingIssueNumber,
+    openFallbackIssue,
+    collectDiagnosticsArtifacts,
+    buildDraftInput,
+  } = input;
+
+  const handleSubmit = React.useCallback(async () => {
+    if (submitting) return;
+
+    const draftInput = buildDraftInput({
+      includeDiagnostics,
+      diagnosticsKinds,
+    });
+    const validation = validateBugReportDraft(draftInput);
+    if (validation.code !== 'ok') {
+      await Modal.alert(validation.title, validation.message);
+      return;
+    }
+
+    setSubmitting(true);
+    recordBugReportUserAction('bug-report.submit-started', {
+      route,
+      metadata: {
+        includeDiagnostics,
+        existingIssueNumber: existingIssueNumber ?? undefined,
+        providerEnabled: feature.enabled,
+        hasProviderUrl: Boolean(feature.providerUrl),
+      },
+    });
+
+    try {
+      const result = await submitBugReportFromDraft({
+        feature,
+        machines,
+        input: draftInput,
+        issueOwner,
+        issueRepo,
+        existingIssueNumber: existingIssueNumber ?? undefined,
+        openFallbackIssue,
+        collectDiagnosticsArtifacts: collectDiagnosticsArtifacts ?? collectBugReportDiagnosticsArtifacts,
+        submitBugReport: submitBugReportToService,
+      });
+
+      if (result.mode === 'fallback') {
+        return;
+      }
+
+      const submittedMessage = existingIssueNumber
+        ? t('bugReports.composer.alerts.submittedExistingIssueBody', { issueNumber: result.issueNumber, reportId: result.reportId })
+        : t('bugReports.composer.alerts.submittedNewIssueBody', { issueNumber: result.issueNumber, reportId: result.reportId });
+      await Modal.alert(t('bugReports.composer.alerts.submittedTitle'), submittedMessage);
+      recordBugReportUserAction('bug-report.submit-succeeded', {
+        route,
+        metadata: {
+          issueNumber: result.issueNumber,
+          includeDiagnostics,
+          existingIssueNumber: existingIssueNumber ?? undefined,
+        },
+      });
+
+      // Best-effort only: avoid stacking extra modals over the success state if opening fails.
+      void openBugReportIssueUrlSilently(result.issueUrl);
+      clearBugReportUserActionTrail();
+      clearBugReportLogBuffer();
+      void clearPreRestartBugReportSnapshot();
+      router.back();
+    } catch (error) {
+      const baseMessage =
+        error instanceof Error ? error.message : t('bugReports.composer.alerts.submitFailedFallbackMessage');
+      const fallback = await Modal.confirm(
+        t('bugReports.composer.alerts.submitFailedTitle'),
+        t('bugReports.composer.alerts.submitFailedBody', { message: baseMessage }),
+        {
+          confirmText: t('bugReports.composer.alerts.openFallbackIssueButton'),
+          cancelText: t('common.cancel'),
+        },
+      );
+
+      if (fallback) {
+        await openFallbackIssue(draftInput.environment);
+      }
+      recordBugReportUserAction('bug-report.submit-failed', {
+        route,
+        metadata: {
+          includeDiagnostics,
+          fallbackOpened: Boolean(fallback),
+        },
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }, [
+    buildDraftInput,
+    diagnosticsKinds,
+    existingIssueNumber,
+    feature,
+    includeDiagnostics,
+    issueOwner,
+    issueRepo,
+    machines,
+    openFallbackIssue,
+    route,
+    router,
+    submitting,
+    collectDiagnosticsArtifacts,
+  ]);
+
+  return {
+    submitting,
+    handleSubmit,
+  };
+}

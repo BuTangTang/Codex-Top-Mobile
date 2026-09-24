@@ -1,0 +1,64 @@
+import React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import type { ToolCall } from '@/sync/domains/messages/messageTypes';
+import { makeToolViewProps, renderScreen } from '@/dev/testkit';
+import { makeCompletedTool, normalizedHostText } from '../core/truncationView.testHelpers';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+vi.mock('../../shell/presentation/ToolSectionView', () => ({
+    ToolSectionView: ({ children }: any) => React.createElement(React.Fragment, null, children),
+}));
+
+describe('WebSearchView', () => {
+    async function renderView(tool: ToolCall, detailLevel?: 'title' | 'summary' | 'full') {
+        const { WebSearchView } = await import('./WebSearchView');
+        return renderScreen(React.createElement(
+            WebSearchView,
+            makeToolViewProps(tool, detailLevel ? { detailLevel } : {}),
+        ));
+    }
+
+    it('shows a compact subset of results by default', async () => {
+        const results = Array.from({ length: 10 }, (_, i) => `https://example.com/${i}`);
+        const screen = await renderView(
+            makeCompletedTool('WebSearch', { query: 'test' }, results),
+        );
+        const renderedText = normalizedHostText(screen.tree);
+
+        expect(renderedText).toContain('https://example.com/0');
+        expect(renderedText).toContain('https://example.com/4');
+        expect(renderedText).not.toContain('https://example.com/5');
+        expect(renderedText).toContain('+5 more');
+    });
+
+    it('expands to show more results when detailLevel=full', async () => {
+        const results = Array.from({ length: 10 }, (_, i) => `https://example.com/${i}`);
+        const screen = await renderView(
+            makeCompletedTool('WebSearch', { query: 'test' }, results),
+            'full',
+        );
+        const renderedText = normalizedHostText(screen.tree);
+
+        expect(renderedText).toContain('https://example.com/0');
+        expect(renderedText).toContain('https://example.com/9');
+        expect(renderedText).not.toContain('+5 more');
+    });
+
+    it('supports item-object payloads and returns null for malformed payloads', async () => {
+        const itemsScreen = await renderView(
+            makeCompletedTool(
+                'WebSearch',
+                { query: 'x' },
+                { items: [{ title: 'Doc', link: 'https://example.com/doc', description: 'helpful' }] },
+            ),
+        );
+        const itemsText = normalizedHostText(itemsScreen.tree);
+        expect(itemsText).toContain('Doc');
+        expect(itemsText).toContain('https://example.com/doc');
+        expect(itemsText).toContain('helpful');
+
+        const malformedScreen = await renderView(makeCompletedTool('WebSearch', { query: 'x' }, { items: 123 }));
+        expect(malformedScreen.findAllByType('Text' as any)).toHaveLength(0);
+    });
+});

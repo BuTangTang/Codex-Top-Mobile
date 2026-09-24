@@ -1,0 +1,288 @@
+import { afterAll, describe, expect, it } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { RPC_METHODS } from '@happier-dev/protocol/rpc';
+import {
+  openEncryptedDataKeyEnvelopeV1,
+  sealEncryptedDataKeyEnvelopeV1,
+  SessionContinueWithReplayRpcResultSchema,
+} from '@happier-dev/protocol';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { createTestAuth } from '../../src/testkit/auth';
+import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { daemonControlPostJson } from '../../src/testkit/daemon/controlServerClient';
+import { seedCliDataKeyAuthForServer } from '../../src/testkit/cliAuth';
+import { createUserScopedSocketCollector } from '../../src/testkit/socketClient';
+import { createDataKeyRpcClient } from '../../src/testkit/syntheticAgent/rpcClient';
+import { encryptDataKeyBase64, decryptDataKeyBase64 } from '../../src/testkit/rpcCrypto';
+import { fetchJson } from '../../src/testkit/http';
+import { waitFor } from '../../src/testkit/timing';
+import { createSession, fetchAllMessages } from '../../src/testkit/sessions';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { decryptLegacyBase64 } from '../../src/testkit/messageCrypto';
+import { unwrapSerializedJsonValue } from '../../src/testkit/unwrapSerializedJsonValue';
+
+const run = createRunDirs({ runLabel: 'core' });
+
+type SessionsV2GetResponse = {
+  session?: {
+    id?: unknown;
+    dataEncryptionKey?: unknown;
+    metadata?: unknown;
+  };
+};
+
+async function fetchSessionDataEncryptionKeyBase64(params: {
+  baseUrl: string;
+  token: string;
+  sessionId: string;
+}): Promise<string> {
+  const res = await fetchJson<SessionsV2GetResponse>(`${params.baseUrl}/v2/sessions/${params.sessionId}`, {
+    headers: { Authorization: `Bearer ${params.token}` },
+    timeoutMs: 20_000,
+  });
+  if (res.status !== 200) {
+    throw new Error(`Failed to fetch /v2/sessions/${params.sessionId} (status=${res.status})`);
+  }
+  const dek = (res.data as any)?.session?.dataEncryptionKey;
+  if (typeof dek !== 'string' || dek.length === 0) {
+    throw new Error('Missing session.dataEncryptionKey');
+  }
+  return dek;
+}
+
+async function fetchSessionMetadataCiphertextBase64(params: {
+  baseUrl: string;
+  token: string;
+  sessionId: string;
+}): Promise<string> {
+  const res = await fetchJson<SessionsV2GetResponse>(`${params.baseUrl}/v2/sessions/${params.sessionId}`, {
+    headers: { Authorization: `Bearer ${params.token}` },
+    timeoutMs: 20_000,
+  });
+  if (res.status !== 200) {
+    throw new Error(`Failed to fetch /v2/sessions/${params.sessionId} (status=${res.status})`);
+  }
+  const metadata = (res.data as any)?.session?.metadata;
+  if (typeof metadata !== 'string' || metadata.length === 0) {
+    throw new Error('Missing session.metadata');
+  }
+  return metadata;
+}
+
+function tryParseSessionMetadata(ciphertextBase64: string, machineKey: Uint8Array): any | null {
+  const trimmed = ciphertextBase64.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      return unwrapSerializedJsonValue(JSON.parse(trimmed));
+    } catch {
+      // Fall through to encrypted payload handling.
+    }
+  }
+
+  // Most sessions store metadata encrypted-at-rest. In dataKey mode this uses the same AES-256-GCM
+  // bundle format as encrypted messages, keyed by the opened DEK (or machineKey fallback).
+  try {
+    const maybeDataKey = decryptDataKeyBase64(trimmed, machineKey);
+    const unwrapped = unwrapSerializedJsonValue(maybeDataKey);
+    if (unwrapped && typeof unwrapped === 'object') return unwrapped;
+  } catch {
+    // Ignore and fall through to legacy.
+  }
+
+  const legacy = unwrapSerializedJsonValue(decryptLegacyBase64(trimmed, machineKey));
+  return legacy && typeof legacy === 'object' ? legacy : null;
+}
+
+async function postEncryptedMessage(params: {
+  baseUrl: string;
+  token: string;
+  sessionId: string;
+  sessionKey: Uint8Array;
+  message: unknown;
+}): Promise<void> {
+  const ciphertext = encryptDataKeyBase64(params.message, params.sessionKey);
+  const endpoint = `${params.baseUrl}/v2/sessions/${params.sessionId}/messages`;
+  const res = await fetchJson<any>(endpoint, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${params.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ciphertext }),
+    timeoutMs: 20_000,
+  });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Failed to post message to ${endpoint} (status=${res.status})`);
+  }
+}
+
+describe('core e2e: machine RPC session.continueWithReplay hydrates transcript in dataKey mode', () => {
+  let server: StartedServer | null = null;
+  let daemon: StartedDaemon | null = null;
+
+  afterAll(async () => {
+    await daemon?.stop().catch(() => {});
+    await server?.stop();
+  });
+
+  it('decrypts prior transcript via dataEncryptionKey and spawns a new session with replaySeedV1 stored in metadata', async () => {
+    const testDir = run.testDir('session-continue-with-replay-datakey-hydration');
+    // Deterministic control-plane timing.
+    server = await startServerLight({ testDir, dbProvider: 'sqlite' });
+    const auth = await createTestAuth(server.baseUrl);
+
+    const daemonHomeDir = resolve(join(testDir, 'daemon-home'));
+    const workspaceDir = resolve(join(testDir, 'workspace'));
+    await mkdir(daemonHomeDir, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const machineKey = Uint8Array.from(randomBytes(32));
+    const seeded = await seedCliDataKeyAuthForServer({
+      cliHome: daemonHomeDir,
+      serverUrl: server.baseUrl,
+      token: auth.token,
+      machineKey,
+    });
+
+    const fakeClaudePath = fakeClaudeFixturePath();
+
+    daemon = await startTestDaemon({
+      testDir,
+      happyHomeDir: daemonHomeDir,
+      env: {
+        ...process.env,
+        CI: '1',
+        HAPPIER_VARIANT: 'dev',
+        HAPPIER_DISABLE_CAFFEINATE: '1',
+        HAPPIER_HOME_DIR: daemonHomeDir,
+        HAPPIER_SERVER_URL: server.baseUrl,
+        HAPPIER_WEBAPP_URL: server.baseUrl,
+        HAPPIER_CLAUDE_PATH: fakeClaudePath,
+      },
+    });
+
+    const controlToken = (daemon.state as any)?.controlToken as string | undefined;
+    await waitFor(
+      async () => {
+        const res = await daemonControlPostJson({ port: daemon!.state.httpPort, path: '/list', body: {}, controlToken });
+        return res.status === 200;
+      },
+      { timeoutMs: 20_000 },
+    );
+
+    // This test only needs a prior session with dataKey-encrypted messages; creating it via the server API is
+    // significantly more reliable than going through daemon /spawn-session (which involves starting a runner).
+    const dekPlain = Uint8Array.from(randomBytes(32));
+    const sealedDek = sealEncryptedDataKeyEnvelopeV1({
+      dataKey: dekPlain,
+      recipientPublicKey: seeded.publicKey,
+      randomBytes: (length) => Uint8Array.from(randomBytes(length)),
+    });
+    const { sessionId: previousSessionId } = await createSession(server.baseUrl, auth.token, {
+      dataEncryptionKeyBase64: Buffer.from(sealedDek).toString('base64'),
+    });
+
+    const encryptedDekBase64 = await fetchSessionDataEncryptionKeyBase64({
+      baseUrl: server.baseUrl,
+      token: auth.token,
+      sessionId: previousSessionId,
+    });
+    const dek = openEncryptedDataKeyEnvelopeV1({
+      envelope: new Uint8Array(Buffer.from(encryptedDekBase64, 'base64')),
+      recipientSecretKeyOrSeed: machineKey,
+    });
+    if (!dek || dek.length !== 32) {
+      throw new Error('Failed to open session dataEncryptionKey');
+    }
+    expect(Buffer.from(dek).toString('base64')).toBe(Buffer.from(dekPlain).toString('base64'));
+
+    const userText = 'hello from e2e replay';
+    const assistantText = 'hi from e2e replay';
+    await postEncryptedMessage({
+      baseUrl: server.baseUrl,
+      token: auth.token,
+      sessionId: previousSessionId,
+      sessionKey: dek,
+      message: { role: 'user', content: { type: 'text', text: userText } },
+    });
+    await postEncryptedMessage({
+      baseUrl: server.baseUrl,
+      token: auth.token,
+      sessionId: previousSessionId,
+      sessionKey: dek,
+      message: { role: 'agent', content: { type: 'text', text: assistantText } },
+    });
+
+    const transcript = await fetchAllMessages(server.baseUrl, auth.token, previousSessionId);
+    const decrypted = transcript
+      .map((m) => decryptDataKeyBase64(m.content.c, dek))
+      .filter((row) => row && typeof row === 'object');
+    expect(decrypted.some((m: any) => m?.role === 'user' && m?.content?.text === userText)).toBe(true);
+    expect(decrypted.some((m: any) => m?.role === 'agent' && m?.content?.text === assistantText)).toBe(true);
+
+    const ui = createUserScopedSocketCollector(server.baseUrl, auth.token);
+    ui.connect();
+    await waitFor(() => ui.isConnected(), { timeoutMs: 20_000 });
+
+    const machineRpc = createDataKeyRpcClient(ui, machineKey);
+
+    let replayResult: any | null = null;
+    await waitFor(
+      async () => {
+        const res = await machineRpc.call(`${seeded.machineId}:${RPC_METHODS.SESSION_CONTINUE_WITH_REPLAY}`, {
+          directory: workspaceDir,
+          agent: 'claude',
+          approvedNewDirectoryCreation: true,
+          replay: {
+            previousSessionId,
+            strategy: 'recent_messages',
+            recentMessagesCount: 8,
+            seedMode: 'draft',
+          },
+        });
+        if (!res.ok) return false;
+        replayResult = res.result;
+        const parsed = SessionContinueWithReplayRpcResultSchema.safeParse(replayResult);
+        return parsed.success && parsed.data.type === 'success';
+      },
+      { timeoutMs: 30_000 },
+    );
+
+    const parsed = SessionContinueWithReplayRpcResultSchema.safeParse(replayResult);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success || parsed.data.type !== 'success') {
+      throw new Error('Expected success result from session.continueWithReplay');
+    }
+    expect(typeof parsed.data.sessionId).toBe('string');
+    expect(parsed.data.sessionId.length).toBeGreaterThan(0);
+
+    const childMetadataCiphertext = await fetchSessionMetadataCiphertextBase64({
+      baseUrl: server.baseUrl,
+      token: auth.token,
+      sessionId: parsed.data.sessionId,
+    });
+    const childEncryptedDekBase64 = await fetchSessionDataEncryptionKeyBase64({
+      baseUrl: server.baseUrl,
+      token: auth.token,
+      sessionId: parsed.data.sessionId,
+    });
+    const childDek = openEncryptedDataKeyEnvelopeV1({
+      envelope: new Uint8Array(Buffer.from(childEncryptedDekBase64, 'base64')),
+      recipientSecretKeyOrSeed: machineKey,
+    });
+    if (!childDek || childDek.length !== 32) {
+      throw new Error('Failed to open child session dataEncryptionKey');
+    }
+
+    const childMetadata =
+      tryParseSessionMetadata(childMetadataCiphertext, childDek) ??
+      tryParseSessionMetadata(childMetadataCiphertext, machineKey);
+    expect(childMetadata && typeof childMetadata === 'object').toBe(true);
+    expect((childMetadata as any)?.replaySeedV1?.seedText).toContain(userText);
+    expect((childMetadata as any)?.forkV1?.parentSessionId).toBe(previousSessionId);
+
+    ui.close();
+  }, 240_000);
+});

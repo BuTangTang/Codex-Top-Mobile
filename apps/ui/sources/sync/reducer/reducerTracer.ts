@@ -1,0 +1,494 @@
+// ============================================================================
+// Reducer Tracer - Message Relationship Tracking for Sidechains
+// ============================================================================
+//
+// This module is responsible for tracking relationships between messages,
+// specifically focusing on linking sidechain messages to their originating
+// Task tool calls. This is crucial for understanding the flow of AI agent
+// interactions where Task tools spawn separate execution contexts (sidechains).
+//
+// Key Concepts:
+// -------------
+// 1. Task Tools: When the AI uses a Task tool, it initiates a separate
+//    execution context that produces its own message stream (a sidechain).
+//
+// 2. Sidechains: These are message sequences that occur in a separate context
+//    but need to be linked back to the Task that spawned them. Messages in
+//    sidechains have isSidechain=true.
+//
+// 3. Message Relationships: Each message can have:
+//    - A UUID: Unique identifier for the message
+//    - A parentUUID: Reference to its parent message (for nested responses)
+//    - A sidechainId: The tool-call id of the Task tool call that spawned it
+//
+// How It Works:
+// -------------
+// 1. Task Detection: When a Task tool call is encountered, we store it in
+//    taskTools indexed by the message ID. We also index by prompt to the
+//    Task tool-call id for quick lookup when matching sidechain roots.
+//
+// 2. Sidechain Root Matching: When a sidechain message arrives with a prompt
+//    that matches a known Task prompt, it's identified as a sidechain root
+//    and assigned the Task tool-call id as its sidechainId.
+//
+//    Provider-agnostic override: if a message already carries a `sidechainId`,
+//    we treat it as authoritative and do not rely on prompt matching.
+//
+// 3. Parent-Child Linking: Sidechain messages can reference parent messages
+//    via parentUUID. Children inherit the sidechainId from their parent.
+//
+// 4. Orphan Handling: Messages may arrive out of order. If a child arrives
+//    before its parent, it's buffered as an "orphan" until the parent
+//    arrives, then processed recursively.
+//
+// 5. Propagation: Once a sidechain root is identified, all its descendants
+//    (direct children and their children) inherit the same sidechainId.
+//
+// Example Flow:
+// -------------
+// 1. Message "msg1" contains Task tool call with prompt "Search for files"
+// 2. Sidechain message "sc1" arrives with type="sidechain" and same prompt
+//    -> sc1 gets sidechainId="<task tool-call id>"
+// 3. Message "sc2" arrives with parentUUID="sc1"
+//    -> sc2 inherits sidechainId="<task tool-call id>" from its parent
+// 4. Any orphans waiting for "sc1" or "sc2" are processed recursively
+//
+// This tracking enables the UI to group related messages together and show
+// the complete context of Task executions, even when messages arrive out
+// of order or from different execution contexts.
+//
+// ============================================================================
+
+import { NormalizedMessage } from '../typesRaw';
+import { isDebugFlagEnabled } from './helpers/debugFlags';
+import { readStreamSegmentMetaV1 } from './helpers/streamSegmentMeta';
+import { readAcpToolCallSnapshotRevision } from './helpers/toolCallSnapshotRevision';
+
+type OrphanBucket = {
+    updatedAt: number;
+    messages: NormalizedMessage[];
+};
+
+function normalizePromptKey(prompt: string): string {
+    return String(prompt ?? '').trim();
+}
+
+function firstNonEmptyString(...values: unknown[]): string | null {
+    for (const value of values) {
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed) return trimmed;
+        }
+    }
+    return null;
+}
+
+function firstBoolean(...values: unknown[]): boolean | null {
+    for (const value of values) {
+        if (typeof value === 'boolean') return value;
+    }
+    return null;
+}
+
+function promptOrphanKey(promptKey: string): string {
+    return `__prompt__:${promptKey}`;
+}
+
+const ORPHAN_TTL_MS = 10 * 60_000;
+const MAX_ORPHANS_PER_PARENT = 50;
+const MAX_TOTAL_ORPHANS = 500;
+
+// Extended message type with sidechain ID for tracking message relationships
+export type TracedMessage = NormalizedMessage & {
+    sidechainId?: string;  // ID of the Task tool-call that initiated this sidechain
+}
+
+// Tracer state for tracking message relationships and sidechain processing
+export interface TracerState {
+    // Task tracking - stores Task tool calls by their message ID
+    taskTools: Map<string, { toolCallId: string; prompt: string }>;  // messageId -> Task info
+    promptToTaskId: Map<string, string>;  // prompt -> task tool-call ID (for matching sidechains)
+    
+    // Sidechain tracking - maps message UUIDs to their originating Task tool-call ID
+    uuidToSidechainId: Map<string, string>;  // uuid -> sidechain ID (originating task tool-call ID)
+    
+    // Buffering for out-of-order messages that arrive before their parent
+    orphanMessages: Map<string, OrphanBucket>;  // parentUuid -> orphan messages waiting for parent
+    
+    // Track already processed messages to avoid duplicates.
+    //
+    // IMPORTANT: do not dedupe agent messages by UUID alone.
+    // Tool calls and tool results can share the same UUID/tool id; collapsing them breaks tool streaming.
+    //
+    // We dedupe by a composite key that includes the transport id (message.id) plus the first content
+    // item type + uuid when present. This allows incremental streaming updates that reuse message.id
+    // while still preventing double-application of the same delta.
+    processedIds: Set<string>;
+
+    telemetry: {
+        orphanBuffered: number;
+        orphanFlushed: number;
+        sidechainBufferedByPrompt: number;
+        sidechainDroppedUnlinked: number;
+        sidechainParentMappedButMissingHint: number;
+        agentMultiContentSeen: number;
+    };
+}
+
+// Create a new tracer state with empty collections
+export function createTracer(): TracerState {
+    return {
+        taskTools: new Map(),
+        promptToTaskId: new Map(),
+        uuidToSidechainId: new Map(),
+        orphanMessages: new Map(),
+        processedIds: new Set(),
+        telemetry: {
+            orphanBuffered: 0,
+            orphanFlushed: 0,
+            sidechainBufferedByPrompt: 0,
+            sidechainDroppedUnlinked: 0,
+            sidechainParentMappedButMissingHint: 0,
+            agentMultiContentSeen: 0,
+        },
+    };
+}
+
+function isTracerDebugEnabled(): boolean {
+    return isDebugFlagEnabled({
+        globalKey: '__HAPPIER_DEBUG_TRACER__',
+        localStorageKey: 'happier.debug.tracer',
+    });
+}
+
+function maybeLog(event: unknown): void {
+    if (!isTracerDebugEnabled()) return;
+    // Never log message bodies or prompts. Tracer events are intended for diagnosing classification bugs.
+    // eslint-disable-next-line no-console
+    console.log('[reducer-tracer]', event);
+}
+
+function pruneOrphans(state: TracerState, now = Date.now()): void {
+    // TTL eviction.
+    for (const [parentUuid, bucket] of state.orphanMessages) {
+        if (now - bucket.updatedAt > ORPHAN_TTL_MS) {
+            state.orphanMessages.delete(parentUuid);
+        }
+    }
+
+    let total = 0;
+    for (const bucket of state.orphanMessages.values()) {
+        total += bucket.messages.length;
+    }
+
+    if (total <= MAX_TOTAL_ORPHANS) return;
+
+    // Global cap: drop oldest buckets first.
+    const buckets = [...state.orphanMessages.entries()]
+        .map(([parentUuid, bucket]) => ({ parentUuid, updatedAt: bucket.updatedAt, count: bucket.messages.length }))
+        .sort((a, b) => a.updatedAt - b.updatedAt);
+
+    for (const bucket of buckets) {
+        if (total <= MAX_TOTAL_ORPHANS) break;
+        state.orphanMessages.delete(bucket.parentUuid);
+        total -= bucket.count;
+    }
+}
+
+function addOrphan(state: TracerState, parentUuid: string, message: NormalizedMessage): void {
+    const now = Date.now();
+    pruneOrphans(state, now);
+
+    const bucket = state.orphanMessages.get(parentUuid) ?? { updatedAt: now, messages: [] };
+    bucket.updatedAt = now;
+    bucket.messages.push(message);
+    state.telemetry.orphanBuffered += 1;
+    if (bucket.messages.length > MAX_ORPHANS_PER_PARENT) {
+        bucket.messages.splice(0, bucket.messages.length - MAX_ORPHANS_PER_PARENT);
+    }
+    state.orphanMessages.set(parentUuid, bucket);
+
+    pruneOrphans(state, now);
+}
+
+// Extract UUID from the first content item of an agent message
+function getMessageUuid(message: NormalizedMessage): string | null {
+    if (message.role === 'agent' && message.content.length > 0) {
+        const firstContent = message.content[0];
+        if ('uuid' in firstContent && firstContent.uuid) {
+            return firstContent.uuid;
+        }
+    }
+    return null;
+}
+
+function getProcessedKey(message: NormalizedMessage): string {
+    if (message.role !== 'agent') {
+        return `id:${message.id}`;
+    }
+
+    const hashStringFNV1a32 = (value: string): string => {
+        // Non-cryptographic, deterministic hash to fingerprint streaming deltas without embedding full text in keys.
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < value.length; i += 1) {
+            hash ^= value.charCodeAt(i);
+            hash = Math.imul(hash, 0x01000193);
+        }
+        return (hash >>> 0).toString(16);
+    };
+
+    const first = message.content[0] as any;
+    const type = typeof first?.type === 'string' ? String(first.type) : 'unknown';
+    const uuid =
+        typeof first?.uuid === 'string' && first.uuid.trim().length > 0
+            ? first.uuid.trim()
+            : null;
+
+    const streamSegmentUpdatedAtMs = readStreamSegmentMetaV1((message as any)?.meta)?.updatedAtMs ?? null;
+    const streamFingerprint = (() => {
+        if (streamSegmentUpdatedAtMs !== null) return `seg:${streamSegmentUpdatedAtMs}`;
+        if (type === 'text') {
+            const text = typeof first?.text === 'string' ? first.text : '';
+            return `txt:${hashStringFNV1a32(text)}:${text.length}`;
+        }
+        if (type === 'thinking') {
+            const thinking = typeof first?.thinking === 'string' ? first.thinking : '';
+            return `thinking:${hashStringFNV1a32(thinking)}:${thinking.length}`;
+        }
+        if (type === 'tool-call') {
+            const revision = readAcpToolCallSnapshotRevision(first?.input);
+            if (revision !== null) return `tool:${revision}`;
+        }
+        return 'v0';
+    })();
+
+    return uuid
+        ? `agent:${message.id}:${type}:${uuid}:${streamFingerprint}`
+        : `agent:${message.id}:${type}:${streamFingerprint}`;
+}
+
+// Extract parent UUID from the first content item of an agent message
+function getParentUuid(message: NormalizedMessage): string | null {
+    if (message.role === 'agent' && message.content.length > 0) {
+        const firstContent = message.content[0];
+        if ('parentUUID' in firstContent) {
+            return firstContent.parentUUID;
+        }
+    }
+    return null;
+}
+
+// Process orphan messages recursively when their parent becomes available
+function processOrphans(state: TracerState, parentUuid: string, sidechainId: string): TracedMessage[] {
+    const results: TracedMessage[] = [];
+    const bucket = state.orphanMessages.get(parentUuid);
+    
+    if (!bucket) {
+        return results;
+    }
+    
+    // Remove from orphan map
+    state.orphanMessages.delete(parentUuid);
+    state.telemetry.orphanFlushed += bucket.messages.length;
+    
+    // Process each orphan
+    for (const orphan of bucket.messages) {
+        const uuid = getMessageUuid(orphan);
+        const key = getProcessedKey(orphan);
+        
+        // Mark as processed (dedupe key handles agent id reuse).
+        state.processedIds.add(key);
+        
+        // Assign sidechain ID
+        if (uuid) {
+            state.uuidToSidechainId.set(uuid, sidechainId);
+        }
+        
+        // Create traced message
+        const tracedMessage: TracedMessage = {
+            ...orphan,
+            sidechainId
+        };
+        results.push(tracedMessage);
+        
+        // Recursively process any orphans waiting for this message
+        if (uuid) {
+            const childOrphans = processOrphans(state, uuid, sidechainId);
+            results.push(...childOrphans);
+        }
+    }
+    
+    return results;
+}
+
+// Main tracer function - processes messages and assigns sidechain IDs based on Task relationships
+export function traceMessages(state: TracerState, messages: NormalizedMessage[]): TracedMessage[] {
+    const results: TracedMessage[] = [];
+    pruneOrphans(state);
+    
+    for (const message of messages) {
+        if (message.role === 'agent' && message.content.length > 1) {
+            state.telemetry.agentMultiContentSeen += 1;
+        }
+        const uuid = getMessageUuid(message);
+        const key = getProcessedKey(message);
+
+        // Skip if already processed (dedupe key handles agent id reuse).
+        if (state.processedIds.has(key)) continue;
+        
+        // Extract Task tools and index them by message ID for later sidechain matching
+        if (message.role === 'agent') {
+            for (const content of message.content) {
+                if (content.type === 'tool-call' && isGenericSubAgentToolName(content.name)) {
+                    if (content.input && typeof content.input === 'object' && 'prompt' in content.input) {
+                        const toolCallId =
+                            typeof content.id === 'string' && content.id ? content.id : message.id;
+                        if (!toolCallId) continue;
+                        const prompt = (content.input as any).prompt;
+                        if (typeof prompt !== 'string' || !prompt) continue;
+                        const promptKey = normalizePromptKey(prompt);
+                        if (!promptKey) continue;
+                        // Store Task info indexed by message ID (and map prompt -> tool-call id).
+                        state.taskTools.set(message.id, {
+                            toolCallId,
+                            prompt: promptKey
+                        });
+                        state.promptToTaskId.set(promptKey, toolCallId);
+
+                        // Flush any buffered sidechain roots that arrived before this Task tool-call.
+                        results.push(...processOrphans(state, promptOrphanKey(promptKey), toolCallId));
+                    }
+                }
+            }
+        }
+
+        const parentUuid = getParentUuid(message);
+        const meta = (message as any)?.meta as Record<string, unknown> | undefined;
+        const metaSidechainId = firstNonEmptyString(meta?.sidechainId, meta?.sidechain_id);
+        const metaIsSidechain = firstBoolean(meta?.isSidechain, meta?.is_sidechain);
+
+        const explicitSidechainId = firstNonEmptyString(message.sidechainId, metaSidechainId) ?? undefined;
+        const inferredFromParent = parentUuid ? state.uuidToSidechainId.get(parentUuid) : undefined;
+        // IMPORTANT: parentUUID is a threading hint, not an authoritative sidechain signal.
+        //
+        // We only use parent-based propagation when the provider has already indicated that the message
+        // is part of a sidechain (via isSidechain=true) or when an explicit sidechainId is present.
+        //
+        // This prevents a class of bugs where main-timeline messages become accidentally parented to the
+        // last sidechain UUID during streaming (cross-chain parent contamination), which would otherwise
+        // fold real main transcript output into a Task/SubAgentRun thread in an order-dependent way.
+        const shouldTreatAsSidechain =
+            message.isSidechain
+            || metaIsSidechain === true
+            || Boolean(explicitSidechainId)
+            || (message.isSidechain && Boolean(inferredFromParent));
+        
+        // Non-sidechain messages are returned immediately without sidechain ID.
+        // Fallbacks:
+        // - explicit sidechainId from provider metadata
+        // - parent already mapped to a sidechain (when isSidechain flag is missing)
+        if (!shouldTreatAsSidechain) {
+            if (inferredFromParent) {
+                state.telemetry.sidechainParentMappedButMissingHint += 1;
+                maybeLog({
+                    kind: 'sidechain-parent-mapped-missing-hint',
+                    messageId: message.id,
+                    parentUuid,
+                    inferredSidechainId: inferredFromParent,
+                    role: message.role,
+                    firstType: (message as any)?.content?.[0]?.type,
+                });
+            }
+            state.processedIds.add(key);
+            const tracedMessage: TracedMessage = {
+                ...message
+            };
+            results.push(tracedMessage);
+            continue;
+        }
+
+        // Handle sidechain messages - these need to be linked to their originating Task.
+        // Provider-agnostic: prefer explicit sidechainId if present on the message.
+        let isSidechainRoot = false;
+        let sidechainId: string | undefined = explicitSidechainId;
+        let pendingPromptKey: string | null = null;
+        
+        // If not provided explicitly, look for sidechain content type with a prompt that matches a Task.
+        if (!sidechainId && message.role === 'agent') {
+            for (const content of message.content) {
+                if (content.type === 'sidechain' && content.prompt) {
+                    const promptKey = normalizePromptKey(content.prompt);
+                    if (!promptKey) continue;
+                    const taskId = state.promptToTaskId.get(promptKey);
+                    if (taskId) {
+                        isSidechainRoot = true;
+                        sidechainId = taskId;
+                        break;
+                    }
+                    // Sidechain root arrived before the Task tool-call: buffer it by prompt.
+                    pendingPromptKey = promptKey;
+                }
+            }
+        }
+        
+        if ((explicitSidechainId || isSidechainRoot) && sidechainId) {
+            // This is a sidechain root - mark it and process any waiting orphans
+            state.processedIds.add(key);
+            if (uuid) {
+                state.uuidToSidechainId.set(uuid, sidechainId);
+            }
+            
+            const tracedMessage: TracedMessage = {
+                ...message,
+                sidechainId
+            };
+            results.push(tracedMessage);
+            
+            // Process any orphan messages that were waiting for this parent
+            if (uuid) {
+                const orphanResults = processOrphans(state, uuid, sidechainId);
+                results.push(...orphanResults);
+            }
+        } else if (parentUuid) {
+            // This message has a parent - check if parent's sidechain ID is known
+            const parentSidechainId = state.uuidToSidechainId.get(parentUuid);
+            
+            if (parentSidechainId) {
+                // Parent is known - inherit the same sidechain ID
+                state.processedIds.add(key);
+                if (uuid) {
+                    state.uuidToSidechainId.set(uuid, parentSidechainId);
+                }
+                
+                const tracedMessage: TracedMessage = {
+                    ...message,
+                    sidechainId: parentSidechainId
+                };
+                results.push(tracedMessage);
+                
+                // Process any orphans waiting for this UUID
+                if (uuid) {
+                    const orphanResults = processOrphans(state, uuid, parentSidechainId);
+                    results.push(...orphanResults);
+                }
+            } else {
+                // Parent not yet processed - buffer this message as an orphan
+                addOrphan(state, parentUuid, message);
+            }
+        } else {
+            // Sidechain message with no parent and not a root:
+            // - If it's a sidechain root with a prompt, buffer until the Task tool-call arrives.
+            // - Otherwise drop it to avoid leaking sidechain tool execution into the main transcript.
+            if (pendingPromptKey) {
+                state.telemetry.sidechainBufferedByPrompt += 1;
+                addOrphan(state, promptOrphanKey(pendingPromptKey), message);
+            } else {
+                state.processedIds.add(key);
+                state.telemetry.sidechainDroppedUnlinked += 1;
+            }
+        }
+    }
+    
+    return results;
+}
+import { isGenericSubAgentToolName } from '@happier-dev/protocol/tools/v2';

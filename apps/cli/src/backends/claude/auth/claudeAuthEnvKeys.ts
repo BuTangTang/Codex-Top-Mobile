@@ -1,0 +1,20 @@
+export const CLAUDE_AUTH_ENV_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+  'CLAUDE_CODE_OAUTH_SCOPES',
+  'CLAUDE_CODE_SETUP_TOKEN',
+] as const;
+
+export type ClaudeAuthEnvKey = typeof CLAUDE_AUTH_ENV_KEYS[number];
+
+export const CLAUDE_RUNTIME_REFRESH_SECRET_ENV_KEYS = [
+  'CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+  'CLAUDE_CODE_OAUTH_SCOPES',
+] as const satisfies readonly ClaudeAuthEnvKey[];
+
+export const CLAUDE_CONFIG_ENV_KEYS = [
+  'CLAUDE_CONFIG_DIR',
+] as const;

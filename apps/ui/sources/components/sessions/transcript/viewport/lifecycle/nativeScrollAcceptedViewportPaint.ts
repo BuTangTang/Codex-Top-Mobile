@@ -1,0 +1,154 @@
+export type NativeScrollAcceptedViewportPaintDecision =
+    | Readonly<{ type: 'record-accepted-viewport-paint' }>
+    | Readonly<{
+        reason:
+            | 'not-native'
+            | 'not-loaded'
+            | 'empty-list'
+            | 'trusted-observation'
+            | 'not-accepted';
+        type: 'skip';
+    }>;
+
+export type NativeScrollAcceptedViewportPaintEffect = Readonly<{
+    fallbackMetrics: Readonly<{
+        contentHeight: number;
+        distanceFromLiveTailPx: number;
+        layoutHeight: number;
+    }>;
+    sessionId: string;
+    type: 'record-accepted-viewport-paint';
+}>;
+
+/**
+ * Native reveal edge. The transcript must not release its first accepted paint before native mount
+ * placement has settled, otherwise it paints and then moves — the cold-open flicker.
+ *
+ * Release requires mount-settle stability, the mount-settle deadline, or the warm keep-alive
+ * allowance. It is never an unconditional accept.
+ *
+ * The renderer fact (`usesNativeFlashListBottomMaintenance`, i.e.
+ * `rendererKind === 'flashList' && platformOS !== 'web'`) deliberately does not participate. It used
+ * to short-circuit to `true` here, which was inert while FlashList shipped but turned this gate into
+ * an unconditional accept on every native open once Legend became the shipped renderer. Mount settle
+ * is a placement fact of the native host, produced identically under both renderers.
+ *
+ * This gate can only ever DELAY a reveal. `useTranscriptNativeMountSettleLifecycle` guarantees
+ * `nativeMountSettleDeadlineReached` within
+ * `transcriptInitialFillBudgetMs + transcriptMountSettleQuiescentWindowMs`, so a settle signal that
+ * never stabilizes still reveals on the deadline.
+ */
+export function resolveNativeFollowBottomObservationCanReleasePaint(params: Readonly<{
+    distanceFromLiveTailPx: number;
+    isWarmKeepAliveInstance: boolean;
+    nativeMountSettleDeadlineReached: boolean;
+    nativeMountSettleStable: boolean;
+    sessionEntryShouldFollowBottom: boolean | null | undefined;
+    thresholdPx: number;
+}>): boolean {
+    if (params.distanceFromLiveTailPx > params.thresholdPx) return false;
+    if (params.nativeMountSettleStable) return true;
+    if (params.nativeMountSettleDeadlineReached) return true;
+    return params.isWarmKeepAliveInstance && params.sessionEntryShouldFollowBottom !== false;
+}
+
+export function resolveNativeScrollAcceptedViewportPaintDecision(params: Readonly<{
+    entryRestoreConfirmedByObservation: boolean;
+    hasRenderedItems: boolean;
+    isLoaded: boolean;
+    isNative: boolean;
+    isTrusted: boolean;
+    nativeFollowBottomObservationCanReleasePaint: boolean;
+    refDistanceFromLiveTailPx: number;
+    thresholdPx: number;
+    wantsPinned: boolean;
+}>): NativeScrollAcceptedViewportPaintDecision {
+    if (!params.isNative) return { reason: 'not-native', type: 'skip' };
+    if (!params.isLoaded) return { reason: 'not-loaded', type: 'skip' };
+    if (!params.hasRenderedItems) return { reason: 'empty-list', type: 'skip' };
+    if (params.isTrusted) return { reason: 'trusted-observation', type: 'skip' };
+
+    if (
+        params.nativeFollowBottomObservationCanReleasePaint ||
+        params.entryRestoreConfirmedByObservation ||
+        (!params.wantsPinned && params.refDistanceFromLiveTailPx > params.thresholdPx)
+    ) {
+        return { type: 'record-accepted-viewport-paint' };
+    }
+
+    return { reason: 'not-accepted', type: 'skip' };
+}
+
+export function resolveNativeScrollAcceptedViewportPaintEffects(params: Readonly<{
+    decision: NativeScrollAcceptedViewportPaintDecision;
+    fallbackMetrics: Readonly<{
+        contentHeight: number;
+        distanceFromLiveTailPx: number;
+        layoutHeight: number;
+    }>;
+    sessionId: string;
+}>): readonly NativeScrollAcceptedViewportPaintEffect[] {
+    if (params.decision.type !== 'record-accepted-viewport-paint') return [];
+
+    return [{
+        fallbackMetrics: {
+            contentHeight: Math.max(0, Math.trunc(params.fallbackMetrics.contentHeight)),
+            distanceFromLiveTailPx: Math.max(0, Math.trunc(params.fallbackMetrics.distanceFromLiveTailPx)),
+            layoutHeight: Math.max(0, Math.trunc(params.fallbackMetrics.layoutHeight)),
+        },
+        sessionId: params.sessionId,
+        type: 'record-accepted-viewport-paint',
+    }];
+}
+
+export function resolveNativeScrollAcceptedViewportPaintObservationEffects(params: Readonly<{
+    distanceFromLiveTailPx: number;
+    entryRestoreConfirmedByObservation: boolean;
+    fallbackMetrics: Readonly<{
+        contentHeight: number;
+        distanceFromLiveTailPx: number;
+        layoutHeight: number;
+    }>;
+    hasRenderedItems: boolean;
+    isLoaded: boolean;
+    isNative: boolean;
+    isTrusted: boolean;
+    isWarmKeepAliveInstance: boolean;
+    nativeMountSettleDeadlineReached: boolean;
+    nativeMountSettleStable: boolean;
+    sessionId: string;
+    sessionEntryShouldFollowBottom: boolean | null | undefined;
+    thresholdPx: number;
+    /**
+     * Renderer positioning ownership as reported by the scroll-observation input. Retained on this
+     * boundary because the caller reports it for the surrounding native observation, but it no
+     * longer gates the reveal — see `resolveNativeFollowBottomObservationCanReleasePaint`.
+     */
+    usesNativeFlashListBottomMaintenance: boolean;
+    wantsPinned: boolean;
+}>): readonly NativeScrollAcceptedViewportPaintEffect[] {
+    const nativeFollowBottomObservationCanReleasePaint = resolveNativeFollowBottomObservationCanReleasePaint({
+        distanceFromLiveTailPx: params.distanceFromLiveTailPx,
+        isWarmKeepAliveInstance: params.isWarmKeepAliveInstance,
+        nativeMountSettleDeadlineReached: params.nativeMountSettleDeadlineReached,
+        nativeMountSettleStable: params.nativeMountSettleStable,
+        sessionEntryShouldFollowBottom: params.sessionEntryShouldFollowBottom,
+        thresholdPx: params.thresholdPx,
+    });
+
+    return resolveNativeScrollAcceptedViewportPaintEffects({
+        decision: resolveNativeScrollAcceptedViewportPaintDecision({
+            entryRestoreConfirmedByObservation: params.entryRestoreConfirmedByObservation,
+            hasRenderedItems: params.hasRenderedItems,
+            isLoaded: params.isLoaded,
+            isNative: params.isNative,
+            isTrusted: params.isTrusted,
+            nativeFollowBottomObservationCanReleasePaint,
+            refDistanceFromLiveTailPx: params.distanceFromLiveTailPx,
+            thresholdPx: params.thresholdPx,
+            wantsPinned: params.wantsPinned,
+        }),
+        fallbackMetrics: params.fallbackMetrics,
+        sessionId: params.sessionId,
+    });
+}

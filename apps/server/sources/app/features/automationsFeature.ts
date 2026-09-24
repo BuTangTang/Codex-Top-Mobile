@@ -1,0 +1,14 @@
+import type { FeaturesPayloadDelta } from "./types";
+import { readAutomationsFeatureEnv } from "./catalog/readFeatureEnv";
+
+export function resolveAutomationsFeature(env: NodeJS.ProcessEnv): FeaturesPayloadDelta {
+    const config = readAutomationsFeatureEnv(env);
+    const enabled = config.enabled;
+    return {
+        features: {
+            automations: {
+                enabled,
+            },
+        },
+    };
+}

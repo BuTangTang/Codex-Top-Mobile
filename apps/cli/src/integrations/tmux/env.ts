@@ -1,0 +1,42 @@
+import { buildPosixShellCommand } from '@/utils/posixShellCommand';
+
+export function readNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+export function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = readNonNegativeIntegerEnv(name, fallback);
+  return value <= 0 ? fallback : value;
+}
+
+export function resolveTmuxCommandTimeoutMs(): number {
+  return readPositiveIntegerEnv('HAPPIER_CLI_TMUX_COMMAND_TIMEOUT_MS', 15_000);
+}
+
+export function resolveTmuxPromptSubmitDelayMs(): number {
+  const explicit = process.env.HAPPIER_CLI_TMUX_PROMPT_SUBMIT_DELAY_MS;
+  if (explicit !== undefined && explicit.length > 0) {
+    return readNonNegativeIntegerEnv('HAPPIER_CLI_TMUX_PROMPT_SUBMIT_DELAY_MS', 50);
+  }
+  return readNonNegativeIntegerEnv('HAPPIER_CLI_TMUX_PASTE_SUBMIT_DELAY_MS', 50);
+}
+
+export function resolveTmuxSendKeysChunkSize(): number {
+  return readPositiveIntegerEnv('HAPPIER_CLI_TMUX_SEND_KEYS_CHUNK_SIZE', 512);
+}
+
+export function isTmuxWindowIndexConflict(stderr: string | undefined): boolean {
+  return /index\s+\d+\s+in\s+use/i.test(stderr ?? '');
+}
+
+export function normalizeExitCode(code: number | null): number {
+  // Node passes `code === null` when the process was terminated by a signal.
+  // Preserve failure semantics rather than treating it as success.
+  return code ?? 1;
+}
+
+export { buildPosixShellCommand };

@@ -1,0 +1,401 @@
+import React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import { renderScreen } from '@/dev/testkit';
+import { installAgentInputCommonModuleMocks } from '../agentInputTestHelpers';
+
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+installAgentInputCommonModuleMocks();
+
+let detailPaneRenderCount = 0;
+
+vi.mock('@/components/ui/text/Text', () => ({
+    Text: 'Text',
+}));
+
+vi.mock('@/components/ui/lists/Item', () => ({
+    Item: (props: any) => React.createElement('Item', props, null),
+}));
+
+vi.mock('@/components/ui/lists/ItemGroup', () => ({
+    ItemGroup: (props: any) => React.createElement('ItemGroup', props, props.children),
+}));
+
+vi.mock('@/components/ui/lists/ItemList', () => ({
+    ItemListStatic: (props: any) => React.createElement('ItemListStatic', props, props.children),
+}));
+
+vi.mock('./AgentInputChipPickerDetailPane', () => ({
+    AgentInputChipPickerDetailPane: (props: any) => {
+        detailPaneRenderCount += 1;
+        return React.createElement('AgentInputChipPickerDetailPane', {
+            ...props,
+            testID: 'agent-input-chip-picker.detail-pane',
+        }, null);
+    },
+}));
+
+vi.mock('./AgentInputChipPickerOptionSelector', () => ({
+    AgentInputChipPickerOptionSelector: (props: any) => {
+        const sections = Array.isArray(props.sections) ? props.sections : [];
+        return React.createElement(
+            'View',
+            { testID: 'agent-input-chip-picker.option-rail' },
+            sections.flatMap((section: any) => Array.isArray(section?.options) ? section.options : [])
+                .map((option: any) => React.createElement(
+                    'Pressable',
+                    {
+                        key: String(option.id),
+                        testID: `agent-input-chip-picker.option:${option.id}`,
+                        onPress: () => props.onFocusOption?.(String(option.id)),
+                    },
+                    null,
+                )),
+        );
+    },
+}));
+
+describe('AgentInputChipPickerPanel', () => {
+    it('reconciles an external selection change without a passive follow-up render', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+        const options = [
+            { id: 'one', label: 'One', detailDescription: 'Primary checkout' } as any,
+            { id: 'two', label: 'Two', detailDescription: 'Feature checkout' } as any,
+        ];
+        detailPaneRenderCount = 0;
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={options}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+        const rendersAfterMount = detailPaneRenderCount;
+
+        await screen.update(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[...options]}
+            selectedOptionId="two"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker.detail-pane')?.props.option.id).toBe('two');
+        expect(detailPaneRenderCount).toBe(rendersAfterMount + 1);
+    });
+
+    it('does not render inner scroll views in simple mode', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                { id: 'one', label: 'One' } as any,
+                { id: 'two', label: 'Two' } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.title')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.close')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.option:one')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.option:two')).toBeTruthy();
+    });
+
+    it('does not render inner scroll views in detailed mode', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                { id: 'one', label: 'One', detailDescription: 'Primary checkout' } as any,
+                { id: 'two', label: 'Two', detailDescription: 'Feature checkout' } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.title')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.close')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.option-rail')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-chip-picker.detail-pane')).toBeTruthy();
+    });
+
+    it('uses the single-pane detailed layout when the selector rail is hidden', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title=""
+            showCloseButton={false}
+            options={[
+                {
+                    id: 'engine:codex',
+                    label: 'Codex',
+                    detailDescription: 'Engine detail',
+                } as any,
+            ]}
+            selectedOptionId="engine:codex"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker.option-rail')).toBeNull();
+        const detailPane = screen.findByTestId('agent-input-chip-picker.detail-pane');
+        expect(detailPane).toBeTruthy();
+
+        const resolvedStyle = Object.assign(
+            {},
+            ...(Array.isArray(detailPane?.props.style) ? detailPane?.props.style : [detailPane?.props.style]).filter(Boolean),
+        );
+
+        expect(resolvedStyle.paddingHorizontal).toBe(12);
+        expect(resolvedStyle.paddingTop).toBe(19);
+        expect(resolvedStyle.paddingBottom).toBe(12);
+        expect(resolvedStyle.width).toBe('100%');
+    });
+
+    it('omits the title row when the title is empty', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title=""
+            showCloseButton={false}
+            options={[
+                { id: 'one', label: 'One' } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker')).toBeTruthy();
+        expect(screen.findAllByTestId('agent-input-chip-picker.title')).toHaveLength(0);
+        expect(screen.findAllByTestId('agent-input-chip-picker.close')).toHaveLength(0);
+    });
+
+    it('dismisses the picker when the close button is pressed', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+        const onRequestClose = vi.fn();
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                { id: 'one', label: 'One' } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={onRequestClose}
+        />);
+
+        await screen.pressByTestIdAsync('agent-input-chip-picker.close');
+        expect(onRequestClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes by default when selecting an immediate option in detailed mode', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+        const onRequestClose = vi.fn();
+        const onSelect = vi.fn();
+        const onSelectImmediate = vi.fn();
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                { id: 'one', label: 'One', detailDescription: 'Primary checkout' } as any,
+                {
+                    id: 'two',
+                    label: 'Two',
+                    detailDescription: 'Feature checkout',
+                    onSelectImmediate,
+                } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={onSelect}
+            onRequestClose={onRequestClose}
+        />);
+
+        await screen.pressByTestIdAsync('agent-input-chip-picker.option:two');
+        expect(onSelectImmediate).toHaveBeenCalledTimes(1);
+        expect(onSelect).not.toHaveBeenCalled();
+
+        // `deferAgentInputPopoverClose` uses `setTimeout(0)` on web to avoid click fall-through.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(onRequestClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the popover open when immediate selection opts out of auto-close', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+        const onRequestClose = vi.fn();
+        const onSelectImmediate = vi.fn();
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                { id: 'one', label: 'One', detailDescription: 'Primary checkout' } as any,
+                {
+                    id: 'two',
+                    label: 'Two',
+                    detailDescription: 'Feature checkout',
+                    closeOnSelectImmediate: false,
+                    onSelectImmediate,
+                } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={onRequestClose}
+        />);
+
+        await screen.pressByTestIdAsync('agent-input-chip-picker.option:two');
+        expect(onSelectImmediate).toHaveBeenCalledTimes(1);
+
+        // Allow any deferred close to run (it should not be scheduled for this option).
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(onRequestClose).not.toHaveBeenCalled();
+    });
+
+    it('keeps a preserved detail option focused when an immediate selection updates the selected option', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                {
+                    id: 'favorites',
+                    label: 'Favorites',
+                    preserveFocusOnExternalSelectionChange: true,
+                    renderDetailContent: () => React.createElement('View', { testID: 'detail:favorites' }),
+                },
+                {
+                    id: 'engine:codex',
+                    label: 'Codex',
+                    renderDetailContent: () => React.createElement('View', { testID: 'detail:codex' }),
+                },
+            ]}
+            selectedOptionId="favorites"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker.detail-pane')?.props.option.id).toBe('favorites');
+
+        await screen.update(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                {
+                    id: 'favorites',
+                    label: 'Favorites',
+                    preserveFocusOnExternalSelectionChange: true,
+                    renderDetailContent: () => React.createElement('View', { testID: 'detail:favorites' }),
+                },
+                {
+                    id: 'engine:codex',
+                    label: 'Codex',
+                    renderDetailContent: () => React.createElement('View', { testID: 'detail:codex' }),
+                },
+            ]}
+            selectedOptionId="engine:codex"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        expect(screen.findByTestId('agent-input-chip-picker.detail-pane')?.props.option.id).toBe('favorites');
+    });
+
+    it('lets the focused option name its own apply outcome', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            applyLabel="Use"
+            options={[
+                { id: 'engine:claude', label: 'Claude', detailDescription: 'Current Agent' } as any,
+                {
+                    id: 'engine:codex',
+                    label: 'Codex',
+                    detailDescription: 'Another Agent',
+                    applyLabel: 'Continue with Codex',
+                    onApply: () => {},
+                } as any,
+            ]}
+            selectedOptionId="engine:claude"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+        />);
+
+        // The panel-wide label still applies to a row that does not name its own outcome.
+        expect(screen.findByTestId('agent-input-chip-picker.detail-pane')?.props.applyLabel).toBe('Use');
+
+        await screen.pressByTestIdAsync('agent-input-chip-picker.option:engine:codex');
+
+        expect(screen.findByTestId('agent-input-chip-picker.detail-pane')?.props.applyLabel)
+            .toBe('Continue with Codex');
+    });
+
+    it('does not apply an option that owns an explicit apply action when it is merely focused', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+        const onApply = vi.fn();
+        const onSelect = vi.fn();
+        const onRequestClose = vi.fn();
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title="Pick"
+            options={[
+                { id: 'engine:claude', label: 'Claude', detailDescription: 'Current Agent' } as any,
+                {
+                    id: 'engine:codex',
+                    label: 'Codex',
+                    detailDescription: 'Another Agent',
+                    applyLabel: 'Continue with Codex',
+                    onApply,
+                } as any,
+            ]}
+            selectedOptionId="engine:claude"
+            onSelect={onSelect}
+            onRequestClose={onRequestClose}
+        />);
+
+        await screen.pressByTestIdAsync('agent-input-chip-picker.option:engine:codex');
+
+        expect(onApply).not.toHaveBeenCalled();
+        expect(onSelect).not.toHaveBeenCalled();
+
+        // `deferAgentInputPopoverClose` uses `setTimeout(0)` on web; nothing should be scheduled.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        expect(onRequestClose).not.toHaveBeenCalled();
+    });
+    it('gives the split rail and detail column their own bounded scroller', async () => {
+        const { AgentInputChipPickerPanel } = await import('./AgentInputChipPickerPanel');
+
+        const screen = await renderScreen(<AgentInputChipPickerPanel
+            title=""
+            showCloseButton={false}
+            options={[
+                { id: 'one', label: 'One', detailDescription: 'Primary checkout' } as any,
+                { id: 'two', label: 'Two', detailDescription: 'Feature checkout' } as any,
+            ]}
+            selectedOptionId="one"
+            onSelect={() => {}}
+            onRequestClose={() => {}}
+            maxHeight={420}
+        />);
+
+        // One scroller for the whole panel means browsing models drags the Agent rail out of
+        // view with it. Each column owns its scroll, bounded by the height the popover granted.
+        const rail = screen.findByTestId('agent-input-chip-picker.option-rail-scroll');
+        const detail = screen.findByTestId('agent-input-chip-picker.detail-scroll');
+        expect(rail).toBeTruthy();
+        expect(detail).toBeTruthy();
+
+        const flatten = (style: unknown): Record<string, unknown> => Array.isArray(style)
+            ? style.reduce<Record<string, unknown>>((acc, entry) => ({ ...acc, ...flatten(entry) }), {})
+            : (style && typeof style === 'object' ? style as Record<string, unknown> : {});
+        expect(flatten(rail?.props.style).maxHeight).toBe(420);
+        expect(flatten(detail?.props.style).maxHeight).toBe(420);
+    });
+});

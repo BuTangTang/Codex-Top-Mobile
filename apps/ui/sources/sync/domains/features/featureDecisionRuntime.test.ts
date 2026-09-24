@@ -1,0 +1,343 @@
+import React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import { act } from 'react-test-renderer';
+import { FeaturesResponseSchema } from '@happier-dev/protocol';
+
+import { flushHookEffects } from '@/hooks/server/serverFeatureHookHarness.testHelpers';
+import { renderScreen } from '@/dev/testkit';
+
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+const activeServerRef = vi.hoisted(() => ({
+    current: {
+        serverId: 'server-a',
+        serverUrl: 'https://server-a.example.test',
+        generation: 1,
+    },
+}));
+
+const activeServerListeners = vi.hoisted(() => ({
+    listeners: new Set<(snapshot: unknown) => void>(),
+}));
+
+vi.mock('@/sync/domains/server/serverRuntime', () => ({
+    getActiveServerSnapshot: () => activeServerRef.current,
+    subscribeActiveServer: (listener: (snapshot: unknown) => void) => {
+        activeServerListeners.listeners.add(listener);
+        return () => activeServerListeners.listeners.delete(listener);
+    },
+}));
+
+function createFeaturesPayload(params: { voiceEnabled: boolean }) {
+    return FeaturesResponseSchema.parse({
+        features: {
+            voice: { enabled: params.voiceEnabled },
+        },
+        capabilities: {
+            voice: {
+                configured: params.voiceEnabled,
+                provider: params.voiceEnabled ? 'elevenlabs' : null,
+            },
+        },
+    });
+}
+
+function emitActiveServerChanged(next: { serverId: string; serverUrl: string; generation: number }) {
+    activeServerRef.current = next;
+    for (const listener of activeServerListeners.listeners) {
+        listener(next);
+    }
+}
+
+function isFeaturesFetchUrl(url: unknown): boolean {
+    const raw = String(url ?? '');
+    return raw.includes('/v1/features');
+}
+
+function isHealthFetchUrl(url: unknown): boolean {
+    const raw = String(url ?? '');
+    return raw.endsWith('/health');
+}
+
+function countFeaturesFetchCalls(fetchMock: { mock: { calls: Array<readonly unknown[]> } }): number {
+    return fetchMock.mock.calls.filter((call) => isFeaturesFetchUrl(call[0])).length;
+}
+
+describe('featureDecisionRuntime', () => {
+	    it('ignores non-public build policy env vars in UI bundles', async () => {
+	        vi.resetModules();
+
+        const previousDenyPublic = process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+        const previousDenyPrivate = process.env.HAPPIER_BUILD_FEATURES_DENY;
+        delete process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+        process.env.HAPPIER_BUILD_FEATURES_DENY = 'voice';
+
+	        try {
+	            const { getStorage } = await import('@/sync/domains/state/storage');
+	            getStorage().getState().applySettingsLocal({ experiments: true, featureToggles: { voice: true } });
+	            const settings = getStorage().getState().settings;
+	            const { resolveRuntimeFeatureDecisionFromSnapshot } = await import('./featureDecisionRuntime');
+
+            // When server features are still loading, a server-required feature should remain unresolved
+            // unless it is blocked by a *public* build policy.
+            const decision = resolveRuntimeFeatureDecisionFromSnapshot({
+                featureId: 'voice',
+                settings,
+                snapshot: { status: 'loading' },
+                scope: { scopeKind: 'runtime' },
+            });
+
+            expect(decision).toBeNull();
+        } finally {
+            if (previousDenyPublic === undefined) delete process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+            else process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY = previousDenyPublic;
+            if (previousDenyPrivate === undefined) delete process.env.HAPPIER_BUILD_FEATURES_DENY;
+            else process.env.HAPPIER_BUILD_FEATURES_DENY = previousDenyPrivate;
+        }
+    });
+
+	    it('applies build policy without waiting for server probes in runtime scope', async () => {
+	        vi.resetModules();
+
+        const previousDeny = process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+        process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY = 'voice';
+
+	        try {
+	            const { getStorage } = await import('@/sync/domains/state/storage');
+	            getStorage().getState().applySettingsLocal({ experiments: true, featureToggles: { voice: true } });
+	            const settings = getStorage().getState().settings;
+	            const { resolveRuntimeFeatureDecisionFromSnapshot } = await import('./featureDecisionRuntime');
+
+            const decision = resolveRuntimeFeatureDecisionFromSnapshot({
+                featureId: 'voice',
+                settings,
+                snapshot: { status: 'loading' },
+                scope: { scopeKind: 'runtime' },
+            });
+
+            expect(decision).not.toBeNull();
+            expect(decision?.state).toBe('disabled');
+            expect(decision?.blockedBy).toBe('build_policy');
+        } finally {
+            if (previousDeny === undefined) delete process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY;
+            else process.env.EXPO_PUBLIC_HAPPIER_BUILD_FEATURES_DENY = previousDeny;
+        }
+    });
+
+    it('refetches the server feature snapshot when active server changes', async () => {
+        vi.resetModules();
+
+        const fetchMock = vi.fn(async (url: any) => {
+            const raw = String(url ?? '');
+            if (isHealthFetchUrl(raw)) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({ ok: true }),
+                } as Response;
+            }
+            const voiceEnabled = raw.includes('server-a.example.test');
+            return {
+                ok: true,
+                status: 200,
+                json: async () => createFeaturesPayload({ voiceEnabled }),
+            } as Response;
+        });
+        vi.stubGlobal('fetch', fetchMock as any);
+
+        const { resetServerFeaturesClientForTests } = await import('@/sync/api/capabilities/serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        const { useServerFeaturesRuntimeSnapshot } = await import('./featureDecisionRuntime');
+
+        const seen: any[] = [];
+
+        function Test() {
+            const value = useServerFeaturesRuntimeSnapshot();
+            React.useEffect(() => {
+                seen.push(value);
+            }, [value]);
+            return React.createElement('View');
+        }
+
+        await renderScreen(React.createElement(Test));
+        await flushHookEffects(6);
+
+        expect(
+            fetchMock.mock.calls.some(
+                (call) => isFeaturesFetchUrl(call[0]) && String(call[0] ?? '').includes('server-a.example.test'),
+            ),
+        ).toBe(true);
+        expect(seen.some((entry) => entry?.status === 'ready')).toBe(true);
+        const firstReady = seen.find((entry) => entry?.status === 'ready') as any;
+        expect(firstReady.features.features.voice.enabled).toBe(true);
+
+        await act(async () => {
+            emitActiveServerChanged({
+                serverId: 'server-b',
+                serverUrl: 'https://server-b.example.test',
+                generation: 2,
+            });
+            await flushHookEffects(6);
+        });
+
+        expect(
+            fetchMock.mock.calls.some(
+                (call) => isFeaturesFetchUrl(call[0]) && String(call[0] ?? '').includes('server-b.example.test'),
+            ),
+        ).toBe(true);
+        const last = seen.at(-1) as any;
+        expect(last?.status).toBe('ready');
+        expect(last.features.features.voice.enabled).toBe(false);
+    });
+
+    it('refreshes the runtime server feature snapshot after the cache TTL expires', async () => {
+        vi.resetModules();
+
+        let now = 0;
+        const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+
+        let fetchCallIndex = 0;
+        const fetchMock = vi.fn(async (url: any) => {
+            if (isHealthFetchUrl(url)) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({ ok: true }),
+                } as Response;
+            }
+            const voiceEnabled = fetchCallIndex === 0;
+            fetchCallIndex += 1;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => createFeaturesPayload({ voiceEnabled }),
+            } as Response;
+        });
+        vi.stubGlobal('fetch', fetchMock as any);
+
+        const { resetServerFeaturesClientForTests } = await import('@/sync/api/capabilities/serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        const { useServerFeaturesRuntimeSnapshot } = await import('./featureDecisionRuntime');
+
+        const seen: any[] = [];
+
+        function Test() {
+            const value = useServerFeaturesRuntimeSnapshot();
+            React.useEffect(() => {
+                seen.push(value);
+            }, [value]);
+            return React.createElement('View');
+        }
+
+        let screen = await renderScreen(React.createElement(Test));
+        await flushHookEffects(6);
+
+        expect(countFeaturesFetchCalls(fetchMock)).toBe(1);
+        expect(seen.some((entry) => entry?.status === 'ready')).toBe(true);
+        const firstReady = seen.find((entry) => entry?.status === 'ready') as any;
+        expect(firstReady.features.features.voice.enabled).toBe(true);
+
+        // Advance beyond TTL_READY_MS (10 minutes) so the cached snapshot should be treated as stale.
+        now = 10 * 60 * 1000 + 1;
+
+        await act(async () => {
+            screen.tree.unmount();
+            screen = await renderScreen(React.createElement(Test));
+            await flushHookEffects(6);
+        });
+
+        expect(countFeaturesFetchCalls(fetchMock)).toBe(2);
+        const last = seen.at(-1) as any;
+        expect(last?.status).toBe('ready');
+        expect(last.features.features.voice.enabled).toBe(false);
+
+        nowSpy.mockRestore();
+    });
+
+    it('does not refetch explicit serverId snapshots on remount while cache is fresh', async () => {
+        vi.resetModules();
+
+        let now = 0;
+        const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+
+        // Clean up any leaked listeners from prior tests (defensive); otherwise emitting an active
+        // server change can trigger state updates outside of this test's `act()` scopes.
+        activeServerListeners.listeners.clear();
+
+        await act(async () => {
+            emitActiveServerChanged({
+                serverId: 'server-a',
+                serverUrl: 'https://server-a.example.test',
+                generation: 1,
+            });
+            await flushHookEffects(2);
+        });
+
+        const { resetRuntimeFetch } = await import('@/sync/http/client');
+        resetRuntimeFetch();
+
+        const fetchMock = vi.fn(async () => ({
+            ok: true,
+            status: 200,
+            json: async () => createFeaturesPayload({ voiceEnabled: true }),
+        }) as Response);
+        vi.stubGlobal('fetch', fetchMock as any);
+
+        const { resetServerFeaturesClientForTests } = await import('@/sync/api/capabilities/serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        const { useServerFeaturesSnapshotForServerId } = await import('./featureDecisionRuntime');
+
+        function Test() {
+            useServerFeaturesSnapshotForServerId('server-a');
+            return React.createElement('View');
+        }
+
+        let screen = await renderScreen(React.createElement(Test));
+        await flushHookEffects(20);
+        expect(countFeaturesFetchCalls(fetchMock)).toBe(1);
+
+        // Remount within TTL_READY_MS.
+        now = 1;
+        await act(async () => {
+            screen.tree.unmount();
+            screen = await renderScreen(React.createElement(Test));
+            await flushHookEffects(20);
+        });
+
+        expect(countFeaturesFetchCalls(fetchMock)).toBe(1);
+
+        await act(async () => {
+            screen.tree.unmount();
+            await flushHookEffects(4);
+        });
+
+        nowSpy.mockRestore();
+    });
+
+    it('keeps disabled main-selection snapshots stable for equivalent server id arrays', async () => {
+        vi.resetModules();
+
+        const { useServerFeaturesMainSelectionSnapshot } = await import('./featureDecisionRuntime');
+
+        let renders = 0;
+        function Test() {
+            renders += 1;
+            useServerFeaturesMainSelectionSnapshot(['server-a'], { enabled: false });
+            return React.createElement('View');
+        }
+
+        const screen = await renderScreen(React.createElement(Test));
+        await flushHookEffects(6);
+
+        expect(renders).toBeLessThanOrEqual(2);
+
+        await act(async () => {
+            screen.tree.unmount();
+            await flushHookEffects(2);
+        });
+    });
+});

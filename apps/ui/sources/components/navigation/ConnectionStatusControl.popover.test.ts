@@ -1,0 +1,1164 @@
+import React from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import renderer, { act } from 'react-test-renderer';
+import { pressTestInstanceAsync, renderScreen } from '@/dev/testkit';
+import { installConnectionStatusControlCommonModuleMocks } from './connectionStatusControlTestHelpers';
+
+
+(
+    globalThis as typeof globalThis & {
+        IS_REACT_ACT_ENVIRONMENT?: boolean;
+    }
+).IS_REACT_ACT_ENVIRONMENT = true;
+
+type PopoverCaptureProps = {
+    open?: boolean;
+    portal?: {
+        web?: boolean;
+        native?: boolean;
+        matchAnchorWidth?: boolean;
+    };
+    maxWidthCap?: number;
+    children?: ((params: { maxHeight: number }) => React.ReactNode) | React.ReactNode;
+};
+
+type ActionLike = { id?: unknown; label?: unknown; onPress?: () => void };
+type ActionListSectionProps = {
+    actions?: ActionLike[];
+};
+
+type DropdownMenuCaptureProps = {
+    items?: Array<{ id?: string; title?: string; subtitle?: string }>;
+    selectedId?: string | null;
+    matchTriggerWidth?: boolean;
+    maxWidthCap?: number;
+    overlayStyle?: unknown;
+    itemTrigger?: { title?: string; subtitle?: string };
+    onSelect?: (itemId: string) => void;
+};
+
+const capture = vi.hoisted(() => ({
+    popoverProps: null as PopoverCaptureProps | null,
+    actionSections: [] as ActionListSectionProps[],
+    dropdownMenuProps: [] as DropdownMenuCaptureProps[],
+    reset() {
+        this.popoverProps = null;
+        this.actionSections = [];
+        this.dropdownMenuProps = [];
+    },
+}));
+
+const authMocks = vi.hoisted(() => ({
+    refreshFromActiveServer: vi.fn(async () => {}),
+}));
+
+const connectionMocks = vi.hoisted(() => ({
+    switchConnectionToActiveServer: vi.fn(async (_params?: unknown) => null),
+}));
+
+const modalMocks = vi.hoisted(() => ({
+    confirm: vi.fn(async () => true),
+}));
+
+const tokenStorageMock = vi.hoisted(() => ({
+    getCredentialsForServerUrl: vi.fn<(serverUrl: string) => Promise<{ token: string; secret: string } | null>>(
+        async () => ({ token: 'scoped-token', secret: 'scoped-secret' })
+    ),
+}));
+
+const routerMocks = vi.hoisted(() => ({
+    push: vi.fn(),
+    replace: vi.fn(),
+}));
+
+const pendingSetupIntentMocks = vi.hoisted(() => ({
+    setPendingSetupIntent: vi.fn(),
+}));
+
+const tauriDesktopState = vi.hoisted(() => ({
+    value: false,
+}));
+
+const settingsState = vi.hoisted(() => ({
+    serverSelectionGroups: [] as Array<{ id: string; name: string; serverIds: string[]; presentation: 'grouped' | 'flat-with-badge' }>,
+    serverSelectionActiveTargetKind: null as 'server' | 'group' | null,
+    serverSelectionActiveTargetId: null as string | null,
+}));
+const syncMocks = vi.hoisted(() => ({
+    retryNow: vi.fn(),
+}));
+const connectionHealthState = vi.hoisted(() => ({
+    value: {
+        kind: 'no_machine',
+        tone: 'attention',
+        color: '#ff9900',
+        isPulsing: false,
+        statusLabelKey: 'status.actionRequired',
+        machineLabelKey: 'newSession.noMachinesFound',
+    },
+}));
+const accountSettingsSyncStatusState = vi.hoisted(() => ({
+    value: { state: 'idle', lastSyncedAt: null } as
+        | { state: 'idle' | 'synced'; lastSyncedAt: number | null }
+        | {
+            state: 'retrying' | 'failed';
+            message: string;
+            retryable: boolean;
+            kind: 'auth' | 'config' | 'network' | 'server' | 'unknown';
+            at: number;
+            nextRetryAt?: number;
+        },
+}));
+const syncErrorState = vi.hoisted(() => ({
+    value: null as null | {
+        message: string;
+        retryable: boolean;
+        kind: 'auth' | 'config' | 'network' | 'server' | 'unknown';
+        at: number;
+        nextRetryAt?: number;
+        serverId?: string;
+    },
+}));
+
+installConnectionStatusControlCommonModuleMocks({
+    reactNative: async () => {
+        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+        return createReactNativeWebMock({
+            Platform: {
+                OS: 'web',
+                select: (options: { web?: unknown; default?: unknown; ios?: unknown; android?: unknown }) =>
+                    options.web ?? options.default ?? options.ios ?? options.android,
+            },
+            View: 'View',
+            Text: 'Text',
+            Pressable: 'Pressable',
+        });
+    },
+    unistyles: async () => {
+        const { createUnistylesMock } = await import('@/dev/testkit/mocks/unistyles');
+        return createUnistylesMock({
+            theme: {
+                colors: {
+                    status: {
+                        connected: '#00ff00',
+                        connecting: '#ffcc00',
+                        actionRequired: '#ff9900',
+                        disconnected: '#ff0000',
+                        error: '#ff0000',
+                        default: '#999999',
+                    },
+                    text: '#111111',
+                    textSecondary: '#666666',
+                },
+            },
+        });
+    },
+    text: async () => {
+        const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+        return createTextModuleMock({ translate: (key) => key });
+    },
+    storage: async () => {
+        const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+        return createStorageModuleStub({
+            useSocketStatus: () => ({ status: 'connected' }),
+            useSyncError: () => syncErrorState.value,
+            useAccountSettingsSyncStatus: () => accountSettingsSyncStatusState.value,
+            useLastSyncAt: () => null,
+            useSettingMutable: (key: keyof typeof settingsState) => [
+                settingsState[key],
+                (value: unknown) => {
+                    (settingsState as Record<string, unknown>)[String(key)] = value;
+                },
+            ],
+        });
+    },
+    modal: async () => {
+        const { createModalModuleMock } = await import('@/dev/testkit/mocks/modal');
+        return createModalModuleMock({
+            spies: {
+                confirm: modalMocks.confirm,
+            },
+        }).module;
+    },
+    router: async () => {
+        const { createExpoRouterMock } = await import('@/dev/testkit/mocks/router');
+        return createExpoRouterMock({
+            router: { push: routerMocks.push, replace: routerMocks.replace },
+        }).module;
+    },
+});
+
+vi.mock('@expo/vector-icons', () => ({
+    Ionicons: 'Ionicons',
+}));
+
+vi.mock('@/components/ui/status/StatusDot', () => ({
+    StatusDot: 'StatusDot',
+}));
+
+vi.mock('@/components/ui/lists/ActionListSection', () => ({
+    ActionListSection: (props: ActionListSectionProps) => {
+        capture.actionSections.push(props);
+        return null;
+    },
+}));
+
+vi.mock('@/components/ui/forms/dropdown/DropdownMenu', () => ({
+    DropdownMenu: (props: DropdownMenuCaptureProps) => {
+        capture.dropdownMenuProps.push(props);
+        return null;
+    },
+}));
+
+vi.mock('@/components/ui/overlays/FloatingOverlay', () => ({
+    FloatingOverlay: (props: { children?: React.ReactNode }) =>
+        React.createElement(React.Fragment, null, props.children),
+}));
+
+vi.mock('@/components/ui/popover', () => ({
+    Popover: (props: PopoverCaptureProps) => {
+        capture.popoverProps = props;
+        if (!props.open) return null;
+        return React.createElement(
+            React.Fragment,
+            null,
+            typeof props.children === 'function' ? props.children({ maxHeight: 520 }) : props.children,
+        );
+    },
+    PopoverScope: ({ children }: any) => React.createElement(React.Fragment, null, children),
+}));
+
+vi.mock('@/auth/context/AuthContext', () => ({
+    useAuth: () => ({ isAuthenticated: true, refreshFromActiveServer: authMocks.refreshFromActiveServer }),
+}));
+
+vi.mock('@/auth/storage/tokenStorage', () => ({
+    TokenStorage: tokenStorageMock,
+}));
+
+vi.mock('@/sync/sync', () => ({
+    sync: syncMocks,
+}));
+
+vi.mock('@/sync/runtime/orchestration/connectionManager', () => ({
+    switchConnectionToActiveServer: connectionMocks.switchConnectionToActiveServer,
+}));
+
+vi.mock('@/sync/domains/pending/pendingSetupIntent', () => ({
+    setPendingSetupIntent: pendingSetupIntentMocks.setPendingSetupIntent,
+}));
+
+vi.mock('@/utils/platform/tauri', () => ({
+    isTauriDesktop: () => tauriDesktopState.value,
+}));
+
+vi.mock('@/components/navigation/connectionStatus/useConnectionHealth', () => ({
+    useConnectionHealth: () => connectionHealthState.value,
+}));
+
+function getActionLabels(): string[] {
+    return capture.actionSections.flatMap((section) =>
+        (section.actions ?? []).flatMap((action) => {
+            if (!action || typeof action !== 'object') return [];
+            const label = action.label;
+            return typeof label === 'string' ? [label] : [];
+        }),
+    );
+}
+
+function latestDropdown(): DropdownMenuCaptureProps | undefined {
+    return capture.dropdownMenuProps.at(-1);
+}
+
+function getActions(): ActionLike[] {
+    return capture.actionSections.flatMap((section) => section.actions ?? []);
+}
+
+function findAction(id: string): ActionLike | undefined {
+    return getActions().find((action) => action.id === id);
+}
+
+/**
+ * Chooses a relay target the way the user does, through whichever presentation the popover picked
+ * for the current target count — the inline action list, or the dropdown.
+ */
+async function selectConnectionTarget(id: string): Promise<void> {
+    const action = findAction(id);
+    if (action?.onPress) {
+        action.onPress();
+        return;
+    }
+    latestDropdown()?.onSelect?.(id);
+}
+
+async function importConnectionStatusControl() {
+    const module = await import('./ConnectionStatusControl');
+    return module.ConnectionStatusControl;
+}
+
+afterEach(() => {
+    capture.reset();
+    authMocks.refreshFromActiveServer.mockClear();
+    connectionMocks.switchConnectionToActiveServer.mockClear();
+    modalMocks.confirm.mockReset();
+    tokenStorageMock.getCredentialsForServerUrl.mockReset();
+    tokenStorageMock.getCredentialsForServerUrl.mockResolvedValue({ token: 'scoped-token', secret: 'scoped-secret' });
+    routerMocks.push.mockReset();
+    routerMocks.replace.mockReset();
+    pendingSetupIntentMocks.setPendingSetupIntent.mockReset();
+    syncMocks.retryNow.mockReset();
+    syncErrorState.value = null;
+    connectionHealthState.value = {
+        kind: 'no_machine',
+        tone: 'attention',
+        color: '#ff9900',
+        isPulsing: false,
+        statusLabelKey: 'status.actionRequired',
+        machineLabelKey: 'newSession.noMachinesFound',
+    };
+    accountSettingsSyncStatusState.value = { state: 'idle', lastSyncedAt: null };
+    tauriDesktopState.value = false;
+    settingsState.serverSelectionGroups = [];
+    settingsState.serverSelectionActiveTargetKind = null;
+    settingsState.serverSelectionActiveTargetId = null;
+});
+
+describe('ConnectionStatusControl (native popover config)', () => {
+    it('does not mount the closed popover shell until the trigger opens it', async () => {
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+
+        expect(capture.popoverProps).toBeNull();
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        expect(capture.popoverProps?.open).toBe(true);
+    });
+
+    it('toggles the popover when pressing the trigger twice', async () => {
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        expect(capture.popoverProps).toBeNull();
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        expect(capture.popoverProps?.open).toBe(true);
+
+        capture.popoverProps = null;
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        expect(capture.popoverProps).toBeNull();
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('enables a native portal so the menu is not width-constrained to the trigger', async () => {
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        expect(capture.popoverProps).toBeTruthy();
+        expect(capture.popoverProps?.portal?.web).toBe(true);
+        expect(capture.popoverProps?.portal?.native).toBe(true);
+        expect(capture.popoverProps?.portal?.matchAnchorWidth).toBe(false);
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('shows readiness and machines rows in the popover', async () => {
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        const textNodes = tree!.findAllByType('Text' as any);
+        const allText = textNodes
+            .map((node: any) => String(node.props.children ?? ''))
+            .join('\n');
+
+        expect(allText).toContain('profile.status');
+        expect(allText).toContain('status.actionRequired');
+        expect(allText).toContain('settings.machines');
+        expect(allText).toContain('newSession.noMachinesFound');
+    });
+
+    it('renders the popover readiness state through the shared status pill', async () => {
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        expect(screen.findByTestId('connection-popover-health-status')).toBeTruthy();
+        expect(screen.findByTestId('connection-popover-health-status:variant:warning')).toBeTruthy();
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('places an icon-only retry action next to the status badge when the server is unreachable', async () => {
+        connectionHealthState.value = {
+            kind: 'server_unreachable',
+            tone: 'danger',
+            color: '#ff0000',
+            isPulsing: false,
+            statusLabelKey: 'status.disconnected',
+            machineLabelKey: 'status.unknown',
+        };
+
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        const retryButton = screen.findByTestId('connection-popover-retry');
+        const healthStatus = screen.findByTestId('connection-popover-health-status');
+        expect(retryButton).toBeTruthy();
+        expect(healthStatus).toBeTruthy();
+
+        await act(async () => {
+            await pressTestInstanceAsync(retryButton);
+        });
+
+        expect(syncMocks.retryNow).toHaveBeenCalledTimes(1);
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('shows account settings sync retry details in the existing connection popover', async () => {
+        connectionHealthState.value = {
+            kind: 'server_error',
+            tone: 'danger',
+            color: '#ff0000',
+            isPulsing: false,
+            statusLabelKey: 'status.error',
+            machineLabelKey: 'status.unknown',
+        };
+        accountSettingsSyncStatusState.value = {
+            state: 'retrying',
+            message: 'settings sync unavailable',
+            retryable: true,
+            kind: 'network',
+            at: Date.now(),
+            nextRetryAt: Date.now() + 1000,
+        };
+
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        const textNodes = tree!.findAllByType('Text' as any);
+        const allText = textNodes
+            .map((node: any) => String(node.props.children ?? ''))
+            .join('\n');
+
+        expect(allText).toContain('connectionStatus.labels.nextRetry');
+        expect(allText).toContain('connectionStatus.labels.lastError');
+        expect(allText).toContain('settings sync unavailable');
+        expect(screen.findByTestId('connection-popover-retry')).toBeTruthy();
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('does not show the server retry action for authentication-required status', async () => {
+        connectionHealthState.value = {
+            kind: 'auth_required',
+            tone: 'attention',
+            color: '#ff9900',
+            isPulsing: false,
+            statusLabelKey: 'status.actionRequired',
+            machineLabelKey: 'status.unknown',
+        };
+
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        expect(screen.findByTestId('connection-popover-retry')).toBeNull();
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('shows account settings auth errors before generic sync errors in the existing connection popover', async () => {
+        connectionHealthState.value = {
+            kind: 'auth_required',
+            tone: 'danger',
+            color: '#ff0000',
+            isPulsing: false,
+            statusLabelKey: 'status.actionRequired',
+            machineLabelKey: 'status.unknown',
+        };
+        syncErrorState.value = {
+            message: 'generic sync unavailable',
+            retryable: true,
+            kind: 'network',
+            at: Date.now(),
+        };
+        accountSettingsSyncStatusState.value = {
+            state: 'failed',
+            message: 'account settings auth required',
+            retryable: false,
+            kind: 'auth',
+            at: Date.now(),
+        };
+
+        const ConnectionStatusControl = await importConnectionStatusControl();
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        const textNodes = tree!.findAllByType('Text' as any);
+        const allText = textNodes
+            .map((node: any) => String(node.props.children ?? ''))
+            .join('\n');
+
+        expect(allText).toContain('account settings auth required');
+        expect(allText).not.toContain('generic sync unavailable');
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('uses the profile label when the active server id is identity-backed', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const active = profiles.upsertServerProfile({
+                serverUrl: 'https://identity.example.test',
+                name: 'Identity Server',
+            });
+            profiles.setServerProfileIdentityForUrl(active.serverUrl, 'srv_identity_active');
+            profiles.setActiveServerId(active.id, { scope: 'device' });
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const textNodes = tree!.findAllByType('Text' as any);
+            const allText = textNodes
+                .map((node: any) => String(node.props.children ?? ''))
+                .join('\n');
+
+            expect(profiles.getActiveServerId()).toBe('srv_identity_active');
+            expect(allText).toContain('Identity Server');
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            else process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+        }
+    });
+
+    it('renders relay switching with a dropdown only when there are more than two targets', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const local = profiles.upsertServerProfile({ serverUrl: 'https://local.example.test', name: 'Local' });
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            profiles.setActiveServerId(local.id, { scope: 'device' });
+            settingsState.serverSelectionGroups = [
+                {
+                    id: 'grp-dev',
+                    name: 'Dev Group',
+                    serverIds: [local.id, company.id],
+                    presentation: 'grouped',
+                },
+            ];
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const dropdown = latestDropdown();
+            const dropdownTitles = (dropdown?.items ?? []).map((item) => item.title);
+            const actionLabels = getActionLabels();
+
+            expect(dropdownTitles.some((title) => String(title).toLowerCase().includes('company'))).toBe(true);
+            expect(dropdownTitles.some((title) => String(title).toLowerCase().includes('dev group'))).toBe(true);
+            expect(dropdown?.items?.some((item) => item.id === 'connection-popover-manage-relay')).toBe(false);
+            expect(dropdown?.selectedId).toBeTruthy();
+            expect(dropdown?.itemTrigger).toMatchObject({
+                title: expect.stringContaining('Local'),
+                subtitle: expect.stringContaining('local.example.test'),
+            });
+            expect(dropdown?.overlayStyle).toBeUndefined();
+            expect(actionLabels.some((label) => label.toLowerCase().includes('company'))).toBe(false);
+            expect(actionLabels.some((label) => label.toLowerCase().includes('dev group'))).toBe(false);
+            expect(actionLabels.some((label) => label.includes('server.makeDefaultOnDevice'))).toBe(false);
+            expect(actionLabels.some((label) => label.toLowerCase().includes('manage servers'))).toBe(false);
+            expect(actionLabels.some((label) => label.includes('common.retry'))).toBe(false);
+            expect(actionLabels.some((label) => label.includes('settings.account'))).toBe(false);
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('opens relay settings from the relay section gear action', async () => {
+        const ConnectionStatusControl = await importConnectionStatusControl();
+
+        let tree: renderer.ReactTestRenderer | undefined;
+        const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+        tree = screen.tree;
+
+        const trigger = screen.findByProps({ accessibilityRole: 'button' });
+        await act(async () => {
+            await pressTestInstanceAsync(trigger);
+        });
+
+        const settingsButton = screen.findByProps({ testID: 'connection-popover-relay-settings' });
+        expect(settingsButton).toBeTruthy();
+
+        await act(async () => {
+            await pressTestInstanceAsync(settingsButton);
+        });
+
+        expect(routerMocks.push).toHaveBeenCalledWith('/settings/server');
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('shows relay targets inline when there are at most two targets', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const local = profiles.upsertServerProfile({ serverUrl: 'https://local.example.test', name: 'Local' });
+            profiles.setActiveServerId(local.id, { scope: 'device' });
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const actionLabels = getActionLabels();
+            expect(capture.dropdownMenuProps).toHaveLength(0);
+            expect(actionLabels.some((label) => label.toLowerCase().includes('local'))).toBe(true);
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('switches server without reload by using runtime switch handlers', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const companyItem = findAction(`target-use-server-${company.id}`);
+
+            expect(companyItem).toBeTruthy();
+
+            await act(async () => {
+                companyItem?.onPress?.();
+            });
+
+            expect(connectionMocks.switchConnectionToActiveServer).toHaveBeenCalledTimes(1);
+            expect(authMocks.refreshFromActiveServer).toHaveBeenCalledTimes(1);
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('selects the active server row when saved target settings point at a previous server', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            const defaultServer = profiles.listServerProfiles().find((profile) => profile.id !== company.id);
+            expect(defaultServer).toBeTruthy();
+            profiles.setActiveServerId(company.id, { scope: 'device' });
+            settingsState.serverSelectionActiveTargetKind = 'server';
+            settingsState.serverSelectionActiveTargetId = defaultServer!.id;
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const localItem = findAction(`target-use-server-${defaultServer!.id}`);
+            const companyItem = findAction(`target-use-server-${company.id}`);
+
+            expect(localItem).toBeTruthy();
+            expect(companyItem).toBeTruthy();
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('requires confirmation before switching to a signed-out server target', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            tokenStorageMock.getCredentialsForServerUrl.mockImplementation(async (...args: unknown[]) => {
+                const url = String(args[0] ?? '');
+                if (url.includes('company.example.test')) return null;
+                return { token: 'scoped-token', secret: 'scoped-secret' };
+            });
+            modalMocks.confirm.mockResolvedValue(false);
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const companyItem = findAction(`target-use-server-${company.id}`);
+
+            expect(companyItem).toBeTruthy();
+
+            await act(async () => {
+                companyItem?.onPress?.();
+            });
+
+            expect(modalMocks.confirm).toHaveBeenCalledTimes(1);
+            expect(connectionMocks.switchConnectionToActiveServer).not.toHaveBeenCalled();
+            expect(authMocks.refreshFromActiveServer).not.toHaveBeenCalled();
+            expect(routerMocks.replace).not.toHaveBeenCalled();
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('records setup auth intent when accepting a signed-out server target on Tauri', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            tauriDesktopState.value = true;
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            tokenStorageMock.getCredentialsForServerUrl.mockImplementation(async (...args: unknown[]) => {
+                const url = String(args[0] ?? '');
+                if (url.includes('company.example.test')) return null;
+                return { token: 'scoped-token', secret: 'scoped-secret' };
+            });
+            modalMocks.confirm.mockResolvedValue(true);
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const companyItem = findAction(`target-use-server-${company.id}`);
+
+            expect(companyItem).toBeTruthy();
+
+            await act(async () => {
+                companyItem?.onPress?.();
+            });
+
+            expect(pendingSetupIntentMocks.setPendingSetupIntent).toHaveBeenCalledWith({
+                branch: 'thisComputer',
+                phase: 'awaiting_auth',
+                relayUrl: 'https://company.example.test',
+            });
+            expect(routerMocks.replace).toHaveBeenCalledWith('/');
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('does not update target settings when cancelling a signed-out group switch', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const local = profiles.upsertServerProfile({ serverUrl: 'https://local.example.test', name: 'Local' });
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            profiles.setActiveServerId(local.id, { scope: 'device' });
+
+            settingsState.serverSelectionActiveTargetKind = 'server';
+            settingsState.serverSelectionActiveTargetId = local.id;
+            settingsState.serverSelectionGroups = [
+                {
+                    id: 'grp-one',
+                    name: 'One',
+                    serverIds: [company.id],
+                    presentation: 'grouped',
+                },
+            ];
+
+            tokenStorageMock.getCredentialsForServerUrl.mockImplementation(async (...args: unknown[]) => {
+                const url = String(args[0] ?? '');
+                if (url.includes('company.example.test')) return null;
+                return { token: 'scoped-token', secret: 'scoped-secret' };
+            });
+            modalMocks.confirm.mockResolvedValue(false);
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const dropdown = latestDropdown();
+            const groupItem = dropdown?.items?.find((item) => item.id === 'target-use-group-grp-one');
+
+            expect(groupItem).toBeTruthy();
+
+            await act(async () => {
+                dropdown?.onSelect?.(groupItem?.id ?? '');
+            });
+
+            expect(modalMocks.confirm).toHaveBeenCalledTimes(1);
+            expect(settingsState.serverSelectionActiveTargetKind).toBe('server');
+            expect(settingsState.serverSelectionActiveTargetId).toBe(local.id);
+            expect(connectionMocks.switchConnectionToActiveServer).not.toHaveBeenCalled();
+            expect(authMocks.refreshFromActiveServer).not.toHaveBeenCalled();
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('uses serverId-scoped auth lookups when switching between same-origin server profiles', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const local = profiles.upsertServerProfile({ serverUrl: 'https://shared.example.test', name: 'Local' });
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://shared.example.test', name: 'Company' });
+            profiles.setActiveServerId(local.id, { scope: 'device' });
+
+            tokenStorageMock.getCredentialsForServerUrl.mockImplementation(async (_serverUrl: string, options?: { serverId?: string | null }) => {
+                if (options?.serverId === company.id) {
+                    return null;
+                }
+                return { token: 'scoped-token', secret: 'scoped-secret' };
+            });
+            modalMocks.confirm.mockResolvedValue(false);
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const companyItem = findAction(`target-use-server-${company.id}`);
+
+            expect(companyItem).toBeTruthy();
+
+            await act(async () => {
+                companyItem?.onPress?.();
+            });
+
+            expect(tokenStorageMock.getCredentialsForServerUrl).toHaveBeenCalledWith('https://shared.example.test', { serverId: local.id });
+            expect(tokenStorageMock.getCredentialsForServerUrl).toHaveBeenCalledWith('https://shared.example.test', { serverId: company.id });
+            expect(modalMocks.confirm).toHaveBeenCalledTimes(1);
+            expect(connectionMocks.switchConnectionToActiveServer).not.toHaveBeenCalled();
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('uses target action ids and does not expose legacy scope toggles', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const { Platform } = await import('react-native');
+            const previousPlatform = Platform.OS;
+            (Platform as any).OS = 'web';
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            const ConnectionStatusControl = await importConnectionStatusControl();
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            const actionIds = new Set(
+                getActions().flatMap((action) => typeof action.id === 'string' ? [action.id] : []),
+            );
+            expect(Array.from(actionIds).some((id) => id.startsWith('server-use-') && id.endsWith('-tab'))).toBe(false);
+            expect(Array.from(actionIds).some((id) => id.startsWith('server-use-') && id.endsWith('-device'))).toBe(false);
+            expect(Array.from(actionIds).some((id) => id.startsWith('target-use-server-'))).toBe(true);
+            expect(Array.from(actionIds).some((id) => id === 'server-switch-tab')).toBe(false);
+            expect(Array.from(actionIds).some((id) => id === 'server-switch-device')).toBe(false);
+            expect(actionIds.has('connection-popover-manage-relay')).toBe(false);
+
+            (Platform as any).OS = previousPlatform;
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('records the direct Relay/Home selection intent, and records nothing for a group (R8/INV7)', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const local = profiles.upsertServerProfile({ serverUrl: 'https://local.example.test', name: 'Local' });
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            profiles.setActiveServerId(local.id, { scope: 'device' });
+            settingsState.serverSelectionGroups = [
+                { id: 'grp-dev', name: 'Dev Group', serverIds: [local.id, company.id], presentation: 'grouped' },
+            ];
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+            const intent = await import('@/setup/directRelaySelectionIntent');
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            // A group names several relays and cannot name one daemon target (B2), so choosing one
+            // must leave the setup gate with nothing to consume.
+            await act(async () => {
+                await selectConnectionTarget('target-use-group-grp-dev');
+            });
+            expect(intent.consumeDirectRelaySelectionIntent(company.id)).toBe(false);
+            expect(intent.consumeDirectRelaySelectionIntent(local.id)).toBe(false);
+
+            // The direct Relay/Home action is the one place the user chooses a single relay, and
+            // it is the only thing allowed to authorise repointing this computer's daemon.
+            await act(async () => {
+                await selectConnectionTarget(`target-use-server-${company.id}`);
+            });
+            expect(intent.consumeDirectRelaySelectionIntent(company.id)).toBe(true);
+            expect(intent.consumeDirectRelaySelectionIntent(company.id)).toBe(false);
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+});

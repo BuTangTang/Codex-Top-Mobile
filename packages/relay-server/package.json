@@ -1,0 +1,34 @@
+{
+  "name": "@happier-dev/relay-server",
+  "version": "0.2.12",
+  "description": "Happier server runner (downloads and verifies the correct server binary for your platform).",
+  "repository": "https://github.com/happier-dev/happier.git",
+  "author": "Leeroy Brun <leeroy.brun@gmail.com>",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "relay-server": "bin/happier-server.mjs",
+    "happier-server": "bin/happier-server.mjs"
+  },
+  "files": [
+    "assets",
+    "bin",
+    "src"
+  ],
+  "bundledDependencies": [
+    "@happier-dev/release-runtime"
+  ],
+  "dependencies": {
+    "@happier-dev/release-runtime": "0.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "node ./scripts/bundleWorkspaceDeps.mjs",
+    "test": "HAPPIER_FEATURE_POLICY_ENV= node --test"
+  }
+}

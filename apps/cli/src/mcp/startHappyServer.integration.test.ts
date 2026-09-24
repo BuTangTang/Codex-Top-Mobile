@@ -1,0 +1,817 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { request as httpRequest } from 'node:http';
+import { createServer } from 'node:net';
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+
+import { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
+import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
+import type { Metadata } from '@/api/types';
+import type { AgentBackend } from '@/agent/core/AgentBackend';
+import { reloadConfiguration } from '@/configuration';
+import { registerExecutionRunHandlers } from '@/rpc/handlers/executionRuns';
+import { HAPPIER_MCP_ACTION_SPECS_RESOURCE_URI } from '@/mcp/resources/registerHappierMcpResources';
+import { startHappyServer, type HappyMcpSessionClient } from '@/mcp/startHappyServer';
+
+const env = process.env;
+
+function createStaticBackend(responseText: string): AgentBackend {
+  const handlers = new Set<(msg: any) => void>();
+  let fullText = '';
+
+  return {
+    async startSession() {
+      return { sessionId: 'child_sess_1' };
+    },
+    async sendPrompt(_sessionId, _prompt) {
+      fullText = responseText;
+      for (const h of handlers) h({ type: 'model-output', fullText });
+    },
+    async cancel() {},
+    onMessage(handler) {
+      handlers.add(handler);
+    },
+    async dispose() {
+      handlers.clear();
+    },
+  };
+}
+
+function parseMcpJsonText(result: any): any {
+  const text = result?.content?.[0]?.text;
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new Error('Missing MCP text response');
+  }
+  return JSON.parse(text);
+}
+
+function isTextResourceContentEntry(
+  entry: unknown,
+): entry is { uri: string; text: string; mimeType?: string | undefined } {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const record = entry as Record<string, unknown>;
+  return typeof record.uri === 'string' && typeof record.text === 'string';
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 3_000): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function reservePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  if (!address || typeof address === 'string') {
+    throw new Error('failed to reserve port');
+  }
+  return address.port;
+}
+
+describe('startHappyServer (MCP integration)', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...env };
+    delete process.env.HAPPIER_ACTIONS_SETTINGS_V1;
+    delete process.env.HAPPIER_MCP_SSE_KEEPALIVE_INTERVAL_MS;
+    reloadConfiguration();
+  });
+
+  it('binds an explicitly requested port', async () => {
+    const requestedPort = await reservePort();
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_requested_port',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_requested_port',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient, { requestedPort });
+    try {
+      expect(new URL(server.url).port).toBe(String(requestedPort));
+    } finally {
+      server.stop();
+    }
+  });
+
+  it('fails cleanly when the requested port is already occupied', async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = blocker.address();
+    if (!address || typeof address === 'string') {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      throw new Error('failed to allocate occupied port');
+    }
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_requested_port_taken',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_requested_port_taken',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    try {
+      await expect(startHappyServer(fakeClient, {
+        requestedPort: address.port,
+      })).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it('emits SSE keepalive comments on the standalone GET stream (prevents idle timeouts)', async () => {
+    const prev = process.env.HAPPIER_MCP_SSE_KEEPALIVE_INTERVAL_MS;
+    process.env.HAPPIER_MCP_SSE_KEEPALIVE_INTERVAL_MS = '25';
+    reloadConfiguration();
+
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_keepalive_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    registerExecutionRunHandlers(rpcHandlerManager, {
+      sessionId: 'sess_mcp_keepalive_1',
+      cwd: process.cwd(),
+      parentProvider: 'claude',
+      createBackend: () => createStaticBackend(JSON.stringify({ ok: true })),
+      sendAcp: () => {},
+    });
+
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_keepalive_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient);
+    try {
+      const url = new URL(server.url);
+      const firstChunk = await new Promise<string>((resolve, reject) => {
+        let settled = false;
+        let timeoutId: NodeJS.Timeout | null = null;
+        const finish = (value: { ok: true; chunk: string } | { ok: false; error: Error }) => {
+          if (settled) return;
+          settled = true;
+          if (timeoutId) clearTimeout(timeoutId);
+          if (value.ok) resolve(value.chunk);
+          else reject(value.error);
+        };
+
+        const req = httpRequest(
+          {
+            method: 'GET',
+            host: url.hostname,
+            port: Number(url.port),
+            path: `${url.pathname}${url.search}`,
+            headers: {
+              Accept: 'text/event-stream',
+            },
+          },
+          (res) => {
+            if (res.statusCode !== 200) {
+              finish({ ok: false, error: new Error(`Unexpected status: ${res.statusCode}`) });
+              req.destroy();
+              return;
+            }
+            res.once('data', (chunk) => {
+              finish({ ok: true, chunk: Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk) });
+              req.destroy();
+            });
+            res.once('end', () => {
+              finish({ ok: false, error: new Error('SSE stream ended before any keepalive data was received') });
+            });
+            res.once('close', () => {
+              finish({ ok: false, error: new Error('SSE stream closed before any keepalive data was received') });
+            });
+          },
+        );
+        req.on('error', (err) => finish({ ok: false, error: err instanceof Error ? err : new Error(String(err)) }));
+        req.end();
+
+        timeoutId = setTimeout(() => {
+          req.destroy();
+          finish({ ok: false, error: new Error('Timed out waiting for SSE keepalive chunk') });
+        }, 1000);
+      });
+
+      // SSE comments start with ":" and are safe to interleave with event streams.
+      expect(firstChunk).toContain(':');
+    } finally {
+      server.stop();
+      if (prev === undefined) delete process.env.HAPPIER_MCP_SSE_KEEPALIVE_INTERVAL_MS;
+      else process.env.HAPPIER_MCP_SSE_KEEPALIVE_INTERVAL_MS = prev;
+      reloadConfiguration();
+    }
+  });
+
+  it('snapshots tool names from account action settings when provided', async () => {
+    process.env.HAPPIER_ACTIONS_SETTINGS_V1 = JSON.stringify({
+      v: 1,
+      actions: {
+        'session.list': { enabled: true, disabledSurfaces: ['session_agent'], disabledPlacements: [] },
+      },
+    });
+
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_account_tool_names_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_account_tool_names_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient, {
+      accountSettings: {
+        actionsSettingsV1: {
+          v: 1,
+          actions: {
+            'session.list': {
+              disabledSurfaces: [],
+              toolExposureModes: { session_agent: 'direct' },
+            },
+          },
+        },
+      },
+    } as any);
+    try {
+      expect(server.toolNames).toContain('session_list');
+    } finally {
+      server.stop();
+    }
+  });
+
+  it('keeps session-agent execution-run actions discoverable and can start/list/action a review run over HTTP transport', async () => {
+    const sent: Array<{ body: ACPMessageData; meta?: Record<string, unknown> }> = [];
+
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    registerExecutionRunHandlers(rpcHandlerManager, {
+      sessionId: 'sess_mcp_1',
+      cwd: process.cwd(),
+      parentProvider: 'claude',
+      createBackend: () =>
+        createStaticBackend(
+          JSON.stringify({
+            findings: [
+              { id: 'f1', title: 'Example', severity: 'low', category: 'style', summary: 'One paragraph.' },
+            ],
+            summary: 'Summary.',
+          }),
+        ),
+      sendAcp: (_provider: string, body: ACPMessageData, opts?: { meta?: Record<string, unknown> }) =>
+        sent.push({ body, meta: opts?.meta }),
+    });
+
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+      getPermissionMode: () => 'default',
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const tools = await client.listTools();
+      const names = new Set((tools.tools ?? []).map((t: any) => String(t.name)));
+      expect(names.has('action_spec_search')).toBe(true);
+      expect(names.has('action_spec_get')).toBe(true);
+      expect(names.has('action_options_resolve')).toBe(true);
+      expect(names.has('action_execute')).toBe(true);
+      expect(names.has('review_start')).toBe(false);
+      expect(names.has('subagents_plan_start')).toBe(false);
+      expect(names.has('subagents_delegate_start')).toBe(false);
+      expect(names.has('execution_run_start')).toBe(false);
+      expect(names.has('execution_run_list')).toBe(true);
+      expect(names.has('execution_run_get')).toBe(true);
+      expect(names.has('execution_run_wait')).toBe(true);
+      expect(names.has('execution_run_action')).toBe(false);
+
+      const delegateSpecRaw = await client.callTool({
+        name: 'action_spec_get',
+        arguments: { id: 'subagents.delegate.start' },
+      });
+      const delegateSpec = parseMcpJsonText(delegateSpecRaw);
+      expect(delegateSpec.actionSpec?.id).toBe('subagents.delegate.start');
+
+      const resolvedOptionsRaw = await client.callTool({
+        name: 'action_options_resolve',
+        arguments: {
+          actionId: 'subagents.plan.start',
+          fieldPath: 'backendTargetKeys',
+          sessionId: fakeClient.sessionId,
+        },
+      });
+      const resolvedOptions = parseMcpJsonText(resolvedOptionsRaw);
+      expect(resolvedOptions.actionId).toBe('subagents.plan.start');
+      expect(resolvedOptions.fieldPath).toBe('backendTargetKeys');
+      expect(resolvedOptions.optionsSourceId).toBe('execution.backends.enabled');
+      expect(resolvedOptions.options).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            value: 'agent:claude',
+            label: expect.any(String),
+          }),
+        ]),
+      );
+
+      const startedRaw = await client.callTool({
+        name: 'action_execute',
+        arguments: {
+          actionId: 'execution.run.start',
+          input: {
+            intent: 'review',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            instructions: 'Review.',
+            permissionMode: 'read_only',
+            retentionPolicy: 'ephemeral',
+            runClass: 'bounded',
+            ioMode: 'request_response',
+          },
+        },
+      });
+      const started = parseMcpJsonText(startedRaw);
+      expect(String(started.runId)).toMatch(/^run_/);
+
+      const listedRaw = await client.callTool({
+        name: 'action_execute',
+        arguments: {
+          actionId: 'execution.run.list',
+          input: {},
+        },
+      });
+      const listed = parseMcpJsonText(listedRaw);
+      expect(listed.runs, JSON.stringify(listed)).toEqual(
+        expect.arrayContaining([expect.objectContaining({ runId: started.runId })]),
+      );
+
+      const actionRaw = await client.callTool({
+        name: 'action_execute',
+        arguments: {
+          actionId: 'execution.run.action',
+          input: {
+            runId: started.runId,
+            actionId: 'review.triage',
+            input: { findings: [{ id: 'f1', status: 'accept' }] },
+          },
+        },
+      });
+      const action = parseMcpJsonText(actionRaw);
+      expect(action.updatedToolResult).toEqual(expect.objectContaining({ ok: true, actionId: 'review.triage' }));
+
+      // Verify the run emitted tool-call/tool-result into transcript (via sendAcp).
+      expect(sent.some((m) => (m.body as any)?.type === 'tool-call')).toBe(true);
+      expect(sent.some((m) => (m.body as any)?.type === 'tool-result')).toBe(true);
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('routes change_title through session metadata updates instead of provider-specific summary messages', async () => {
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_change_title_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    let metadata: Metadata = {
+      path: '/tmp/project',
+      host: 'localhost',
+      homeDir: '/tmp/home',
+      happyHomeDir: '/tmp/happy',
+      happyLibDir: '/tmp/happy/lib',
+      happyToolsDir: '/tmp/happy/tools',
+      flavor: 'claude',
+    };
+    const updateMetadata = vi.fn((updater: (current: Metadata) => Metadata) => {
+      metadata = updater(metadata);
+    });
+    const sendClaudeSessionMessage = vi.fn();
+
+    const fakeClient = {
+      sessionId: 'sess_mcp_change_title_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage,
+      updateMetadata,
+    } satisfies HappyMcpSessionClient;
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-change-title', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const resultRaw = await client.callTool({
+        name: 'change_title',
+        arguments: { title: 'QA MCP Title' },
+      });
+      const result = parseMcpJsonText(resultRaw);
+
+      expect(result.success).toBe(true);
+      expect(updateMetadata).toHaveBeenCalled();
+      expect(sendClaudeSessionMessage).not.toHaveBeenCalled();
+      expect((metadata.summary as { text?: string }).text).toBe('QA MCP Title');
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('surfaces execution.run.start action_execute app-level failures as MCP tool errors', async () => {
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_run_start_error_1',
+      rpcHandlerManager: {
+        invokeLocal: vi.fn(async (method: string) => {
+          if (method === 'execution.run.start') {
+            return {
+              ok: false,
+              errorCode: 'execution_run_budget_exceeded',
+              error: 'Execution run budget exceeded',
+            };
+          }
+          return {};
+        }),
+      } as any,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+      getPermissionMode: () => 'default',
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-run-start-error', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const resultRaw = await client.callTool({
+        name: 'action_execute',
+        arguments: {
+          actionId: 'execution.run.start',
+          input: {
+            intent: 'review',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            instructions: 'Review.',
+            permissionMode: 'read_only',
+            retentionPolicy: 'ephemeral',
+            runClass: 'bounded',
+            ioMode: 'request_response',
+          },
+        },
+      });
+      expect(resultRaw.isError).toBe(true);
+      expect(parseMcpJsonText(resultRaw)).toEqual({
+        errorCode: 'execution_run_budget_exceeded',
+        error: 'Execution run budget exceeded',
+      });
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('rejects execution.run.start targeting another session instead of retargeting the current MCP session', async () => {
+    const invokeLocal = vi.fn(async () => ({ runId: 'run_wrong_session' }));
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_current_1',
+      rpcHandlerManager: { invokeLocal } as any,
+      getPermissionMode: () => 'default',
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-run-cross-session', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const resultRaw = await client.callTool({
+        name: 'action_execute',
+        arguments: {
+          actionId: 'execution.run.start',
+          input: {
+            sessionId: 'sess_mcp_target_2',
+            intent: 'review',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            instructions: 'Review.',
+            permissionMode: 'default',
+            retentionPolicy: 'ephemeral',
+            runClass: 'bounded',
+            ioMode: 'request_response',
+          },
+        },
+      });
+
+      expect(resultRaw.isError).toBe(true);
+      expect(parseMcpJsonText(resultRaw)).toEqual({
+        errorCode: 'execution_run_target_unavailable',
+        error: 'Cross-session execution run control is unavailable from a session-scoped MCP bridge',
+      });
+      expect(invokeLocal).not.toHaveBeenCalled();
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('surfaces execution.run.send action_execute app-level failures as MCP tool errors', async () => {
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_run_send_error_1',
+      rpcHandlerManager: {
+        invokeLocal: vi.fn(async (method: string) => {
+          if (method === 'execution.run.send') {
+            return {
+              ok: false,
+              errorCode: 'execution_run_not_allowed',
+              error: 'Not running',
+            };
+          }
+          return {};
+        }),
+      } as any,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-run-send-error', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const resultRaw = await client.callTool({
+        name: 'action_execute',
+        arguments: {
+          actionId: 'execution.run.send',
+          input: {
+            runId: 'run_1',
+            message: 'still there?',
+          },
+        },
+      });
+      expect(fakeClient.rpcHandlerManager.invokeLocal).toHaveBeenCalledWith(
+        'execution.run.send',
+        expect.objectContaining({
+          runId: 'run_1',
+          message: 'still there?',
+          delivery: 'steer_if_supported',
+        }),
+      );
+      expect(resultRaw.isError).toBe(true);
+      expect(parseMcpJsonText(resultRaw)).toEqual({
+        errorCode: 'execution_run_not_allowed',
+        error: 'Not running',
+      });
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('uses the live session metadata snapshot for MCP action_options_resolve inventory lookups', async () => {
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_options_metadata_1',
+      rpcHandlerManager: {
+        invokeLocal: vi.fn(async () => ({})),
+      } as any,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+      getMetadataSnapshot: () => ({
+        sessionModesV1: {
+          currentModeId: 'build',
+          availableModes: [
+            { id: 'build', name: 'Build' },
+            { id: 'plan', name: 'Plan' },
+          ],
+        },
+      } as Metadata),
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-action-options-metadata', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const resultRaw = await client.callTool({
+        name: 'action_options_resolve',
+        arguments: {
+          optionsSourceId: 'session.modes.available',
+          sessionId: fakeClient.sessionId,
+        },
+      });
+      expect(resultRaw.isError).toBe(false);
+      expect(parseMcpJsonText(resultRaw)).toEqual({
+        actionId: null,
+        fieldPath: null,
+        optionsSourceId: 'session.modes.available',
+        options: [
+          { value: 'build', label: 'Build' },
+          { value: 'plan', label: 'Plan' },
+        ],
+      });
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('hides session-agent-disabled action-spec tools and rejects action_spec_get for disabled actions', async () => {
+    const prev = process.env.HAPPIER_ACTIONS_SETTINGS_V1;
+    process.env.HAPPIER_ACTIONS_SETTINGS_V1 = JSON.stringify({
+      v: 1,
+      actions: {
+        'review.start': { enabled: true, disabledSurfaces: ['session_agent'], disabledPlacements: [] },
+      },
+    });
+
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_disabled_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    registerExecutionRunHandlers(rpcHandlerManager, {
+      sessionId: 'sess_mcp_disabled_1',
+      cwd: process.cwd(),
+      parentProvider: 'claude',
+      createBackend: () => createStaticBackend(JSON.stringify({ ok: true })),
+      sendAcp: () => {},
+    });
+
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_disabled_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-disabled', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const tools = await client.listTools();
+      const names = new Set((tools.tools ?? []).map((t: any) => String(t.name)));
+      expect(names.has('review_start')).toBe(false);
+      expect(names.has('subagents_plan_start')).toBe(false);
+
+      const got = await client.callTool({
+        name: 'action_spec_get',
+        arguments: { id: 'review.start' },
+      });
+      const parsed = parseMcpJsonText(got);
+      expect(parsed.errorCode).toBe('action_disabled');
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+      if (prev === undefined) delete process.env.HAPPIER_ACTIONS_SETTINGS_V1;
+      else process.env.HAPPIER_ACTIONS_SETTINGS_V1 = prev;
+    }
+  });
+
+  it('lists and reads Happier MCP resources over HTTP transport', async () => {
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_resources_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    registerExecutionRunHandlers(rpcHandlerManager, {
+      sessionId: 'sess_mcp_resources_1',
+      cwd: process.cwd(),
+      parentProvider: 'claude',
+      createBackend: () => createStaticBackend(JSON.stringify({ ok: true })),
+      sendAcp: () => {},
+    });
+
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_resources_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient);
+    let client: Client | null = null;
+    try {
+      client = new Client({ name: 'mcp-test-resources', version: '1.0.0' }, { capabilities: {} });
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+      const resources = await withTimeout(client.listResources(), 'resources/list');
+      const actionSpecsResource = resources.resources.find(
+        (resource: any) => String(resource.uri) === HAPPIER_MCP_ACTION_SPECS_RESOURCE_URI,
+      );
+      expect(actionSpecsResource).toBeDefined();
+
+      const read = await withTimeout(
+        client.readResource({ uri: HAPPIER_MCP_ACTION_SPECS_RESOURCE_URI }),
+        'resources/read',
+      );
+      const textContent = read.contents.find(
+        (entry) => isTextResourceContentEntry(entry) && entry.uri === HAPPIER_MCP_ACTION_SPECS_RESOURCE_URI,
+      );
+      expect(textContent?.mimeType).toBe('application/json');
+      expect(textContent && 'text' in textContent).toBe(true);
+      if (!textContent || !('text' in textContent)) {
+        throw new Error('Expected text MCP resource content');
+      }
+
+      const parsed = JSON.parse(textContent.text);
+      expect(Array.isArray(parsed.actionSpecs)).toBe(true);
+      expect(parsed.actionSpecs.some((spec: any) => spec.id === 'review.start')).toBe(true);
+    } finally {
+      await (client as any)?.close?.();
+      server.stop();
+    }
+  });
+
+  it('allows multiple independent MCP clients to connect without sharing transport initialization state', async () => {
+    const rpcHandlerManager = new RpcHandlerManager({
+      scopePrefix: 'sess_mcp_seq_1',
+      encryptionKey: new Uint8Array([1, 2, 3, 4]),
+      encryptionVariant: 'legacy',
+    });
+
+    registerExecutionRunHandlers(rpcHandlerManager, {
+      sessionId: 'sess_mcp_seq_1',
+      cwd: process.cwd(),
+      parentProvider: 'claude',
+      createBackend: () => createStaticBackend(JSON.stringify({ ok: true })),
+      sendAcp: () => {},
+    });
+
+    const fakeClient: HappyMcpSessionClient = {
+      sessionId: 'sess_mcp_seq_1',
+      rpcHandlerManager,
+      sendClaudeSessionMessage: () => {},
+      updateMetadata: () => {},
+    };
+
+    const server = await startHappyServer(fakeClient);
+    try {
+      const clientA = new Client({ name: 'mcp-test-a', version: '1.0.0' }, { capabilities: {} });
+      const clientB = new Client({ name: 'mcp-test-b', version: '1.0.0' }, { capabilities: {} });
+
+      await clientA.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+      const toolsA = await clientA.listTools();
+      const namesA = new Set((toolsA.tools ?? []).map((t: any) => String(t.name)));
+      expect(namesA.has('action_execute')).toBe(true);
+      expect(namesA.has('execution_run_start')).toBe(false);
+
+      await clientB.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+      const toolsB = await clientB.listTools();
+      const namesB = new Set((toolsB.tools ?? []).map((t: any) => String(t.name)));
+      expect(namesB.has('action_execute')).toBe(true);
+      expect(namesB.has('execution_run_start')).toBe(false);
+
+      await (clientA as any).close?.();
+      await (clientB as any).close?.();
+    } finally {
+      server.stop();
+    }
+  });
+});

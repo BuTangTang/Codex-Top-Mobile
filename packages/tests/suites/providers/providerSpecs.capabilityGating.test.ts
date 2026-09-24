@@ -1,0 +1,132 @@
+import { describe, expect, it } from 'vitest';
+
+import { loadProvidersFromCliSpecs } from '../../src/testkit/providers/specs/providerSpecs';
+
+describe('providers: scenario capability gating', () => {
+  it('does not require ACP model probe for kilo', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const kilo = providers.find((provider) => provider.id === 'kilo');
+    expect(kilo).toBeTruthy();
+    expect(kilo!.scenarioRegistry.tiers.extended).not.toContain('acp_probe_models');
+  });
+
+  it('does not require ACP resume-load scenarios for qwen', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const qwen = providers.find((provider) => provider.id === 'qwen');
+    expect(qwen).toBeTruthy();
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_load_session');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_fresh_session_imports_history');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('read_known_file');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('read_missing_file_in_workspace');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('search_known_token');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('search_ls_equivalence');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('glob_list_files');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('edit_result_includes_diff');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('multi_file_edit_in_workspace');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('multi_file_edit_in_workspace_includes_diff');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('permission_mode_default_outside_workspace');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('permission_mode_safe_yolo_outside_workspace');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('permission_mode_read_only_outside_workspace');
+    expect(qwen!.scenarioRegistry.tiers.extended).not.toContain('permission_mode_yolo_outside_workspace');
+  });
+
+  it('covers Kimi negotiated load-resume without claiming unverified history import', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const kimi = providers.find((p) => p.id === 'kimi');
+    expect(kimi).toBeTruthy();
+    expect(kimi!.scenarioRegistry.tiers.extended).toContain('acp_resume_load_session');
+    expect(kimi!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_fresh_session_imports_history');
+  });
+
+  it('does not require ACP resume-load scenarios for auggie', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const auggie = providers.find((provider) => provider.id === 'auggie');
+    expect(auggie).toBeTruthy();
+    expect(auggie!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_load_session');
+    expect(auggie!.scenarioRegistry.tiers.extended).not.toContain('acp_resume_fresh_session_imports_history');
+  });
+
+  it('models auggie safe-yolo outside-workspace behavior as write-allowed/no-prompt', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const auggie = providers.find((provider) => provider.id === 'auggie');
+    expect(auggie).toBeTruthy();
+
+    const acpPermissions = (auggie!.permissions as any)?.acp;
+    expect(acpPermissions?.toolPermissionPromptsByMode?.['safe-yolo']).toBe(false);
+    expect(acpPermissions?.outsideWorkspaceWriteAllowedByMode?.['safe-yolo']).toBe(true);
+    expect(acpPermissions?.outsideWorkspaceWriteMustCompleteByMode?.['safe-yolo']).toBe(true);
+  });
+
+  it('uses the existing Kimi Code host authentication state', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const kimi = providers.find((provider) => provider.id === 'kimi');
+    expect(kimi).toBeTruthy();
+    expect(kimi!.auth?.mode).toBe('host');
+  });
+
+  it('keeps gemini extended coverage focused on ACP capability/model inventory', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const gemini = providers.find((provider) => provider.id === 'gemini');
+    expect(gemini).toBeTruthy();
+
+    const smoke = gemini!.scenarioRegistry.tiers.smoke;
+    const extended = gemini!.scenarioRegistry.tiers.extended;
+    expect(smoke).toContain('acp_probe_capabilities');
+    expect(extended).toContain('acp_probe_models');
+    expect(extended).toContain('acp_set_model_inventory');
+    expect(extended).not.toContain('acp_resume_load_session');
+    expect(extended).not.toContain('acp_resume_fresh_session_imports_history');
+  });
+
+  it('does not hardcode gemini ACP probe timeout in provider spec env', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const gemini = providers.find((provider) => provider.id === 'gemini');
+    expect(gemini).toBeTruthy();
+
+    const timeoutRaw = gemini!.cli?.env?.HAPPIER_ACP_PROBE_TIMEOUT_GEMINI_MS;
+    expect(timeoutRaw).toBeUndefined();
+  });
+
+  it('keeps Codex runtime provider-lane scenarios ACP-scoped and limits app-server coverage to targeted capabilities', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const codex = providers.find((provider) => provider.id === 'codex');
+    expect(codex).toBeTruthy();
+
+    const allScenarioIds = [
+      ...codex!.scenarioRegistry.tiers.smoke,
+      ...codex!.scenarioRegistry.tiers.extended,
+    ];
+
+    expect(codex!.coverageExpectation).toEqual({
+      providerLaneScope: 'acp-only',
+      defaultRuntimePath: 'appServer',
+      appServerCoverage: 'capability-contract',
+      appServerCapabilitySurfaces: ['modes', 'models', 'speed', 'rollback'],
+    });
+    expect(codex!.scenarioRegistry.tiers.smoke).toContain('acp_probe_capabilities');
+    expect(allScenarioIds.some((scenarioId) => /app(?:-|_)?server/i.test(scenarioId))).toBe(false);
+    expect(codex!.cli?.env?.HAPPIER_CODEX_BACKEND_MODE).toBe('acp');
+  });
+
+  it('wires Cursor scenarios through the existing ACP verification gates', async () => {
+    const providers = await loadProvidersFromCliSpecs();
+    const cursor = providers.find((provider) => provider.id === 'cursor');
+    expect(cursor).toBeTruthy();
+
+    const allScenarioIds = [
+      ...cursor!.scenarioRegistry.tiers.smoke,
+      ...cursor!.scenarioRegistry.tiers.extended,
+    ];
+    expect(cursor!.scenarioRegistry.tiers.smoke).toContain('acp_probe_capabilities');
+    expect(allScenarioIds).toEqual(expect.arrayContaining([
+      'acp_probe_capabilities',
+      'acp_probe_models',
+      'acp_set_model_dynamic',
+      'acp_resume_load_session',
+      'mcp_change_title',
+    ]));
+    expect(cursor!.auth?.mode).toBe('auto');
+    expect(cursor!.auth?.env?.requiredAnyOf).toEqual([['CURSOR_API_KEY']]);
+    expect(cursor!.cli.envFrom?.HAPPIER_CURSOR_PATH).toBe('HAPPIER_E2E_PROVIDER_CURSOR_BIN');
+  });
+});

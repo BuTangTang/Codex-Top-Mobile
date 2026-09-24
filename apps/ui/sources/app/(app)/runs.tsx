@@ -1,0 +1,285 @@
+import * as React from 'react';
+import { Pressable, View } from 'react-native';
+import { Stack, useRouter } from 'expo-router';
+import { useUnistyles } from 'react-native-unistyles';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+
+import type { DaemonExecutionRunEntry } from '@happier-dev/protocol';
+
+import { Item } from '@/components/ui/lists/Item';
+import { ItemGroup } from '@/components/ui/lists/ItemGroup';
+import { ItemList } from '@/components/ui/lists/ItemList';
+import { ExecutionRunRow } from '@/components/sessions/runs/ExecutionRunRow';
+import { ConstrainedScreenContent } from '@/components/ui/layout/ConstrainedScreenContent';
+import { Modal } from '@/modal';
+import { t } from '@/text';
+import { tryShowDaemonUnavailableAlertForRpcFailure } from '@/utils/errors/daemonUnavailableAlert';
+import { useMachineListByServerId, useMachineListStatusByServerId } from '@/sync/domains/state/storage';
+import { machineExecutionRunsList } from '@/sync/ops/machineExecutionRuns';
+import { sessionExecutionRunStop } from '@/sync/ops/sessionExecutionRuns';
+import { machineStopSession } from '@/sync/ops/machines';
+import { isMachineOnline } from '@/utils/sessions/machineUtils';
+import { Text } from '@/components/ui/text/Text';
+import { useMountedShouldContinue } from '@/hooks/ui/useMountedShouldContinue';
+import { Icon } from '@/components/ui/icons/Icon';
+
+
+type MachineRunsState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; runsByMachineId: Record<string, readonly DaemonExecutionRunEntry[]> }
+  | { status: 'error'; error: string };
+
+function getMachineTitle(machine: any): string {
+  const displayName = typeof machine?.metadata?.displayName === 'string' ? machine.metadata.displayName.trim() : '';
+  if (displayName) return displayName;
+  const host = typeof machine?.metadata?.host === 'string' ? machine.metadata.host.trim() : '';
+  if (host) return host;
+  return String(machine?.id ?? t('runs.unknownMachine'));
+}
+
+function formatRunDetails(run: DaemonExecutionRunEntry): string {
+  const detailParts: string[] = [t('runs.sessionTitle', { sessionId: run.happySessionId }), t('runs.detail.pid', { pid: run.pid })];
+  const cpu = (run as any).process?.cpu;
+  const memory = (run as any).process?.memory;
+  if (typeof cpu === 'number' && Number.isFinite(cpu)) {
+    detailParts.push(t('runs.detail.cpu', { percent: cpu.toFixed(1) }));
+  }
+  if (typeof memory === 'number' && Number.isFinite(memory)) {
+    detailParts.push(t('runs.detail.memory', { megabytes: Math.round(memory / (1024 * 1024)) }));
+  }
+  return `${t('runs.runLabel', { runId: run.runId })} · ${detailParts.join(' · ')}`;
+}
+
+export default function RunsScreen() {
+  const { theme } = useUnistyles();
+  const router = useRouter();
+  const shouldContinue = useMountedShouldContinue();
+  const machineListByServerId = useMachineListByServerId();
+  const machineListStatusByServerId = useMachineListStatusByServerId();
+  const [showFinished, setShowFinished] = React.useState(false);
+  const [stoppingRunId, setStoppingRunId] = React.useState<string | null>(null);
+  const [state, setState] = React.useState<MachineRunsState>({ status: 'idle' });
+  const headerTint = theme.colors.chrome?.header?.foreground ?? theme.colors.text.primary;
+
+  const serverEntries = React.useMemo(() => {
+    const entries = Object.entries(machineListByServerId ?? {})
+      .filter(([serverId, machines]) => typeof serverId === 'string' && serverId.trim().length > 0 && Array.isArray(machines));
+    entries.sort(([a], [b]) => a.localeCompare(b));
+    return entries as Array<[string, any[]]>;
+  }, [machineListByServerId]);
+
+  const load = React.useCallback(async () => {
+    setState({ status: 'loading' });
+
+    const runsByMachineId: Record<string, readonly DaemonExecutionRunEntry[]> = {};
+
+    try {
+      await Promise.all(
+        serverEntries.flatMap(([serverId, machines]) => {
+          const serverStatus = machineListStatusByServerId?.[serverId] ?? 'idle';
+          if (serverStatus === 'signedOut') return [];
+
+          return machines.map(async (machine) => {
+            const machineId = String(machine?.id ?? '').trim();
+            if (!machineId) return;
+            if (!isMachineOnline(machine)) return;
+
+            const res = await machineExecutionRunsList(machineId, { serverId });
+            if (res.ok) {
+              runsByMachineId[machineId] = res.runs;
+            }
+          });
+        }),
+      );
+
+      setState({ status: 'loaded', runsByMachineId });
+    } catch (error) {
+      setState({ status: 'error', error: error instanceof Error ? error.message : t('runs.failedToLoad') });
+    }
+  }, [machineListStatusByServerId, serverEntries]);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  const headerRight = React.useCallback(() => {
+    return (
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={t('runs.a11y.toggleFinished')}
+          onPress={() => setShowFinished((value) => !value)}
+          hitSlop={10}
+          style={({ pressed }) => ({ padding: 4, opacity: pressed ? 0.7 : 1 })}
+        >
+          <Icon
+            name="funnel-simple"
+            size={20}
+            color={showFinished ? theme.colors.text.link : headerTint}
+          />
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={t('runs.a11y.refresh')}
+          onPress={() => void load()}
+          hitSlop={10}
+          style={({ pressed }) => ({ padding: 4, opacity: pressed ? 0.7 : 1 })}
+        >
+          <Icon name="arrow-clockwise" size={20} color={headerTint} />
+        </Pressable>
+      </View>
+    );
+  }, [headerTint, load, showFinished]);
+
+  const screenOptions = React.useMemo(() => ({
+    headerShown: true,
+    headerTitle: t('runs.title'),
+    headerRight,
+  }), [headerRight]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}>
+      <Stack.Screen options={screenOptions} />
+      <ConstrainedScreenContent style={{ flex: 1 }}>
+        <View style={{ paddingHorizontal: 16, paddingTop: 12 }}>
+          <Text style={{ color: theme.colors.text.secondary }}>
+            {showFinished ? 'Showing finished runs' : 'Showing running runs'}
+          </Text>
+        </View>
+
+        <ItemList style={{ paddingTop: 0 }}>
+          {state.status === 'loading' ? (
+            <Item
+              title={t('common.loading')}
+              showChevron={false}
+              rightElement={<ActivitySpinner size="small" color={theme.colors.text.secondary} />}
+            />
+          ) : state.status === 'error' ? (
+            <Item title={t('common.error')} subtitle={state.error} showChevron={false} />
+          ) : serverEntries.length === 0 ? (
+            <Item title={t('status.unknown')} subtitle={t('runs.noMachinesAvailable')} showChevron={false} />
+          ) : (
+            serverEntries.flatMap(([serverId, machines]) => {
+              if (!Array.isArray(machines) || machines.length === 0) return [];
+              const header = (
+                <Item
+                  key={`server:${serverId}`}
+                  title={t('runs.serverTitle', { serverId })}
+                  subtitle={t('runs.machinesSubtitle')}
+                  showChevron={false}
+                />
+              );
+
+              const machineGroups = machines.map((machine) => {
+                const machineId = String(machine?.id ?? '').trim();
+                const title = getMachineTitle(machine);
+
+                const rawRuns = (state.status === 'loaded' ? state.runsByMachineId[machineId] : null) ?? [];
+                const runs = showFinished ? rawRuns : rawRuns.filter((r) => r.status === 'running');
+
+                return (
+                  <ItemGroup key={`machine:${serverId}:${machineId}`} title={title}>
+                    <Item
+                      title={machineId}
+                      subtitle={t('runs.openMachine')}
+                      subtitleStyle={{ color: theme.colors.text.secondary, fontFamily: 'Menlo' as any, fontSize: 12 }}
+                      rightElement={<Icon name="caret-right" size={16} color={theme.colors.text.secondary} />}
+                      onPress={() => {
+                        const query = serverId ? `?serverId=${encodeURIComponent(serverId)}` : '';
+                        router.push(`/machine/${machineId}${query}` as any);
+                      }}
+                    />
+                    {runs.length === 0 ? (
+                      <Item title={t('runs.empty')} subtitle={t('runs.empty')} showChevron={false} />
+                    ) : (
+                      runs.slice(0, 50).map((run) => {
+                        const canStop = run.status === 'running';
+                        const onStop = async () => {
+                          if (!canStop) return;
+                          setStoppingRunId(run.runId);
+                          const stopSessionProcess = async () => {
+                            const stopResult = await machineStopSession(machineId, run.happySessionId, { serverId });
+                            if (stopResult.ok) return;
+
+                            const shownDaemonUnavailable = tryShowDaemonUnavailableAlertForRpcFailure({
+                              rpcErrorCode: stopResult.errorCode ?? null,
+                              message: stopResult.error ?? null,
+                              machine,
+                              onRetry: () => {
+                                void stopSessionProcess();
+                              },
+                              shouldContinue,
+                            });
+                            if (!shownDaemonUnavailable) {
+                              Modal.alert(t('common.error'), stopResult.error || t('runs.stop.failedToStopSession'));
+                            }
+                          };
+                          try {
+                            const res = await sessionExecutionRunStop(run.happySessionId, { runId: run.runId }, { serverId });
+                            if ((res as any)?.ok === false) {
+                              const confirmed = await Modal.confirm(
+                                t('runs.stop.stopRunFailedTitle'),
+                                t('runs.stop.stopRunFailedBody'),
+                                { confirmText: t('runs.stop.stopSession'), cancelText: t('common.cancel'), destructive: true },
+                              );
+                              if (confirmed) {
+                                await stopSessionProcess();
+                              } else {
+                                Modal.alert(t('common.error'), String((res as any).error ?? t('runs.stop.failedToStopRun')));
+                              }
+                            }
+                          } catch (error) {
+                            const confirmed = await Modal.confirm(
+                              t('runs.stop.stopRunFailedTitle'),
+                              t('runs.stop.stopRunFailedBody'),
+                              { confirmText: t('runs.stop.stopSession'), cancelText: t('common.cancel'), destructive: true },
+                            );
+                            if (confirmed) {
+                              await stopSessionProcess();
+                            } else {
+                              Modal.alert(t('common.error'), error instanceof Error ? error.message : t('runs.stop.failedToStopRun'));
+                            }
+                          } finally {
+                            setStoppingRunId(null);
+                            await load();
+                          }
+                        };
+
+                        return (
+                          <ExecutionRunRow
+                            key={run.runId}
+                            run={run as any}
+                            subtitle={formatRunDetails(run)}
+                            onPress={() => router.push(`/session/${run.happySessionId}/runs/${run.runId}` as any)}
+                            rightAccessory={canStop ? (
+                              <Pressable
+                                accessibilityRole="button"
+                                accessibilityLabel={t('runs.stop.stopRunA11y')}
+                                onPress={onStop}
+                                disabled={stoppingRunId === run.runId}
+                                style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+                              >
+                                {stoppingRunId === run.runId ? (
+                                  <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+                                ) : (
+                                  <Icon name="stop-circle" size={20} color={theme.colors.accent.orange} />
+                                )}
+                              </Pressable>
+                            ) : null}
+                          />
+                        );
+                      })
+                    )}
+                  </ItemGroup>
+                );
+              });
+
+              return [header, ...machineGroups];
+            })
+          )}
+        </ItemList>
+      </ConstrainedScreenContent>
+    </View>
+  );
+}

@@ -1,0 +1,6 @@
+Claude Code v2.1.170
+
+· Counting from 1 to 30… (esc to interrupt)
+
+> /model claude-haiku-4-5-20251001
+Press up to edit queued messages

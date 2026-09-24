@@ -1,0 +1,134 @@
+import * as React from 'react';
+
+import { describe, expect, it, vi } from 'vitest';
+import { renderScreen } from '@/dev/testkit';
+import { createTextModuleMock } from '@/dev/testkit/mocks/text';
+import { createReactNativeWebMock } from '@/dev/testkit/mocks/reactNative';
+import { createUnistylesMock } from '@/dev/testkit/mocks/unistyles';
+
+import { installAgentInputCommonModuleMocks } from '../agentInputTestHelpers';
+
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+let capturedDropdownMenuProps: Record<string, unknown> | null = null;
+let capturedHorizontalRowProps: Record<string, unknown> | null = null;
+
+function flattenStyle(style: unknown): Record<string, unknown> {
+    if (!style) return {};
+    if (Array.isArray(style)) {
+        return Object.assign({}, ...style.map(flattenStyle));
+    }
+    if (typeof style === 'object') return style as Record<string, unknown>;
+    return {};
+}
+
+installAgentInputCommonModuleMocks({
+    reactNative: () => createReactNativeWebMock({
+        Platform: {
+            OS: 'web',
+            select: (value: any) => value.web ?? value.default ?? null,
+        },
+        Pressable: (props: Record<string, unknown> & { children?: React.ReactNode }) =>
+            React.createElement('Pressable', props, props.children),
+        View: (props: Record<string, unknown> & { children?: React.ReactNode }) =>
+            React.createElement('View', props, props.children),
+    }),
+    unistyles: () => createUnistylesMock({
+        theme: {
+            colors: {
+                textSecondary: '#666',
+            },
+        },
+    }),
+    icons: () => ({
+        Ionicons: 'Ionicons',
+    }),
+    text: () => createTextModuleMock({
+        translate: (key: string) => key,
+    }),
+});
+
+vi.mock('@/components/ui/forms/dropdown/DropdownMenu', () => ({
+    DropdownMenu: (props: Record<string, unknown>) => {
+        capturedDropdownMenuProps = props;
+        return React.createElement('DropdownMenu', props);
+    },
+}));
+
+vi.mock('@/components/ui/scroll/HorizontalScrollableRow', () => ({
+    HorizontalScrollableRow: (props: Record<string, unknown> & { children?: React.ReactNode }) => {
+        capturedHorizontalRowProps = props;
+        return React.createElement('HorizontalScrollableRow', props, props.children);
+    },
+}));
+
+vi.mock('@/components/ui/text/Text', () => ({
+    Text: 'Text',
+}));
+
+describe('AgentInputChipPickerTopSelector', () => {
+    it('renders a one-tap icon rail using the shared horizontal scroll row', async () => {
+        const { AgentInputChipPickerTopSelector } = await import('./AgentInputChipPickerTopSelector');
+        const { AGENT_INPUT_CHIP_PICKER_OPTION_ICON_SIZE } = await import('./agentInputChipPickerOptionStyles');
+        capturedDropdownMenuProps = null;
+        capturedHorizontalRowProps = null;
+        const onFocusOption = vi.fn();
+
+        const screen = await renderScreen(<AgentInputChipPickerTopSelector
+                    sections={[
+                        {
+                            id: 'providers',
+                            label: 'Providers',
+                            options: [
+                                { id: 'codex', label: 'Codex', subtitle: 'OpenAI', icon: React.createElement('EngineIcon', { testID: 'codex-icon', size: 24 }) },
+                                { id: 'claude', label: 'Claude' },
+                            ],
+                        },
+                    ]}
+                    focusedOptionId="codex"
+                    selectedOptionId="codex"
+                    onFocusOption={onFocusOption}
+                />);
+
+        expect(capturedDropdownMenuProps).toBeNull();
+        expect(capturedHorizontalRowProps).toEqual(expect.objectContaining({
+            testID: 'agent-input-chip-picker.top-selector-scroll',
+            contentTestID: 'agent-input-chip-picker.top-selector-content',
+            fadeColor: expect.any(String),
+            indicatorColor: expect.any(String),
+        }));
+
+        const codexButton = screen.findByTestId('agent-input-chip-picker.top-selector-option:codex');
+        const claudeButton = screen.findByTestId('agent-input-chip-picker.top-selector-option:claude');
+
+        expect(codexButton).toBeTruthy();
+        expect(claudeButton).toBeTruthy();
+        // The compact rail has no checkmark at all, so the selected row's name is the only
+        // place its state can live — `accessibilityState.selected` is dropped on a button role.
+        expect(codexButton?.props.accessibilityLabel).not.toBe('Codex');
+        expect(claudeButton?.props.accessibilityLabel).toBe('Claude');
+
+        const codexStyle = flattenStyle(codexButton?.props.style({ pressed: false }));
+        const claudeStyle = flattenStyle(claudeButton?.props.style({ pressed: false }));
+        expect(codexStyle.minWidth).toBeGreaterThanOrEqual(44);
+        expect(codexStyle.minHeight).toBeGreaterThanOrEqual(44);
+        // The declared size must match the enforced minimum. When width/height are smaller,
+        // Yoga measures the horizontal ScrollView from the smaller flex bases before the
+        // minimum expands each button, leaving the final options beyond its legal scroll end.
+        expect(codexStyle.width).toBe(codexStyle.minWidth);
+        expect(codexStyle.height).toBe(codexStyle.minHeight);
+        expect(codexStyle.backgroundColor).toEqual(expect.any(String));
+        expect(Boolean(codexStyle.boxShadow || codexStyle.elevation)).toBe(true);
+        expect(claudeStyle.backgroundColor).toBe('transparent');
+
+        // Located by identity rather than by child position: a chip renders its
+        // icon plus any state marker, so a positional reach breaks the moment a
+        // second child exists without telling us anything about the icon.
+        const codexIcon = screen.findByTestId('codex-icon');
+        expect(codexIcon?.props.size).toBe(AGENT_INPUT_CHIP_PICKER_OPTION_ICON_SIZE);
+
+        await screen.pressByTestIdAsync('agent-input-chip-picker.top-selector-option:claude');
+        expect(onFocusOption).toHaveBeenCalledWith('claude');
+    });
+});

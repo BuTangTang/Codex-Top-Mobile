@@ -1,0 +1,89 @@
+import { z } from 'zod';
+import { LOCAL_SETTING_ARTIFACTS } from './registry/local/localSettingDefinitions';
+
+//
+// Schema
+//
+
+export const LocalSettingsSchema = z.object(LOCAL_SETTING_ARTIFACTS.shape);
+
+//
+// NOTE: Local settings are device-specific and should NOT be synced.
+// These are preferences that make sense to be different on each device.
+//
+
+const LocalSettingsSchemaPartial = LocalSettingsSchema.passthrough().partial();
+type LocalSettingsParseInput = z.infer<typeof LocalSettingsSchemaPartial>;
+
+export type LocalSettings = z.infer<typeof LocalSettingsSchema>;
+
+//
+// Defaults
+//
+
+export const localSettingsDefaults: LocalSettings = LOCAL_SETTING_ARTIFACTS.defaults;
+Object.freeze(localSettingsDefaults);
+
+const deprecatedLocalSettingKeys = [
+    'editorFocusModeEnabled',
+    'commandPaletteEnabled',
+    'keyboardShortcutsV2Enabled',
+    'keyboardSingleKeyShortcutsEnabled',
+    'keyboardShortcutDisabledCommandIdsV1',
+    'keyboardShortcutOverridesV1',
+] as const;
+
+function stripDeprecatedLocalSettingsKeys(settings: Readonly<Record<string, unknown>>): Record<string, unknown> {
+    const next: Record<string, unknown> = { ...settings };
+    for (const key of deprecatedLocalSettingKeys) {
+        delete next[key];
+    }
+    return next;
+}
+
+//
+// Parsing
+//
+
+export function localSettingsParse(settings: unknown): LocalSettings {
+    const parsed = LocalSettingsSchemaPartial.safeParse(settings);
+    if (!parsed.success) {
+        return { ...localSettingsDefaults };
+    }
+
+    const legacyScaleBySize: Record<string, number> = {
+        xxsmall: 0.8,
+        xsmall: 0.85,
+        small: 0.93,
+        default: 1,
+        large: 1.1,
+        xlarge: 1.2,
+        xxlarge: 1.3,
+    };
+
+    const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+    const UI_FONT_SCALE_MIN = 0.5;
+    const UI_FONT_SCALE_MAX = 2.5;
+
+    const data = stripDeprecatedLocalSettingsKeys(parsed.data) as LocalSettingsParseInput;
+    const nextUiFontScaleRaw =
+        typeof data.uiFontScale === 'number'
+            ? data.uiFontScale
+            : (typeof data.uiFontSize === 'string' ? legacyScaleBySize[data.uiFontSize] : undefined);
+
+    const nextUiFontScale =
+        typeof nextUiFontScaleRaw === 'number' && Number.isFinite(nextUiFontScaleRaw)
+            ? clamp(nextUiFontScaleRaw, UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX)
+            : localSettingsDefaults.uiFontScale;
+
+    return { ...localSettingsDefaults, ...data, uiFontScale: nextUiFontScale };
+}
+
+//
+// Applying changes
+//
+
+export function applyLocalSettings(settings: LocalSettings, delta: Partial<LocalSettings> | Readonly<Record<string, unknown>>): LocalSettings {
+    return localSettingsParse(stripDeprecatedLocalSettingsKeys({ ...localSettingsDefaults, ...settings, ...delta }));
+}

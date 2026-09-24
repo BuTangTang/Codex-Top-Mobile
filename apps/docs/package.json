@@ -1,0 +1,39 @@
+{
+  "name": "docs",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "tsc": "node ../../scripts/workspaces/runTypeScriptCli.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test \"scripts/*.test.mjs\" \"src/**/*.test.mjs\"",
+    "check:content": "node scripts/checkContent.mjs",
+    "generate:reference": "node scripts/generateReference.mjs",
+    "dev": "next dev",
+    "start": "next start",
+    "types:check": "fumadocs-mdx && next typegen && node ../../scripts/workspaces/runTypeScriptCli.mjs --noEmit",
+    "postinstall:real": "fumadocs-mdx",
+    "postinstall": "node -e \"const fs=require('fs');const cp=require('child_process');if(/(^|[\\\\\\\\/])node_modules([\\\\\\\\/]|$)/i.test(process.cwd()))process.exit(0);try{const gate=require('../../scripts/postinstall/shouldRunPostinstall.cjs');if(!gate.shouldRunPostinstall({workspace:'docs',scope:process.env.HAPPIER_INSTALL_SCOPE||''}))process.exit(0);}catch{}if(!fs.existsSync('content'))process.exit(0);const run=(cmd,args)=>cp.spawnSync(cmd,args,{stdio:'inherit'});const npmExec=process.env.npm_execpath;let r;if(npmExec){r=run(process.execPath,[npmExec,'run','-s','postinstall:real']);}else{r=run(process.platform==='win32'?'yarn.cmd':'yarn',['-s','postinstall:real']);if(r.error&&process.platform==='win32'){r=run('yarn',['-s','postinstall:real']);}}if(r.error){console.error(r.error.message);process.exit(1);}process.exit(r.status??1);\""
+  },
+  "dependencies": {
+    "fumadocs-core": "16.4.11",
+    "fumadocs-mdx": "14.2.6",
+    "fumadocs-ui": "16.4.11",
+    "lucide-react": "^0.563.0",
+    "next": "16.1.7",
+    "posthog-js": "1.414.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.18",
+    "@types/mdx": "^2.0.13",
+    "@types/node": "^25.0.10",
+    "@types/react": "^19.2.9",
+    "@types/react-dom": "^19.2.3",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.18",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "typescript": "5.9.3"
+  }
+}

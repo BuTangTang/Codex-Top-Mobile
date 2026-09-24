@@ -1,0 +1,404 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { RpcError } from '@/sync/runtime/rpcErrors';
+import { RPC_ERROR_CODES } from '@happier-dev/protocol/rpc';
+
+const machineRpcWithServerScopeMock = vi.hoisted(() => vi.fn());
+const storageState = vi.hoisted(() => ({
+    value: {
+        machines: {},
+    },
+}));
+
+vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({
+    machineRpcWithServerScope: machineRpcWithServerScopeMock,
+}));
+
+vi.mock('@/sync/domains/state/storage', async () => {
+    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+    return createStorageModuleStub({
+        storage: {
+            getState: () => storageState.value,
+        },
+    });
+});
+
+const directSource = {
+    kind: 'codexHome' as const,
+    home: 'user' as const,
+};
+
+describe('machine direct sessions ops server-scoped routing', () => {
+    // 租约协议走真实 schema 与服务器路由，拒绝缺少租约信息的成功响应。
+    it('validates viewer leases and detaches on the captured owning server', async () => {
+        const { machineDirectSessionAttach, machineDirectSessionDetach } = await import('./machineDirectSessions');
+        const input = { machineId: 'machine-1', sessionId: 'linked', providerId: 'codex' as const,
+            remoteSessionId: 'native-1', source: directSource, leaseId: 'viewer-1', ttlMs: 45_000 };
+        const attached = { ok: true, leaseId: 'viewer-1', expiresAtMs: 50_000, renewed: false };
+        machineRpcWithServerScopeMock.mockResolvedValueOnce(attached);
+        expect(await machineDirectSessionAttach(input, { serverId: 'owner' })).toEqual(attached);
+        expect(machineRpcWithServerScopeMock).toHaveBeenLastCalledWith(expect.objectContaining({
+            serverId: 'owner', method: 'daemon.directSessions.attach', payload: input,
+        }));
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true });
+        await expect(machineDirectSessionAttach(input)).rejects.toThrow('Unsupported response');
+        await expect(machineDirectSessionAttach({ ...input, ttlMs: 0 })).rejects.toThrow();
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, detached: false });
+        expect(await machineDirectSessionDetach({ machineId: 'machine-1', sessionId: 'linked', leaseId: 'viewer-1' },
+            { serverId: 'owner' })).toEqual({ ok: true, detached: false });
+        expect(machineRpcWithServerScopeMock).toHaveBeenLastCalledWith(expect.objectContaining({
+            serverId: 'owner', method: 'daemon.directSessions.detach',
+            payload: { machineId: 'machine-1', sessionId: 'linked', leaseId: 'viewer-1' },
+        }));
+    });
+    // 关注独立于置顶，以已关联会话和电脑为目标写入 daemon。
+    it('sets follow policy on the owning server and validates its capability response', async () => {
+        const response = { ok: true, enabled: true, leaseActive: true, updatedAtMs: 1,
+            notifications: { capability: 'explicit_lifecycle_v1', enabled: true } };
+        machineRpcWithServerScopeMock.mockResolvedValueOnce(response);
+        const { machineDirectSessionFollowPolicySet } = await import('./machineDirectSessions');
+        const input = { machineId: 'machine-1', sessionId: 'linked', providerId: 'codex' as const,
+            remoteSessionId: 'native-1', source: directSource, enabled: true };
+        expect(await machineDirectSessionFollowPolicySet(input, { serverId: 'owner' })).toEqual(response);
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1', serverId: 'owner', method: 'daemon.directSessions.followPolicy.set', payload: input,
+            authorization: { kind: 'session.write', sessionId: 'linked' },
+        }));
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ...response, notifications: { enabled: true } });
+        await expect(machineDirectSessionFollowPolicySet(input)).rejects.toThrow('Unsupported response');
+    });
+    it('uses the linked-session write authorization for desktop read and once-only control', async () => {
+        const { machineDirectSessionControlRead, machineDirectSessionControlAction } = await import('./machineDirectSessions');
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, snapshot: { v: 1, turnId: 'turn', state: 'running', requests: [] } });
+        await machineDirectSessionControlRead({ machineId: 'machine-1', sessionId: 'linked' }, { serverId: 'owner' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenLastCalledWith(expect.objectContaining({ method: 'daemon.directSessions.control.read', serverId: 'owner', authorization: { kind: 'session.write', sessionId: 'linked' } }));
+        const result = { ok: true, result: { status: 'unknown', reason: 'approval_outcome_unknown' } };
+        machineRpcWithServerScopeMock.mockResolvedValueOnce(result);
+        expect(await machineDirectSessionControlAction({ machineId: 'machine-1', sessionId: 'linked', kind: 'approval', operationId: 'op', expectedTurnId: 'turn', requestId: 'req', revision: 'rev', decision: 'allow_once' }, { serverId: 'owner' })).toEqual(result);
+        expect(machineRpcWithServerScopeMock).toHaveBeenLastCalledWith(expect.objectContaining({ method: 'daemon.directSessions.control.action', onIssued: expect.any(Function), authorization: { kind: 'session.write', sessionId: 'linked' } }));
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true });
+        await expect(machineDirectSessionControlRead({ machineId: 'machine-1', sessionId: 'linked' })).rejects.toThrow('Unsupported response');
+    });
+    it('reads actual desktop projects from the selected machine and source', async () => {
+        const { machineDirectSessionsProjectsList } = await import('./machineDirectSessions');
+        const response = { ok: true, projects: [{ id: 'p', name: 'Project', rootPaths: ['/synthetic/project'], available: true }], nativeCreate: false, unavailableReason: 'desktop_native_create_unavailable' };
+        machineRpcWithServerScopeMock.mockResolvedValueOnce(response);
+        expect(await machineDirectSessionsProjectsList({ machineId: 'machine-1', providerId: 'codex', source: directSource }, { serverId: 'owner' })).toEqual(response);
+        expect(machineRpcWithServerScopeMock).toHaveBeenLastCalledWith(expect.objectContaining({ method: 'daemon.directSessions.projects.list', serverId: 'owner' }));
+    });
+    beforeEach(() => {
+        machineRpcWithServerScopeMock.mockReset();
+        storageState.value = { machines: {} };
+    });
+
+    // 外部发送沿用服务器分区和会话写授权，并在实际发出后禁止传输层换路重投。
+    it('sends to the linked session with write authorization and an issuance fence', async () => {
+        const onIssued = vi.fn();
+        machineRpcWithServerScopeMock.mockImplementationOnce(async (request) => {
+            request.onIssued();
+            return { ok: false, error: 'delivery_outcome_unknown', errorCode: 'delivery_outcome_unknown' };
+        });
+        const { machineDirectSessionSend } = await import('./machineDirectSessions');
+        const result = await machineDirectSessionSend({
+            machineId: 'machine-1', sessionId: 'linked-session', text: 'hello', localId: 'message-1', meta: {},
+        }, { serverId: 'server-a', onIssued });
+        expect(onIssued).toHaveBeenCalledTimes(1);
+        expect(result).toMatchObject({ ok: false, errorCode: 'delivery_outcome_unknown' });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1', serverId: 'server-a', method: 'daemon.directSessions.send',
+            authorization: { kind: 'session.write', sessionId: 'linked-session' },
+            payload: { machineId: 'machine-1', sessionId: 'linked-session', text: 'hello', localId: 'message-1', meta: {} },
+            onIssued: expect.any(Function),
+        }));
+    });
+
+    // 即使调用者不需要进度回调，发送入口也必须启用已有的已发出保护。
+    it('keeps the issuance fence when the caller does not observe it', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true });
+        const { machineDirectSessionSend } = await import('./machineDirectSessions');
+        await machineDirectSessionSend({
+            machineId: 'machine-1', sessionId: 'linked-session', text: 'hello', localId: 'message-1', meta: {},
+        });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({ onIssued: expect.any(Function) }));
+    });
+
+    it('routes direct session candidate listing through server-scoped machine rpc', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({
+            ok: true,
+            candidates: [],
+            nextCursor: null,
+        });
+        const { machineDirectSessionsCandidatesList } = await import('./machineDirectSessions');
+
+        const result = await machineDirectSessionsCandidatesList({
+            machineId: 'machine-1',
+            providerId: 'codex',
+            source: directSource,
+            limit: 20,
+        }, { serverId: 'server-a' });
+
+        expect(result).toEqual({ ok: true, candidates: [], nextCursor: null });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            serverId: 'server-a',
+            method: 'daemon.directSessions.candidates.list',
+            payload: expect.objectContaining({
+                providerId: 'codex',
+                limit: 20,
+            }),
+        }));
+    });
+
+    it('negotiates ACP session-list capability before calling a current daemon', async () => {
+        machineRpcWithServerScopeMock
+            .mockResolvedValueOnce({
+                ok: true,
+                capability: 'acp_session_list_v1',
+                protocolVersion: 1,
+                sourceKind: 'acpSessionList',
+                resumeOnly: true,
+            })
+            .mockResolvedValueOnce({ ok: true, candidates: [], nextCursor: null });
+        const { machineDirectSessionsCandidatesList } = await import('./machineDirectSessions');
+
+        await expect(machineDirectSessionsCandidatesList({
+            machineId: 'machine-1',
+            providerId: 'kimi',
+            source: { kind: 'acpSessionList', cwd: '/work/repo' },
+        }, { serverId: 'server-a' })).resolves.toEqual({ ok: true, candidates: [], nextCursor: null });
+
+        expect(machineRpcWithServerScopeMock).toHaveBeenNthCalledWith(1, expect.objectContaining({
+            method: 'daemon.directSessions.acpSessionList.capability.get',
+            payload: {},
+        }));
+        expect(machineRpcWithServerScopeMock).toHaveBeenNthCalledWith(2, expect.objectContaining({
+            method: 'daemon.directSessions.candidates.list',
+            payload: expect.objectContaining({ source: { kind: 'acpSessionList', cwd: '/work/repo' } }),
+        }));
+    });
+
+    it('degrades ACP listing without sending its new source to the released v0.2.12 daemon', async () => {
+        machineRpcWithServerScopeMock.mockRejectedValueOnce(new RpcError(
+            'RPC method not available',
+            RPC_ERROR_CODES.METHOD_NOT_AVAILABLE,
+        ));
+        const { machineDirectSessionsCandidatesList } = await import('./machineDirectSessions');
+
+        await expect(machineDirectSessionsCandidatesList({
+            machineId: 'machine-1',
+            providerId: 'kimi',
+            source: { kind: 'acpSessionList', cwd: '/work/repo' },
+        })).resolves.toEqual({
+            ok: false,
+            errorCode: 'provider_unavailable',
+            error: 'acp_session_list_requires_daemon_upgrade',
+        });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reinterpret a capable daemon rejecting a relative ACP directory as compatibility fallback', async () => {
+        machineRpcWithServerScopeMock
+            .mockResolvedValueOnce({
+                ok: true,
+                capability: 'acp_session_list_v1',
+                protocolVersion: 1,
+                sourceKind: 'acpSessionList',
+                resumeOnly: true,
+            })
+            .mockResolvedValueOnce({ ok: false, errorCode: 'invalid_request', error: 'cwd must be absolute' });
+        const { machineDirectSessionsCandidatesList } = await import('./machineDirectSessions');
+
+        await expect(machineDirectSessionsCandidatesList({
+            machineId: 'machine-1',
+            providerId: 'kimi',
+            source: { kind: 'acpSessionList', cwd: 'relative/repo' },
+        })).resolves.toEqual({ ok: false, errorCode: 'invalid_request', error: 'cwd must be absolute' });
+    });
+
+    it('routes direct session linking hints through server-scoped machine rpc', async () => {
+        const runtimeDescriptor = {
+            v: 1 as const,
+            providerId: 'codex' as const,
+            provider: {
+                backendMode: 'appServer' as const,
+                vendorSessionId: 'vendor-session-1',
+                home: 'user' as const,
+            },
+        };
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({
+            ok: true,
+            sessionId: 'happy-session-1',
+            created: true,
+        });
+        const { machineDirectSessionLinkEnsure } = await import('./machineDirectSessions');
+
+        const result = await machineDirectSessionLinkEnsure({
+            machineId: 'machine-1',
+            providerId: 'codex',
+            remoteSessionId: 'vendor-session-1',
+            titleHint: 'Existing Codex Session',
+            directoryHint: '/tmp/worktree',
+            codexBackendMode: 'appServer',
+            runtimeDescriptor,
+            source: directSource,
+        }, { serverId: 'server-a' });
+
+        expect(result).toEqual({
+            ok: true,
+            sessionId: 'happy-session-1',
+            created: true,
+        });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            serverId: 'server-a',
+            method: 'daemon.directSessions.link.ensure',
+            payload: {
+                machineId: 'machine-1',
+                providerId: 'codex',
+                remoteSessionId: 'vendor-session-1',
+                titleHint: 'Existing Codex Session',
+                directoryHint: '/tmp/worktree',
+                codexBackendMode: 'appServer',
+                runtimeDescriptor,
+                source: directSource,
+            },
+        }));
+    });
+
+    it('routes provider-owned candidate deletion through server-scoped machine rpc', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ ok: true, deleted: true });
+        const { machineDirectSessionCandidateDelete } = await import('./machineDirectSessions');
+
+        const result = await machineDirectSessionCandidateDelete({
+            machineId: 'machine-1',
+            providerId: 'kimi',
+            remoteSessionId: 'vendor-session-1',
+            source: { kind: 'acpSessionList', cwd: '/work/repo' },
+        }, { serverId: 'server-a' });
+
+        expect(result).toEqual({ ok: true, deleted: true });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            serverId: 'server-a',
+            method: 'daemon.directSessions.candidate.delete',
+            payload: {
+                machineId: 'machine-1',
+                providerId: 'kimi',
+                remoteSessionId: 'vendor-session-1',
+                source: { kind: 'acpSessionList', cwd: '/work/repo' },
+            },
+        }));
+    });
+
+    it('routes direct transcript paging through server-scoped machine rpc', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({
+            ok: true,
+            items: [],
+            nextCursor: 'cursor-2',
+            hasMore: true,
+        });
+        const { machineDirectSessionTranscriptPage } = await import('./machineDirectSessions');
+
+        const result = await machineDirectSessionTranscriptPage({
+            machineId: 'machine-1',
+            providerId: 'codex',
+            remoteSessionId: 'vendor-session-1',
+            source: directSource,
+            direction: 'older',
+        }, { serverId: 'server-a' });
+
+        expect(result).toEqual({
+            ok: true,
+            items: [],
+            nextCursor: 'cursor-2',
+            hasMore: true,
+        });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            serverId: 'server-a',
+            method: 'daemon.directSessions.transcript.page',
+            payload: expect.objectContaining({
+                remoteSessionId: 'vendor-session-1',
+                direction: 'older',
+            }),
+        }));
+    });
+
+    it('routes direct session takeover+persist through server-scoped machine rpc', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({
+            ok: true,
+            converted: true,
+        });
+        const { machineDirectSessionTakeoverPersist } = await import('./machineDirectSessions');
+
+        const result = await machineDirectSessionTakeoverPersist({
+            machineId: 'machine-1',
+            sessionId: 'happy-session-1',
+            forceStop: true,
+        }, { serverId: 'server-a' });
+
+        expect(result).toEqual({ ok: true, converted: true });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-1',
+            serverId: 'server-a',
+            method: 'daemon.directSessions.takeoverPersist',
+            payload: {
+                machineId: 'machine-1',
+                sessionId: 'happy-session-1',
+                forceStop: true,
+            },
+        }));
+    });
+
+    it('routes direct session RPCs to an active replacement machine while preserving linked metadata identity', async () => {
+        storageState.value = {
+            machines: {
+                'machine-old': {
+                    id: 'machine-old',
+                    active: false,
+                    replacedByMachineId: 'machine-new',
+                    replacedAt: 123,
+                },
+                'machine-new': {
+                    id: 'machine-new',
+                    active: true,
+                },
+            },
+        };
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({
+            ok: true,
+            converted: true,
+        });
+        const { machineDirectSessionTakeoverPersist } = await import('./machineDirectSessions');
+
+        const result = await machineDirectSessionTakeoverPersist({
+            machineId: 'machine-old',
+            sessionId: 'happy-session-1',
+            forceStop: true,
+        }, { serverId: 'server-a' });
+
+        expect(result).toEqual({ ok: true, converted: true });
+        expect(machineRpcWithServerScopeMock).toHaveBeenCalledWith(expect.objectContaining({
+            machineId: 'machine-new',
+            serverId: 'server-a',
+            method: 'daemon.directSessions.takeoverPersist',
+            payload: {
+                machineId: 'machine-old',
+                sessionId: 'happy-session-1',
+                forceStop: true,
+            },
+        }));
+    });
+
+    it('throws for malformed transcript page responses', async () => {
+        machineRpcWithServerScopeMock.mockResolvedValueOnce({ nope: true });
+        const { machineDirectSessionTranscriptPage } = await import('./machineDirectSessions');
+
+        await expect(machineDirectSessionTranscriptPage({
+            machineId: 'machine-1',
+            providerId: 'codex',
+            remoteSessionId: 'vendor-session-1',
+            source: directSource,
+            direction: 'older',
+        })).rejects.toThrow('Unsupported response from machine RPC (daemon.directSessions.transcript.page)');
+    });
+});

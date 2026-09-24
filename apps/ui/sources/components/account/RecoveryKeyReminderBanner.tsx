@@ -1,0 +1,88 @@
+import React from 'react';
+import { Pressable, type GestureResponderEvent } from 'react-native';
+import { useUnistyles } from 'react-native-unistyles';
+
+import { Item } from '@/components/ui/lists/Item';
+import { ItemGroup } from '@/components/ui/lists/ItemGroup';
+import { useAuth } from '@/auth/context/AuthContext';
+import { TokenStorage, isLegacyAuthCredentials } from '@/auth/storage/tokenStorage';
+import { getCachedReadyServerFeatures, getReadyServerFeatures } from '@/sync/api/capabilities/getReadyServerFeatures';
+import { Modal } from '@/modal';
+import { t } from '@/text';
+import { SecretKeyBackupModal } from '@/components/account/SecretKeyBackupModal';
+import { fireAndForget } from '@/utils/system/fireAndForget';
+import { Icon } from '@/components/ui/icons/Icon';
+
+function isRecoveryKeyReminderEnabled(features: ReturnType<typeof getCachedReadyServerFeatures>): boolean | null {
+    if (!features) return null;
+    return features.features?.auth?.ui?.recoveryKeyReminder?.enabled === true;
+}
+
+export const RecoveryKeyReminderBanner = React.memo(() => {
+    const { theme } = useUnistyles();
+    const auth = useAuth();
+
+    const [dismissed, setDismissed] = React.useState<boolean | null>(() => TokenStorage.getCachedRecoveryKeyReminderDismissed());
+    const [enabled, setEnabled] = React.useState<boolean | null>(() => isRecoveryKeyReminderEnabled(getCachedReadyServerFeatures()));
+
+    React.useEffect(() => {
+        let mounted = true;
+        fireAndForget((async () => {
+            const [isDismissed, features] = await Promise.all([
+                TokenStorage.getRecoveryKeyReminderDismissed().catch(() => true),
+                getReadyServerFeatures().catch(() => null),
+            ]);
+
+            const featureEnabled = isRecoveryKeyReminderEnabled(features);
+            if (!mounted) return;
+            setDismissed(isDismissed);
+            setEnabled(featureEnabled);
+        })(), { tag: 'RecoveryKeyReminderBanner.loadState' });
+        return () => {
+            mounted = false;
+        };
+    }, []);
+
+    if (!auth.isAuthenticated) return null;
+    if (!auth.credentials || !isLegacyAuthCredentials(auth.credentials)) return null;
+    if (dismissed !== false) return null;
+    if (enabled !== true) return null;
+
+    const secret = auth.credentials.secret;
+
+    return (
+        <ItemGroup>
+            <Item
+                testID="recovery-key-reminder"
+                title={t('settingsAccount.secretKey')}
+                subtitle={t('settingsAccount.backupDescription')}
+                icon={<Icon name="key" size={29} color={theme.colors.text.secondary} />}
+                onPress={() => {
+                    Modal.show({
+                        component: SecretKeyBackupModal,
+                        props: { secret },
+                    });
+                }}
+                showChevron={false}
+                rightElement={
+                    <Pressable
+                        testID="recovery-key-reminder-dismiss"
+                        onPress={async (event: GestureResponderEvent) => {
+                            event.stopPropagation();
+                            try {
+                                await TokenStorage.setRecoveryKeyReminderDismissed(true);
+                                setDismissed(true);
+                            } catch {
+                                Modal.alert(t('common.error'), t('errors.unknownError'), [{ text: t('common.ok') }]);
+                            }
+                        }}
+                        hitSlop={12}
+                    >
+                        <Icon name="x" size={20} color={theme.colors.text.secondary} />
+                    </Pressable>
+                }
+                rightElementOutsidePressable={true}
+            />
+        </ItemGroup>
+    );
+});

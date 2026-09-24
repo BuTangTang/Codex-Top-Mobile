@@ -1,0 +1,2722 @@
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import {
+  cp,
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, join, win32 as win32Path } from 'node:path';
+
+import { parseArgs } from './utils/cli/args.mjs';
+import { printResult, wantsHelp, wantsJson } from './utils/cli/cli.mjs';
+import { banner, sectionTitle } from './utils/ui/layout.mjs';
+import { cyan, dim, green, yellow } from './utils/ui/ansi.mjs';
+import {
+  installService as installManagedService,
+  restartService as restartManagedService,
+  stopService as stopManagedService,
+  uninstallService as uninstallManagedService,
+} from './utils/service/service_manager.mjs';
+import {
+  applyServicePlan,
+  buildLaunchdPath,
+  buildLaunchdPlistXml,
+  buildServiceDefinition,
+  buildWindowsScheduledTaskPowerShellAction,
+  planServiceAction,
+  renderSystemdServiceUnit,
+  renderWindowsScheduledTaskWrapperPs1,
+  resolveServiceBackend,
+} from '@happier-dev/cli-common/service';
+import {
+  resolveConfiguredRelayRuntimeBinaryOverride,
+  resolveConfiguredRelayRuntimePaths,
+} from '@happier-dev/cli-common/firstPartyRuntime/relayRuntime';
+import {
+  mergeSelfHostServerEnvText,
+  parseEnvText as parseEnvTextShared,
+  renderSelfHostServerEnvText as renderSelfHostServerEnvTextShared,
+  resolveSelfHostServerMigrationPlan,
+} from '@happier-dev/cli-common/firstPartyRuntime/selfHostServerEnv';
+import {
+  assertPackagedServerRuntimeClosure,
+  relocateServerRuntimeArtifactClosure,
+} from '@happier-dev/cli-common/firstPartyRuntime/serverRuntimeArtifactLayout';
+import { commandExistsOnPath } from '@happier-dev/cli-common/process';
+import { DEFAULT_MINISIGN_PUBLIC_KEY } from '@happier-dev/release-runtime/minisign';
+import {
+  PUBLIC_RELEASE_RING_IDS,
+  getReleaseRingCatalogEntry,
+  normalizePublicReleaseRingId,
+} from '@happier-dev/release-runtime/releaseRings';
+import { resolveReleaseAssetBundle } from '@happier-dev/release-runtime/assets';
+import { downloadVerifiedReleaseAssetBundle } from '@happier-dev/release-runtime/verifiedDownload';
+import { extractFirstPartyReleaseArchiveToDirectory } from '@happier-dev/release-runtime/archiveExtraction';
+import { fetchFirstGitHubReleaseByTags, fetchGitHubReleaseByTag } from '@happier-dev/release-runtime/github';
+import { findExtractedExecutableByName } from './self_host/findExtractedExecutableByName.mjs';
+import { maybeInstallCompanionCli } from './self_host/install_companion_cli.mjs';
+import { listVersionedDirectoryIdsNewestFirst, pruneVersionedDirectories } from './self_host/version_retention.mjs';
+
+const SUPPORTED_CHANNELS = new Set(PUBLIC_RELEASE_RING_IDS);
+const DEFAULTS = Object.freeze({
+  githubRepo: 'happier-dev/happier',
+  installRoot: '/opt/happier',
+  binDir: '/usr/local/bin',
+  configDir: '/etc/happier',
+  dataDir: '/var/lib/happier',
+  logDir: '/var/log/happier',
+  serviceName: 'happier-server',
+  serverHost: '127.0.0.1',
+  serverPort: 3005,
+  healthCheckTimeoutMs: 90_000,
+  autoUpdateIntervalMinutes: 1440,
+  uiWebProduct: 'happier-ui-web',
+  uiWebOs: 'web',
+  uiWebArch: 'any',
+});
+
+function resolveSelfHostReleaseSuffix(channel) {
+  const entry = getReleaseRingCatalogEntry(channel);
+  if (!entry.rollingReleaseSuffix) {
+    throw new Error(`[self-host] public release ring ${channel} is missing a rolling suffix`);
+  }
+  return entry.rollingReleaseSuffix;
+}
+
+function appendSelfHostReleaseSuffix(baseValue, channel) {
+  return channel === 'stable' ? baseValue : `${baseValue}-${resolveSelfHostReleaseSuffix(channel)}`;
+}
+
+export function resolveSelfHostDefaults({ platform = process.platform, mode = 'user', channel = 'stable', homeDir = homedir() } = {}) {
+  const p = String(platform ?? '').trim() || process.platform;
+  const m = String(mode ?? '').trim().toLowerCase() === 'system' ? 'system' : 'user';
+  const normalizedChannel = normalizeChannel(channel);
+  const home = String(homeDir ?? '').trim() || homedir();
+
+  if (m === 'system') {
+    return {
+      installRoot: appendSelfHostReleaseSuffix(DEFAULTS.installRoot, normalizedChannel),
+      binDir: DEFAULTS.binDir,
+      configDir: appendSelfHostReleaseSuffix(DEFAULTS.configDir, normalizedChannel),
+      dataDir: appendSelfHostReleaseSuffix(DEFAULTS.dataDir, normalizedChannel),
+      logDir: appendSelfHostReleaseSuffix(DEFAULTS.logDir, normalizedChannel),
+      serviceName: appendSelfHostReleaseSuffix(DEFAULTS.serviceName, normalizedChannel),
+    };
+  }
+
+  const happierHome = p === 'win32' ? `${home}\\.happier` : join(home, '.happier');
+  const installRootBase = p === 'win32' ? `${happierHome}\\self-host` : join(happierHome, 'self-host');
+  const installRoot = appendSelfHostReleaseSuffix(installRootBase, normalizedChannel);
+  return {
+    installRoot,
+    binDir: p === 'win32' ? `${happierHome}\\bin` : join(happierHome, 'bin'),
+    configDir: p === 'win32' ? `${installRoot}\\config` : join(installRoot, 'config'),
+    dataDir: p === 'win32' ? `${installRoot}\\data` : join(installRoot, 'data'),
+    logDir: p === 'win32' ? `${installRoot}\\logs` : join(installRoot, 'logs'),
+    serviceName: appendSelfHostReleaseSuffix(DEFAULTS.serviceName, normalizedChannel),
+  };
+}
+
+function parseBoolean(raw, fallback = false) {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (!value) return fallback;
+  if (value === '1' || value === 'true' || value === 'yes' || value === 'y' || value === 'on') return true;
+  if (value === '0' || value === 'false' || value === 'no' || value === 'n' || value === 'off') return false;
+  return fallback;
+}
+
+function parsePort(raw, fallback = DEFAULTS.serverPort) {
+  const value = Number(String(raw ?? '').trim());
+  if (!Number.isFinite(value)) return fallback;
+  const port = Math.floor(value);
+  return port > 0 && port <= 65535 ? port : fallback;
+}
+
+function parseDailyAtTime(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(text);
+  if (!m) return null;
+  const hourRaw = Number(m[1]);
+  const minuteRaw = Number(m[2]);
+  const hour = Number.isFinite(hourRaw) ? Math.floor(hourRaw) : NaN;
+  const minute = Number.isFinite(minuteRaw) ? Math.floor(minuteRaw) : NaN;
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour < 0 || hour > 23) return null;
+  if (minute < 0 || minute > 59) return null;
+  const hh = String(hour).padStart(2, '0');
+  const mm = String(minute).padStart(2, '0');
+  return { hour, minute, normalized: `${hh}:${mm}` };
+}
+
+export function resolveSelfHostHealthTimeoutMs(env = process.env) {
+  const raw = String(env?.HAPPIER_SELF_HOST_HEALTH_TIMEOUT_MS ?? '').trim();
+  if (!raw) return DEFAULTS.healthCheckTimeoutMs;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 10_000
+    ? Math.floor(parsed)
+    : DEFAULTS.healthCheckTimeoutMs;
+}
+
+export function resolveSelfHostEffectiveServerPort({ config, env } = {}) {
+  const fallback = parsePort(config?.serverPort, DEFAULTS.serverPort);
+  return parsePort(env?.PORT, fallback);
+}
+
+export function resolveSelfHostAutoUpdateDefault(env = process.env) {
+  return parseBoolean(env?.HAPPIER_SELF_HOST_AUTO_UPDATE, false);
+}
+
+export function resolveSelfHostAutoUpdateIntervalMinutes(env = process.env) {
+  const raw = String(env?.HAPPIER_SELF_HOST_AUTO_UPDATE_INTERVAL_MINUTES ?? '').trim();
+  if (!raw) return DEFAULTS.autoUpdateIntervalMinutes;
+  const parsed = Number(raw);
+  const minutes = Number.isFinite(parsed) ? Math.floor(parsed) : NaN;
+  return Number.isFinite(minutes) && minutes >= 15
+    ? minutes
+    : DEFAULTS.autoUpdateIntervalMinutes;
+}
+
+export function resolveSelfHostAutoUpdateAt(env = process.env) {
+  const raw = String(env?.HAPPIER_SELF_HOST_AUTO_UPDATE_AT ?? '').trim();
+  const parsed = parseDailyAtTime(raw);
+  return parsed?.normalized || '';
+}
+
+export function normalizeSelfHostAutoUpdateState(state, { fallbackIntervalMinutes = DEFAULTS.autoUpdateIntervalMinutes } = {}) {
+  const fallbackRaw = Number(fallbackIntervalMinutes);
+  const fallback =
+    Number.isFinite(fallbackRaw) && Math.floor(fallbackRaw) >= 15
+      ? Math.floor(fallbackRaw)
+      : DEFAULTS.autoUpdateIntervalMinutes;
+
+  const raw = state?.autoUpdate;
+  if (raw != null && typeof raw === 'object') {
+    const enabled = Boolean(raw.enabled);
+    const parsed = Number(raw.intervalMinutes);
+    const intervalMinutes = Number.isFinite(parsed) && Math.floor(parsed) >= 15 ? Math.floor(parsed) : fallback;
+    const at = typeof raw.at === 'string' ? (parseDailyAtTime(raw.at)?.normalized || '') : '';
+    return { enabled, intervalMinutes, at };
+  }
+  if (raw === true || raw === false) {
+    return { enabled: raw, intervalMinutes: fallback, at: '' };
+  }
+  return { enabled: false, intervalMinutes: fallback, at: '' };
+}
+
+export function decideSelfHostAutoUpdateReconcile(state, { fallbackIntervalMinutes = DEFAULTS.autoUpdateIntervalMinutes } = {}) {
+  const normalized = normalizeSelfHostAutoUpdateState(state, { fallbackIntervalMinutes });
+  return {
+    action: normalized.enabled ? 'install' : 'uninstall',
+    enabled: normalized.enabled,
+    intervalMinutes: normalized.intervalMinutes,
+    at: normalized.at,
+  };
+}
+
+function assertRoot() {
+  if (typeof process.getuid !== 'function') return;
+  if (process.getuid() !== 0) {
+    throw new Error('[self-host] root privileges are required for this command.');
+  }
+}
+
+function runCommand(cmd, args, { cwd, env, allowFail = false, stdio = 'pipe' } = {}) {
+  const result = spawnSync(cmd, args, {
+    cwd,
+    env: env ?? process.env,
+    encoding: 'utf-8',
+    stdio,
+  });
+  if (result.error) {
+    if (!allowFail) throw result.error;
+    return result;
+  }
+  if (!allowFail && (result.status ?? 1) !== 0) {
+    const stderr = String(result.stderr ?? '').trim();
+    throw new Error(`[self-host] command failed: ${cmd} ${args.join(' ')}${stderr ? `\n${stderr}` : ''}`);
+  }
+  return result;
+}
+
+function commandExists(cmd) {
+  const name = String(cmd ?? '').trim();
+  if (!name) return false;
+  if (process.platform === 'win32') {
+    return commandExistsOnPath(name);
+  }
+  const result = runCommand('sh', ['-lc', `command -v ${name} >/dev/null 2>&1`], { allowFail: true, stdio: 'ignore' });
+  return (result.status ?? 1) === 0;
+}
+
+function normalizeArch() {
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : '';
+  if (!arch) {
+    throw new Error(`[self-host] unsupported architecture: ${process.arch}`);
+  }
+  return arch;
+}
+
+function normalizeOs(platform = process.platform) {
+  const p = String(platform ?? '').trim() || process.platform;
+  if (p === 'linux') return 'linux';
+  if (p === 'darwin') return 'darwin';
+  if (p === 'win32') return 'windows';
+  throw new Error(`[self-host] unsupported platform: ${p}`);
+}
+
+function normalizeChannel(raw) {
+  const requested = String(raw ?? '').trim() || 'stable';
+  const channel = normalizePublicReleaseRingId(requested);
+  if (!SUPPORTED_CHANNELS.has(channel)) {
+    throw new Error(`[self-host] invalid channel: ${requested} (expected stable|preview|dev)`);
+  }
+  return channel;
+}
+
+function displayChannel(channel) {
+  return getReleaseRingCatalogEntry(normalizeChannel(channel)).publicLabel;
+}
+
+export function resolveSelfHostReleaseTargets(channel) {
+  const normalizedChannel = normalizeChannel(channel);
+  const suffix = resolveSelfHostReleaseSuffix(normalizedChannel);
+  const stableServerTag = `server-${resolveSelfHostReleaseSuffix('stable')}`;
+  const previewServerTag = `server-${resolveSelfHostReleaseSuffix('preview')}`;
+  const channelServerTag = `server-${suffix}`;
+  const serverTags = Array.from(new Set(
+    normalizedChannel === 'stable'
+      ? [stableServerTag]
+      : normalizedChannel === 'preview'
+        ? [previewServerTag, stableServerTag]
+        : [channelServerTag, previewServerTag, stableServerTag],
+  ));
+  return {
+    channel: normalizedChannel,
+    serverTag: serverTags[0],
+    serverTags,
+  };
+}
+
+function normalizeMode(raw) {
+  const mode = String(raw ?? '').trim().toLowerCase();
+  if (!mode) return 'user';
+  if (mode === 'user' || mode === 'system') return mode;
+  throw new Error(`[self-host] invalid mode: ${mode} (expected user|system)`);
+}
+
+export function parseSelfHostInvocation(argv) {
+  const args = Array.isArray(argv) ? [...argv] : [];
+  if (args[0] === 'self-host' || args[0] === 'selfhost') {
+    args.shift();
+  }
+  const subcommand = args.find((arg) => arg && !arg.startsWith('-')) ?? 'help';
+  const subcommandIndex = args.indexOf(subcommand);
+  return {
+    subcommand,
+    rest: subcommandIndex >= 0 ? args.slice(subcommandIndex + 1) : [],
+    argv: args,
+  };
+}
+
+export function pickReleaseAsset({ assets, product, os, arch }) {
+  const { version, archive, checksums, checksumsSig } = resolveReleaseAssetBundle({
+    assets,
+    product,
+    os,
+    arch,
+  });
+  return {
+    archiveUrl: archive.url,
+    archiveName: archive.name,
+    checksumsUrl: checksums.url,
+    signatureUrl: checksumsSig.url,
+    version,
+  };
+}
+
+export async function applySelfHostServerMigrationsAtInstallTime({
+  config,
+  env,
+  runCommandImpl = runCommand,
+}) {
+  const plan = resolveSelfHostServerMigrationPlan({
+    serverBinaryPath: config.serverBinaryPath,
+    env,
+    platform: config.platform ?? process.platform,
+  });
+  if (!plan) return null;
+  return runCommandImpl(plan.command, [...plan.args], {
+    cwd: config.installRoot,
+    env,
+    stdio: 'pipe',
+  });
+}
+
+export function resolveConfig({ channel, mode = 'user', platform = process.platform } = {}) {
+  const defaults = resolveSelfHostDefaults({ platform, mode, channel, homeDir: homedir() });
+  const configuredPaths = resolveConfiguredRelayRuntimePaths({ defaults, env: process.env });
+  const installRoot = configuredPaths.installRoot;
+  const binDir = configuredPaths.binDir;
+  const configDir = configuredPaths.configDir;
+  const dataDir = configuredPaths.dataDir;
+  const logDir = configuredPaths.logDir;
+  const serviceName = String(process.env.HAPPIER_SELF_HOST_SERVICE_NAME ?? defaults.serviceName).trim() || defaults.serviceName;
+  const serverHost = String(process.env.HAPPIER_SERVER_HOST ?? DEFAULTS.serverHost).trim();
+  const serverPort = parsePort(process.env.HAPPIER_SERVER_PORT, DEFAULTS.serverPort);
+  const githubRepo = String(process.env.HAPPIER_GITHUB_REPO ?? DEFAULTS.githubRepo).trim();
+  const autoUpdate = resolveSelfHostAutoUpdateDefault(process.env);
+  const autoUpdateIntervalMinutes = resolveSelfHostAutoUpdateIntervalMinutes(process.env);
+  const autoUpdateAt = resolveSelfHostAutoUpdateAt(process.env);
+  const serverBinaryName = platform === 'win32' ? 'happier-server.exe' : 'happier-server';
+  const uiWebRootDir = join(installRoot, 'ui-web');
+
+  return {
+    channel,
+    mode,
+    platform,
+    installRoot,
+    versionsDir: join(installRoot, 'versions'),
+    installBinDir: join(installRoot, 'bin'),
+    serverBinaryName,
+    serverBinaryPath: join(installRoot, 'bin', serverBinaryName),
+    serverPreviousBinaryPath: join(installRoot, 'bin', `${serverBinaryName}.previous`),
+    statePath: join(installRoot, 'self-host-state.json'),
+    binDir,
+    configDir,
+    configEnvPath: join(configDir, 'server.env'),
+    dataDir,
+    filesDir: join(dataDir, 'files'),
+    dbDir: join(dataDir, 'pglite'),
+    logDir,
+    serverStdoutLogPath: join(logDir, 'server.out.log'),
+    serverStderrLogPath: join(logDir, 'server.err.log'),
+    serviceName,
+    serverHost,
+    serverPort,
+    githubRepo,
+    autoUpdate,
+    autoUpdateIntervalMinutes,
+    autoUpdateAt,
+    uiWebProduct: DEFAULTS.uiWebProduct,
+    uiWebOs: DEFAULTS.uiWebOs,
+    uiWebArch: DEFAULTS.uiWebArch,
+    uiWebRootDir,
+    uiWebVersionsDir: join(uiWebRootDir, 'versions'),
+    uiWebCurrentDir: join(uiWebRootDir, 'current'),
+  };
+}
+
+export function renderServerEnvFile({
+  port,
+  host,
+  dataDir,
+  filesDir,
+  dbDir,
+  uiDir,
+  serverBinDir = '',
+  arch = process.arch,
+  platform = process.platform,
+}) {
+  return renderSelfHostServerEnvTextShared({
+    port,
+    host,
+    dataDir,
+    filesDir,
+    dbDir,
+    uiDir,
+    serverBinDir,
+    arch,
+    platform,
+  });
+}
+
+function parseEnvText(raw) {
+  return parseEnvTextShared(raw);
+}
+
+function listEnvKeysInOrder(raw) {
+  const keys = [];
+  const seen = new Set();
+  for (const line of String(raw ?? '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx <= 0) continue;
+    const k = trimmed.slice(0, idx).trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    keys.push(k);
+  }
+  return keys;
+}
+
+function parseEnvKeyValue(raw) {
+  const text = String(raw ?? '');
+  const idx = text.indexOf('=');
+  if (idx <= 0) {
+    throw new Error(`[self-host] invalid env assignment (expected KEY=VALUE): ${text}`);
+  }
+  const key = text.slice(0, idx).trim();
+  const value = text.slice(idx + 1);
+  return { key, value };
+}
+
+function assertValidEnvKey(key) {
+  const k = String(key ?? '').trim();
+  if (!/^[A-Z][A-Z0-9_]*$/.test(k)) {
+    throw new Error(`[self-host] invalid env key: ${k || '(empty)'}`);
+  }
+  return k;
+}
+
+function assertValidEnvValue(value) {
+  const v = String(value ?? '');
+  if (v.includes('\n') || v.includes('\r')) {
+    throw new Error('[self-host] invalid env value (must not contain newlines)');
+  }
+  return v;
+}
+
+export function parseEnvOverridesFromArgv(argv) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  const overrides = [];
+  const rest = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] ?? '';
+    if (a === '--env') {
+      const next = args[i + 1] ?? '';
+      if (!next || next.startsWith('--')) {
+        throw new Error('[self-host] missing value for --env (expected KEY=VALUE)');
+      }
+      const parsed = parseEnvKeyValue(next);
+      overrides.push({
+        key: assertValidEnvKey(parsed.key),
+        value: assertValidEnvValue(parsed.value),
+      });
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--env=')) {
+      const raw = a.slice('--env='.length);
+      if (!raw) {
+        throw new Error('[self-host] missing value for --env (expected KEY=VALUE)');
+      }
+      const parsed = parseEnvKeyValue(raw);
+      overrides.push({
+        key: assertValidEnvKey(parsed.key),
+        value: assertValidEnvValue(parsed.value),
+      });
+      continue;
+    }
+    rest.push(a);
+  }
+
+  return { overrides, rest };
+}
+
+export function applyEnvOverridesToEnvText(envText, overrides) {
+  const base = String(envText ?? '');
+  const list = Array.isArray(overrides) ? overrides : [];
+  if (!base.trim() || list.length === 0) return base.endsWith('\n') ? base : `${base}\n`;
+
+  const env = parseEnvText(base);
+  const keys = listEnvKeysInOrder(base);
+  const seen = new Set(keys);
+
+  for (const entry of list) {
+    const key = assertValidEnvKey(entry?.key);
+    const value = assertValidEnvValue(entry?.value);
+    env[key] = value;
+    if (!seen.has(key)) {
+      seen.add(key);
+      keys.push(key);
+    }
+  }
+
+  const lines = [];
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(env, key)) continue;
+    lines.push(`${key}=${env[key]}`);
+  }
+  lines.push('');
+  return `${lines.join('\n')}\n`;
+}
+
+export function mergeSelfHostServerRuntimeEnvText({ baseEnvText, existingEnvText = '', envOverrides = [] } = {}) {
+  return mergeSelfHostServerEnvText({
+    baseEnvText: String(baseEnvText ?? ''),
+    existingEnvText: String(existingEnvText ?? ''),
+    overrides: Object.fromEntries((Array.isArray(envOverrides) ? envOverrides : []).map(({ key, value }) => [key, value])),
+  });
+}
+
+export function mergeEnvTextWithDefaults(existingText, defaultsText) {
+  const existingRaw = String(existingText ?? '');
+  const defaultsRaw = String(defaultsText ?? '');
+  if (!existingRaw.trim()) return defaultsRaw.endsWith('\n') ? defaultsRaw : `${defaultsRaw}\n`;
+
+  const existingEnv = parseEnvText(existingRaw);
+  const defaultsEnv = parseEnvText(defaultsRaw);
+  const defaultKeys = listEnvKeysInOrder(defaultsRaw);
+  const existingKeys = listEnvKeysInOrder(existingRaw);
+
+  const lines = [];
+  for (const key of defaultKeys) {
+    const fromExisting = Object.prototype.hasOwnProperty.call(existingEnv, key) ? existingEnv[key] : null;
+    const v = fromExisting != null ? fromExisting : defaultsEnv[key];
+    if (v == null) continue;
+    lines.push(`${key}=${v}`);
+  }
+  for (const key of existingKeys) {
+    if (Object.prototype.hasOwnProperty.call(defaultsEnv, key)) continue;
+    if (!Object.prototype.hasOwnProperty.call(existingEnv, key)) continue;
+    lines.push(`${key}=${existingEnv[key]}`);
+  }
+  lines.push('');
+  return `${lines.join('\n')}\n`;
+}
+
+function identity(s) {
+  return String(s ?? '');
+}
+
+function formatTriState(value, { yes, no, unknown }) {
+  if (value == null) return unknown('unknown');
+  return value ? yes('yes') : no('no');
+}
+
+function formatHealth(value, { ok, warn }) {
+  return value ? ok('ok') : warn('failed');
+}
+
+function formatJobState(value, { yes, no, unknown }) {
+  if (value == null) return unknown('unknown');
+  return value ? yes('enabled') : no('disabled');
+}
+
+function formatJobActive(value, { yes, no, unknown }) {
+  if (value == null) return unknown('unknown');
+  return value ? yes('active') : no('inactive');
+}
+
+export function renderSelfHostStatusText(report, { colors = true } = {}) {
+  const fmt = colors
+    ? {
+        label: cyan,
+        yes: green,
+        no: yellow,
+        ok: green,
+        warn: yellow,
+        unknown: dim,
+        dim,
+      }
+    : {
+        label: identity,
+        yes: identity,
+        no: identity,
+        ok: identity,
+        warn: identity,
+        unknown: identity,
+        dim: identity,
+      };
+
+  const channel = report?.channel ? displayChannel(report.channel) : '';
+  const mode = String(report?.mode ?? '').trim();
+  const serviceName = String(report?.serviceName ?? '').trim();
+  const serverUrl = String(report?.serverUrl ?? '').trim();
+  const healthy = Boolean(report?.healthy);
+  const updatedAt = report?.updatedAt ? String(report.updatedAt) : '';
+
+  const serviceActive = report?.service?.active ?? null;
+  const serviceEnabled = report?.service?.enabled ?? null;
+
+  const serverVersion = report?.versions?.server ? String(report.versions.server) : '';
+  const uiWebVersion = report?.versions?.uiWeb ? String(report.versions.uiWeb) : '';
+
+  const autoConfiguredEnabled = Boolean(report?.autoUpdate?.configured?.enabled);
+  const autoConfiguredInterval = report?.autoUpdate?.configured?.intervalMinutes ?? null;
+  const autoConfiguredAtRaw = typeof report?.autoUpdate?.configured?.at === 'string' ? report.autoUpdate.configured.at : '';
+  const autoConfiguredAt = parseDailyAtTime(autoConfiguredAtRaw)?.normalized || '';
+  const updaterEnabled = report?.autoUpdate?.job?.enabled ?? null;
+  const updaterActive = report?.autoUpdate?.job?.active ?? null;
+
+  const configuredLine = autoConfiguredEnabled
+    ? (
+        autoConfiguredAt
+          ? `configured enabled (daily at ${autoConfiguredAt})`
+          : `configured enabled${autoConfiguredInterval ? ` (every ${autoConfiguredInterval}m)` : ''}`
+      )
+    : 'configured disabled';
+
+  const jobLine =
+    updaterEnabled == null && updaterActive == null
+      ? 'job unknown'
+      : `job ${formatJobState(updaterEnabled, fmt)}, ${formatJobActive(updaterActive, fmt)}`;
+
+  return [
+    channel ? `${fmt.label('channel')}: ${channel}` : null,
+    mode ? `${fmt.label('mode')}: ${mode}` : null,
+    serviceName ? `${fmt.label('service')}: ${serviceName}` : null,
+    serverUrl ? `${fmt.label('url')}: ${serverUrl}` : null,
+    `${fmt.label('health')}: ${formatHealth(healthy, fmt)}`,
+    `${fmt.label('active')}: ${formatTriState(serviceActive, fmt)}`,
+    `${fmt.label('enabled')}: ${formatTriState(serviceEnabled, fmt)}`,
+    `${fmt.label('auto-update')}: ${configuredLine}; ${jobLine}`,
+    `${fmt.label('server')}: ${serverVersion || fmt.unknown('unknown')}`,
+    `${fmt.label('ui-web')}: ${uiWebVersion || fmt.unknown('unknown')}`,
+    updatedAt ? `${fmt.label('updated')}: ${updatedAt}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function renderServerServiceUnit({ serviceName, binaryPath, envFilePath, workingDirectory, logPath }) {
+  return [
+    '[Unit]',
+    `Description=${serviceName}`,
+    'After=network-online.target',
+    'Wants=network-online.target',
+    '',
+    '[Service]',
+    'Type=simple',
+    `EnvironmentFile=${envFilePath}`,
+    `WorkingDirectory=${workingDirectory}`,
+    `ExecStart=${binaryPath}`,
+    'Restart=on-failure',
+    'RestartSec=5',
+    'LimitNOFILE=65535',
+    `StandardOutput=append:${logPath}`,
+    `StandardError=append:${logPath}`,
+    '',
+    '[Install]',
+    'WantedBy=multi-user.target',
+    '',
+  ].join('\n');
+}
+
+export function buildSelfHostDoctorChecks(config, { state, commandExists: commandExistsOverride, pathExists } = {}) {
+  const cfg = config ?? {};
+  const platform = String(cfg.platform ?? process.platform).trim() || process.platform;
+  const mode = String(cfg.mode ?? 'user').trim() || 'user';
+  const os = normalizeOs(platform);
+
+  const commandExistsFn = typeof commandExistsOverride === 'function' ? commandExistsOverride : commandExists;
+  const pathExistsFn = typeof pathExists === 'function'
+    ? pathExists
+    : (p) => existsSync(String(p ?? ''));
+  const stateObj = state ?? {};
+
+  const uiExpected = Boolean(stateObj?.uiWeb?.installed);
+  const uiIndexPath = cfg.uiWebCurrentDir ? join(String(cfg.uiWebCurrentDir), 'index.html') : '';
+
+  return [
+    { name: 'platform', ok: ['linux', 'darwin', 'windows'].includes(os) },
+    { name: 'mode', ok: mode === 'user' || (mode === 'system' && platform !== 'win32') },
+    // We verify minisign signatures using the bundled public key + node:crypto, so no external `minisign` dependency.
+    { name: 'powershell', ok: os === 'windows' ? commandExistsFn('powershell') : true },
+    { name: 'systemctl', ok: os === 'linux' ? commandExistsFn('systemctl') : true },
+    { name: 'launchctl', ok: os === 'darwin' ? commandExistsFn('launchctl') : true },
+    { name: 'schtasks', ok: os === 'windows' ? commandExistsFn('schtasks') : true },
+    { name: 'server-binary', ok: cfg.serverBinaryPath ? pathExistsFn(cfg.serverBinaryPath) : false },
+    { name: 'server-env', ok: cfg.configEnvPath ? pathExistsFn(cfg.configEnvPath) : false },
+    ...(uiExpected
+      ? [{ name: 'ui-web', ok: uiIndexPath ? pathExistsFn(uiIndexPath) : false }]
+      : []),
+  ];
+}
+
+export function renderUpdaterSystemdUnit({
+  updaterLabel,
+  hstackPath,
+  channel,
+  mode,
+  workingDirectory,
+  stdoutPath,
+  stderrPath,
+  wantedBy,
+} = {}) {
+  const label = String(updaterLabel ?? '').trim() || 'happier-self-host-updater';
+  const hstack = String(hstackPath ?? '').trim();
+  if (!hstack) throw new Error('[self-host] missing hstackPath for updater unit');
+  const ch = displayChannel(channel);
+  const m = String(mode ?? '').trim().toLowerCase() === 'system' ? 'system' : 'user';
+  const wd = String(workingDirectory ?? '').trim();
+  const out = String(stdoutPath ?? '').trim();
+  const err = String(stderrPath ?? '').trim();
+  const wb = String(wantedBy ?? '').trim() || 'default.target';
+
+  return renderSystemdServiceUnit({
+    description: `${label} (auto-update)`,
+    execStart: [
+      hstack,
+      'self-host',
+      'update',
+      `--channel=${ch}`,
+      `--mode=${m}`,
+      '--non-interactive',
+    ],
+    workingDirectory: wd,
+    env: {},
+    restart: 'no',
+    stdoutPath: out,
+    stderrPath: err,
+    wantedBy: wb,
+  });
+}
+
+export function renderUpdaterSystemdTimerUnit({ updaterLabel, intervalMinutes = 1440, at } = {}) {
+  const label = String(updaterLabel ?? '').trim() || 'happier-self-host-updater';
+  const parsedAt = parseDailyAtTime(at);
+  const minutesRaw = Number(intervalMinutes);
+  const minutes = Number.isFinite(minutesRaw) ? Math.max(15, Math.floor(minutesRaw)) : 1440;
+  const timerLines = parsedAt
+    ? [
+        '[Timer]',
+        `OnCalendar=*-*-* ${parsedAt.normalized}:00`,
+        `Unit=${label}.service`,
+        'Persistent=true',
+      ]
+    : [
+        '[Timer]',
+        'OnBootSec=5m',
+        `OnUnitActiveSec=${minutes}m`,
+        `Unit=${label}.service`,
+        'Persistent=true',
+      ];
+  return [
+    '[Unit]',
+    `Description=${label} (auto-update timer)`,
+    '',
+    ...timerLines,
+    '',
+    '[Install]',
+    'WantedBy=timers.target',
+    '',
+  ].join('\n');
+}
+
+export function renderUpdaterLaunchdPlistXml({
+  updaterLabel,
+  hstackPath,
+  channel,
+  mode,
+  intervalMinutes,
+  at,
+  workingDirectory,
+  stdoutPath,
+  stderrPath,
+} = {}) {
+  const label = String(updaterLabel ?? '').trim() || 'happier-self-host-updater';
+  const hstack = String(hstackPath ?? '').trim();
+  if (!hstack) throw new Error('[self-host] missing hstackPath for updater launchd plist');
+  const ch = displayChannel(channel);
+  const m = String(mode ?? '').trim().toLowerCase() === 'system' ? 'system' : 'user';
+  const wd = String(workingDirectory ?? '').trim();
+  const out = String(stdoutPath ?? '').trim();
+  const err = String(stderrPath ?? '').trim();
+  const parsedAt = parseDailyAtTime(at);
+  const intervalRaw = Number(intervalMinutes);
+  const startIntervalSec = Number.isFinite(intervalRaw) && intervalRaw > 0 ? Math.max(15, Math.floor(intervalRaw)) * 60 : 0;
+
+  return buildLaunchdPlistXml({
+    label,
+    programArgs: [
+      hstack,
+      'self-host',
+      'update',
+      `--channel=${ch}`,
+      `--mode=${m}`,
+      '--non-interactive',
+    ],
+    env: {
+      PATH: buildLaunchdPath({ execPath: hstack, basePath: process.env.PATH }),
+    },
+    stdoutPath: out,
+    stderrPath: err,
+    workingDirectory: wd,
+    keepAliveOnFailure: false,
+    ...(parsedAt
+      ? { startCalendarInterval: { hour: parsedAt.hour, minute: parsedAt.minute } }
+      : { startIntervalSec: startIntervalSec || undefined }),
+  });
+}
+
+export function renderUpdaterScheduledTaskWrapperPs1({
+  updaterLabel,
+  hstackPath,
+  channel,
+  mode,
+  workingDirectory,
+  stdoutPath,
+  stderrPath,
+} = {}) {
+  const label = String(updaterLabel ?? '').trim() || 'happier-self-host-updater';
+  const hstack = String(hstackPath ?? '').trim();
+  if (!hstack) throw new Error('[self-host] missing hstackPath for updater scheduled task wrapper');
+  const ch = displayChannel(channel);
+  const m = String(mode ?? '').trim().toLowerCase() === 'system' ? 'system' : 'user';
+  const wd = String(workingDirectory ?? '').trim();
+  const out = String(stdoutPath ?? '').trim();
+  const err = String(stderrPath ?? '').trim();
+
+  return renderWindowsScheduledTaskWrapperPs1({
+    workingDirectory: wd,
+    programArgs: [
+      hstack,
+      'self-host',
+      'update',
+      `--channel=${ch}`,
+      `--mode=${m}`,
+      '--non-interactive',
+    ],
+    env: {},
+    stdoutPath: out,
+    stderrPath: err,
+  });
+}
+
+export function buildUpdaterScheduledTaskCreateArgs({ backend, taskName, definitionPath, intervalMinutes = 1440, at } = {}) {
+  const b = String(backend ?? '').trim();
+  const name = String(taskName ?? '').trim();
+  const definition = String(definitionPath ?? '').trim();
+  if (!name) throw new Error('[self-host] missing taskName for updater scheduled task');
+  if (!definition) throw new Error('[self-host] missing definitionPath for updater scheduled task');
+
+  const parsedAt = parseDailyAtTime(at);
+  const minutesRaw = Number(intervalMinutes);
+  const minutes = Number.isFinite(minutesRaw) ? Math.max(15, Math.floor(minutesRaw)) : 1440;
+  const ps = buildWindowsScheduledTaskPowerShellAction({ definitionPath: definition });
+
+  return [
+    '/Create',
+    '/F',
+    '/SC',
+    parsedAt ? 'DAILY' : 'MINUTE',
+    ...(parsedAt ? [] : ['/MO', String(minutes)]),
+    '/ST',
+    parsedAt ? parsedAt.normalized : '00:00',
+    '/TN',
+    name,
+    '/TR',
+    ps,
+    ...(b === 'schtasks-system' ? ['/RU', 'SYSTEM', '/RL', 'HIGHEST'] : []),
+  ];
+}
+
+function resolveAutoUpdateEnabled(argv, fallback) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  if (args.includes('--no-auto-update')) return false;
+  if (args.includes('--auto-update')) return true;
+  return Boolean(fallback);
+}
+
+function resolveAutoUpdateIntervalMinutes(argv, fallback) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  const findEq = args.find((a) => a.startsWith('--auto-update-interval='));
+  const value = findEq
+    ? findEq.slice('--auto-update-interval='.length)
+    : (() => {
+        const idx = args.indexOf('--auto-update-interval');
+        if (idx >= 0 && args[idx + 1] && !String(args[idx + 1]).startsWith('-')) return String(args[idx + 1]);
+        return '';
+      })();
+  const raw = String(value ?? '').trim();
+  if (!raw) return Number(fallback) || DEFAULTS.autoUpdateIntervalMinutes;
+  const parsed = Number(raw);
+  const minutes = Number.isFinite(parsed) ? Math.floor(parsed) : NaN;
+  if (!Number.isFinite(minutes) || minutes < 15) return Number(fallback) || DEFAULTS.autoUpdateIntervalMinutes;
+  return Math.min(minutes, 60 * 24 * 7);
+}
+
+function resolveAutoUpdateAt(argv, fallback) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  const findEq = args.find((a) => a.startsWith('--auto-update-at='));
+  const value = findEq
+    ? findEq.slice('--auto-update-at='.length)
+    : (() => {
+        const idx = args.indexOf('--auto-update-at');
+        if (idx >= 0 && args[idx + 1] && !String(args[idx + 1]).startsWith('-')) return String(args[idx + 1]);
+        return '';
+      })();
+  const raw = String(value ?? '').trim();
+  if (!raw) return String(fallback ?? '').trim();
+  const parsed = parseDailyAtTime(raw);
+  if (!parsed) {
+    throw new Error(`[self-host] invalid --auto-update-at value: ${raw} (expected HH:MM)`);
+  }
+  return parsed.normalized;
+}
+
+function resolveUpdaterLabel(config) {
+  const override = String(process.env.HAPPIER_SELF_HOST_UPDATER_LABEL ?? '').trim();
+  if (override) return override;
+  const base = String(config?.serviceName ?? '').trim() || 'happier-server';
+  return `${base}-updater`;
+}
+
+function resolveHstackPathForUpdater(config) {
+  const override = String(process.env.HAPPIER_SELF_HOST_HSTACK_PATH ?? '').trim();
+  if (override) return override;
+  const platform = String(config?.platform ?? '').trim() || process.platform;
+  const exe = platform === 'win32' ? 'hstack.exe' : 'hstack';
+  return join(String(config?.binDir ?? '').trim() || '', exe);
+}
+
+async function installAutoUpdateJob({ config, enabled, intervalMinutes, at }) {
+  if (!enabled) return { installed: false, reason: 'disabled' };
+  const updaterLabel = resolveUpdaterLabel(config);
+  const hstackPath = resolveHstackPathForUpdater(config);
+  const stdoutPath = join(config.logDir, 'updater.out.log');
+  const stderrPath = join(config.logDir, 'updater.err.log');
+  const backend = resolveServiceBackend({ platform: config.platform, mode: config.mode });
+  const interval = resolveAutoUpdateIntervalMinutes([], intervalMinutes ?? config.autoUpdateIntervalMinutes);
+  const effectiveAt = resolveAutoUpdateAt([], at ?? config.autoUpdateAt ?? '');
+
+  const baseSpec = {
+    label: updaterLabel,
+    description: `Happier Self-Host (${updaterLabel})`,
+    programArgs: [hstackPath],
+    workingDirectory: config.installRoot,
+    env: {},
+    stdoutPath,
+    stderrPath,
+  };
+  const definitionPath = buildServiceDefinition({ backend, homeDir: homedir(), spec: baseSpec }).path;
+  const wantedBy =
+    backend === 'systemd-system' ? 'multi-user.target' : backend === 'systemd-user' ? 'default.target' : '';
+
+  if (backend === 'systemd-system' || backend === 'systemd-user') {
+    const timerPath = definitionPath.replace(/\.service$/, '.timer');
+    const serviceContents = renderUpdaterSystemdUnit({
+      updaterLabel,
+      hstackPath,
+      channel: config.channel,
+      mode: config.mode,
+      workingDirectory: config.installRoot,
+      stdoutPath,
+      stderrPath,
+      wantedBy,
+    });
+    const timerContents = renderUpdaterSystemdTimerUnit({ updaterLabel, intervalMinutes: interval, at: effectiveAt });
+    const prefix = backend === 'systemd-user' ? ['--user'] : [];
+    const plan = {
+      writes: [
+        { path: definitionPath, contents: serviceContents, mode: 0o644 },
+        { path: timerPath, contents: timerContents, mode: 0o644 },
+      ],
+      commands: [
+        { cmd: 'systemctl', args: [...prefix, 'daemon-reload'] },
+        { cmd: 'systemctl', args: [...prefix, 'enable', '--now', `${updaterLabel}.timer`] },
+        { cmd: 'systemctl', args: [...prefix, 'start', `${updaterLabel}.service`], allowFail: true },
+      ],
+    };
+    await applyServicePlan(plan);
+    return { installed: true, backend, label: updaterLabel, definitionPath, timerPath, intervalMinutes: interval, at: effectiveAt };
+  }
+
+  if (backend === 'launchd-system' || backend === 'launchd-user') {
+    const definitionContents = renderUpdaterLaunchdPlistXml({
+      updaterLabel,
+      hstackPath,
+      channel: config.channel,
+      mode: config.mode,
+      intervalMinutes: interval,
+      at: effectiveAt,
+      workingDirectory: config.installRoot,
+      stdoutPath,
+      stderrPath,
+    });
+    const plan = planServiceAction({
+      backend,
+      action: 'install',
+      label: updaterLabel,
+      definitionPath,
+      definitionContents,
+      persistent: true,
+    });
+    await applyServicePlan(plan);
+    return { installed: true, backend, label: updaterLabel, definitionPath, intervalMinutes: interval, at: effectiveAt };
+  }
+
+  const definitionContents = renderUpdaterScheduledTaskWrapperPs1({
+    updaterLabel,
+    hstackPath,
+    channel: config.channel,
+    mode: config.mode,
+    workingDirectory: config.installRoot,
+    stdoutPath,
+    stderrPath,
+  });
+  const name = `Happier\\${updaterLabel}`;
+  const args = buildUpdaterScheduledTaskCreateArgs({
+    backend,
+    taskName: name,
+    definitionPath,
+    intervalMinutes: interval,
+    at: effectiveAt,
+  });
+  const plan = {
+    writes: [{ path: definitionPath, contents: definitionContents, mode: 0o644 }],
+    commands: [
+      { cmd: 'schtasks', args },
+      { cmd: 'schtasks', args: ['/Run', '/TN', name] },
+    ],
+  };
+  await applyServicePlan(plan);
+  return { installed: true, backend, label: updaterLabel, definitionPath, taskName: name, intervalMinutes: interval, at: effectiveAt };
+}
+
+async function uninstallAutoUpdateJob({ config }) {
+  const updaterLabel = resolveUpdaterLabel(config);
+  const hstackPath = resolveHstackPathForUpdater(config);
+  const stdoutPath = join(config.logDir, 'updater.out.log');
+  const stderrPath = join(config.logDir, 'updater.err.log');
+  const backend = resolveServiceBackend({ platform: config.platform, mode: config.mode });
+  const baseSpec = {
+    label: updaterLabel,
+    description: `Happier Self-Host (${updaterLabel})`,
+    programArgs: [hstackPath],
+    workingDirectory: config.installRoot,
+    env: {},
+    stdoutPath,
+    stderrPath,
+  };
+  const definitionPath = buildServiceDefinition({ backend, homeDir: homedir(), spec: baseSpec }).path;
+
+  if (backend === 'systemd-system' || backend === 'systemd-user') {
+    const prefix = backend === 'systemd-user' ? ['--user'] : [];
+    const timerPath = definitionPath.replace(/\.service$/, '.timer');
+    const plan = {
+      writes: [],
+      commands: [
+        { cmd: 'systemctl', args: [...prefix, 'disable', '--now', `${updaterLabel}.timer`], allowFail: true },
+        { cmd: 'systemctl', args: [...prefix, 'disable', '--now', `${updaterLabel}.service`], allowFail: true },
+        { cmd: 'systemctl', args: [...prefix, 'daemon-reload'] },
+      ],
+    };
+    await applyServicePlan(plan);
+    await rm(timerPath, { force: true }).catch(() => {});
+    await rm(definitionPath, { force: true }).catch(() => {});
+    return { uninstalled: true, backend, label: updaterLabel };
+  }
+
+  if (backend === 'launchd-system' || backend === 'launchd-user') {
+    const plan = planServiceAction({
+      backend,
+      action: 'uninstall',
+      label: updaterLabel,
+      definitionPath,
+      persistent: true,
+    });
+    await applyServicePlan(plan);
+    await rm(definitionPath, { force: true }).catch(() => {});
+    return { uninstalled: true, backend, label: updaterLabel };
+  }
+
+  const name = `Happier\\${updaterLabel}`;
+  const plan = {
+    writes: [],
+    commands: [
+      { cmd: 'schtasks', args: ['/End', '/TN', name], allowFail: true },
+      { cmd: 'schtasks', args: ['/Delete', '/F', '/TN', name], allowFail: true },
+    ],
+  };
+  await applyServicePlan(plan);
+  await rm(definitionPath, { force: true }).catch(() => {});
+  return { uninstalled: true, backend, label: updaterLabel };
+}
+
+async function restartAndCheckHealth({ config, serviceSpec, port }) {
+  await restartManagedService({ platform: config.platform, mode: config.mode, spec: serviceSpec }).catch(() => {});
+  const timeoutMs = resolveSelfHostHealthTimeoutMs();
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const ok = await checkHealth({ port: parsePort(port, config.serverPort) });
+    if (ok) return true;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  return false;
+}
+
+async function checkHealth({ port }) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/version`, {
+      headers: { accept: 'application/json' },
+    });
+    if (!response.ok) return false;
+    const payload = await response.json().catch(() => ({}));
+    return payload?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveMinisignPublicKeyText(env = process.env) {
+  const inline = String(env?.HAPPIER_MINISIGN_PUBKEY ?? '').trim();
+  return inline || DEFAULT_MINISIGN_PUBLIC_KEY;
+}
+
+export async function installBinaryAtomically({ sourceBinaryPath, targetBinaryPath, previousBinaryPath, versionedTargetPath }) {
+  await mkdir(dirname(targetBinaryPath), { recursive: true });
+  await mkdir(dirname(versionedTargetPath), { recursive: true });
+  const stagedPath = `${targetBinaryPath}.new`;
+  await copyFile(sourceBinaryPath, stagedPath);
+  await chmod(stagedPath, 0o755).catch(() => {});
+  if (existsSync(targetBinaryPath)) {
+    await copyFile(targetBinaryPath, previousBinaryPath);
+    await chmod(previousBinaryPath, 0o755).catch(() => {});
+  }
+  await copyFile(stagedPath, versionedTargetPath);
+  await chmod(versionedTargetPath, 0o755).catch(() => {});
+
+  // Replacing an on-disk executable that may currently be running can fail with ETXTBSY if we try to
+  // write over the existing path. Prefer an atomic rename/swap on POSIX so the running process keeps
+  // using the old inode while new spawns see the new binary.
+  if (process.platform !== 'win32') {
+    await rename(stagedPath, targetBinaryPath).catch(async (e) => {
+      const code = String(e?.code ?? '');
+      // Best-effort fallback (should be rare): keep behavior working even on filesystems where rename fails.
+      if (code === 'EXDEV') {
+        await copyFile(versionedTargetPath, targetBinaryPath);
+        await chmod(targetBinaryPath, 0o755).catch(() => {});
+        await rm(stagedPath, { force: true });
+        return;
+      }
+      throw e;
+    });
+    await chmod(targetBinaryPath, 0o755).catch(() => {});
+    return;
+  }
+
+  // Windows does not reliably support overwrite semantics for rename.
+  await copyFile(versionedTargetPath, targetBinaryPath);
+  await chmod(targetBinaryPath, 0o755).catch(() => {});
+  await rm(stagedPath, { force: true });
+}
+
+async function syncSelfHostSqliteMigrations({ artifactRootDir, targetDir }) {
+  const root = String(artifactRootDir ?? '').trim();
+  const dest = String(targetDir ?? '').trim();
+  if (!root || !dest) return { copied: false, reason: 'missing-paths' };
+
+  const source = join(root, 'prisma', 'sqlite', 'migrations');
+  if (!existsSync(source)) return { copied: false, reason: 'missing-source' };
+
+  await rm(dest, { recursive: true, force: true });
+  await mkdir(dirname(dest), { recursive: true });
+  await cp(source, dest, { recursive: true });
+  return { copied: true, reason: 'ok' };
+}
+
+async function stageSelfHostRuntimePayload({ artifactRootDir, stageRootDir }) {
+  const stageRoot = String(stageRootDir ?? '').trim();
+  if (!stageRoot) {
+    throw new Error('[self-host] missing runtime staging directory');
+  }
+
+  await cp(artifactRootDir, stageRoot, { recursive: true });
+  const relocated = await relocateServerRuntimeArtifactClosure({
+    payloadRoot: stageRoot,
+    platform: process.platform,
+  });
+  await assertPackagedServerRuntimeClosure({ runtimeRoot: relocated.runtimeRoot });
+
+  const sqliteMigrationsDir = join(stageRoot, 'managed-data', 'migrations', 'sqlite');
+  await syncSelfHostSqliteMigrations({
+    artifactRootDir: relocated.runtimeRoot,
+    targetDir: sqliteMigrationsDir,
+  }).catch(() => {});
+
+  const embeddedUiDir = join(stageRoot, 'ui-web', 'current');
+  const embeddedUiIndex = await stat(join(embeddedUiDir, 'index.html')).catch(() => null);
+
+  return {
+    embeddedUiDir: embeddedUiIndex?.isFile() ? embeddedUiDir : '',
+    generatedDir: join(relocated.runtimeRoot, 'generated'),
+    nodeModulesDir: join(relocated.runtimeRoot, 'node_modules'),
+    prismaDir: join(relocated.runtimeRoot, 'prisma'),
+    runtimeDir: join(relocated.runtimeRoot, 'runtime'),
+    migrationBinaryPath: relocated.migrationBinaryPath || '',
+    sqliteMigrationsDir: existsSync(sqliteMigrationsDir) ? sqliteMigrationsDir : '',
+  };
+}
+
+async function promoteStagedDirectory({ stagedDir, targetDir }) {
+  const staged = String(stagedDir ?? '').trim();
+  const target = String(targetDir ?? '').trim();
+  if (!staged || !target || !existsSync(staged)) return;
+
+  await mkdir(dirname(target), { recursive: true });
+  const backupDir = `${target}.backup-${randomUUID()}`;
+  const hadTarget = existsSync(target);
+  if (hadTarget) {
+    await rm(backupDir, { recursive: true, force: true }).catch(() => {});
+    await rename(target, backupDir);
+  }
+
+  try {
+    await rename(staged, target).catch(async (e) => {
+      if (String(e?.code ?? '') !== 'EXDEV') throw e;
+      await cp(staged, target, { recursive: true });
+      await rm(staged, { recursive: true, force: true });
+    });
+    if (hadTarget) {
+      await rm(backupDir, { recursive: true, force: true }).catch(() => {});
+    }
+  } catch (error) {
+    await rm(target, { recursive: true, force: true }).catch(() => {});
+    if (hadTarget && existsSync(backupDir)) {
+      await rename(backupDir, target).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function rollbackPromotedDirectory({ targetDir, backupDir, hadTarget }) {
+  const target = String(targetDir ?? '').trim();
+  const backup = String(backupDir ?? '').trim();
+  if (target) {
+    await rm(target, { recursive: true, force: true }).catch(() => {});
+  }
+  if (hadTarget && backup && existsSync(backup)) {
+    await rename(backup, target).catch(() => {});
+  }
+}
+
+async function prepareFailClosedBinaryPromotionWindow({ targetBinaryPath, previousBinaryPath }) {
+  const target = String(targetBinaryPath ?? '').trim();
+  const previous = String(previousBinaryPath ?? '').trim();
+  if (!target) {
+    return { targetBinaryPath: '', recoveryBinaryPath: '', hadActiveBinary: false };
+  }
+
+  await mkdir(dirname(target), { recursive: true });
+  const hadActiveBinary = existsSync(target);
+  if (!hadActiveBinary) {
+    return { targetBinaryPath: target, recoveryBinaryPath: '', hadActiveBinary };
+  }
+
+  if (previous) {
+    await mkdir(dirname(previous), { recursive: true });
+    await copyFile(target, previous);
+    await chmod(previous, 0o755).catch(() => {});
+  }
+
+  const recoveryBinaryPath = `${target}.rollback-${randomUUID()}`;
+  await rm(recoveryBinaryPath, { force: true }).catch(() => {});
+  await rename(target, recoveryBinaryPath);
+
+  return { targetBinaryPath: target, recoveryBinaryPath, hadActiveBinary };
+}
+
+async function finalizeFailClosedBinaryPromotionWindow(window) {
+  const recovery = String(window?.recoveryBinaryPath ?? '').trim();
+  if (recovery) {
+    await rm(recovery, { force: true }).catch(() => {});
+  }
+}
+
+async function rollbackFailClosedBinaryPromotionWindow(window) {
+  const target = String(window?.targetBinaryPath ?? '').trim();
+  const recovery = String(window?.recoveryBinaryPath ?? '').trim();
+  const hadActiveBinary = Boolean(window?.hadActiveBinary);
+
+  if (target) {
+    await rm(target, { force: true }).catch(() => {});
+  }
+  if (hadActiveBinary && recovery && existsSync(recovery)) {
+    await rename(recovery, target).catch(() => {});
+  }
+}
+
+async function promoteStagedSelfHostRuntimePayload({
+  stagedRuntime,
+  config,
+  beforePromote,
+  beforeOnPromoted,
+  onPromoted,
+  afterPromoted,
+}) {
+  const promotions = [
+    {
+      stagedDir: stagedRuntime.sqliteMigrationsDir,
+      targetDir: join(config.dataDir, 'migrations', 'sqlite'),
+    },
+    {
+      stagedDir: stagedRuntime.generatedDir,
+      targetDir: join(dirname(config.serverBinaryPath), 'generated'),
+    },
+    {
+      stagedDir: stagedRuntime.nodeModulesDir,
+      targetDir: join(dirname(config.serverBinaryPath), 'node_modules'),
+    },
+    {
+      stagedDir: stagedRuntime.prismaDir,
+      targetDir: join(dirname(config.serverBinaryPath), 'prisma'),
+    },
+    {
+      stagedDir: stagedRuntime.runtimeDir,
+      targetDir: join(dirname(config.serverBinaryPath), 'runtime'),
+    },
+    {
+      stagedDir: stagedRuntime.migrationBinaryPath,
+      targetDir: stagedRuntime.migrationBinaryPath
+        ? join(dirname(config.serverBinaryPath), basename(stagedRuntime.migrationBinaryPath))
+        : '',
+    },
+  ].filter(({ stagedDir }) => {
+    const staged = String(stagedDir ?? '').trim();
+    return staged && existsSync(staged);
+  });
+
+  let binaryPromotionWindow = null;
+  const promoted = [];
+  try {
+    if (typeof beforePromote === 'function') {
+      await beforePromote();
+    }
+
+    binaryPromotionWindow = await prepareFailClosedBinaryPromotionWindow({
+      targetBinaryPath: config.serverBinaryPath,
+      previousBinaryPath: config.serverPreviousBinaryPath,
+    });
+
+    for (const promotion of promotions) {
+      const target = String(promotion.targetDir ?? '').trim();
+      await mkdir(dirname(target), { recursive: true });
+      promotion.backupDir = `${target}.backup-${randomUUID()}`;
+      promotion.hadTarget = existsSync(target);
+      if (promotion.hadTarget) {
+        await rm(promotion.backupDir, { recursive: true, force: true }).catch(() => {});
+        await rename(target, promotion.backupDir);
+      }
+
+      try {
+        await promoteStagedDirectory({
+          stagedDir: promotion.stagedDir,
+          targetDir: promotion.targetDir,
+        });
+      } catch (error) {
+        await rollbackPromotedDirectory(promotion);
+        throw error;
+      }
+
+      promoted.push(promotion);
+    }
+
+    if (typeof beforeOnPromoted === 'function') {
+      await beforeOnPromoted();
+    }
+    if (typeof onPromoted === 'function') {
+      await onPromoted();
+    }
+    if (typeof afterPromoted === 'function') {
+      await afterPromoted(stagedRuntime);
+    }
+    await finalizeFailClosedBinaryPromotionWindow(binaryPromotionWindow);
+
+    for (const promotion of promoted) {
+      if (promotion.hadTarget) {
+        await rm(promotion.backupDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  } catch (error) {
+    await rollbackFailClosedBinaryPromotionWindow(binaryPromotionWindow);
+    for (const promotion of promoted.reverse()) {
+      await rollbackPromotedDirectory(promotion);
+    }
+    throw error;
+  }
+}
+
+export async function installSelfHostBinaryFromBundle({
+  bundle,
+  binaryName,
+  config,
+  pubkeyFile = resolveMinisignPublicKeyText(process.env),
+  userAgent = 'happier-self-host-installer',
+  beforeRuntimePromote,
+  beforeBinaryInstall,
+  afterPromote,
+} = {}) {
+  const resolvedBundle = bundle;
+  const name = String(binaryName ?? '').trim();
+  if (!resolvedBundle?.archive?.url || !resolvedBundle?.archive?.name) {
+    throw new Error('[self-host] invalid release bundle (missing archive)');
+  }
+  if (!resolvedBundle?.checksums?.url || !resolvedBundle?.checksumsSig?.url) {
+    throw new Error('[self-host] invalid release bundle (missing checksums assets)');
+  }
+  if (!name) {
+    throw new Error('[self-host] missing binary name');
+  }
+  const platform = String(config?.platform ?? process.platform).trim() || process.platform;
+  const os = normalizeOs(platform);
+  const existingVersionIds = await listVersionedDirectoryIdsNewestFirst({
+    versionsDir: config.versionsDir,
+    entryPrefix: `${name}-`,
+  });
+  const previousVersionId = existingVersionIds.find((candidate) => candidate !== String(bundle?.version ?? '').trim()) ?? null;
+
+  const tempDir = await mkdtemp(join(tmpdir(), 'happier-self-host-release-'));
+  try {
+    const downloaded = await downloadVerifiedReleaseAssetBundle({
+      bundle: resolvedBundle,
+      destDir: tempDir,
+      pubkeyFile,
+      userAgent,
+    });
+
+    const extractDir = join(tempDir, 'extract');
+    await mkdir(extractDir, { recursive: true });
+    await extractFirstPartyReleaseArchiveToDirectory({
+      archiveName: downloaded.archiveName,
+      archivePath: downloaded.archivePath,
+      extractDir,
+    });
+    const extractedBinary = await findExtractedExecutableByName(extractDir, name);
+    if (!extractedBinary) {
+      throw new Error('[self-host] failed to locate extracted server binary');
+    }
+
+    const version = downloaded.version || String(resolvedBundle?.version ?? '').trim() || `${Date.now()}`;
+    const artifactRootDir = dirname(extractedBinary);
+    const stagedRuntime = await stageSelfHostRuntimePayload({
+      artifactRootDir,
+      stageRootDir: join(tempDir, 'runtime-stage'),
+    });
+    await promoteStagedSelfHostRuntimePayload({
+      stagedRuntime,
+      config,
+      beforePromote: beforeRuntimePromote,
+      beforeOnPromoted: beforeBinaryInstall,
+      onPromoted: async () => installBinaryAtomically({
+        sourceBinaryPath: extractedBinary,
+        targetBinaryPath: config.serverBinaryPath,
+        previousBinaryPath: config.serverPreviousBinaryPath,
+        versionedTargetPath: join(config.versionsDir, `${name}-${version}`),
+      }),
+      afterPromoted: typeof afterPromote === 'function'
+        ? async (runtime) => afterPromote({ ...runtime, version })
+        : undefined,
+    });
+    await pruneVersionedDirectories({
+      versionsDir: config.versionsDir,
+      entryPrefix: `${name}-`,
+      currentVersionId: version,
+      previousVersionId,
+    });
+    return { version, source: resolvedBundle.archive.url };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+export async function installSelfHostBinaryFromLocalPath({
+  sourceBinaryPath,
+  binaryName,
+  config,
+  beforeRuntimePromote,
+  afterPromote,
+} = {}) {
+  const srcPath = String(sourceBinaryPath ?? '').trim();
+  const name = String(binaryName ?? '').trim();
+  if (!srcPath) {
+    throw new Error('[self-host] missing local source binary path');
+  }
+  if (!existsSync(srcPath)) {
+    throw new Error(`[self-host] missing --server-binary path: ${srcPath}`);
+  }
+  if (!name) {
+    throw new Error('[self-host] missing binary name');
+  }
+
+  const version = `local-${Date.now()}`;
+  const existingVersionIds = await listVersionedDirectoryIdsNewestFirst({
+    versionsDir: config.versionsDir,
+    entryPrefix: `${name}-`,
+  });
+  const previousVersionId = existingVersionIds.find((candidate) => candidate !== version) ?? null;
+  const artifactRootDir = dirname(srcPath);
+  const runtimeStageDir = await mkdtemp(join(tmpdir(), 'happier-self-host-local-runtime-stage-'));
+  try {
+    const stagedRuntime = await stageSelfHostRuntimePayload({
+      artifactRootDir,
+      stageRootDir: runtimeStageDir,
+    });
+    await promoteStagedSelfHostRuntimePayload({
+      stagedRuntime,
+      config,
+      beforePromote: beforeRuntimePromote,
+      onPromoted: async () => installBinaryAtomically({
+        sourceBinaryPath: srcPath,
+        targetBinaryPath: config.serverBinaryPath,
+        previousBinaryPath: config.serverPreviousBinaryPath,
+        versionedTargetPath: join(config.versionsDir, `${name}-${version}`),
+      }),
+      afterPromoted: typeof afterPromote === 'function'
+        ? async (runtime) => afterPromote({ ...runtime, version })
+        : undefined,
+    });
+    await pruneVersionedDirectories({
+      versionsDir: config.versionsDir,
+      entryPrefix: `${name}-`,
+      currentVersionId: version,
+      previousVersionId,
+    });
+    return { version, source: 'local' };
+  } finally {
+    await rm(runtimeStageDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function installFromRelease({
+  product,
+  binaryName,
+  config,
+  explicitBinaryPath = '',
+  beforeRuntimePromote,
+  beforeBinaryInstall,
+  afterPromote,
+} = {}) {
+  if (explicitBinaryPath) {
+    return installSelfHostBinaryFromLocalPath({
+      sourceBinaryPath: explicitBinaryPath,
+      binaryName,
+      config,
+      beforeRuntimePromote,
+      afterPromote,
+    });
+  }
+
+  const { serverTags: tags } = resolveSelfHostReleaseTargets(config.channel);
+  const resolvedRelease = await fetchFirstGitHubReleaseByTags({
+    githubRepo: config.githubRepo,
+    tags,
+    userAgent: 'happier-self-host-installer',
+    githubToken: String(process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? ''),
+  }).catch((e) => {
+    const status = Number(e?.status);
+    if (status === 404) return null;
+    throw e;
+  });
+
+  if (!resolvedRelease) {
+    throw new Error(`[self-host] server release tag not found (${tags.join(', ')})`);
+  }
+
+  const { release, tag: channelTag } = resolvedRelease;
+  const os = normalizeOs(config.platform);
+  const resolved = resolveReleaseAssetBundle({
+    assets: release?.assets,
+    product,
+    os,
+    arch: normalizeArch(),
+  });
+  const result = await installSelfHostBinaryFromBundle({
+    bundle: resolved,
+    binaryName,
+    config,
+    pubkeyFile: resolveMinisignPublicKeyText(process.env),
+    userAgent: 'happier-self-host-installer',
+    beforeRuntimePromote,
+    beforeBinaryInstall,
+    afterPromote,
+  });
+  return { version: result.version || resolved.version || String(release?.tag_name ?? '').replace(/^server-v/, ''), source: result.source };
+}
+
+async function stopSelfHostServiceBeforeRuntimePromote({ config }) {
+  const currentEnvText = existsSync(config.configEnvPath)
+    ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+    : '';
+  await stopManagedService({
+    platform: config.platform,
+    mode: config.mode,
+    homeDir: homedir(),
+    spec: buildSelfHostServerServiceSpec({ config, envText: currentEnvText }),
+    persistent: true,
+  }).catch(() => {});
+}
+
+export function resolveSelfHostServerInstallFromReleaseParams({
+  product,
+  binaryName,
+  config,
+  env = process.env,
+  ...rest
+} = {}) {
+  const explicitBinaryPath = resolveConfiguredRelayRuntimeBinaryOverride(env);
+  return {
+    product,
+    binaryName,
+    config,
+    ...(explicitBinaryPath ? { explicitBinaryPath } : {}),
+    ...rest,
+  };
+}
+
+async function assertUiWebBundleIsValid(rootDir) {
+  const indexPath = join(rootDir, 'index.html');
+  const info = await stat(indexPath).catch(() => null);
+  if (!info?.isFile()) {
+    throw new Error(`[self-host] UI web bundle is missing index.html: ${indexPath}`);
+  }
+}
+
+export async function installUiWebFromEmbeddedRuntime({ config, embeddedUiDir, version }) {
+  const sourceDir = String(embeddedUiDir ?? '').trim();
+  const runtimeVersion = String(version ?? '').trim();
+  if (!sourceDir || !existsSync(sourceDir)) {
+    throw new Error('[self-host] managed UI was requested, but the server payload is missing its embedded UI');
+  }
+  await assertUiWebBundleIsValid(sourceDir);
+
+  const existingVersionIds = await listVersionedDirectoryIdsNewestFirst({
+    versionsDir: config.uiWebVersionsDir,
+    entryPrefix: `${config.uiWebProduct}-`,
+  });
+  const uiVersion = runtimeVersion || `${Date.now()}`;
+  const versionedTargetDir = join(config.uiWebVersionsDir, `${config.uiWebProduct}-${uiVersion}`);
+  const previousVersionId = existingVersionIds.find((candidate) => candidate !== uiVersion) ?? null;
+
+  await rm(versionedTargetDir, { recursive: true, force: true });
+  await mkdir(dirname(versionedTargetDir), { recursive: true });
+  await cp(sourceDir, versionedTargetDir, { recursive: true });
+  await rm(config.uiWebCurrentDir, { recursive: true, force: true }).catch(() => {});
+  await symlink(versionedTargetDir, config.uiWebCurrentDir, config.platform === 'win32' ? 'junction' : 'dir').catch(async () => {
+    await cp(versionedTargetDir, config.uiWebCurrentDir, { recursive: true });
+  });
+  await pruneVersionedDirectories({
+    versionsDir: config.uiWebVersionsDir,
+    entryPrefix: `${config.uiWebProduct}-`,
+    currentVersionId: uiVersion,
+    previousVersionId,
+  });
+
+  return { installed: true, version: uiVersion, source: 'embedded-server-archive' };
+}
+
+async function writeSelfHostState(config, statePatch) {
+  const existing = existsSync(config.statePath)
+    ? JSON.parse(await readFile(config.statePath, 'utf-8').catch(() => '{}'))
+    : {};
+  const next = {
+    ...existing,
+    ...statePatch,
+    updatedAt: new Date().toISOString(),
+  };
+  await mkdir(dirname(config.statePath), { recursive: true });
+  await writeFile(config.statePath, `${JSON.stringify(next, null, 2)}\n`, 'utf-8');
+}
+
+function buildSelfHostServerServiceSpec({ config, envText }) {
+  return {
+    label: config.serviceName,
+    description: `Happier Self-Host (${config.serviceName})`,
+    programArgs: [config.serverBinaryPath],
+    workingDirectory: config.installRoot,
+    env: parseEnvText(envText),
+    stdoutPath: config.serverStdoutLogPath,
+    stderrPath: config.serverStderrLogPath,
+  };
+}
+
+export async function runSelfHostRuntimeMutationWithServiceRecovery({
+  config,
+  mutateRuntime,
+} = {}) {
+  if (typeof mutateRuntime !== 'function') {
+    throw new Error('[self-host] mutateRuntime is required');
+  }
+
+  const previousEnvText = existsSync(config.configEnvPath)
+    ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+    : '';
+  const previousEnvExisted = existsSync(config.configEnvPath);
+  const backend = resolveServiceBackend({ platform: config.platform, mode: config.mode });
+  const previousServiceSpec = buildSelfHostServerServiceSpec({ config, envText: previousEnvText });
+  const previousDefinition = buildServiceDefinition({
+    backend,
+    homeDir: homedir(),
+    spec: previousServiceSpec,
+  });
+  const previousDefinitionExisted = existsSync(previousDefinition.path);
+  const previousDefinitionContents = existsSync(previousDefinition.path)
+    ? await readFile(previousDefinition.path, 'utf-8').catch(() => previousDefinition.contents)
+    : previousDefinition.contents;
+
+  try {
+    return await mutateRuntime({
+      beforeRuntimePromote: async () => stopSelfHostServiceBeforeRuntimePromote({ config }),
+    });
+  } catch (error) {
+    if (previousEnvExisted) {
+      await mkdir(dirname(config.configEnvPath), { recursive: true });
+      await writeFile(config.configEnvPath, previousEnvText, 'utf-8');
+    } else {
+      await rm(config.configEnvPath, { force: true }).catch(() => {});
+    }
+    if (previousDefinitionExisted) {
+      await mkdir(dirname(previousDefinition.path), { recursive: true });
+      await writeFile(previousDefinition.path, previousDefinitionContents, 'utf-8');
+    } else {
+      await rm(previousDefinition.path, { force: true }).catch(() => {});
+    }
+    if (previousEnvExisted || previousDefinitionExisted) {
+      await installManagedService({
+        platform: config.platform,
+        mode: config.mode,
+        homeDir: homedir(),
+        spec: previousServiceSpec,
+        persistent: true,
+      }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+export async function runSelfHostUiWebMutationWithRollback({
+  config,
+  mutateUi,
+} = {}) {
+  if (typeof mutateUi !== 'function') {
+    throw new Error('[self-host] mutateUi is required');
+  }
+
+  const uiCurrentDir = String(config?.uiWebCurrentDir ?? '').trim();
+  const uiVersionsDir = String(config?.uiWebVersionsDir ?? '').trim();
+  const uiProduct = String(config?.uiWebProduct ?? DEFAULTS.uiWebProduct).trim() || DEFAULTS.uiWebProduct;
+  const entryPrefix = `${uiProduct}-`;
+  const previousVersionIds = uiVersionsDir
+    ? await listVersionedDirectoryIdsNewestFirst({
+      versionsDir: uiVersionsDir,
+      entryPrefix,
+    }).catch(() => [])
+    : [];
+  const currentBackupDir = uiCurrentDir && existsSync(uiCurrentDir)
+    ? `${uiCurrentDir}.rollback-${randomUUID()}`
+    : '';
+
+  if (currentBackupDir) {
+    await rename(uiCurrentDir, currentBackupDir);
+  }
+
+  try {
+    const result = await mutateUi();
+    if (currentBackupDir) {
+      await rm(currentBackupDir, { recursive: true, force: true }).catch(() => {});
+    }
+    return result;
+  } catch (error) {
+    if (uiCurrentDir) {
+      await rm(uiCurrentDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (currentBackupDir && existsSync(currentBackupDir)) {
+      await rename(currentBackupDir, uiCurrentDir).catch(() => {});
+    }
+    if (uiVersionsDir) {
+      const nextVersionIds = await listVersionedDirectoryIdsNewestFirst({
+        versionsDir: uiVersionsDir,
+        entryPrefix,
+      }).catch(() => []);
+      const previousVersionIdSet = new Set(previousVersionIds);
+      for (const versionId of nextVersionIds) {
+        if (previousVersionIdSet.has(versionId)) continue;
+        await rm(join(uiVersionsDir, versionId), { recursive: true, force: true }).catch(() => {});
+      }
+    }
+    if (currentBackupDir) {
+      await rm(currentBackupDir, { recursive: true, force: true }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function performSelfHostPostPromoteSteps({
+  config,
+  embeddedUiDir,
+  runtimeVersion,
+  withUi,
+  envOverrides,
+  autoUpdateMode,
+  autoUpdateEnabled,
+  autoUpdateIntervalMinutes,
+  autoUpdateAt,
+  autoUpdateReconcile,
+}) {
+  const uiResult = withUi
+    ? await runSelfHostUiWebMutationWithRollback({
+      config,
+      mutateUi: async () => installUiWebFromEmbeddedRuntime({
+        config,
+        embeddedUiDir,
+        version: runtimeVersion,
+      }),
+    })
+    : { installed: false, version: null, source: null, reason: 'disabled' };
+  const uiInstalled = Boolean(uiResult?.installed);
+
+  const envText = renderServerEnvFile({
+    port: config.serverPort,
+    host: config.serverHost,
+    dataDir: config.dataDir,
+    filesDir: config.filesDir,
+    dbDir: config.dbDir,
+    uiDir: uiInstalled ? config.uiWebCurrentDir : '',
+    serverBinDir: dirname(config.serverBinaryPath),
+    arch: process.arch,
+    platform: config.platform,
+  });
+  const existingEnvText = existsSync(config.configEnvPath)
+    ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+    : '';
+  const envTextWithOverrides = mergeSelfHostServerRuntimeEnvText({
+    baseEnvText: envText,
+    existingEnvText,
+    envOverrides,
+  });
+  await writeFile(config.configEnvPath, envTextWithOverrides, 'utf-8');
+  const installEnv = parseEnvText(envTextWithOverrides);
+  const healthPort = resolveSelfHostEffectiveServerPort({ config, env: installEnv });
+  await applySelfHostServerMigrationsAtInstallTime({ config, env: installEnv }).catch((e) => {
+    throw new Error(`[self-host] failed to apply database migrations at install time: ${String(e?.message ?? e)}`);
+  });
+
+  const serverShimPath = join(config.binDir, config.serverBinaryName);
+  await mkdir(config.binDir, { recursive: true });
+  await rm(serverShimPath, { force: true });
+  await symlink(config.serverBinaryPath, serverShimPath).catch(async () => {
+    await copyFile(config.serverBinaryPath, serverShimPath);
+    await chmod(serverShimPath, 0o755).catch(() => {});
+  });
+
+  const serviceSpec = buildSelfHostServerServiceSpec({ config, envText: envTextWithOverrides });
+  await installManagedService({
+    platform: config.platform,
+    mode: config.mode,
+    homeDir: homedir(),
+    spec: serviceSpec,
+    persistent: true,
+  });
+
+  const healthy = await restartAndCheckHealth({ config, serviceSpec, port: healthPort });
+  if (!healthy) {
+    throw new Error('[self-host] service failed health checks after install');
+  }
+
+  const autoUpdateResult = autoUpdateMode === 'install'
+    ? await installAutoUpdateJob({
+      config: { ...config, autoUpdateAt },
+      enabled: autoUpdateEnabled,
+      intervalMinutes: autoUpdateIntervalMinutes,
+      at: autoUpdateAt,
+    }).catch((e) => ({
+      installed: false,
+      reason: String(e?.message ?? e),
+    }))
+    : autoUpdateReconcile.action === 'install'
+      ? await installAutoUpdateJob({
+        config: { ...config, autoUpdateAt: autoUpdateReconcile.at },
+        enabled: true,
+        intervalMinutes: autoUpdateReconcile.intervalMinutes,
+        at: autoUpdateReconcile.at,
+      }).catch(() => null)
+      : await uninstallAutoUpdateJob({ config }).catch(() => null);
+
+  return {
+    uiResult,
+    autoUpdateResult,
+  };
+}
+
+async function cmdInstall({ channel, mode, argv, json }) {
+  if (mode === 'system' && process.platform !== 'win32') {
+    assertRoot();
+  }
+  const parsedEnvOverrides = parseEnvOverridesFromArgv(argv);
+  const envOverrides = parsedEnvOverrides.overrides;
+  const argvSansEnv = parsedEnvOverrides.rest;
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  const autoUpdateEnabled = resolveAutoUpdateEnabled(argvSansEnv, config.autoUpdate);
+  const autoUpdateIntervalMinutes = resolveAutoUpdateIntervalMinutes(argvSansEnv, config.autoUpdateIntervalMinutes);
+  const autoUpdateAt = resolveAutoUpdateAt(argvSansEnv, config.autoUpdateAt);
+  const withoutCli = argvSansEnv.includes('--without-cli') || parseBoolean(process.env.HAPPIER_WITH_CLI, true) === false;
+  const withUi =
+    !(argvSansEnv.includes('--without-ui')
+      || parseBoolean(process.env.HAPPIER_WITH_UI, true) === false
+      || parseBoolean(process.env.HAPPIER_SELF_HOST_WITH_UI, true) === false);
+  const nonInteractive = argvSansEnv.includes('--non-interactive') || parseBoolean(process.env.HAPPIER_NONINTERACTIVE, false);
+
+  if (normalizeOs(config.platform) === 'windows' && !commandExists('powershell')) {
+    throw new Error('[self-host] powershell is required on Windows');
+  }
+  if (normalizeOs(config.platform) === 'linux' && !commandExists('systemctl')) {
+    throw new Error('[self-host] systemctl is required on Linux');
+  }
+  if (autoUpdateEnabled && normalizeOs(config.platform) === 'darwin' && !commandExists('launchctl')) {
+    throw new Error('[self-host] launchctl is required on macOS for auto-update scheduling');
+  }
+  if (autoUpdateEnabled && normalizeOs(config.platform) === 'windows' && !commandExists('schtasks')) {
+    throw new Error('[self-host] schtasks is required on Windows for auto-update scheduling');
+  }
+
+  await mkdir(config.installRoot, { recursive: true });
+  await mkdir(config.installBinDir, { recursive: true });
+  await mkdir(config.versionsDir, { recursive: true });
+  await mkdir(config.configDir, { recursive: true });
+  await mkdir(config.dataDir, { recursive: true });
+  await mkdir(config.filesDir, { recursive: true });
+  await mkdir(config.dbDir, { recursive: true });
+  await mkdir(config.logDir, { recursive: true });
+  await mkdir(config.uiWebRootDir, { recursive: true });
+  await mkdir(config.uiWebVersionsDir, { recursive: true });
+
+  let postPromoteResult = null;
+  const installResult = await runSelfHostRuntimeMutationWithServiceRecovery({
+    config,
+    mutateRuntime: async ({ beforeRuntimePromote }) => await installFromRelease(
+      resolveSelfHostServerInstallFromReleaseParams({
+        product: 'happier-server',
+        binaryName: config.serverBinaryName,
+        config,
+        env: process.env,
+        beforeRuntimePromote,
+      afterPromote: async ({ embeddedUiDir, version }) => {
+        postPromoteResult = await performSelfHostPostPromoteSteps({
+          config,
+          embeddedUiDir,
+          runtimeVersion: version,
+            withUi,
+            envOverrides,
+            autoUpdateMode: 'install',
+            autoUpdateEnabled,
+            autoUpdateIntervalMinutes,
+            autoUpdateAt,
+          });
+        },
+      }),
+    ),
+  });
+
+  const uiResult = postPromoteResult?.uiResult ?? { installed: false, version: null, source: null, reason: 'disabled' };
+  const uiInstalled = Boolean(uiResult?.installed);
+  const autoUpdateResult = postPromoteResult?.autoUpdateResult ?? {
+    installed: false,
+    reason: 'missing-post-promote-result',
+  };
+
+  const cliResult = await maybeInstallCompanionCli({
+    channel,
+    githubRepo: config.githubRepo,
+    withCli: !withoutCli,
+    processEnv: process.env,
+  });
+  await writeSelfHostState(config, {
+    channel,
+    mode,
+    version: installResult.version,
+    source: installResult.source,
+    withCli: !withoutCli,
+    uiWeb: uiInstalled
+      ? { installed: true, version: uiResult.version, source: uiResult.source, tag: uiResult.tag }
+      : { installed: false, reason: String(uiResult?.reason ?? (withUi ? 'missing' : 'disabled')) },
+    autoUpdate: { enabled: autoUpdateEnabled, intervalMinutes: autoUpdateIntervalMinutes, at: autoUpdateAt },
+  });
+
+  printResult({
+    json,
+    data: {
+      ok: true,
+      channel,
+      mode,
+      version: installResult.version,
+      service: config.serviceName,
+      serverPort: config.serverPort,
+      autoUpdate: {
+        enabled: autoUpdateEnabled,
+        intervalMinutes: autoUpdateIntervalMinutes,
+        at: autoUpdateAt || null,
+        ...autoUpdateResult,
+      },
+      cli: cliResult,
+    },
+    text: [
+      `${green('✓')} Happier Self-Host installed`,
+      `- mode: ${cyan(mode)}`,
+      `- service: ${cyan(config.serviceName)}`,
+      `- version: ${cyan(installResult.version || 'unknown')}`,
+      `- server: ${cyan(`http://127.0.0.1:${config.serverPort}`)}`,
+      `- auto-update: ${autoUpdateEnabled ? (autoUpdateResult.installed ? green(`installed (${autoUpdateAt ? `daily at ${autoUpdateAt}` : `every ${autoUpdateIntervalMinutes}m`})`) : yellow('failed')) : dim('disabled')}`,
+      `- cli: ${cliResult.installed ? green('installed') : dim(cliResult.reason)}`,
+      `- ui: ${uiInstalled ? green('installed') : dim(String(uiResult?.reason ?? 'disabled'))}`,
+    ].join('\n'),
+  });
+}
+
+async function cmdStatus({ channel, mode, json }) {
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  const state = existsSync(config.statePath)
+    ? JSON.parse(await readFile(config.statePath, 'utf-8').catch(() => '{}'))
+    : {};
+
+  let active = null;
+  let enabled = null;
+  let updaterActive = null;
+  let updaterEnabled = null;
+  const updaterLabel = resolveUpdaterLabel(config);
+  try {
+    if (config.platform === 'linux' && commandExists('systemctl')) {
+      const prefix = config.mode === 'user' ? ['--user'] : [];
+      const isActive = runCommand('systemctl', [...prefix, 'is-active', '--quiet', `${config.serviceName}.service`], {
+        allowFail: true,
+        stdio: 'ignore',
+      });
+      active = (isActive.status ?? 1) === 0;
+      const isEnabled = runCommand('systemctl', [...prefix, 'is-enabled', '--quiet', `${config.serviceName}.service`], {
+        allowFail: true,
+        stdio: 'ignore',
+      });
+      enabled = (isEnabled.status ?? 1) === 0;
+
+      const updaterTimerIsActive = runCommand('systemctl', [...prefix, 'is-active', '--quiet', `${updaterLabel}.timer`], {
+        allowFail: true,
+        stdio: 'ignore',
+      });
+      updaterActive = (updaterTimerIsActive.status ?? 1) === 0;
+      const updaterIsEnabled = runCommand('systemctl', [...prefix, 'is-enabled', '--quiet', `${updaterLabel}.timer`], {
+        allowFail: true,
+        stdio: 'ignore',
+      });
+      updaterEnabled = (updaterIsEnabled.status ?? 1) === 0;
+    } else if (config.platform === 'darwin' && commandExists('launchctl')) {
+      const list = runCommand('launchctl', ['list'], { allowFail: true, stdio: 'pipe' });
+      const out = String(list.stdout ?? '');
+      active = out.includes(`\t${config.serviceName}`) || out.includes(` ${config.serviceName}`);
+      updaterActive = out.includes(`\t${updaterLabel}`) || out.includes(` ${updaterLabel}`);
+      enabled = null;
+      updaterEnabled = null;
+    } else if (config.platform === 'win32' && commandExists('schtasks')) {
+      const query = runCommand('schtasks', ['/Query', '/TN', `Happier\\${config.serviceName}`, '/FO', 'LIST', '/V'], {
+        allowFail: true,
+        stdio: 'pipe',
+      });
+      const out = String(query.stdout ?? '');
+      active = /Status:\s*Running/i.test(out) ? true : /Status:/i.test(out) ? false : null;
+      enabled = /Scheduled Task State:\s*Enabled/i.test(out) ? true : /Scheduled Task State:/i.test(out) ? false : null;
+
+      const updaterQuery = runCommand('schtasks', ['/Query', '/TN', `Happier\\${updaterLabel}`, '/FO', 'LIST', '/V'], {
+        allowFail: true,
+        stdio: 'pipe',
+      });
+      const updaterOut = String(updaterQuery.stdout ?? '');
+      updaterActive = /Status:\s*Running/i.test(updaterOut) ? true : /Status:/i.test(updaterOut) ? false : null;
+      updaterEnabled = /Scheduled Task State:\s*Enabled/i.test(updaterOut)
+        ? true
+        : /Scheduled Task State:/i.test(updaterOut)
+          ? false
+          : null;
+    }
+  } catch {
+    active = null;
+    enabled = null;
+    updaterActive = null;
+    updaterEnabled = null;
+  }
+
+  const healthy = await checkHealth({ port: config.serverPort });
+  const serverVersion = state?.version ? String(state.version) : '';
+  const uiWebVersion =
+    state?.uiWeb?.installed === true && state?.uiWeb?.version
+      ? String(state.uiWeb.version)
+      : '';
+  const autoUpdateState = normalizeSelfHostAutoUpdateState(state, {
+    fallbackIntervalMinutes: config.autoUpdateIntervalMinutes,
+  });
+
+  const serverUrl = `http://${config.serverHost}:${config.serverPort}`;
+  printResult({
+    json,
+    data: {
+      ok: true,
+      channel,
+      mode,
+      serverUrl,
+      versions: {
+        server: serverVersion || null,
+        uiWeb: uiWebVersion || null,
+      },
+      service: {
+        name: config.serviceName,
+        active,
+        enabled,
+      },
+      autoUpdate: {
+        label: updaterLabel,
+        active: updaterActive,
+        enabled: updaterEnabled,
+        configured: {
+          enabled: Boolean(autoUpdateState?.enabled),
+          intervalMinutes: autoUpdateState?.intervalMinutes ?? null,
+          at: autoUpdateState?.at ? String(autoUpdateState.at) : null,
+        },
+      },
+      healthy,
+      state,
+    },
+    text: renderSelfHostStatusText({
+      channel,
+      mode,
+      serviceName: config.serviceName,
+      serverUrl,
+      healthy,
+      service: { active, enabled },
+      versions: { server: serverVersion || null, uiWeb: uiWebVersion || null },
+      autoUpdate: {
+        label: updaterLabel,
+        job: { active: updaterActive, enabled: updaterEnabled },
+        configured: {
+          enabled: Boolean(autoUpdateState?.enabled),
+          intervalMinutes: autoUpdateState?.intervalMinutes ?? null,
+          at: autoUpdateState?.at ? String(autoUpdateState.at) : null,
+        },
+      },
+      updatedAt: state?.updatedAt ?? null,
+    }),
+  });
+}
+
+async function cmdUpdate({ channel, mode, json }) {
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  if (config.mode === 'system' && config.platform !== 'win32') {
+    assertRoot();
+  }
+  const existingState = existsSync(config.statePath)
+    ? JSON.parse(await readFile(config.statePath, 'utf-8').catch(() => '{}'))
+    : {};
+  const autoUpdateReconcile = decideSelfHostAutoUpdateReconcile(existingState, {
+    fallbackIntervalMinutes: config.autoUpdateIntervalMinutes,
+  });
+  const withUi =
+    parseBoolean(process.env.HAPPIER_WITH_UI, true) !== false
+    && parseBoolean(process.env.HAPPIER_SELF_HOST_WITH_UI, true) !== false;
+  let postPromoteResult = null;
+  const installResult = await runSelfHostRuntimeMutationWithServiceRecovery({
+    config,
+    mutateRuntime: async ({ beforeRuntimePromote }) => await installFromRelease(
+      resolveSelfHostServerInstallFromReleaseParams({
+        product: 'happier-server',
+        binaryName: config.serverBinaryName,
+        config,
+        env: process.env,
+        beforeRuntimePromote,
+      afterPromote: async ({ embeddedUiDir, version }) => {
+        postPromoteResult = await performSelfHostPostPromoteSteps({
+          config,
+          embeddedUiDir,
+          runtimeVersion: version,
+            withUi,
+            envOverrides: [],
+            autoUpdateMode: 'reconcile',
+            autoUpdateReconcile,
+          });
+        },
+      }),
+    ),
+  });
+  const uiResult = postPromoteResult?.uiResult ?? { installed: false, version: null, source: null, reason: 'disabled' };
+  const uiInstalled = Boolean(uiResult?.installed);
+  const autoUpdateResult = postPromoteResult?.autoUpdateResult ?? null;
+
+  await writeSelfHostState(config, {
+    channel,
+    mode,
+    version: installResult.version,
+    source: installResult.source,
+    autoUpdate: { enabled: autoUpdateReconcile.enabled, intervalMinutes: autoUpdateReconcile.intervalMinutes, at: autoUpdateReconcile.at },
+    uiWeb: uiInstalled
+      ? { installed: true, version: uiResult.version, source: uiResult.source, tag: uiResult.tag }
+      : { installed: false, reason: String(uiResult?.reason ?? (withUi ? 'missing' : 'disabled')) },
+  });
+
+  printResult({
+    json,
+    data: { ok: true, version: installResult.version, service: config.serviceName },
+    text: `${green('✓')} updated self-host runtime to ${cyan(installResult.version || 'latest')}`,
+  });
+}
+
+function parseRollbackVersion(argv) {
+  const { kv } = parseArgs(argv);
+  const fromEq = String(kv.get('--to') ?? '').trim();
+  if (fromEq) return fromEq;
+  const idx = argv.indexOf('--to');
+  if (idx >= 0 && argv[idx + 1]) return String(argv[idx + 1]).trim();
+  return '';
+}
+
+async function cmdRollback({ channel, mode, argv, json }) {
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  if (config.mode === 'system' && config.platform !== 'win32') {
+    assertRoot();
+  }
+  const to = parseRollbackVersion(argv);
+  const target = to
+    ? join(config.versionsDir, `${config.serverBinaryName}-${to}`)
+    : config.serverPreviousBinaryPath;
+  if (!existsSync(target)) {
+    throw new Error(
+      to
+        ? `[self-host] rollback target version not found: ${to}`
+        : '[self-host] no previous binary is available for rollback'
+    );
+  }
+  await copyFile(target, config.serverBinaryPath);
+  await chmod(config.serverBinaryPath, 0o755).catch(() => {});
+  const envText = existsSync(config.configEnvPath)
+    ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+    : '';
+  const parsedEnv = parseEnvText(envText);
+  const effectivePort = parsePort(parsedEnv.PORT, config.serverPort);
+  const configWithPort = effectivePort === config.serverPort ? config : { ...config, serverPort: effectivePort };
+  const defaultsEnvText = renderServerEnvFile({
+    port: configWithPort.serverPort,
+    host: configWithPort.serverHost,
+    dataDir: configWithPort.dataDir,
+    filesDir: configWithPort.filesDir,
+    dbDir: configWithPort.dbDir,
+    serverBinDir: dirname(configWithPort.serverBinaryPath),
+    arch: process.arch,
+    platform: configWithPort.platform,
+  });
+  const nextEnvText = envText ? mergeEnvTextWithDefaults(envText, defaultsEnvText) : defaultsEnvText;
+  await mkdir(configWithPort.configDir, { recursive: true });
+  await writeFile(configWithPort.configEnvPath, nextEnvText, 'utf-8');
+
+  const serviceSpec = buildSelfHostServerServiceSpec({ config: configWithPort, envText: nextEnvText });
+  await installManagedService({
+    platform: configWithPort.platform,
+    mode: configWithPort.mode,
+    homeDir: homedir(),
+    spec: serviceSpec,
+    persistent: true,
+  }).catch(() => {});
+  const healthy = await restartAndCheckHealth({ config: configWithPort, serviceSpec });
+  if (!healthy) {
+    throw new Error('[self-host] rollback completed binary swap but health checks failed');
+  }
+  await writeSelfHostState(config, {
+    channel,
+    mode,
+    version: to || 'previous',
+    rolledBackAt: new Date().toISOString(),
+  });
+  printResult({
+    json,
+    data: { ok: true, version: to || 'previous' },
+    text: `${green('✓')} rollback completed (${cyan(to || 'previous')})`,
+  });
+}
+
+async function cmdUninstall({ channel, mode, argv, json }) {
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  if (config.mode === 'system' && config.platform !== 'win32') {
+    assertRoot();
+  }
+  const purgeData = argv.includes('--purge-data');
+  const yes = argv.includes('--yes') || parseBoolean(process.env.HAPPIER_NONINTERACTIVE, false);
+  if (!yes) {
+    throw new Error('[self-host] uninstall requires --yes (or HAPPIER_NONINTERACTIVE=1)');
+  }
+
+  const envText = existsSync(config.configEnvPath)
+    ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+    : '';
+  const fallbackEnvText = envText || renderServerEnvFile({
+    port: config.serverPort,
+    host: config.serverHost,
+    dataDir: config.dataDir,
+    filesDir: config.filesDir,
+    dbDir: config.dbDir,
+    serverBinDir: dirname(config.serverBinaryPath),
+    arch: process.arch,
+    platform: config.platform,
+  });
+  const serviceSpec = buildSelfHostServerServiceSpec({ config, envText: fallbackEnvText });
+  await uninstallAutoUpdateJob({ config }).catch(() => {});
+  await uninstallManagedService({
+    platform: config.platform,
+    mode: config.mode,
+    homeDir: homedir(),
+    spec: serviceSpec,
+    persistent: true,
+  }).catch(() => {});
+
+  await rm(config.serverBinaryPath, { force: true });
+  await rm(config.serverPreviousBinaryPath, { force: true });
+  await rm(join(config.binDir, config.serverBinaryName), { force: true });
+  await rm(config.statePath, { force: true });
+
+  if (purgeData) {
+    await rm(config.installRoot, { recursive: true, force: true });
+    await rm(config.configDir, { recursive: true, force: true });
+    await rm(config.dataDir, { recursive: true, force: true });
+    await rm(config.logDir, { recursive: true, force: true });
+  }
+
+  printResult({
+    json,
+    data: { ok: true, purgeData },
+    text: `${green('✓')} self-host uninstalled${purgeData ? ' (data purged)' : ''}`,
+  });
+}
+
+async function cmdDoctor({ channel, mode, json }) {
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  const state = existsSync(config.statePath)
+    ? JSON.parse(await readFile(config.statePath, 'utf-8').catch(() => '{}'))
+    : {};
+  const checks = buildSelfHostDoctorChecks(config, { state });
+  const ok = checks.every((check) => check.ok);
+  printResult({
+    json,
+    data: { ok, checks },
+    text: [
+      banner('self-host doctor', { subtitle: 'Self-host diagnostics.' }),
+      '',
+      ...checks.map((check) => `${check.ok ? green('✓') : yellow('!')} ${check.name}`),
+    ].join('\n'),
+  });
+  if (!ok) {
+    process.exitCode = 1;
+  }
+}
+
+function pickFirstPositional(argv) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  return args.find((a) => a && !a.startsWith('-')) ?? '';
+}
+
+function safeParseJson(text) {
+  try {
+    return JSON.parse(String(text ?? ''));
+  } catch {
+    return null;
+  }
+}
+
+function redactEnvForDisplay(env) {
+  const input = env ?? {};
+  const out = {};
+  const allowed = new Set([
+    'PORT',
+    'HAPPIER_SERVER_HOST',
+    'HAPPIER_DB_PROVIDER',
+    'HAPPIER_FILES_BACKEND',
+    'HAPPIER_SERVER_UI_DIR',
+  ]);
+  for (const [k, v] of Object.entries(input)) {
+    if (!allowed.has(k)) continue;
+    out[k] = String(v ?? '');
+  }
+  return out;
+}
+
+async function cmdConfig({ channel, mode, argv, json, output }) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  const sub = pickFirstPositional(args) || 'view';
+  const subIndex = args.indexOf(sub);
+  const rest = subIndex >= 0 ? args.slice(subIndex + 1) : [];
+
+  const config = resolveConfig({ channel, mode, platform: process.platform });
+  const existingState = existsSync(config.statePath)
+    ? safeParseJson(await readFile(config.statePath, 'utf-8').catch(() => '')) ?? {}
+    : {};
+  const normalizedAutoUpdate = normalizeSelfHostAutoUpdateState(existingState, {
+    fallbackIntervalMinutes: config.autoUpdateIntervalMinutes,
+  });
+  const envText = existsSync(config.configEnvPath)
+    ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+    : '';
+  const envObj = envText ? parseEnvText(envText) : {};
+
+  if (sub === 'view') {
+    printResult({
+      json,
+      output,
+      data: {
+        ok: true,
+        channel,
+        mode,
+        paths: {
+          installRoot: config.installRoot,
+          binDir: config.binDir,
+          configDir: config.configDir,
+          configEnvPath: config.configEnvPath,
+          statePath: config.statePath,
+          logDir: config.logDir,
+        },
+        autoUpdate: {
+          enabled: Boolean(normalizedAutoUpdate.enabled),
+          intervalMinutes: normalizedAutoUpdate.intervalMinutes,
+          at: normalizedAutoUpdate.at || null,
+        },
+        env: redactEnvForDisplay(envObj),
+        state: existingState,
+      },
+      text: json
+        ? null
+        : [
+            banner('self-host config', { subtitle: 'Self-host configuration (paths + auto-update).' }),
+            '',
+            sectionTitle('paths:'),
+            `- installRoot: ${cyan(config.installRoot)}`,
+            `- configEnvPath: ${cyan(config.configEnvPath)}`,
+            `- statePath: ${cyan(config.statePath)}`,
+            '',
+            sectionTitle('auto-update:'),
+            `- enabled: ${normalizedAutoUpdate.enabled ? green('yes') : dim('no')}`,
+            `- schedule: ${normalizedAutoUpdate.enabled ? cyan(normalizedAutoUpdate.at ? `daily at ${normalizedAutoUpdate.at}` : `every ${normalizedAutoUpdate.intervalMinutes}m`) : dim('disabled')}`,
+          ].join('\n'),
+    });
+    return;
+  }
+
+  if (sub === 'set') {
+    const wantsApply = !rest.includes('--no-apply');
+    const enabled =
+      rest.includes('--auto-update') ? true : rest.includes('--no-auto-update') ? false : Boolean(normalizedAutoUpdate.enabled);
+
+    const wantsInterval = rest.some((a) => a === '--auto-update-interval' || a.startsWith('--auto-update-interval='));
+    const nextIntervalMinutes = wantsInterval
+      ? resolveAutoUpdateIntervalMinutes(rest, normalizedAutoUpdate.intervalMinutes)
+      : normalizedAutoUpdate.intervalMinutes;
+
+    const wantsAt = rest.some((a) => a === '--auto-update-at' || a.startsWith('--auto-update-at='));
+    const clearAt = rest.includes('--clear-auto-update-at');
+    const nextAt = clearAt
+      ? ''
+      : wantsAt
+        ? resolveAutoUpdateAt(rest, normalizedAutoUpdate.at || config.autoUpdateAt || '')
+        : normalizedAutoUpdate.at || '';
+
+    const parsedEnvOverrides = parseEnvOverridesFromArgv(rest);
+    const envOverrides = parsedEnvOverrides.overrides;
+
+    await mkdir(config.installRoot, { recursive: true });
+
+    if (envOverrides.length) {
+      const baseEnvText = envText || renderServerEnvFile({
+        port: config.serverPort,
+        host: config.serverHost,
+        dataDir: config.dataDir,
+        filesDir: config.filesDir,
+        dbDir: config.dbDir,
+        uiDir: existingState?.uiWeb?.installed === true ? config.uiWebCurrentDir : '',
+        serverBinDir: dirname(config.serverBinaryPath),
+        arch: process.arch,
+        platform: config.platform,
+      });
+      const nextEnvText = applyEnvOverridesToEnvText(baseEnvText, envOverrides);
+      await mkdir(config.configDir, { recursive: true });
+      await writeFile(config.configEnvPath, nextEnvText, 'utf-8');
+    }
+
+    await writeSelfHostState(config, {
+      channel,
+      mode,
+      autoUpdate: { enabled, intervalMinutes: nextIntervalMinutes, at: nextAt },
+    });
+
+    let applyResult = null;
+    if (wantsApply) {
+      if (config.mode === 'system' && config.platform !== 'win32') {
+        assertRoot();
+      }
+      if (enabled) {
+        applyResult = await installAutoUpdateJob({
+          config: { ...config, autoUpdateAt: nextAt },
+          enabled: true,
+          intervalMinutes: nextIntervalMinutes,
+          at: nextAt,
+        }).catch((e) => ({ installed: false, reason: String(e?.message ?? e) }));
+      } else {
+        applyResult = await uninstallAutoUpdateJob({ config }).catch((e) => ({ uninstalled: false, reason: String(e?.message ?? e) }));
+      }
+    }
+
+    const nextEnvText = existsSync(config.configEnvPath)
+      ? await readFile(config.configEnvPath, 'utf-8').catch(() => '')
+      : '';
+    const nextEnvObj = nextEnvText ? parseEnvText(nextEnvText) : {};
+
+    printResult({
+      json,
+      output,
+      data: {
+        ok: true,
+        channel,
+        mode,
+        autoUpdate: { enabled, intervalMinutes: nextIntervalMinutes, at: nextAt || null },
+        env: redactEnvForDisplay(nextEnvObj),
+        applied: wantsApply,
+        applyResult,
+      },
+      text: json
+        ? null
+        : [
+            `${green('✓')} self-host config updated`,
+            `- auto-update: ${enabled ? (nextAt ? `daily at ${nextAt}` : `every ${nextIntervalMinutes}m`) : 'disabled'}`,
+            `- apply: ${wantsApply ? green('yes') : dim('no')}`,
+          ].join('\n'),
+    });
+    return;
+  }
+
+  throw new Error(`[self-host] unknown config command: ${sub}`);
+}
+
+export function usageText() {
+  return [
+    banner('self-host', { subtitle: 'Happier Self-Host guided installation flow.' }),
+    '',
+    sectionTitle('usage:'),
+    `  ${cyan('hstack self-host')} install [--mode=user|system] [--without-cli] [--without-ui] [--channel=stable|preview|dev] [--auto-update|--no-auto-update] [--auto-update-interval=<minutes>] [--auto-update-at=<HH:MM>] [--env KEY=VALUE]... [--non-interactive] [--json]`,
+    `  ${cyan('hstack self-host')} status [--mode=user|system] [--channel=stable|preview|dev] [--json]`,
+    `  ${cyan('hstack self-host')} update [--mode=user|system] [--channel=stable|preview|dev] [--json]`,
+    `  ${cyan('hstack self-host')} rollback [--mode=user|system] [--to=<version>] [--channel=stable|preview|dev] [--json]`,
+    `  ${cyan('hstack self-host')} uninstall [--mode=user|system] [--purge-data] [--yes] [--json]`,
+    `  ${cyan('hstack self-host')} doctor [--json]`,
+    `  ${cyan('hstack self-host')} config view|set [--mode=user|system] [--channel=stable|preview|dev] [--json]`,
+    '',
+    sectionTitle('notes:'),
+    '- works without a repository checkout (binary-safe flow).',
+    `- runtime paths are configurable via env vars (${dim('HAPPIER_SELF_HOST_*')}).`,
+  ].join('\n');
+}
+
+let cachedRelayHostForwardSupport = null;
+const RELAY_HOST_FORWARDABLE_SUBCOMMANDS = new Set(['install', 'status', 'update', 'uninstall']);
+
+export function resolveRelayHostForwardedArgv(argv) {
+  const args = Array.isArray(argv) ? [...argv] : [];
+  if (String(args[0] ?? '').trim() === 'update') {
+    args[0] = 'install';
+  }
+  return args;
+}
+
+function shouldAttemptRelayHostForward(env = process.env) {
+  const raw = String(env?.HAPPIER_STACK_SELF_HOST_FORWARD ?? '1').trim().toLowerCase();
+  if (!raw) return true;
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false;
+  return true;
+}
+
+function resolveRelayHostForwardSupport(env = process.env) {
+  if (cachedRelayHostForwardSupport != null) {
+    return cachedRelayHostForwardSupport;
+  }
+
+  try {
+    const probe = spawnSync('happier', ['relay', 'host', '--help'], {
+      env,
+      stdio: 'ignore',
+      encoding: 'utf-8',
+    });
+    cachedRelayHostForwardSupport = (probe.status ?? 1) === 0;
+  } catch {
+    cachedRelayHostForwardSupport = false;
+  }
+
+  return cachedRelayHostForwardSupport;
+}
+
+export async function runSelfHostCli(argv = process.argv.slice(2), { configOutput = process.stdout } = {}) {
+  const parsed = parseSelfHostInvocation(argv);
+  if (
+    RELAY_HOST_FORWARDABLE_SUBCOMMANDS.has(parsed.subcommand)
+    && shouldAttemptRelayHostForward(process.env)
+    && resolveRelayHostForwardSupport(process.env)
+  ) {
+    const forwarded = spawnSync('happier', ['relay', 'host', ...resolveRelayHostForwardedArgv(argv)], {
+      env: process.env,
+      stdio: 'inherit',
+      encoding: 'utf-8',
+    });
+    if (forwarded.error) {
+      throw forwarded.error;
+    }
+    if ((forwarded.status ?? 1) !== 0) {
+      throw new Error(`[self-host] forwarded command failed (happier relay host), exit code: ${forwarded.status ?? 1}`);
+    }
+    return;
+  }
+
+  const { flags, kv } = parseArgs(argv);
+  const json = wantsJson(argv, { flags });
+  const channel = normalizeChannel(String(kv.get('--channel') ?? process.env.HAPPIER_CHANNEL ?? 'stable'));
+  const mode = normalizeMode(
+    String(
+      kv.get('--mode') ??
+        (argv.includes('--system') ? 'system' : argv.includes('--user') ? 'user' : process.env.HAPPIER_SELF_HOST_MODE ?? 'user')
+    )
+  );
+
+  if (wantsHelp(argv, { flags }) || parsed.subcommand === 'help') {
+    printResult({
+      json,
+      data: {
+        ok: true,
+        commands: ['install', 'status', 'update', 'rollback', 'uninstall', 'doctor', 'config'],
+      },
+      text: usageText(),
+    });
+    return;
+  }
+
+  if (parsed.subcommand === 'install') {
+    await cmdInstall({ channel, mode, argv: parsed.rest, json });
+    return;
+  }
+  if (parsed.subcommand === 'status') {
+    await cmdStatus({ channel, mode, json });
+    return;
+  }
+  if (parsed.subcommand === 'update') {
+    await cmdUpdate({ channel, mode, json });
+    return;
+  }
+  if (parsed.subcommand === 'rollback') {
+    await cmdRollback({ channel, mode, argv: parsed.rest, json });
+    return;
+  }
+  if (parsed.subcommand === 'uninstall') {
+    await cmdUninstall({ channel, mode, argv: parsed.rest, json });
+    return;
+  }
+  if (parsed.subcommand === 'doctor' || parsed.subcommand === 'migrate-from-npm') {
+    await cmdDoctor({ channel, mode, json });
+    return;
+  }
+  if (parsed.subcommand === 'config') {
+    await cmdConfig({ channel, mode, argv: parsed.rest, json, output: configOutput });
+    return;
+  }
+
+  throw new Error(`[self-host] unknown command: ${parsed.subcommand}`);
+}

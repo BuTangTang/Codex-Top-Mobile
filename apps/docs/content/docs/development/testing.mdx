@@ -1,0 +1,404 @@
+---
+title: Testing & CI
+description: Test tiers, how to run them locally, and how they are gated in CI/releases.
+---
+
+## Test tiers (repo-wide model)
+
+We use these lanes consistently across scripts and GitHub Actions.
+
+### 1) Unit
+
+Fast deterministic tests for pure logic/component behavior.
+
+**Root command:**
+```bash
+yarn test
+yarn test:import-cycles
+```
+
+This runs:
+- `yarn workspace @happier-dev/self-hosting/protocol test`
+- `yarn workspace @happier-dev/transfers test`
+- `yarn workspace @happier-dev/agents test`
+- `yarn workspace @happier-dev/cli-common test`
+- `yarn workspace @happier-dev/connection-supervisor test`
+- `yarn workspace @happier-dev/app test`
+- `yarn workspace @happier-dev/cli test:unit`
+- `yarn --cwd apps/server test:unit`
+- `yarn --cwd packages/relay-server test`
+- `yarn --cwd apps/stack test:unit`
+
+The CLI unit lane also runs the CLI runtime import-cycle guard. To run only that guard:
+
+```bash
+yarn test:import-cycles
+```
+
+Note: the UI workspace package name is `@happier-dev/app` and its directory is `apps/ui`.
+
+### 2) Integration
+
+Real process/filesystem/network orchestration tests at app level.
+
+**Naming convention:**
+- `*.integration.test.*`
+- `*.integration.spec.*`
+- `*.real.integration.test.*`
+
+**Root command:**
+```bash
+yarn test:integration
+```
+
+This runs:
+- `yarn workspace @happier-dev/app test:integration`
+- `yarn workspace @happier-dev/cli test:integration`
+- `yarn --cwd apps/server test:integration`
+- `yarn --cwd apps/stack test:integration`
+
+### 3) Server DB contract
+
+Server-only contract suite against explicit DB providers (Postgres/MySQL in Docker lanes).
+
+**Root command:**
+```bash
+yarn test:db-contract:docker
+```
+
+**Package-local command:**
+```bash
+yarn --cwd apps/server test:db-contract
+```
+
+### 4) Core E2E
+
+End-to-end suites in `packages/tests` against real server/socket contracts.
+
+**Root commands:**
+```bash
+yarn test:e2e
+yarn test:e2e:core:fast
+yarn test:e2e:core:slow
+yarn test:e2e:core:embedded
+```
+
+Lane intent:
+- `test:e2e` / `test:e2e:core` = full core gate.
+- `test:e2e:core:fast` = default local loop (excludes the longest process-orchestration scenarios).
+- `test:e2e:core:slow` = long-running scenarios (switching/materialization/mode orchestration).
+
+Core E2E slow naming convention:
+- `*.slow.e2e.test.ts` files run only in `test:e2e:core:slow`.
+- All other `suites/core-e2e/**/*.test.ts` files run in `test:e2e:core:fast`.
+- `test:e2e` still runs the full core suite (fast + slow together).
+
+### 4b) UI E2E (Playwright)
+
+Browser-driven end-to-end tests against the Expo web UI, using the same server-light + daemon harness used by core E2E.
+
+**Root command:**
+```bash
+yarn test:e2e:ui
+```
+
+Notes:
+- These tests run Playwright against `expo start --web` and require Playwright browsers to be installed (see Playwright install docs).
+- UI E2E should stay small and focus on flows that are uniquely UI-driven (auth/login/connect, navigation, and key cross-app wiring). Lower-level server/daemon invariants belong in core E2E.
+- If you suspect stale Metro transforms, you can opt into clearing the Expo/Metro cache with `HAPPIER_E2E_EXPO_CLEAR=1` (default is off because `--clear` can occasionally crash Metro).
+- Manual QA tip: if concurrent code changes cause the UI to keep reloading, you can disable Expo web Fast Refresh/HMR **per browser tab** by opening the UI with `?happier_hmr=0` (re-enable with `?happier_hmr=1`). This is web-only + dev-only.
+
+### 4c) Native E2E (Maestro) (iOS/Android)
+
+Native end-to-end tests using **Maestro**. These are intended to cover mobile-specific regressions (touch/keyboard/back/gesture/popup rendering).
+
+**Root commands:**
+```bash
+yarn test:e2e:mobile
+yarn test:e2e:mobile:android
+yarn test:e2e:mobile:ios
+```
+
+Notes:
+- These lanes are **not** PR checks by default; they’re intended for manual dispatch / release validation while we stabilize CI emulator runs.
+- You need Java 17+ and an iOS simulator / Android emulator.
+- Start Metro for the Expo Dev Client (Maestro targets React Native `testID` via native view identifiers).
+- Set the target server URL (host): `HAPPIER_E2E_SERVER_URL=http://127.0.0.1:<port>`.
+  - Android emulator runs automatically map `127.0.0.1`/`localhost` to `10.0.2.2` for device-visible networking.
+- If the server/Metro run on your host machine, enable `adb reverse` so Android can reach them: `HAPPIER_E2E_ANDROID_ADB_REVERSE=1`.
+- Artifacts are written under `packages/tests/.project/logs/e2e/mobile-maestro/`.
+- Override Maestro binary (if needed): `HAPPIER_E2E_MAESTRO_BIN=/path/to/maestro`.
+
+### 4d) WSREPL Lima matrix (macOS/Linux hosts)
+
+The Lima host↔guest WSREPL matrix is exposed as an opt-in tests-owned lane.
+
+**Root command:**
+```bash
+yarn test:e2e:ui:wsrepl:lima -- happier-wsrepl-qa
+```
+
+**Package-local command:**
+```bash
+yarn workspace @happier-dev/tests test:ui:e2e:wsrepl:lima -- happier-wsrepl-qa
+```
+
+**Harness self-tests:**
+```bash
+yarn test:e2e:ui:wsrepl:lima:self
+```
+
+Notes:
+- This lane is intentionally not part of the default GitHub-hosted PR matrix yet. Use it locally or on a self-hosted runner with Lima available.
+- The tests workspace now owns the lane entrypoint, the raw WSREPL Lima harness, and the Lima bootstrap helper: `packages/tests/scripts/run-wsrepl-lima-matrix.mjs`, `packages/tests/scripts/wsrepl-lima-matrix.sh`, `packages/tests/scripts/lima-vm.sh`.
+- The stack copies under `apps/stack/scripts/provision/` are compatibility shims only and are excluded from the published stack package.
+- Pass VM names and existing WSREPL env overrides after `--`. The wrapper always runs the underlying harness from `apps/stack/`, so existing report paths and relative script calls remain stable.
+
+### 5) Providers
+
+Provider contract/baseline suites in `packages/tests` (real provider CLIs).
+
+**Root commands:**
+```bash
+yarn test:providers
+yarn test:providers:all:smoke
+yarn test:providers:claude:extended
+yarn test:providers:codex:smoke
+yarn test:providers:opencode:extended
+```
+
+### 6) Stress
+
+Repeat/chaos reliability suites in `packages/tests`.
+
+**Root command:**
+```bash
+yarn test:stress
+```
+
+### 7) Test governance
+
+Repo-level governance checks for test file naming/lane placement and feature-tag validity.
+
+**Root commands:**
+```bash
+yarn test:import-cycles
+yarn test:wiring:self
+yarn test:wiring
+yarn test:policy:self
+yarn test:policy
+yarn test:inventory
+yarn test:migration:inventory
+```
+
+Notes:
+- `test:import-cycles` runs the CLI runtime import-cycle guard directly; `yarn workspace @happier-dev/cli test:unit` also runs it, so the root unit lane and CI CLI unit job enforce the guard.
+- `test:wiring:self` and `test:policy:self` are fast governance self-tests for the validators themselves.
+- `test:wiring` fails on invalid feature tags, obvious lane naming mistakes, and root-script/workflow/docs parity drift.
+- `test:policy` enforces only the low-noise rules that are safe today; noisier rules stay report-only until the repo cleanup catches up.
+- `test:inventory` and `test:migration:inventory` are report-only. They print lane/package-local coverage and write governance inventory artifacts under `.project/testing/reports/governance/`.
+- The current rollout is:
+  - `enforce`: `.only`, forbidden runtime imports from `@happier-dev/tests` internals, root-script/workflow/docs parity
+  - `report-only`: direct test `console.*`, direct `.skip/.todo`, hidden skip aliases, deprecated helper imports, duplicate-pattern inventory
+
+### 7b) Package-local-only lanes
+
+These lanes are intentionally not exposed as canonical root scripts:
+- CLI slow lane: `yarn test:cli:slow`
+- Website tests: package-local only under `apps/website`
+- Release runtime tests: `yarn --cwd packages/release-runtime test`
+- Stack unit/integration/native real-integration lanes: `yarn --cwd apps/stack test:unit`, `yarn --cwd apps/stack test:integration`, and the guarded real-integration files in `apps/stack`
+
+### 8) Typecheck
+
+TypeScript typechecking for the main runtime packages (UI/CLI/server).
+
+**Root command:**
+```bash
+yarn typecheck
+```
+
+### TypeScript compiler ownership
+
+Happier uses the native TypeScript 7 compiler for first-party typecheck and package-build lanes. The `typescript` package remains on the API-compatible 5.9 line for AST-based tools and integrations that do not yet support TypeScript 7's native API.
+
+Compiler selection is centralized in `scripts/workspaces/typescriptCommand.mjs`. Package scripts use the shared workspace runners rather than a bare `tsc` executable, so dependency hoisting or package-manager bin-link order cannot silently select the API package's older compiler.
+
+For convenience, `yarn tsc ...` is defined at the repository root and in every TypeScript-owning workspace. It delegates to the same native runner and therefore uses TypeScript 7; direct `tsc`, `npx tsc`, and `typescript/bin/tsc` invocations remain unsupported.
+
+### 9) Release contracts
+
+Security/release-pipeline contract checks for workflow/install/signing invariants.
+
+**Root command:**
+```bash
+yarn test:release:contracts
+```
+
+This runs:
+- `scripts/release/*.test.mjs`
+- including installer sync/security/publication invariants
+- and workflow policy guards like the production Tauri signing/notarization fail gate
+
+### 10) Extended DB matrix (Postgres/MySQL)
+
+Optional validation that core E2E and DB contract tests behave on non-embedded engines.
+In CI this runs via a dedicated workflow using service containers.
+
+**Local commands:**
+```bash
+yarn test:e2e:core:docker
+yarn test:db-contract:docker
+```
+
+## Package-level lane scripts
+
+### UI (`apps/ui`, workspace `@happier-dev/app`)
+- Unit: `yarn --cwd apps/ui test:unit`
+- Integration: `yarn --cwd apps/ui test:integration`
+
+### CLI (`apps/cli`)
+- Unit: `yarn --cwd apps/cli test:unit`
+- Integration: `yarn --cwd apps/cli test:integration`
+- Slow-only lane: `yarn test:cli:slow`
+
+### Server (`apps/server`)
+- Unit: `yarn --cwd apps/server test:unit`
+- Integration: `yarn --cwd apps/server test:integration`
+- DB contract: `yarn --cwd apps/server test:db-contract`
+
+### Stack (`apps/stack`)
+- Unit: `yarn --cwd apps/stack test:unit`
+- Integration: `yarn --cwd apps/stack test:integration`
+
+### E2E workspace (`packages/tests`, workspace `@happier-dev/tests`)
+- Core (full): `yarn workspace @happier-dev/tests test`
+- Core fast: `yarn workspace @happier-dev/tests test:core:fast`
+- Core slow: `yarn workspace @happier-dev/tests test:core:slow`
+- UI WSREPL Lima matrix (macOS/Linux host): `yarn workspace @happier-dev/tests test:ui:e2e:wsrepl:lima -- happier-wsrepl-qa`
+- Providers: `yarn workspace @happier-dev/tests test:providers`
+- Stress: `yarn workspace @happier-dev/tests test:stress`
+
+## Env-gated integration suites
+
+Some integration suites intentionally require explicit environment flags:
+- CLI daemon reattach/pid safety: `HAPPIER_CLI_DAEMON_REATTACH_INTEGRATION=1`
+- CLI tmux integration paths in CI: `HAPPIER_CLI_TMUX_INTEGRATION=1`
+
+CI sets these for relevant jobs. Local runs can set them manually when you need those suites.
+
+## Prerequisites matrix
+
+### Unit (`yarn test`)
+- Requires: Node + Yarn only.
+- Should not require tmux, Docker, provider CLIs, or API keys.
+
+### Integration (`yarn test:integration`)
+- UI integration:
+  - Requires: Node + Yarn.
+- CLI integration:
+  - Requires: Node + Yarn.
+  - Optional gated suites:
+    - `HAPPIER_CLI_TMUX_INTEGRATION=1` and `tmux` installed for `*.real.integration.test.ts` tmux coverage.
+    - `HAPPIER_CLI_DAEMON_REATTACH_INTEGRATION=1` for real PID/reattach process inspection suites.
+- Server integration:
+  - Requires: Node + Yarn.
+  - Does not require Docker for regular integration lane.
+- Stack integration:
+  - Requires: Node + Yarn + `git` available in PATH.
+  - Spawns real child processes and validates process ownership/sweep behavior.
+
+### DB contract (`yarn --cwd apps/server test:db-contract`)
+- Requires: DB provider runtime (`postgres`/`mysql`) and matching connection env.
+- Docker-backed helper commands:
+  - `yarn test:db-contract:docker`
+
+### Core E2E (`yarn test:e2e`, `yarn test:e2e:core:embedded`)
+- Requires: Node + Yarn.
+- Uses real server/socket/runtime contracts via `packages/tests`.
+- Does not require provider API keys.
+- Recommended local loop:
+  - `yarn test:e2e:core:fast` during iteration.
+  - `yarn test:e2e:core:slow` before handoff for orchestration-heavy changes.
+  - `yarn test:e2e` for the full core gate.
+
+### Provider suites (`yarn test:providers`, `yarn test:providers:*`)
+- `yarn test:providers` by itself runs provider-suite checks with provider execution disabled by default (`HAPPIER_E2E_PROVIDERS` unset), so it does not require provider CLIs or API keys.
+- `yarn test:providers:all:smoke` / `yarn test:providers:claude:extended` (and similar wrappers) enable real provider execution and then require provider CLIs/binaries for selected providers.
+- Direct workspace command (advanced): `yarn workspace @happier-dev/tests providers:run <preset> <lane>`.
+- Auth mode is provider-spec driven:
+  - `host` mode: uses existing local provider CLI login/session (can run without API keys).
+  - `env` mode: requires provider keys/secrets declared by provider spec.
+- Practical guidance:
+  - `smoke`: minimal scenario tier, but still real provider execution when run via `test:providers:*` wrappers or `providers:run`.
+  - `extended`: broader scenario tier with more scenarios; in CI this typically runs with env-key/secrets overlays.
+
+#### Real Claude Agent Teams probe (opt-in)
+
+Happier includes a small opt-in probe that runs your locally installed `claude` CLI to discover the exact Agent Teams tool names and capture representative payload shapes:
+
+- Test file: `packages/tests/suites/providers/claude.agentTeams.toolNames.realProbe.test.ts`
+
+Run it locally (requires Claude Code installed and already authenticated on the host):
+
+```bash
+HAPPIER_TEST_REAL_CLAUDE=1 yarn -s workspace @happier-dev/tests test:providers claude.agentTeams.toolNames.realProbe.test.ts
+```
+
+Extended signal (spawns teammates and sends messages; may take longer):
+
+```bash
+HAPPIER_TEST_REAL_CLAUDE=1 HAPPIER_TEST_REAL_CLAUDE_FULL=1 yarn -s workspace @happier-dev/tests test:providers claude.agentTeams.toolNames.realProbe.test.ts
+```
+
+### Stress (`yarn test:stress`)
+- Requires: Node + Yarn.
+- Longer-running reliability loops; keep out of PR default local loop.
+
+## Artifacts
+
+Core E2E / Providers / Stress write per-test logs under:
+- `.project/logs/e2e/...`
+
+CI uploads this directory as an artifact on failure.
+
+## GitHub Actions (what runs where)
+
+### Default PR/push gate
+
+Workflow: `CI — Tests` (`.github/workflows/tests.yml`)
+
+Default gate includes:
+- Unit (shared workspace packages + app/unit lanes)
+- Integration (UI/CLI/Server/Stack app lanes)
+- Governance validators (`test:wiring`, `test:policy`, plus report-only inventory commands)
+- Typecheck
+- Release contracts (release/workflow/install/signing guards)
+- Daemon integration E2E (`CLI + Server (light/sqlite) E2E`)
+- Core E2E fast (sqlite)
+
+The daemon integration E2E job is intentionally separate from app unit/integration lanes because it verifies cross-package boot/auth/daemon behavior against a real light server process.
+
+### On-demand provider contracts
+
+Workflow: `CI — Provider Contracts` (`.github/workflows/providers-contracts.yml`)
+
+**Required secrets:**
+- `OPENAI_API_KEY` (required for `codex` and `opencode`)
+- `ANTHROPIC_API_KEY` (required for `claude`)
+- `CODEX_API_KEY` (optional alternative to `OPENAI_API_KEY` for Codex)
+
+### Nightly stress
+
+Workflow: `CI — Stress Tests` (`.github/workflows/stress-tests.yml`)
+
+### Nightly extended DB matrix
+
+Workflow: `CI — Extended DB Matrix` (`.github/workflows/extended-db-tests.yml`)
+
+## Contributor guidance
+
+1. Default local loop: run the smallest unit target first.
+2. If your test needs real process/filesystem/network orchestration, name it as integration and keep it out of unit lane.
+3. Before handoff, run the relevant app/unit and app/integration lanes for touched areas.
+4. For protocol/runtime/socket/database contract changes, also run core E2E.

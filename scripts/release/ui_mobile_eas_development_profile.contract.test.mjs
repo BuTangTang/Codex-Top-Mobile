@@ -1,0 +1,188 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+
+function collectExpectedUiInstallScopeWorkspaces() {
+  const uiPackage = JSON.parse(fs.readFileSync(path.join(repoRoot, 'apps', 'ui', 'package.json'), 'utf8'));
+  const internalDeps = Object.keys(uiPackage?.dependencies ?? {})
+    .filter((name) => name.startsWith('@happier-dev/'))
+    .map((name) => name.split('/')[1])
+    .filter(Boolean);
+
+  const requiresBuildInput = internalDeps.filter((workspace) => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'packages', workspace, 'package.json'), 'utf8'));
+    const candidates = [];
+    for (const key of ['main', 'module', 'types']) {
+      if (typeof pkg?.[key] === 'string') candidates.push(pkg[key]);
+    }
+    const visit = (value) => {
+      if (!value) return;
+      if (typeof value === 'string') {
+        candidates.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach(visit);
+        return;
+      }
+      if (typeof value === 'object') {
+        Object.values(value).forEach(visit);
+      }
+    };
+    visit(pkg?.exports);
+
+    const hasDistExports = candidates.some((candidate) => /^\.?\/?dist\//.test(String(candidate)));
+    const hasExpoNativeModuleConfig = fs.existsSync(
+      path.join(repoRoot, 'packages', workspace, 'expo-module.config.json'),
+    );
+    return hasDistExports || hasExpoNativeModuleConfig;
+  });
+
+  return new Set(['ui', ...requiresBuildInput]);
+}
+
+function resolveCanonicalUiInstallScope() {
+    return [...collectExpectedUiInstallScopeWorkspaces()].sort().join(',');
+}
+
+test('apps/ui/eas.json defines internaldev profiles for OTA-native debug dev-client validation', () => {
+  const easPath = path.join(repoRoot, 'apps', 'ui', 'eas.json');
+  const raw = fs.readFileSync(easPath, 'utf8');
+  const eas = JSON.parse(raw);
+
+  const build = eas?.build ?? null;
+  assert.equal(typeof build, 'object');
+
+  const baseInstallScope = String(build?.base?.env?.HAPPIER_INSTALL_SCOPE ?? '');
+  const installScopeTokens = new Set(
+    baseInstallScope
+      .split(',')
+      .map((token) => token.trim())
+      .filter(Boolean),
+  );
+  assert.deepEqual(
+    [...installScopeTokens].sort(),
+    [...collectExpectedUiInstallScopeWorkspaces()].sort(),
+    'apps/ui/eas.json should define the canonical UI install scope token set',
+  );
+  for (const workspace of collectExpectedUiInstallScopeWorkspaces()) {
+    assert.equal(
+      installScopeTokens.has(workspace),
+      true,
+      `base HAPPIER_INSTALL_SCOPE should include ${workspace} because apps/ui depends on it via dist-based workspace exports`,
+    );
+  }
+  assert.equal(
+    build?.base?.env?.YARN_PRODUCTION,
+    'false',
+    'EAS builds should install devDependencies so workspace postinstall dist builds can resolve TypeScript',
+  );
+  assert.equal(
+    build?.base?.env?.npm_config_production,
+    'false',
+    'EAS builds should install devDependencies so workspace postinstall dist builds can resolve TypeScript',
+  );
+  assert.equal(
+    build?.base?.env?.EXPO_UNSTABLE_WEB_MODAL,
+    '1',
+    'EAS native and OTA builds should keep Expo Router web modal support enabled when bundling UI code',
+  );
+
+  const internaldev = build?.internaldev ?? null;
+  assert.equal(typeof internaldev, 'object');
+  assert.equal(internaldev.extends, 'base');
+  assert.equal(internaldev.environment, 'development');
+  assert.equal(internaldev.developmentClient, true);
+  assert.equal(internaldev.distribution, 'internal');
+  assert.equal(internaldev.channel, 'internaldev');
+  assert.equal(internaldev?.env?.APP_ENV, 'internaldev');
+  assert.equal(internaldev?.env?.EXPO_UPDATES_CHANNEL, 'internaldev');
+  assert.equal(internaldev?.env?.EXPO_APP_NAME, 'Happier (internal dev)');
+  assert.equal(internaldev?.env?.EXPO_APP_BUNDLE_ID, 'dev.happier.app.dev.internal');
+  assert.equal(internaldev?.env?.EXPO_ANDROID_PACKAGE, 'dev.happier.app.internaldev');
+  assert.equal(internaldev?.env?.EXPO_APP_SCHEME, undefined);
+  assert.equal(internaldev?.env?.HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE, 'most-recent');
+  assert.equal(internaldev?.env?.HAPPIER_EXPO_DEVCLIENT_SILENT_LAUNCH, 'true');
+  assert.equal(internaldev?.env?.HAPPIER_EXPO_USE_NATIVE_DEBUG, 'true');
+  assert.equal(internaldev?.env?.EX_UPDATES_NATIVE_DEBUG, '1');
+
+  const internaldevDevClient = build?.['internaldev-dev-client'] ?? null;
+  assert.ok(internaldevDevClient, 'expected internaldev-dev-client build profile');
+  assert.equal(internaldevDevClient.extends, 'internaldev');
+  assert.equal(internaldevDevClient?.env?.EXPO_APP_BUNDLE_ID, 'dev.happier.app.dev.internal.devclient');
+  assert.equal(internaldevDevClient?.env?.EXPO_ANDROID_PACKAGE, 'dev.happier.app.internaldev.devclient');
+
+  const internaldevStore = build?.['internaldev-store'] ?? null;
+  assert.equal(typeof internaldevStore, 'object');
+  assert.equal(internaldevStore.extends, 'base');
+  assert.equal(internaldevStore.environment, 'development');
+  assert.equal(internaldevStore.developmentClient, true);
+  assert.equal(internaldevStore.distribution, 'store');
+  assert.equal(internaldevStore.channel, 'internaldev');
+  assert.equal(internaldevStore?.env?.APP_ENV, 'internaldev');
+  assert.equal(internaldevStore?.env?.EXPO_UPDATES_CHANNEL, 'internaldev');
+  assert.equal(internaldevStore?.env?.EXPO_APP_NAME, 'Happier (internal dev)');
+  assert.equal(internaldevStore?.env?.EXPO_APP_BUNDLE_ID, 'dev.happier.app.dev.internal');
+  assert.equal(internaldevStore?.env?.EXPO_ANDROID_PACKAGE, 'dev.happier.app.internaldev');
+  assert.equal(internaldevStore?.env?.EXPO_APP_SCHEME, undefined);
+});
+
+test('apps/ui direct release scripts enable Expo Router web modal support for EAS builds', () => {
+  for (const relPath of ['apps/ui/release-dev.sh', 'apps/ui/release-production.sh']) {
+    const raw = fs.readFileSync(path.join(repoRoot, relPath), 'utf8');
+    assert.match(
+      raw,
+      /^export EXPO_UNSTABLE_WEB_MODAL=1$/m,
+      `${relPath} should export Expo Router web modal support before invoking EAS`,
+    );
+  }
+});
+
+test('UI mobile release workflows enable Expo Router web modal support', () => {
+  for (const workflowName of ['build-ui-mobile-local.yml', 'publish-ui-mobile-dev.yml', 'promote-ui.yml']) {
+    const raw = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', workflowName), 'utf8');
+    assert.match(
+      raw,
+      /EXPO_UNSTABLE_WEB_MODAL:\s*"1"/,
+      `${workflowName} should set Expo Router web modal support for UI build paths`,
+    );
+  }
+});
+
+test('UI GitHub workflows keep their install scope aligned with apps/ui eas.json', () => {
+  const expectedScope = String(
+    JSON.parse(fs.readFileSync(path.join(repoRoot, 'apps', 'ui', 'eas.json'), 'utf8'))?.build?.base?.env?.HAPPIER_INSTALL_SCOPE ?? '',
+  );
+  const workflowPaths = [
+    path.join(repoRoot, '.github', 'workflows', 'build-ui-mobile-local.yml'),
+    path.join(repoRoot, '.github', 'workflows', 'publish-ui-mobile-dev.yml'),
+    path.join(repoRoot, '.github', 'workflows', 'promote-ui.yml'),
+    path.join(repoRoot, '.github', 'workflows', 'build-tauri.yml'),
+  ];
+
+  for (const workflowPath of workflowPaths) {
+    const raw = fs.readFileSync(workflowPath, 'utf8');
+    let currentStep = '';
+    let scopeCount = 0;
+    for (const line of raw.split('\n')) {
+      const stepName = line.match(/^\s*- name:\s*(.+)\s*$/)?.[1];
+      if (stepName) currentStep = stepName;
+      const scope = line.match(/HAPPIER_INSTALL_SCOPE:\s*"([^"]+)"/)?.[1];
+      if (!scope) continue;
+      scopeCount += 1;
+      if (currentStep === 'Install trusted OTA publisher dependencies') {
+        assert.equal(scope, 'ui,protocol,release-runtime', 'the trusted OTA publisher should install only its trusted control dependencies');
+        continue;
+      }
+      assert.equal(
+        scope,
+        expectedScope,
+        `${path.basename(workflowPath)} should use the canonical UI install scope from apps/ui/eas.json`,
+      );
+    }
+    assert.ok(scopeCount > 0, `${path.basename(workflowPath)} should define HAPPIER_INSTALL_SCOPE`);
+  }
+});

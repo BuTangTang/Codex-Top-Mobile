@@ -1,0 +1,239 @@
+import * as React from 'react';
+import { View, Pressable } from 'react-native';
+import { StyleSheet } from 'react-native-unistyles';
+import { useRouter } from 'expo-router';
+import { ToolStatusIndicator } from '@/components/tools/shell/presentation/ToolStatusIndicator';
+
+import type { Message, ToolCall } from '@/sync/domains/messages/messageTypes';
+import type { Metadata } from '@/sync/domains/state/storageTypes';
+import { t } from '@/text';
+import type { TranscriptInteraction } from '@/utils/sessions/deriveTranscriptInteraction';
+import { Text } from '@/components/ui/text/Text';
+import { collectSubAgentSummaryTools } from './collectSubAgentSummaryTools';
+import { buildToolCallMessageRouteId } from '@/sync/domains/messages/messageRouteIds';
+import { navigateWithBlurOnWeb } from '@/utils/platform/navigateWithBlurOnWeb';
+
+type TaskOperation = 'run' | 'create' | 'list' | 'update' | 'unknown';
+
+function inferOperation(input: any): TaskOperation {
+    const op = typeof input?.operation === 'string' ? input.operation : null;
+    if (op === 'run' || op === 'create' || op === 'list' || op === 'update') return op;
+    if (typeof input?.subject === 'string') return 'create';
+    if (typeof input?.taskId === 'string' || typeof input?.taskId === 'number') return 'update';
+    if (typeof input?.prompt === 'string' || typeof input?.description === 'string') return 'run';
+    return 'unknown';
+}
+
+function formatTaskLikeSummary(tool: ToolCall): string | null {
+    const input = tool.input as any;
+    const op = inferOperation(input);
+    if (op === 'create') {
+        const subject = typeof input?.subject === 'string' ? input.subject : null;
+        return subject
+            ? t('tools.taskLikeSummary.createTaskWithSubject', { subject })
+            : t('tools.taskLikeSummary.createTask');
+    }
+    if (op === 'list') return t('tools.taskLikeSummary.listTasks');
+    if (op === 'update') {
+        const id = typeof input?.taskId === 'string' || typeof input?.taskId === 'number' ? String(input.taskId) : null;
+        const status = typeof input?.status === 'string' ? input.status : null;
+        if (id && status) return t('tools.taskLikeSummary.updateTaskWithIdStatus', { id, status });
+        if (id) return t('tools.taskLikeSummary.updateTaskWithId', { id });
+        return t('tools.taskLikeSummary.updateTask');
+    }
+    if (op === 'run') {
+        const desc = typeof input?.description === 'string' ? input.description : null;
+        const prompt = typeof input?.prompt === 'string' ? input.prompt : null;
+        return desc ?? prompt ?? null;
+    }
+    return null;
+}
+
+function coerceTaskResultText(result: unknown): string | null {
+    if (typeof result === 'string') return result;
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+
+    const record = result as Record<string, unknown>;
+    const content = record.content;
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return null;
+
+    const chunks: string[] = [];
+    for (const item of content) {
+        if (!item || typeof item !== 'object') continue;
+        if ((item as any).type !== 'text') continue;
+        const text = (item as any).text;
+        if (typeof text === 'string' && text.trim().length > 0) {
+            chunks.push(text);
+        }
+    }
+    const joined = chunks.join('\n').trim();
+    return joined.length > 0 ? joined : null;
+}
+
+const stylesheet = StyleSheet.create((theme) => ({
+    container: {
+        paddingVertical: 4,
+    },
+    summaryItem: {
+        paddingVertical: 6,
+        paddingHorizontal: 4,
+    },
+    summaryText: {
+        fontSize: 14,
+        color: theme.colors.text.secondary,
+        lineHeight: 18,
+    },
+    toolItem: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 4,
+        paddingLeft: 4,
+        paddingRight: 2,
+    },
+    toolTitle: {
+        fontSize: 14,
+        fontWeight: '500',
+        color: theme.colors.text.secondary,
+        fontFamily: 'monospace',
+        flex: 1,
+    },
+    statusContainer: {
+        marginLeft: 'auto',
+        paddingLeft: 8,
+    },
+    moreToolsItem: {
+        paddingVertical: 4,
+        paddingHorizontal: 4,
+    },
+    moreToolsText: {
+        fontSize: 14,
+        color: theme.colors.text.secondary,
+        fontStyle: 'italic',
+        opacity: 0.7,
+    },
+}));
+
+export const SubAgentSummarySection = React.memo<{
+    tool: ToolCall;
+    metadata: Metadata | null;
+    messages: readonly Message[];
+    detailLevel?: 'title' | 'summary' | 'full';
+    sessionId?: string;
+    messageId?: string;
+    interaction?: TranscriptInteraction;
+    opts?: Readonly<{
+        hideResultInlineWhenBackgroundRun?: boolean;
+    }>;
+}>(function SubAgentSummarySection({ tool, metadata, messages, detailLevel = 'summary', sessionId, messageId, interaction, opts }) {
+    const styles = stylesheet;
+    const router = useRouter();
+
+    const filtered = React.useMemo(
+        () => (detailLevel === 'title' ? [] : collectSubAgentSummaryTools({ tool, messages, metadata })),
+        [detailLevel, tool, messages, metadata],
+    );
+    const routeMessageId = React.useMemo(() => {
+        return buildToolCallMessageRouteId({
+            toolId: typeof tool.id === 'string' ? tool.id : null,
+            fallbackMessageId: messageId,
+        });
+    }, [messageId, tool.id]);
+
+    const canOpenDetails = Boolean(sessionId && routeMessageId)
+        && detailLevel !== 'full'
+        && interaction?.disableToolNavigation !== true;
+    const handleOpenDetails = React.useCallback(() => {
+        if (!sessionId || !routeMessageId || interaction?.disableToolNavigation === true) return;
+        navigateWithBlurOnWeb(() => {
+            router.push(`/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(routeMessageId)}`);
+        });
+    }, [interaction?.disableToolNavigation, routeMessageId, router, sessionId]);
+
+    if (detailLevel === 'title') return null;
+
+    const isFullView = detailLevel === 'full';
+    const inferredOperation = inferOperation(tool.input);
+    const isBackgroundRun =
+        inferredOperation === 'run' &&
+        ((tool.input as any)?.run_in_background === true || typeof (tool.input as any)?.subagent_type === 'string');
+    const shouldShowResultInline = isFullView || !(opts?.hideResultInlineWhenBackgroundRun ?? true) || !isBackgroundRun;
+    const taskResultContent = shouldShowResultInline ? coerceTaskResultText(tool.result) : null;
+
+    const summary = formatTaskLikeSummary(tool);
+    const visibleTools = isFullView ? filtered : filtered.slice(Math.max(0, filtered.length - 3));
+    const remainingCount = Math.max(0, filtered.length - visibleTools.length);
+    const textMessages = messages.filter((m) => m.kind === 'user-text' || m.kind === 'agent-text');
+    const threadTextMessages = isFullView ? textMessages : [];
+
+    const hasAnyContent = Boolean(summary) || Boolean(taskResultContent) || filtered.length > 0 || threadTextMessages.length > 0;
+    if (!hasAnyContent) return null;
+
+    return (
+        <View style={styles.container}>
+            {summary ? (
+                <View style={styles.summaryItem}>
+                    <Text style={styles.summaryText} numberOfLines={isFullView ? undefined : 3}>
+                        {summary}
+                    </Text>
+                </View>
+            ) : null}
+            {taskResultContent ? (
+                <View style={styles.summaryItem}>
+                    <Text style={styles.summaryText} numberOfLines={isFullView ? undefined : 3}>
+                        {taskResultContent}
+                    </Text>
+                </View>
+            ) : null}
+            {remainingCount > 0 ? (
+                canOpenDetails ? (
+                    <Pressable
+                        testID="task-like-summary-more-tools"
+                        accessibilityRole="button"
+                        onPress={handleOpenDetails}
+                        style={({ pressed }) => [styles.moreToolsItem, pressed && { opacity: 0.8 }]}
+                    >
+                        <Text style={styles.moreToolsText}>
+                            {t('tools.taskView.moreTools', { count: remainingCount })}
+                        </Text>
+                    </Pressable>
+                ) : (
+                    <View testID="task-like-summary-more-tools" style={styles.moreToolsItem}>
+                        <Text style={styles.moreToolsText}>
+                            {t('tools.taskView.moreTools', { count: remainingCount })}
+                        </Text>
+                    </View>
+                )
+            ) : null}
+            {visibleTools.map((item, index) => (
+                <View key={`${item.tool.name}-${index}`} testID="task-like-summary-tool-item" style={styles.toolItem}>
+                    <Text style={styles.toolTitle}>{item.title}</Text>
+                    <View style={styles.statusContainer}>
+                        {/*
+                          * A summary row shows the status of a TOOL CALL, so it takes the same mark
+                          * every other tool row in the transcript takes. The three-arm switch this
+                          * replaces read `ToolCall.state` alone and was wrong twice over: a tool
+                          * that completed with an error result showed a green check, and a tool
+                          * held at an open permission prompt showed a spinner claiming progress.
+                          * `resolveToolStatusIndicatorKind` already owns both facts.
+                          */}
+                        <ToolStatusIndicator tool={item.tool} />
+                    </View>
+                </View>
+            ))}
+            {threadTextMessages.length > 0 && (
+                <View style={styles.summaryItem}>
+                    {threadTextMessages.map((m, idx) => (
+                        <Text
+                            key={`thread-text-${idx}`}
+                            style={styles.summaryText}
+                            numberOfLines={isFullView ? undefined : 3}
+                        >
+                            {m.text}
+                        </Text>
+                    ))}
+                </View>
+            )}
+        </View>
+    );
+});

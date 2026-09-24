@@ -1,0 +1,589 @@
+/**
+ * Shared protocol vectors for same-Session cross-Agent continuation.
+ *
+ * This file is BYTE-IDENTICAL in both trees and imports nothing, so "the two
+ * trees agree on the wire" is provable by diffing it and by each tree parsing
+ * the same data through its own local schemas.
+ *
+ * successor: packages/protocol/src/sessions/agentTransitionVectors.ts
+ * predecessor: packages/protocol/src/sessionAgentTransitionVectors.ts
+ *
+ * `valid` entries MUST parse; `invalid` entries MUST be rejected. Do not edit a
+ * vector to make an implementation pass — a vector change is a wire change.
+ */
+export const SESSION_AGENT_TRANSITION_VECTORS = {
+  schema: 'happier.sessionAgentTransition.v1',
+
+  selection: {
+    valid: {
+      minimal: { v: 1, agentId: 'claude' },
+      withModel: { v: 1, agentId: 'codex', modelId: 'gpt-5' },
+      withProviderConnection: {
+        v: 1,
+        agentId: 'codex',
+        modelId: 'gpt-5',
+        providerConnectionId: 'conn_01',
+      },
+      nullableClears: {
+        v: 1,
+        agentId: 'claude',
+        providerConnectionId: null,
+        acpSessionModeId: null,
+      },
+      withModeAndOverrides: {
+        v: 1,
+        agentId: 'gemini',
+        modelId: 'gemini-3-pro',
+        acpSessionModeId: 'default',
+        sessionConfigOptionOverrides: {
+          v: 1,
+          updatedAt: 1_760_000_000_000,
+          overrides: {
+            reasoning_effort: { updatedAt: 1_760_000_000_000, value: 'high' },
+          },
+        },
+      },
+    },
+    invalid: {
+      /** `providerConnectionId` requires an explicit `modelId`. */
+      providerConnectionWithoutModel: { v: 1, agentId: 'codex', providerConnectionId: 'conn_01' },
+      /** The selection object is closed. */
+      unknownKey: { v: 1, agentId: 'claude', backendTarget: { kind: 'builtInAgent' } },
+      blankAgentId: { v: 1, agentId: '   ' },
+      missingVersion: { agentId: 'claude' },
+      wrongVersion: { v: 2, agentId: 'claude' },
+    },
+  },
+
+  request: {
+    valid: {
+      minimal: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: { text: 'keep going', localId: 'local_01', meta: {} },
+      },
+      /** The mutation envelope is closed, but its opaque metadata remains extensible. */
+      withOpaqueMeta: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: {
+          text: 'keep going',
+          localId: 'local_01',
+          meta: { futureComposerMetadata: { v: 2 } },
+        },
+      },
+    },
+    invalid: {
+      /** `localId` is the dedupe, divider-correlation, and compare-clear key. */
+      missingInputLocalId: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: { text: 'keep going', meta: {} },
+      },
+      blankInputLocalId: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: { text: 'keep going', localId: '   ', meta: {} },
+      },
+      /** The transition service alone owns the divider localId namespace. */
+      reservedDividerInputLocalId: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: { text: 'keep going', localId: 'agent-transition:local_01', meta: {} },
+      },
+      /** The outer request is closed: no native path, resume id, or snapshot. */
+      unknownOuterKey: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: { text: 'keep going', localId: 'local_01', meta: {} },
+        vendorResumeId: 'abc',
+      },
+      /** The nested mutation input is closed independently of its outer request. */
+      unknownInputKey: {
+        v: 1,
+        sessionId: 'sess_01',
+        expectedCurrentAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        input: {
+          text: 'keep going',
+          localId: 'local_01',
+          meta: {},
+          unsupportedRoutingHint: true,
+        },
+      },
+      missingExpectedCurrentAgentId: {
+        v: 1,
+        sessionId: 'sess_01',
+        selection: { v: 1, agentId: 'claude' },
+        input: { text: 'keep going', localId: 'local_01', meta: {} },
+      },
+    },
+  },
+
+  result: {
+    valid: {
+      accepted: { type: 'accepted', localId: 'local_01' },
+
+      /** Every `rejected` code is pre-effect, so `sourceEffect` is always `none`. */
+      rejectedUnsupportedOperation: {
+        type: 'rejected', code: 'unsupported_operation', sourceEffect: 'none',
+      },
+      rejectedForbidden: { type: 'rejected', code: 'forbidden', sourceEffect: 'none' },
+      rejectedSameTarget: { type: 'rejected', code: 'same_target', sourceEffect: 'none' },
+      rejectedStaleSelection: { type: 'rejected', code: 'stale_selection', sourceEffect: 'none' },
+      rejectedTargetUnavailable: {
+        type: 'rejected', code: 'target_unavailable', sourceEffect: 'none',
+      },
+      rejectedSourceNotIdle: { type: 'rejected', code: 'source_not_idle', sourceEffect: 'none' },
+      /**
+       * The one stop outcome whose `sourceEffect: 'none'` is truthful: the stop
+       * result PROVED the source is still running.
+       */
+      rejectedSourceStopFailed: {
+        type: 'rejected', code: 'source_stop_failed', sourceEffect: 'none',
+      },
+
+      /** Source confirmed stopped, nothing committed. Session is still the SOURCE Agent. */
+      partialContextUnavailable: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'source_stopped',
+        code: 'context_unavailable',
+      },
+      partialCutoverConflict: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'source_stopped',
+        code: 'cutover_conflict',
+      },
+
+      /** Session IS the target Agent. */
+      partialDividerUnavailable: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'current_view_committed',
+        code: 'divider_unavailable',
+      },
+      partialTargetStartFailed: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'current_view_committed',
+        code: 'target_start_failed',
+      },
+      partialInputAdmissionFailed: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'current_view_committed',
+        code: 'input_admission_failed',
+      },
+      partialInputRejected: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'current_view_committed',
+        code: 'input_rejected',
+      },
+
+      /**
+       * Genuinely indeterminate — an unconfirmed stop, or facts that cannot
+       * establish whether cutover happened. It carries NO code: every state the
+       * daemon can name rides `rejected` or `partially_applied`.
+       */
+      unknownBare: { type: 'outcome_unknown', localId: 'local_01' },
+    },
+    invalid: {
+      /** A code reachable with the source already stopped may never ride `rejected`. */
+      rejectedCarryingPostStopCode: {
+        type: 'rejected', code: 'cutover_conflict', sourceEffect: 'none',
+      },
+      rejectedCarryingInputRejected: {
+        type: 'rejected', code: 'input_rejected', sourceEffect: 'none',
+      },
+      rejectedCarryingUnknownCode: {
+        type: 'rejected', code: 'reconciliation_required', sourceEffect: 'none',
+      },
+      /** `rejected` cannot claim a source effect. */
+      rejectedWithSourceEffect: {
+        type: 'rejected', code: 'forbidden', sourceEffect: 'current_view_committed',
+      },
+      /** `applied` has exactly two depths; nothing else is a known partial state. */
+      partialWithUnknownAppliedDepth: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'divider_appended',
+        code: 'cutover_conflict',
+      },
+      /** A pre-commit code cannot claim a committed view ... */
+      committedCarryingPreCommitCode: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'current_view_committed',
+        code: 'context_unavailable',
+      },
+      /** ... and a post-commit code cannot claim nothing was committed. */
+      sourceStoppedCarryingCommittedCode: {
+        type: 'partially_applied',
+        localId: 'local_01',
+        applied: 'source_stopped',
+        code: 'target_start_failed',
+      },
+      /** A partial outcome always identifies the input it was carrying. */
+      partialWithoutLocalId: {
+        type: 'partially_applied', applied: 'current_view_committed', code: 'divider_unavailable',
+      },
+      /** `outcome_unknown` carries no code at all — it cannot name a cause. */
+      unknownCarryingRejectedCode: {
+        type: 'outcome_unknown', localId: 'local_01', code: 'forbidden',
+      },
+      unknownCarryingStopCode: {
+        type: 'outcome_unknown', localId: 'local_01', code: 'source_stop_failed',
+      },
+      unknownCarryingPartialCode: {
+        type: 'outcome_unknown', localId: 'local_01', code: 'cutover_conflict',
+      },
+      unknownArm: { type: 'pending', localId: 'local_01' },
+    },
+  },
+
+  inspection: {
+    request: {
+      valid: {
+        minimal: { v: 1, sourceSessionId: 'sess_01', selection: { v: 1, agentId: 'claude' } },
+      },
+      invalid: {
+        unknownKey: {
+          v: 1,
+          sourceSessionId: 'sess_01',
+          selection: { v: 1, agentId: 'claude' },
+          machineId: 'm1',
+        },
+      },
+    },
+    valid: {
+      /** The successor's full depth. */
+      allSupported: {
+        type: 'available',
+        protocolVersion: 1,
+        sameSessionTransition: true,
+      },
+      /** The predecessor minimum: fresh target. */
+      predecessorMinimum: {
+        type: 'available',
+        protocolVersion: 1,
+        sameSessionTransition: true,
+      },
+      noneSupported: {
+        type: 'available',
+        protocolVersion: 1,
+        sameSessionTransition: false,
+      },
+      unavailableOperation: { type: 'unavailable', reason: 'operation_unavailable' },
+      unavailableSession: { type: 'unavailable', reason: 'unsupported_session' },
+      unavailableTarget: { type: 'unavailable', reason: 'target_unavailable' },
+    },
+    invalid: {
+      /** Every support flag is required: a missing flag must not read as `false`. */
+      missingFlag: {
+        type: 'available',
+        protocolVersion: 1,
+      },
+      unknownFlag: {
+        type: 'available',
+        protocolVersion: 1,
+        sameSessionTransition: true,
+        transcriptExport: true,
+      },
+      unknownReason: { type: 'unavailable', reason: 'machine_offline' },
+      wrongProtocolVersion: {
+        type: 'available',
+        protocolVersion: 2,
+        sameSessionTransition: true,
+      },
+    },
+    /**
+     * METHOD_NOT_AVAILABLE collapses "old daemon" and "unreachable machine".
+     * The client disambiguates with the machine-presence fact it already holds.
+     */
+    unavailablePresentation: [
+      { reason: 'operation_unavailable', machinePresence: 'online', expected: 'update_cli' },
+      { reason: 'operation_unavailable', machinePresence: 'offline', expected: 'machine_offline' },
+      {
+        reason: 'operation_unavailable',
+        machinePresence: 'unknown',
+        expected: 'update_or_reconnect',
+      },
+      { reason: 'unsupported_session', machinePresence: 'online', expected: 'unsupported_session' },
+      {
+        reason: 'unsupported_session',
+        machinePresence: 'offline',
+        expected: 'unsupported_session',
+      },
+      { reason: 'target_unavailable', machinePresence: 'offline', expected: 'target_unavailable' },
+    ],
+  },
+
+  divider: {
+    localIdPrefix: 'agent-transition:',
+    sidecarKey: 'sessionAgentTransitionV1',
+    message: 'Continued with another Agent.',
+    submittedLocalId: 'local_01',
+    expectedLocalId: 'agent-transition:local_01',
+    reservedLocalIds: ['agent-transition:local_01', 'agent-transition:'],
+    unreservedLocalIds: ['local_01', 'agent-transition', 'x-agent-transition:local_01'],
+    payload: {
+      valid: {
+        /**
+         * The transcript cutoff the activation brief was built from is part of
+         * the minimum, not an addition to it. It is the pass's upper bound, and
+         * nothing else survives the cutover to record it: `seedText` is blanked
+         * the moment the target accepts it, so a divider without the cutoff
+         * could never explain its own boundary. A fresh target's boundary had
+         * no LOWER bound, so the minimal shape carries none.
+         */
+        minimal: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: 29_979,
+        },
+        /** Zero is "nothing was carried over" — a recorded fact, not an absence. */
+        emptySourceCutoff: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: 0,
+        },
+        /**
+         * A NATIVE RETURN, bounded at both ends: the handoff was the away-delta
+         * between them, and the lower bound lives nowhere else once the next
+         * departure overwrites the device-local record it came from.
+         */
+        nativeReturnBounds: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: 29_979,
+          returningAgentLastSeenSeqInclusive: 29_130,
+        },
+      },
+      invalid: {
+        unknownKey: { v: 1, fromAgentId: 'codex', toAgentId: 'claude', modelId: 'gpt-5' },
+        missingTo: { v: 1, fromAgentId: 'codex' },
+        blankFrom: { v: 1, fromAgentId: '  ', toAgentId: 'claude' },
+        wrongVersion: { v: 2, fromAgentId: 'codex', toAgentId: 'claude' },
+        /**
+         * The cutoff is REQUIRED. The only writer that ever omitted it is an
+         * unreleased intermediate build of this feature, and a sidecar that
+         * cannot name its own bound is not a divider any reader should trust.
+         */
+        missingSourceCutoff: { v: 1, fromAgentId: 'codex', toAgentId: 'claude' },
+        negativeSourceCutoff: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: -1,
+        },
+        fractionalSourceCutoff: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: 1.5,
+        },
+        /**
+         * The lower bound is optional but not lax: a negative or fractional
+         * value is not a smaller bound, it is a broken one, and a reader that
+         * accepted it would rebuild a delta the boundary never sent.
+         */
+        negativeReturningBound: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: 29_979,
+          returningAgentLastSeenSeqInclusive: -1,
+        },
+        fractionalReturningBound: {
+          v: 1,
+          fromAgentId: 'codex',
+          toAgentId: 'claude',
+          sourceCutoffSeqInclusive: 29_979,
+          returningAgentLastSeenSeqInclusive: 1.5,
+        },
+      },
+    },
+    /**
+     * The divider as it appears on the wire: the EXISTING passthrough
+     * `type:'message'` agent-event arm, never a new `AgentEventSchema` variant.
+     */
+    agentEvent: {
+      type: 'message',
+      message: 'Continued with another Agent.',
+      sessionAgentTransitionV1: {
+        v: 1,
+        fromAgentId: 'codex',
+        toAgentId: 'claude',
+        sourceCutoffSeqInclusive: 29_979,
+      },
+    },
+    /** An ordinary message event must not be read as a divider. */
+    plainMessageAgentEvent: { type: 'message', message: 'Continued with another Agent.' },
+    /** A malformed sidecar is ignored rather than half-trusted. */
+    malformedSidecarAgentEvent: {
+      type: 'message',
+      message: 'Continued with another Agent.',
+      sessionAgentTransitionV1: { v: 1, fromAgentId: 'codex' },
+    },
+    /**
+     * A sidecar with both Agent ids but no cutoff: the shape an unreleased
+     * intermediate build of this feature wrote. It is rejected like any other
+     * malformed sidecar, so the row degrades through the SAME already-designed
+     * path an older reader takes — the whole sidecar is dropped and the stored
+     * prose is rendered. There is no third state for it to land in.
+     */
+    cutoffLessSidecarAgentEvent: {
+      type: 'message',
+      message: 'Continued with another Agent.',
+      sessionAgentTransitionV1: { v: 1, fromAgentId: 'codex', toAgentId: 'claude' },
+    },
+  },
+
+  sourceContext: {
+    valid: {
+      latest: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_01',
+        forkPoint: { type: 'latest' },
+      },
+      exactSeq: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_01',
+        forkPoint: { type: 'seq', upToSeqInclusive: 42 },
+      },
+    },
+    invalid: {
+      /** The cutoff is `SessionForkPoint`. There is no `throughSeqInclusive`. */
+      inventedCutoffField: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_01',
+        forkPoint: { type: 'seq', throughSeqInclusive: 42 },
+      },
+      unknownKind: {
+        v: 1,
+        kind: 'session_transcript',
+        sourceSessionId: 'sess_01',
+        forkPoint: { type: 'latest' },
+      },
+      unknownKey: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_01',
+        forkPoint: { type: 'latest' },
+        agentId: 'claude',
+      },
+      missingForkPoint: { v: 1, kind: 'session_replay', sourceSessionId: 'sess_01' },
+    },
+  },
+
+  fork: {
+    /** `native` is the generic "no Replay fallback" intent. */
+    strategies: ['auto', 'native', 'provider_native', 'acp_fork_latest', 'replay'],
+    valid: {
+      nativeIntent: {
+        v: 1,
+        parentSessionId: 'sess_01',
+        forkPoint: { type: 'latest' },
+        strategy: 'native',
+      },
+      /** The predecessor already ships `requestId`; the successor must accept it. */
+      withRequestId: {
+        v: 1,
+        parentSessionId: 'sess_01',
+        forkPoint: { type: 'seq', upToSeqInclusive: 7 },
+        strategy: 'replay',
+        requestId: 'req_01',
+      },
+    },
+    invalid: {
+      unknownStrategy: {
+        v: 1,
+        parentSessionId: 'sess_01',
+        forkPoint: { type: 'latest' },
+        strategy: 'native_only',
+      },
+      blankRequestId: {
+        v: 1,
+        parentSessionId: 'sess_01',
+        forkPoint: { type: 'latest' },
+        requestId: '   ',
+      },
+    },
+    result: {
+      valid: {
+        success: { ok: true, childSessionId: 'child_01' },
+        failure: { ok: false, errorCode: 'invalid_request', errorMessage: 'Invalid params' },
+      },
+      invalid: {
+        successUnknownKey: {
+          ok: true,
+          childSessionId: 'child_01',
+          providerForkReceipt: 'unsupported',
+        },
+        failureUnknownKey: {
+          ok: false,
+          errorCode: 'invalid_request',
+          errorMessage: 'Invalid params',
+          retryAfterMs: 1_000,
+        },
+      },
+    },
+  },
+
+  composerIntent: {
+    valid: {
+      minimal: {
+        v: 1,
+        mode: 'same_session',
+        sourceAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+      },
+    },
+    invalid: {
+      /** No acknowledgment flag, timer, TTL, operation id, or progress phase. */
+      acknowledgedFlag: {
+        v: 1,
+        mode: 'same_session',
+        sourceAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        acknowledged: true,
+      },
+      unknownMode: {
+        v: 1,
+        mode: 'new_session',
+        sourceAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+      },
+      /** Review reasons are derived at read time, never persisted on the intent. */
+      persistedReviewReason: {
+        v: 1,
+        mode: 'same_session',
+        sourceAgentId: 'codex',
+        selection: { v: 1, agentId: 'claude' },
+        reviewReason: 'restored_draft',
+      },
+    },
+  },
+
+} as const;

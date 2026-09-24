@@ -1,0 +1,7 @@
+---
+alwaysApply: true
+---
+
+# Repository Guidance
+
+Use `AGENTS.md` as the canonical instruction source for this repository.

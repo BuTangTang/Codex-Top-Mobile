@@ -1,0 +1,134 @@
+---
+title: Onboarding
+description: Pick hosted vs self-hosted, choose your Relay, then use the app to get your machines ready.
+---
+
+Happier always follows the same high-level flow:
+
+1. **Choose a Relay** (Happier Cloud is recommended to start; self-hosting is optional).
+2. **Sign in / create an account** on that Relay.
+3. **Use the desktop app or web client as your control panel.** Both can start
+   and drive sessions; desktop can also install and manage the local background
+   service.
+4. **Get a machine ready**:
+   - **This computer**: configure the local background service from the app.
+   - **Remote machine**: bootstrap it over SSH from the app.
+5. **Optionally enable private access** (for example Tailscale) for self-hosted/local Relay access from other devices.
+
+## Choose your setup
+
+### Option A — Hosted (recommended to start)
+You use Happier Cloud as your Relay.
+
+1. Open the desktop app (recommended for local setup) or web app.
+2. Choose **Happier Cloud** when the app asks you which Relay to use. It is a
+   deliberate choice, not a migration of an account from another Relay.
+3. Sign in.
+4. In the desktop app, open `/setup` and choose **Set up this computer**.
+   - This configures the local background service against the Relay you just selected.
+   - If the app detects Relay drift later, it shows a repair action instead of silently leaving the daemon on another Relay.
+
+Optional CLI path:
+
+```bash
+# Node-free (recommended): install the CLI binary via the official installer
+curl -fsSL https://happier.dev/install | bash
+happier setup
+```
+
+`happier setup` chooses the relay before authentication, then signs in,
+registers this machine, and reconciles automatic startup. The lower-level
+`happier auth login` command remains available when the relay profile and
+machine lifecycle are already configured.
+
+Notes:
+- The desktop app and the installer-installed CLI are self-contained; you do not need system Node/Yarn installed.
+- If you prefer an npm workflow, see [CLI install](/apps/cli) (requires Node).
+
+### Option B — Self-host Relay only (background service on your laptop)
+You run your own Relay (remote machine, LAN box, or even your own computer), but keep the background service on another machine.
+
+1. Install your Relay (examples):
+   - Proxmox: see [Proxmox deployment](/self-hosting/proxmox).
+   - Any machine (managed service): install the CLI, then run `happier relay host install --mode system` (or remote: `happier relay host install --ssh user@host --mode system`)
+   - Docker: see [Deployment → Docker](/self-hosting/docker).
+
+2. Open the desktop app or web UI and choose that Relay.
+   - Some installers print one-click links/QRs that prefill the Relay URL.
+   - Otherwise, open the app and add/select it in **Relay settings**.
+
+   Use an address every device can actually reach. For Tailscale, each device
+   must be on the same tailnet and the Relay must be published with Tailscale
+   Serve or listen on a reachable Tailscale address; merely installing
+   Tailscale is not enough. For LAN access, bind the Relay to a non-loopback
+   address and allow its port through the host firewall. A Relay bound to
+   `localhost` inside a VM is local to that VM, not to the Mac or PC hosting it.
+
+3. Create an account / sign in on that Relay.
+
+4. In the desktop app, decide which machine should run the background service:
+   - **This computer**: use `/setup` → **Set up this computer**.
+   - **Another machine**: use **Add machine over SSH** from the Machines settings screen.
+
+If you need an advanced CLI fallback for the daemon host:
+
+```bash
+# Recommended remote-machine setup:
+happier machine setup --ssh user@host --install-relay-runtime
+```
+
+Troubleshooting-only (manual daemon setup on the remote host):
+
+```bash
+happier server add --name company --server-url https://YOUR_SERVER_URL --webapp-url https://YOUR_WEBAPP_URL --use
+happier auth login
+happier daemon service install
+```
+
+`--use` sets the default Relay profile for that CLI installation, but the app-first flow is preferred because it keeps Relay/account selection visible.
+
+### Option C — Devbox (server + daemon on the same machine)
+You install both the Relay and the background service on one box.
+
+1. Install the stack (for example via `hstack setup-from-source --profile=selfhost` or the Proxmox “devbox” option).
+2. Open the desktop app or web UI and choose that Relay (use the printed configure-server link/QR if available).
+3. Sign in / create an account.
+4. In the app, use `/setup` → **Set up this computer** if you are on that machine, or set up the box over SSH if you are operating it remotely.
+5. If the Relay is local/self-hosted, optionally enable private access so phones and other devices can reach it without exposing it publicly.
+
+Recommended for first setup:
+
+- Use the same Relay on every device before linking more machines.
+- Use the desktop app as the main control panel for daemon setup, Relay runtime control, and repair actions.
+
+## Multiple Relays (personal + company)
+
+- The app and CLI support **multiple saved Relay profiles**.
+- Credentials/state are **scoped per Relay**, so switching does not overwrite other accounts.
+- Accounts are per Relay. Using the same login provider on two Relays still creates two independent server-side account contexts.
+- Switching profiles selects another Relay and its account; it does not migrate an account, sessions, or settings between Relays.
+- Web: you can switch the Relay **for this tab** or **make it the device default**.
+
+### CLI: target a server per invocation
+
+```bash
+happier --server company auth login
+happier --server company daemon start
+```
+
+### CLI: run multiple daemons on one machine (one per Relay)
+
+```bash
+happier --server personal daemon service install
+happier --server company daemon service install
+```
+
+Then verify (cross-platform):
+
+```bash
+happier daemon status --all
+happier --server personal daemon service status
+happier --server company daemon service status
+```
+
+For complete profile/switching behavior and CLI reference, see [Features → Multi-server](/accounts/multi-server).

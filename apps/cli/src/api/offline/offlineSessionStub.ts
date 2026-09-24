@@ -1,0 +1,143 @@
+/**
+ * Offline Session Stub Factory
+ *
+ * Creates a no-op session stub for offline mode that can be used across all backends
+ * (Claude, Codex, Gemini, etc.). All session methods become no-ops until reconnection.
+ *
+ * This follows DRY principles by providing a single implementation for all backends,
+ * satisfying REQ-8 from serverConnectionErrors.ts.
+ *
+ * @module offlineSessionStub
+ */
+
+import { EventEmitter } from 'node:events';
+import type { ApiSessionClient } from '@/api/session/sessionClient';
+import type { ACPMessageData, ACPProvider } from '@/api/session/sessionMessageTypes';
+import { RpcHandlerManager } from '@/api/rpc/RpcHandlerManager';
+import type { AgentState, Metadata, Usage, UserMessage } from '@/api/types';
+
+type ApiSessionClientStubContract = Pick<
+    ApiSessionClient,
+    | 'sessionId'
+    | 'rpcHandlerManager'
+    | 'sendCodexMessage'
+    | 'sendAgentMessage'
+    | 'sendAgentMessageCommitted'
+    | 'sendClaudeSessionMessage'
+    | 'recordClaudeJsonlMessageConsumed'
+    | 'fetchCommittedClaudeJsonlMessageBaseline'
+    | 'fetchRecentTranscriptTextItemsForAcpImport'
+    | 'sendSessionEvent'
+    | 'keepAlive'
+    | 'getMetadataSnapshot'
+    | 'ensureMetadataSnapshot'
+    | 'refreshSessionSnapshotFromServerBestEffort'
+    | 'waitForMetadataUpdate'
+    | 'waitForPendingEligibilityUpdate'
+    | 'shouldAttemptPendingMaterialization'
+    | 'reconcilePendingQueueState'
+    | 'materializeNextPendingMessageSafely'
+    | 'popPendingMessage'
+    | 'listPendingMessageQueueV2LocalIds'
+    | 'peekPendingMessageQueueV2Count'
+    | 'discardPendingMessageQueueV2All'
+    | 'discardCommittedMessageLocalIds'
+    | 'getCommittedUserMessageSeq'
+    | 'waitForCommittedUserMessageSeq'
+    | 'sendSessionDeath'
+    | 'sendUsageData'
+    | 'updateMetadata'
+    | 'updateAgentState'
+    | 'onUserMessage'
+    | 'flush'
+    | 'close'
+>;
+
+class OfflineSessionStub extends EventEmitter implements ApiSessionClientStubContract {
+    readonly sessionId: string;
+    readonly rpcHandlerManager: RpcHandlerManager;
+
+    constructor(sessionId: string) {
+        super();
+        this.sessionId = sessionId;
+        this.rpcHandlerManager = new RpcHandlerManager({
+            scopePrefix: this.sessionId,
+            encryptionKey: new Uint8Array(32),
+            encryptionVariant: 'legacy',
+            logger: () => undefined,
+        });
+    }
+
+    sendCodexMessage(_body: unknown): void {}
+    sendAgentMessage(_provider: ACPProvider, _body: ACPMessageData, _opts?: { localId?: string; meta?: Record<string, unknown> }): void {}
+    async sendAgentMessageCommitted(
+        _provider: ACPProvider,
+        _body: ACPMessageData,
+        _opts: { localId: string; meta?: Record<string, unknown> },
+    ): Promise<void> {
+        throw new Error('Offline transcript write was not persisted');
+    }
+    sendClaudeSessionMessage(_body: unknown, _meta?: Record<string, unknown>): void {}
+    recordClaudeJsonlMessageConsumed(_body: unknown, _meta?: Record<string, unknown>): void {}
+    async fetchCommittedClaudeJsonlMessageBaseline(): Promise<import('@/backends/claude/utils/claudeJsonlMessageKey').CommittedClaudeJsonlMessageBaseline> { return { keys: new Set(), complete: true, oldestCoveredAtMs: null }; }
+    async fetchRecentTranscriptTextItemsForAcpImport(): Promise<Array<{ role: 'user' | 'agent'; text: string }>> { return []; }
+    sendSessionEvent(
+        _event:
+            | { type: 'switch'; mode: 'local' | 'remote' }
+            | { type: 'message'; message: string }
+            | { type: 'permission-mode-changed'; mode: import('../types').PermissionMode }
+            | { type: 'ready' },
+        _id?: string
+    ): void {}
+    keepAlive(_thinking: boolean, _mode: 'local' | 'remote'): void {}
+    getMetadataSnapshot(): Metadata | null { return null; }
+    async ensureMetadataSnapshot(): Promise<Metadata | null> { return null; }
+    async refreshSessionSnapshotFromServerBestEffort(): Promise<void> {}
+    async waitForMetadataUpdate(): Promise<boolean> { return false; }
+    async waitForPendingEligibilityUpdate(): Promise<boolean> { return false; }
+    shouldAttemptPendingMaterialization(): boolean { return false; }
+    async reconcilePendingQueueState(): Promise<boolean> { return false; }
+    async materializeNextPendingMessageSafely(): Promise<{ type: 'deferred'; reason: 'supervisor_offline' }> {
+        return { type: 'deferred', reason: 'supervisor_offline' };
+    }
+    async popPendingMessage(): Promise<boolean> { return false; }
+    async listPendingMessageQueueV2LocalIds(): Promise<string[]> { return []; }
+    async peekPendingMessageQueueV2Count(): Promise<number> { return 0; }
+    async discardPendingMessageQueueV2All(_opts: { reason: 'switch_to_local' | 'manual' }): Promise<number> { return 0; }
+    async discardCommittedMessageLocalIds(_opts: { localIds: string[]; reason: 'switch_to_local' | 'manual' }): Promise<number> { return 0; }
+    getCommittedUserMessageSeq(_localId: string): number | null { return null; }
+    async waitForCommittedUserMessageSeq(_localId: string): Promise<number | null> { return null; }
+    async sendSessionDeath(): Promise<void> {}
+    sendUsageData(_usage: Usage): void {}
+    async updateMetadata(_handler: (metadata: Metadata) => Metadata): Promise<void> {}
+    async updateAgentState(_handler: (metadata: AgentState) => AgentState): Promise<void> {}
+    onUserMessage(_callback: (data: UserMessage) => void): void {}
+    async flush(): Promise<void> {}
+    async close(): Promise<void> {}
+}
+
+/**
+ * Creates a no-op session stub for offline mode.
+ *
+ * The stub implements the ApiSessionClient interface with no-op methods,
+ * allowing the application to continue running while offline. When reconnection
+ * succeeds, the real session replaces this stub.
+ *
+ * @param sessionTag - Unique session tag (used to create offline session ID)
+ * @returns A no-op ApiSessionClient stub
+ *
+ * @example
+ * ```typescript
+ * const offlineStub = createOfflineSessionStub(sessionTag);
+ * let session: ApiSessionClient = offlineStub;
+ *
+ * // When reconnected:
+ * session = api.sessionSyncClient(response);
+ * ```
+ */
+export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
+    const stub = new OfflineSessionStub(`offline-${sessionTag}`);
+    const _typecheck: ApiSessionClientStubContract = stub;
+    void _typecheck;
+    return stub as unknown as ApiSessionClient;
+}

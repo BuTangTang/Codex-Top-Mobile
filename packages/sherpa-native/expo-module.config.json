@@ -1,0 +1,10 @@
+{
+  "name": "HappierSherpaNative",
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["HappierSherpaNativeModule"]
+  },
+  "android": {
+    "modules": ["dev.happier.sherpa.HappierSherpaNativeModule"]
+  }
+}

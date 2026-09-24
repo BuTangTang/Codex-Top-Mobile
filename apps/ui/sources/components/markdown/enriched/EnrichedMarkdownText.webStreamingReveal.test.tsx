@@ -1,0 +1,834 @@
+import { readFileSync } from 'node:fs';
+
+import React from 'react';
+import TestRenderer from 'react-test-renderer';
+import { describe, expect, it } from 'vitest';
+
+type StreamingRevealModule = Readonly<{
+    createStreamingRevealState: (params: Readonly<{
+        enabled: boolean;
+        activeRanges: readonly StreamingRevealRange[];
+    }>) => {
+        activeRanges: readonly StreamingRevealRange[];
+    } | null;
+    updateStreamingRevealRanges: (params: Readonly<{
+        activeRanges: readonly StreamingRevealRange[];
+        previousComparisonText: string;
+        currentComparisonText: string;
+        nowMs: number;
+        ttlMs: number;
+        previousSourceLength?: number;
+        currentSourceLength?: number;
+    }>) => readonly StreamingRevealRange[];
+    readRenderedComparisonText: (node: MarkdownAstNode | null) => string;
+    renderStreamingRevealText: (params: Readonly<{
+        capabilities: {
+            katex: null;
+            streamingReveal?: {
+                activeRanges: readonly StreamingRevealRange[];
+            } | null;
+        };
+        text: string;
+        revealable: boolean;
+        startOffset: number;
+    }>) => React.ReactNode;
+}>;
+
+type StreamingRevealRange = Readonly<{
+    start: number;
+    end: number;
+    expiresAtMs: number;
+}>;
+
+type WebEnrichedMarkdownTextModule = Readonly<{
+    EnrichedMarkdownText: React.ComponentType<{
+        markdown: string;
+        renderRawFallback?: boolean | 'hidden';
+        streamingAnimation?: boolean;
+        md4cFlags?: { latexMath?: boolean };
+    }>;
+}>;
+
+type WebParseMarkdownModule = Readonly<{
+    preloadMarkdownRuntime: () => Promise<void>;
+}>;
+
+type InlineRendererProps = Readonly<{
+    node: {
+        type: 'Text';
+        content: string;
+        streamingRevealStartOffset?: number;
+    };
+    parentType?: string;
+    capabilities: {
+        katex: null;
+        streamingReveal?: {
+            activeRanges: readonly StreamingRevealRange[];
+        } | null;
+    };
+    style: Record<string, never>;
+    styles: Record<string, never>;
+    callbacks: Record<string, never>;
+    renderChildren: () => React.ReactNode;
+}>;
+
+type InlineRenderersModule = Readonly<{
+    inlineRenderers: Readonly<{
+        Text?: (props: InlineRendererProps) => React.ReactNode;
+    }>;
+}>;
+
+type WebRenderersModule = Readonly<{
+    RenderNode: React.ComponentType<{
+        node: MarkdownAstNode;
+        style: Record<string, unknown>;
+        styles: Record<string, unknown>;
+        callbacks: Record<string, never>;
+        capabilities: { katex: null };
+    }>;
+}>;
+
+type MarkdownAstNode = Readonly<{
+    type: string;
+    content?: string;
+    attributes?: Record<string, string | number | boolean | undefined>;
+    children?: readonly MarkdownAstNode[];
+}>;
+
+type RevealSpanProps = Readonly<{
+    children?: React.ReactNode;
+    'data-happier-enriched-markdown-reveal'?: string;
+}>;
+
+async function loadPatchedStreamingReveal(): Promise<StreamingRevealModule> {
+    const moduleUrl = new URL(
+        '../../../../node_modules/react-native-enriched-markdown/lib/module/web/streamingReveal.js',
+        import.meta.url,
+    ).href;
+    return import(/* @vite-ignore */ moduleUrl) as Promise<StreamingRevealModule>;
+}
+
+async function loadPatchedWebEnrichedMarkdownText(): Promise<WebEnrichedMarkdownTextModule> {
+    const moduleUrl = new URL(
+        '../../../../node_modules/react-native-enriched-markdown/src/web/EnrichedMarkdownText.tsx',
+        import.meta.url,
+    ).href;
+    return import(/* @vite-ignore */ moduleUrl) as Promise<WebEnrichedMarkdownTextModule>;
+}
+
+async function loadPatchedWebParseMarkdown(): Promise<WebParseMarkdownModule> {
+    const moduleUrl = new URL(
+        '../../../../node_modules/react-native-enriched-markdown/lib/module/web/parseMarkdown.js',
+        import.meta.url,
+    ).href;
+    return import(/* @vite-ignore */ moduleUrl) as Promise<WebParseMarkdownModule>;
+}
+
+async function loadPatchedWebSourceParseMarkdown(): Promise<WebParseMarkdownModule> {
+    const moduleUrl = new URL(
+        '../../../../node_modules/react-native-enriched-markdown/src/web/parseMarkdown.ts',
+        import.meta.url,
+    ).href;
+    return import(/* @vite-ignore */ moduleUrl) as Promise<WebParseMarkdownModule>;
+}
+
+async function loadPatchedInlineRenderers(): Promise<InlineRenderersModule> {
+    const moduleUrl = new URL(
+        '../../../../node_modules/react-native-enriched-markdown/src/web/renderers/InlineRenderers.tsx',
+        import.meta.url,
+    ).href;
+    return import(/* @vite-ignore */ moduleUrl) as Promise<InlineRenderersModule>;
+}
+
+async function loadPatchedWebRenderers(): Promise<WebRenderersModule> {
+    const moduleUrl = new URL(
+        '../../../../node_modules/react-native-enriched-markdown/src/web/renderers/index.tsx',
+        import.meta.url,
+    ).href;
+    return import(/* @vite-ignore */ moduleUrl) as Promise<WebRenderersModule>;
+}
+
+function readPatchedPackageFile(relativePath: string): string {
+    return readFileSync(
+        new URL(`../../../../node_modules/react-native-enriched-markdown/${relativePath}`, import.meta.url),
+        'utf8',
+    );
+}
+
+function readPatchedPackageFileBuffer(relativePath: string): Buffer {
+    return readFileSync(new URL(`../../../../node_modules/react-native-enriched-markdown/${relativePath}`, import.meta.url));
+}
+
+function readUiFile(relativePath: string): string {
+    return readFileSync(new URL(`../../../../${relativePath}`, import.meta.url), 'utf8');
+}
+
+function spanChildren(node: React.ReactNode): string[] {
+    if (!Array.isArray(node)) return [];
+    return node
+        .filter((child): child is React.ReactElement<RevealSpanProps> =>
+            React.isValidElement<RevealSpanProps>(child)
+            && child.props['data-happier-enriched-markdown-reveal'] === 'text')
+        .map((child) => String(child.props.children));
+}
+
+function revealTextsFromNode(node: React.ReactNode): string[] {
+    if (Array.isArray(node)) {
+        return node.flatMap(revealTextsFromNode);
+    }
+
+    if (!React.isValidElement<RevealSpanProps>(node)) return [];
+
+    if (node.props['data-happier-enriched-markdown-reveal'] === 'text') {
+        return [String(node.props.children)];
+    }
+
+    return revealTextsFromNode(node.props.children);
+}
+
+function revealSpanTextsFromJson(
+    node: TestRenderer.ReactTestRendererJSON | TestRenderer.ReactTestRendererJSON[] | null,
+): string[] {
+    if (node === null) return [];
+    if (Array.isArray(node)) {
+        return node.flatMap((child) => revealSpanTextsFromJson(child));
+    }
+
+    const children = node.children ?? [];
+    const nestedTexts = children.flatMap((child) =>
+        typeof child === 'string' ? [] : revealSpanTextsFromJson(child));
+    const revealAttribute = (node.props as Record<string, unknown> | undefined)?.[
+        'data-happier-enriched-markdown-reveal'
+    ];
+    if (revealAttribute !== 'text') return nestedTexts;
+
+    const ownText = children.filter((child): child is string => typeof child === 'string').join('');
+    return [ownText, ...nestedTexts];
+}
+
+function countJsonNodesByType(node: TestRenderer.ReactTestRendererJSON | TestRenderer.ReactTestRendererJSON[] | null, type: string): number {
+    if (node === null) return 0;
+    if (Array.isArray(node)) {
+        return node.reduce((count, child) => count + countJsonNodesByType(child, type), 0);
+    }
+
+    return (node.type === type ? 1 : 0)
+        + (node.children ?? []).reduce((count, child) => {
+            if (typeof child === 'string') return count;
+            return count + countJsonNodesByType(child, type);
+        }, 0);
+}
+
+function findFirstJsonNodeByType(
+    node: TestRenderer.ReactTestRendererJSON | TestRenderer.ReactTestRendererJSON[] | null,
+    type: string,
+): TestRenderer.ReactTestRendererJSON | null {
+    if (node === null) return null;
+    if (Array.isArray(node)) {
+        for (const child of node) {
+            const match = findFirstJsonNodeByType(child, type);
+            if (match) return match;
+        }
+        return null;
+    }
+
+    if (node.type === type) return node;
+    for (const child of node.children ?? []) {
+        if (typeof child === 'string') continue;
+        const match = findFirstJsonNodeByType(child, type);
+        if (match) return match;
+    }
+    return null;
+}
+
+describe('EnrichedMarkdownText web streaming reveal', () => {
+    it('computes rendered comparison text from prose, code, and math nodes', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const ast: MarkdownAstNode = {
+            type: 'Paragraph',
+            children: [
+                { type: 'Text', content: 'Look at ' },
+                { type: 'Code', content: 'value' },
+                { type: 'LatexMathInline', content: 'x^2' },
+            ],
+        };
+
+        expect(reveal.readRenderedComparisonText(ast)).toBe('Look at valuex^2');
+    });
+
+    it('wraps only newly rendered prose text after the rendered common prefix', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const ranges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: 'Hello ',
+            currentComparisonText: 'Hello world',
+            nowMs: 1_000,
+            ttlMs: 200,
+        });
+        const streamingReveal = reveal.createStreamingRevealState({
+            enabled: true,
+            activeRanges: ranges,
+        });
+        expect(streamingReveal).not.toBe(null);
+
+        const rendered = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'Hello world',
+            revealable: true,
+            startOffset: 0,
+        });
+
+        expect(spanChildren(rendered)).toEqual(['world']);
+    });
+
+    it('treats the content present when the reveal baseline is empty as already revealed', async () => {
+        // A mount/remount starts with an empty baseline while the instance already
+        // renders the whole message. Classifying that content as "appended" replays the
+        // opacity keyframe over the entire message (measured: 1 570 of 2 098 chars at
+        // opacity < 0.5 for ~155 ms right after the enriched run was replaced).
+        const reveal = await loadPatchedStreamingReveal();
+        const alreadyStreamed = 'A paragraph that was already fully visible before this instance mounted.';
+
+        const ranges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: '',
+            currentComparisonText: alreadyStreamed,
+            nowMs: 1_000,
+            ttlMs: 200,
+            previousSourceLength: 0,
+            currentSourceLength: alreadyStreamed.length,
+        });
+
+        expect(ranges).toEqual([]);
+    });
+
+    it('keeps earlier reveal ranges active while later streaming chunks arrive quickly', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const firstRanges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: 'Hello ',
+            currentComparisonText: 'Hello world',
+            nowMs: 1_000,
+            ttlMs: 200,
+        });
+        const secondRanges = reveal.updateStreamingRevealRanges({
+            activeRanges: firstRanges,
+            previousComparisonText: 'Hello world',
+            currentComparisonText: 'Hello world again',
+            nowMs: 1_050,
+            ttlMs: 200,
+        });
+        const streamingReveal = reveal.createStreamingRevealState({
+            enabled: true,
+            activeRanges: secondRanges,
+        });
+        expect(streamingReveal).not.toBe(null);
+
+        const rendered = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'Hello world again',
+            revealable: true,
+            startOffset: 0,
+        });
+
+        expect(spanChildren(rendered)).toEqual(['world', 'again']);
+    });
+
+    it('expires completed reveal ranges after their animation window', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const ranges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: 'Hello ',
+            currentComparisonText: 'Hello world',
+            nowMs: 1_000,
+            ttlMs: 100,
+        });
+        const expired = reveal.updateStreamingRevealRanges({
+            activeRanges: ranges,
+            previousComparisonText: 'Hello world',
+            currentComparisonText: 'Hello world',
+            nowMs: 1_101,
+            ttlMs: 100,
+        });
+        const streamingReveal = reveal.createStreamingRevealState({
+            enabled: true,
+            activeRanges: expired,
+        });
+
+        const rendered = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'Hello world',
+            revealable: true,
+            startOffset: 0,
+        });
+
+        expect(expired).toEqual([]);
+        expect(spanChildren(rendered)).toEqual([]);
+    });
+
+    it('uses explicit render offsets without wrapping non-revealable text', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const ranges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: 'code ',
+            currentComparisonText: 'code world',
+            nowMs: 1_000,
+            ttlMs: 200,
+        });
+        const streamingReveal = reveal.createStreamingRevealState({
+            enabled: true,
+            activeRanges: ranges,
+        });
+        expect(streamingReveal).not.toBe(null);
+
+        const renderedCode = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'code ',
+            revealable: false,
+            startOffset: 0,
+        });
+        const renderedProse = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'world',
+            revealable: true,
+            startOffset: 'code '.length,
+        });
+
+        expect(renderedCode).toBe('code ');
+        expect(spanChildren(renderedProse)).toEqual(['world']);
+    });
+
+    it('routes web inline text rendering through reveal spans with stamped offsets', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const globalWithReact = globalThis as typeof globalThis & { React?: typeof React };
+        globalWithReact.React = React;
+        const { inlineRenderers } = await loadPatchedInlineRenderers();
+        const textRenderer = inlineRenderers.Text;
+        if (!textRenderer) {
+            throw new Error('Expected web Text inline renderer to exist');
+        }
+
+        const ranges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: 'Hello ',
+            currentComparisonText: 'Hello world',
+            nowMs: 1_000,
+            ttlMs: 200,
+        });
+        const streamingReveal = reveal.createStreamingRevealState({
+            enabled: true,
+            activeRanges: ranges,
+        });
+        expect(streamingReveal).not.toBe(null);
+
+        const rendered = textRenderer({
+            node: {
+                type: 'Text',
+                content: 'Hello world',
+                streamingRevealStartOffset: 0,
+            },
+            parentType: 'Paragraph',
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            style: {},
+            styles: {},
+            callbacks: {},
+            renderChildren: () => null,
+        });
+
+        expect(revealTextsFromNode(rendered)).toEqual(['world']);
+    });
+
+    it('classifies reveal ranges idempotently when React repeats a render pass', async () => {
+        const reveal = await loadPatchedStreamingReveal();
+        const ranges = reveal.updateStreamingRevealRanges({
+            activeRanges: [],
+            previousComparisonText: 'Hello ',
+            currentComparisonText: 'Hello world',
+            nowMs: 1_000,
+            ttlMs: 200,
+        });
+        const streamingReveal = reveal.createStreamingRevealState({
+            enabled: true,
+            activeRanges: ranges,
+        });
+        expect(streamingReveal).not.toBe(null);
+
+        const firstRender = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'Hello world',
+            revealable: true,
+            startOffset: 0,
+        });
+        const repeatedRender = reveal.renderStreamingRevealText({
+            capabilities: {
+                katex: null,
+                streamingReveal,
+            },
+            text: 'Hello world',
+            revealable: true,
+            startOffset: 0,
+        });
+
+        expect(spanChildren(firstRender)).toEqual(['world']);
+        expect(spanChildren(repeatedRender)).toEqual(['world']);
+    });
+
+    it('renders markdown text immediately before the async web parser resolves', async () => {
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        const globalWithReact = globalThis as typeof globalThis & { React?: typeof React };
+        globalWithReact.React = React;
+        const rendererHolder: { current: TestRenderer.ReactTestRenderer | null } = { current: null };
+        TestRenderer.act(() => {
+            rendererHolder.current = TestRenderer.create(<EnrichedMarkdownText markdown="Immediate fallback text" />);
+        });
+
+        const renderer = rendererHolder.current;
+        if (renderer === null) {
+            throw new Error('Expected EnrichedMarkdownText test renderer to be created');
+        }
+
+        expect(JSON.stringify(renderer.toJSON())).toContain('Immediate fallback text');
+        TestRenderer.act(() => {
+            renderer.unmount();
+        });
+    });
+
+    it('can hide the raw markdown fallback while the web parser is cold', async () => {
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        const parser = await loadPatchedWebSourceParseMarkdown();
+        const globalWithReact = globalThis as typeof globalThis & { React?: typeof React };
+        globalWithReact.React = React;
+        const rendererHolder: { current: TestRenderer.ReactTestRenderer | null } = { current: null };
+        TestRenderer.act(() => {
+            rendererHolder.current = TestRenderer.create(
+                <EnrichedMarkdownText
+                    markdown={['## Forensics', '', '`session-id` details'].join('\n')}
+                    renderRawFallback="hidden"
+                />,
+            );
+        });
+
+        const renderer = rendererHolder.current;
+        if (renderer === null) {
+            throw new Error('Expected EnrichedMarkdownText test renderer to be created');
+        }
+
+        const fallbackParagraph = findFirstJsonNodeByType(renderer.toJSON(), 'p');
+        expect(fallbackParagraph?.props.style.visibility).toBe('hidden');
+        expect(JSON.stringify(renderer.toJSON())).toContain('## Forensics');
+        await TestRenderer.act(async () => { await parser.preloadMarkdownRuntime(); });
+        expect(countJsonNodesByType(renderer.toJSON(), 'h2')).toBe(1);
+        expect(JSON.stringify(renderer.toJSON())).not.toContain('## Forensics');
+        TestRenderer.act(() => {
+            renderer.unmount();
+        });
+    });
+
+    it('uses the warmed web parser synchronously on first paint to avoid raw markdown layout flicker', async () => {
+        const parser = await loadPatchedWebSourceParseMarkdown();
+        await parser.preloadMarkdownRuntime();
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        const globalWithReact = globalThis as typeof globalThis & { React?: typeof React };
+        globalWithReact.React = React;
+        const rendererHolder: { current: TestRenderer.ReactTestRenderer | null } = { current: null };
+        TestRenderer.act(() => {
+            rendererHolder.current = TestRenderer.create(
+                <EnrichedMarkdownText markdown={['## Forensics', '', '`session-id` details'].join('\n')} />,
+            );
+        });
+
+        const renderer = rendererHolder.current;
+        if (renderer === null) {
+            throw new Error('Expected EnrichedMarkdownText test renderer to be created');
+        }
+
+        const json = renderer.toJSON();
+        expect(JSON.stringify(json)).not.toContain('## Forensics');
+        expect(countJsonNodesByType(json, 'h2')).toBe(1);
+        TestRenderer.act(() => {
+            renderer.unmount();
+        });
+    });
+
+    it('reveals only appended words after mounting onto an already-streamed message', async () => {
+        const parser = await loadPatchedWebSourceParseMarkdown();
+        await parser.preloadMarkdownRuntime();
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        const globalWithReact = globalThis as typeof globalThis & { React?: typeof React };
+        globalWithReact.React = React;
+        const alreadyStreamed = 'Streaming prose that was already visible before the remount.';
+        const appendedChunk = ' Newly appended words.';
+        const rendererHolder: { current: TestRenderer.ReactTestRenderer | null } = { current: null };
+
+        await TestRenderer.act(async () => {
+            rendererHolder.current = TestRenderer.create(
+                <EnrichedMarkdownText markdown={alreadyStreamed} streamingAnimation />,
+            );
+        });
+
+        const renderer = rendererHolder.current;
+        if (renderer === null) {
+            throw new Error('Expected EnrichedMarkdownText test renderer to be created');
+        }
+
+        // Mounting onto a message that already streamed must not re-animate it.
+        expect(revealSpanTextsFromJson(renderer.toJSON())).toEqual([]);
+
+        await TestRenderer.act(async () => {
+            renderer.update(
+                <EnrichedMarkdownText
+                    markdown={`${alreadyStreamed}${appendedChunk}`}
+                    streamingAnimation
+                />,
+            );
+        });
+
+        // The intended per-word effect still runs for genuinely appended source.
+        expect(revealSpanTextsFromJson(renderer.toJSON())).toEqual(['Newly', 'appended', 'words.']);
+
+        await TestRenderer.act(async () => {
+            renderer.unmount();
+        });
+    });
+
+    it('does not hide a visible partial word when its suffix arrives', async () => {
+        const parser = await loadPatchedWebSourceParseMarkdown();
+        await parser.preloadMarkdownRuntime();
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        Object.assign(globalThis, { React });
+        let renderer!: TestRenderer.ReactTestRenderer;
+        try {
+            await TestRenderer.act(async () => {
+                renderer = TestRenderer.create(<EnrichedMarkdownText markdown="Stable electro" streamingAnimation md4cFlags={{ latexMath: false }} />);
+            });
+            await TestRenderer.act(async () => {
+                renderer.update(<EnrichedMarkdownText markdown="Stable electromagnetic waves" streamingAnimation md4cFlags={{ latexMath: false }} />);
+            });
+            expect(revealSpanTextsFromJson(renderer.toJSON())).toEqual(['waves']);
+            expect(JSON.stringify(renderer.toJSON())).toContain('electromagnetic');
+        } finally {
+            await TestRenderer.act(async () => renderer?.unmount());
+        }
+    });
+
+    it('commits a warm long-document append once without an unused asynchronous AST publication', async () => {
+        const parser = await loadPatchedWebSourceParseMarkdown();
+        await parser.preloadMarkdownRuntime();
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        Object.assign(globalThis, { React });
+        // Exceeds the parser's result-cache ceiling: duplicate work cannot hide behind a cache hit.
+        const markdown = 'A settled paragraph with **formatted** content.\n\n'.repeat(700);
+        const commits: string[] = [];
+        const paint = (text: string) => (
+            <React.Profiler id="enriched" onRender={(_, phase) => commits.push(phase)}>
+                <EnrichedMarkdownText markdown={text} md4cFlags={{ latexMath: false }} />
+            </React.Profiler>
+        );
+        let renderer!: TestRenderer.ReactTestRenderer;
+        try {
+            await TestRenderer.act(async () => { renderer = TestRenderer.create(paint(markdown)); });
+            expect(commits).toEqual(['mount']);
+            commits.length = 0;
+            await TestRenderer.act(async () => { renderer.update(paint(`${markdown}New tail.`)); });
+            expect(commits).toEqual(['update']);
+            expect(JSON.stringify(renderer.toJSON())).toContain('New tail.');
+        } finally {
+            await TestRenderer.act(async () => renderer?.unmount());
+        }
+    });
+
+    it('loads optional math independently when a warm document enables math rendering', async () => {
+        const parser = await loadPatchedWebSourceParseMarkdown();
+        await parser.preloadMarkdownRuntime();
+        const { EnrichedMarkdownText } = await loadPatchedWebEnrichedMarkdownText();
+        Object.assign(globalThis, { React });
+        let renderer!: TestRenderer.ReactTestRenderer;
+        try {
+            await TestRenderer.act(async () => {
+                renderer = TestRenderer.create(<EnrichedMarkdownText markdown="Formula $x^2$." md4cFlags={{ latexMath: false }} />);
+            });
+            expect(renderer.root.findAllByProps({ role: 'math' })).toHaveLength(0);
+            await TestRenderer.act(async () => {
+                renderer.update(<EnrichedMarkdownText markdown="Formula $x^2$." md4cFlags={{ latexMath: true }} />);
+            });
+            const math = renderer.root.findByProps({ role: 'math' });
+            expect(math.props.dangerouslySetInnerHTML.__html).toContain('<math');
+            await TestRenderer.act(async () => {
+                renderer.update(<EnrichedMarkdownText markdown="Formula $x^2$. More prose." md4cFlags={{ latexMath: true }} />);
+            });
+            expect(renderer.root.findByProps({ role: 'math' }).props.dangerouslySetInnerHTML.__html).toContain('<math');
+        } finally {
+            await TestRenderer.act(async () => renderer?.unmount());
+        }
+    });
+
+    it('preserves paragraph block boundaries inside loose ordered list items', async () => {
+        const { RenderNode } = await loadPatchedWebRenderers();
+        const globalWithReact = globalThis as typeof globalThis & { React?: typeof React };
+        globalWithReact.React = React;
+        const ast: MarkdownAstNode = {
+            type: 'OrderedList',
+            children: [
+                {
+                    type: 'ListItem',
+                    children: [
+                        {
+                            type: 'Paragraph',
+                            children: [{ type: 'Text', content: 'First title' }],
+                        },
+                        {
+                            type: 'Paragraph',
+                            children: [{ type: 'Text', content: 'First continuation' }],
+                        },
+                    ],
+                },
+                {
+                    type: 'ListItem',
+                    children: [
+                        {
+                            type: 'Paragraph',
+                            children: [{ type: 'Text', content: 'Second title' }],
+                        },
+                    ],
+                },
+            ],
+        };
+        const rendererHolder: { current: TestRenderer.ReactTestRenderer | null } = { current: null };
+        TestRenderer.act(() => {
+            rendererHolder.current = TestRenderer.create(
+                <RenderNode
+                    node={ast}
+                    style={{}}
+                    styles={{
+                        list: {},
+                        listNested: {},
+                        listTask: {},
+                        paragraph: {},
+                        paragraphInListItem: {},
+                        paragraphInLastListItemChild: {},
+                    }}
+                    callbacks={{}}
+                    capabilities={{ katex: null }}
+                />,
+            );
+        });
+        const renderer = rendererHolder.current;
+        if (renderer === null) {
+            throw new Error('Expected RenderNode test renderer to be created');
+        }
+
+        expect(countJsonNodesByType(renderer.toJSON(), 'ol')).toBe(1);
+        expect(countJsonNodesByType(renderer.toJSON(), 'li')).toBe(2);
+        expect(countJsonNodesByType(renderer.toJSON(), 'p')).toBe(3);
+        TestRenderer.act(() => {
+            renderer.unmount();
+        });
+    });
+
+    it('exposes a web parser warmup hook for transcript preloading', async () => {
+        const parser = await loadPatchedWebParseMarkdown();
+
+        await expect(parser.preloadMarkdownRuntime()).resolves.toBeUndefined();
+    });
+
+    it('builds the web parser with heap input helpers and growable memory', () => {
+        const buildScript = readPatchedPackageFile('cpp/wasm/build.sh');
+
+        expect(buildScript).toContain('SINGLE_FILE=1');
+        expect(buildScript).toContain('SINGLE_FILE_BINARY_ENCODE=0');
+        expect(buildScript).toContain('STACK_SIZE=8MB');
+        expect(buildScript).toContain('ALLOW_MEMORY_GROWTH=1');
+        expect(buildScript).toContain('EXPORT_ES6=1');
+        expect(buildScript).toContain('_malloc');
+        expect(buildScript).toContain('_free');
+        expect(buildScript).toContain('stringToUTF8');
+        expect(buildScript).toContain('lengthBytesUTF8');
+    });
+
+    it('builds the web parser as an ES module so browser dynamic import exposes the factory', () => {
+        const sourceWasmModule = readPatchedPackageFile('src/web/wasm/md4c.js');
+        const builtWasmModule = readPatchedPackageFile('lib/module/web/wasm/md4c.js');
+
+        expect(sourceWasmModule).toContain('export default createMd4cModule');
+        expect(builtWasmModule).toContain('export default createMd4cModule');
+    });
+
+    it('keeps the single-file parser inside the owning web runtime module', () => {
+        const sourceParser = readPatchedPackageFile('src/web/parseMarkdown.ts');
+        const builtParser = readPatchedPackageFile('lib/module/web/parseMarkdown.js');
+
+        expect(sourceParser).toContain("import createMd4cModule from './wasm/md4c.js'");
+        expect(builtParser).toContain("import createMd4cModule from './wasm/md4c.js'");
+        expect(sourceParser).not.toContain("import('./wasm/md4c");
+        expect(builtParser).not.toContain("import('./wasm/md4c");
+    });
+
+    it('keeps the generated web parser compatible with Metro module bundling', () => {
+        const sourceWasmModule = readPatchedPackageFile('src/web/wasm/md4c.js');
+        const builtWasmModule = readPatchedPackageFile('lib/module/web/wasm/md4c.js');
+        const vendoredWasmModule = readUiFile('tools/react-native-enriched-markdown/md4c.esm.single-file.js');
+
+        expect(sourceWasmModule).not.toContain('import.meta');
+        expect(builtWasmModule).not.toContain('import.meta');
+        expect(vendoredWasmModule).not.toContain('import.meta');
+    });
+
+    it('builds the web parser artifact as text so the package patch is distributable', () => {
+        const sourceWasmModule = readPatchedPackageFileBuffer('src/web/wasm/md4c.js');
+        const builtWasmModule = readPatchedPackageFileBuffer('lib/module/web/wasm/md4c.js');
+
+        expect(sourceWasmModule.includes(0)).toBe(false);
+        expect(builtWasmModule.includes(0)).toBe(false);
+    });
+
+    it('keeps the package patch applyable by vendoring the generated web parser outside patch-package', () => {
+        const patchFile = readUiFile('patches/react-native-enriched-markdown+0.5.0.patch');
+        const vendoredWasmModule = readUiFile('tools/react-native-enriched-markdown/md4c.esm.single-file.js');
+
+        expect(patchFile).not.toContain('Binary files');
+        expect(vendoredWasmModule).toContain('export default createMd4cModule');
+    });
+
+    it('passes web parser markdown through a heap pointer instead of cwrap string arguments', () => {
+        const parserSource = readPatchedPackageFile('src/web/parseMarkdown.ts');
+
+        expect(parserSource).toContain("'number'");
+        expect(parserSource).toContain('lengthBytesUTF8(markdown)');
+        expect(parserSource).toContain('stringToUTF8(markdown');
+        expect(parserSource).toContain('_malloc');
+        expect(parserSource).toContain('_free');
+        expect(parserSource).not.toContain("['string',");
+    });
+
+    it('uses themed paragraph fallback for web parse errors', () => {
+        const componentSource = readPatchedPackageFile('src/web/EnrichedMarkdownText.tsx');
+        const parseErrorFallbackStart = componentSource.indexOf('if (parseError && !syncAst)');
+        const parseErrorFallbackEnd = componentSource.indexOf('if (!ast)', parseErrorFallbackStart);
+        const parseErrorFallback = componentSource.slice(parseErrorFallbackStart, parseErrorFallbackEnd);
+
+        expect(parseErrorFallback).toContain('<p');
+        expect(parseErrorFallback).toContain('lastChildStyles.paragraph');
+        expect(parseErrorFallback).not.toContain('<pre');
+    });
+});

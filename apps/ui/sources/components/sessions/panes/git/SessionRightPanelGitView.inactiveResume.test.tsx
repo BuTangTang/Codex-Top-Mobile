@@ -1,0 +1,221 @@
+import * as React from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { SessionResumeProvider } from '@/components/sessions/model/SessionResumeContext';
+import { renderScreen } from '@/dev/testkit';
+import { installSessionDetailsPanelCommonModuleMocks } from '../sessionDetailsPanelTestHelpers';
+
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+let capturedInactiveProps: any = null;
+const emitSessionResumeRequestSpy = vi.hoisted(() => vi.fn());
+const loadCommitHistorySpy = vi.hoisted(() => vi.fn());
+let machineReachable = false;
+let machineRpcTargetAvailable = false;
+let sessionPath: string | null = '/repo';
+let projectPath: string | null = '/repo';
+let activeGitSubTab: 'commit' | 'update' | 'history' = 'commit';
+
+installSessionDetailsPanelCommonModuleMocks({
+    storage: async () => {
+        const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+        return createStorageModuleStub({
+            useSetting: () => null,
+            useProjectForSession: () => (
+                projectPath
+                    ? { key: { machineId: 'm1', path: projectPath } }
+                    : null
+            ),
+            useProjectSessions: () => [],
+            useAllMachines: () => (
+                machineReachable
+                    ? [{ id: 'm1', active: true, activeAt: 1, metadata: { host: 'mbp', platform: 'darwin', happyCliVersion: '0', happyHomeDir: '/tmp/.h', homeDir: '/tmp' } }]
+                    : [{ id: 'm1', active: false, activeAt: 1, metadata: { host: 'mbp', platform: 'darwin', happyCliVersion: '0', happyHomeDir: '/tmp/.h', homeDir: '/tmp' } }]
+            ),
+            useSession: () => ({ active: false, metadata: { machineId: 'm1', path: sessionPath } }),
+            useSessionProjectScmCommitSelectionPaths: () => [],
+            useSessionProjectScmCommitSelectionPatches: () => [],
+            useSessionProjectScmInFlightOperation: () => null,
+            useSessionProjectScmOperationLog: () => [],
+            useSessionProjectScmSnapshot: () => null,
+            useSessionProjectScmSnapshotError: () => ({ message: 'RPC method not available', at: 1 }),
+            useSessionRealtimeScmTranscriptConsumer: () => {},
+            useSessionProjectScmTouchedPaths: () => [],
+        });
+    },
+});
+
+vi.mock('@/components/appShell/panes/hooks/useAppPaneScope', () => ({
+    useAppPaneScope: () => ({
+        scopeState: {},
+    }),
+}));
+
+vi.mock('./useSessionRightPanelGitTabState', () => ({
+    useSessionRightPanelGitTabState: () => ({
+        activeGitSubTab,
+        setActiveGitSubTab: vi.fn(),
+        commitDraftMessage: '',
+        setCommitDraftMessage: vi.fn(),
+    }),
+}));
+
+vi.mock('./useSessionRightPanelGitOpenDetails', () => ({
+    useSessionRightPanelGitOpenDetails: () => ({
+        openFileInDetails: vi.fn(),
+        openFileInDetailsPinned: vi.fn(),
+        openCommitInDetails: vi.fn(),
+    }),
+}));
+
+vi.mock('@/hooks/session/files/useScmCommitHistory', () => ({
+    useScmCommitHistory: () => ({
+        historyEntries: [],
+        historyLoading: false,
+        historyHasMore: false,
+        loadCommitHistory: loadCommitHistorySpy,
+    }),
+}));
+
+vi.mock('@/hooks/session/files/useFilesScmOperations', () => ({
+    useFilesScmOperations: () => ({
+        scmOperationBusy: false,
+        scmOperationStatus: null,
+        commitPreflight: { allowed: true, message: null },
+        pullPreflight: { allowed: true, message: null },
+        pushPreflight: { allowed: true, message: null },
+        runRemoteOperation: vi.fn(),
+        createCommitFromMessage: vi.fn(),
+        commitMessageGeneratorEnabled: false,
+        generateCommitMessageSuggestion: vi.fn(),
+    }),
+}));
+
+vi.mock('@/hooks/server/useFeatureEnabled', () => ({
+    useFeatureEnabled: () => false,
+}));
+
+vi.mock('@/components/sessions/sourceControl/states', () => ({
+    NotSourceControlRepositoryState: () => React.createElement('NotSourceControlRepositoryState'),
+    SourceControlUnavailableState: () => React.createElement('SourceControlUnavailableState'),
+    SourceControlSessionInactiveState: (props: any) => {
+        capturedInactiveProps = props;
+        return React.createElement('SourceControlSessionInactiveState', props);
+    },
+}));
+
+vi.mock('@/components/sessions/model/sessionResumeRequests', () => ({
+    emitSessionResumeRequest: (sessionId: string) => emitSessionResumeRequestSpy(sessionId),
+}));
+
+vi.mock('@/components/sessions/model/useSessionMachineReachability', () => ({
+    useSessionMachineReachability: () => ({
+        machineReachable,
+        machineOnline: machineReachable,
+        machineRpcTargetAvailable,
+    }),
+}));
+
+vi.mock('@/scm/registry/scmUiBackendRegistry', () => ({
+    scmUiBackendRegistry: {
+        getPluginForSnapshot: () => ({
+            displayName: 'Git',
+            commitActionConfig: () => ({ label: 'Commit' }),
+        }),
+    },
+}));
+
+vi.mock('@/scm/scmStatusSync', () => ({
+    scmStatusSync: {
+        invalidateFromUserAndAwait: vi.fn(),
+        invalidateFromAutoRefreshAndAwait: vi.fn(async () => {}),
+    },
+}));
+
+describe('SessionRightPanelGitView (inactive session resume)', () => {
+    beforeEach(() => {
+        machineReachable = false;
+        machineRpcTargetAvailable = false;
+        sessionPath = '/repo';
+        projectPath = '/repo';
+        activeGitSubTab = 'commit';
+        loadCommitHistorySpy.mockReset();
+    });
+
+    it('provides a resume action when session is inactive', async () => {
+        capturedInactiveProps = null;
+        machineReachable = false;
+        sessionPath = null;
+        projectPath = null;
+        const onResumeSession = vi.fn(async () => true);
+
+        const { SessionRightPanelGitView } = await import('./SessionRightPanelGitView');
+
+        await renderScreen(<SessionResumeProvider onResumeSession={onResumeSession}>
+                    <SessionRightPanelGitView sessionId="s1" scopeId="session:s1" />
+                </SessionResumeProvider>);
+
+        expect(capturedInactiveProps).toBeTruthy();
+        expect(typeof capturedInactiveProps.onOpenSession).toBe('function');
+    });
+
+    it('falls back to emitting a resume request when no resume provider is available', async () => {
+        capturedInactiveProps = null;
+        machineReachable = false;
+        sessionPath = null;
+        projectPath = null;
+        emitSessionResumeRequestSpy.mockClear();
+
+        const { SessionRightPanelGitView } = await import('./SessionRightPanelGitView');
+
+        await renderScreen(<SessionRightPanelGitView sessionId="s1" scopeId="session:s1" />);
+
+        expect(capturedInactiveProps).toBeTruthy();
+        expect(typeof capturedInactiveProps.onOpenSession).toBe('function');
+        (capturedInactiveProps.onOpenSession as any)();
+        expect(emitSessionResumeRequestSpy).toHaveBeenCalledWith('s1');
+    });
+
+    it('keeps the inactive resume state when the machine is reachable but no RPC target is available', async () => {
+        capturedInactiveProps = null;
+        machineReachable = true;
+        machineRpcTargetAvailable = false;
+
+        const { SessionRightPanelGitView } = await import('./SessionRightPanelGitView');
+
+        const screen = await renderScreen(<SessionRightPanelGitView sessionId="s1" scopeId="session:s1" />);
+
+        expect(capturedInactiveProps).toMatchObject({ machineReachable: true });
+        expect(screen.findAllByType('SourceControlUnavailableState').length).toBe(0);
+    });
+
+    it('shows unavailable state when machine appears offline but machine RPC target is available', async () => {
+        capturedInactiveProps = null;
+        machineReachable = false;
+        machineRpcTargetAvailable = true;
+        sessionPath = '/repo';
+        projectPath = '/repo';
+
+        const { SessionRightPanelGitView } = await import('./SessionRightPanelGitView');
+
+        const screen = await renderScreen(<SessionRightPanelGitView sessionId="s1" scopeId="session:s1" />);
+
+        expect(capturedInactiveProps).toBeNull();
+        expect(screen.findAllByType('SourceControlUnavailableState').length).toBe(1);
+    });
+
+    it('loads commit history when project path is available even if session metadata path is missing', async () => {
+        capturedInactiveProps = null;
+        machineReachable = true;
+        sessionPath = null;
+        projectPath = '/repo';
+        activeGitSubTab = 'history';
+
+        const { SessionRightPanelGitView } = await import('./SessionRightPanelGitView');
+
+        await renderScreen(<SessionRightPanelGitView sessionId="s1" scopeId="session:s1" />);
+
+        expect(loadCommitHistorySpy).toHaveBeenCalledWith({ reset: true });
+    });
+});

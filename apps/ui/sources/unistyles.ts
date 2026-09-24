@@ -1,0 +1,63 @@
+import { Appearance } from 'react-native';
+import * as SystemUI from 'expo-system-ui';
+import { StyleSheet, UnistylesRuntime } from 'react-native-unistyles';
+
+import { loadThemeRuntimeLocalState } from './sync/domains/state/persistence';
+import {
+    resolveThemeRuntimeStartupThemes,
+    resolveThemeRuntimeVisualTheme,
+} from './theme/profiles/themeProfileRuntime';
+import { fireAndForget } from './utils/system/fireAndForget';
+
+const themeRuntimeLocalState = loadThemeRuntimeLocalState();
+const themePreference = themeRuntimeLocalState.themePreference;
+const startupThemes = resolveThemeRuntimeStartupThemes({
+    themeProfiles: themeRuntimeLocalState.themeProfiles,
+    themePreference,
+    systemTheme: Appearance.getColorScheme(),
+});
+const appThemes = startupThemes.themes;
+
+const breakpoints = {
+    xs: 0, // <-- make sure to register one breakpoint with value 0
+    sm: 300,
+    md: 500,
+    lg: 800,
+    xl: 1200
+};
+
+type AppThemes = typeof appThemes;
+type AppBreakpoints = typeof breakpoints;
+
+declare module 'react-native-unistyles' {
+    export interface UnistylesThemes extends AppThemes { }
+    export interface UnistylesBreakpoints extends AppBreakpoints { }
+}
+
+const getInitialTheme = (): 'light' | 'dark' => {
+    return resolveThemeRuntimeVisualTheme(themePreference, Appearance.getColorScheme());
+};
+
+const settings = themePreference === 'adaptive'
+    ? {
+        adaptiveThemes: true,
+        CSSVars: true,
+    }
+    : {
+        initialTheme: getInitialTheme(),
+        CSSVars: true,
+    };
+
+StyleSheet.configure({
+    settings,
+    breakpoints,
+    themes: appThemes,
+});
+
+const setRootBackgroundColor = () => {
+    const color = startupThemes.backgroundColor;
+    UnistylesRuntime.setRootViewBackgroundColor(color);
+    fireAndForget(SystemUI.setBackgroundColorAsync(color), { tag: 'unistyles.setRootBackgroundColor' });
+};
+
+setRootBackgroundColor();

@@ -1,0 +1,122 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import YAML from 'yaml';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, '..', '..');
+
+async function loadWorkflow(name) {
+  return readFile(join(repoRoot, '.github', 'workflows', name), 'utf8');
+}
+
+async function loadMobileReleaseEnvironmentsModule() {
+  const moduleUrl = pathToFileURL(join(repoRoot, 'scripts', 'pipeline', 'expo', 'mobile-release-environments.mjs'));
+  return import(`${moduleUrl.href}?cacheBust=${Date.now()}`);
+}
+
+test('promote-ui publishes mobile assets under ui-mobile-* GitHub release tags', async () => {
+  const raw = await loadWorkflow('promote-ui.yml');
+
+  assert.match(raw, /uses:\s*\.\/\.github\/workflows\/build-ui-mobile-local\.yml/);
+
+  const { resolveMobileReleaseMetadata } = await loadMobileReleaseEnvironmentsModule();
+  assert.equal(resolveMobileReleaseMetadata({ environment: 'production', appVersion: '1.2.3' }).tag, 'ui-mobile-stable');
+  assert.equal(resolveMobileReleaseMetadata({ environment: 'preview', appVersion: '1.2.3' }).tag, 'ui-mobile-preview');
+  assert.equal(resolveMobileReleaseMetadata({ environment: 'publicdev', appVersion: '1.2.3' }).tag, 'ui-mobile-dev');
+
+  assert.doesNotMatch(raw, /echo "tag=ui-v/);
+  assert.doesNotMatch(raw, /echo "tag=ui-preview"/);
+  assert.doesNotMatch(raw, /format\('ui-v\{0\}'/);
+  assert.doesNotMatch(raw, /'ui-preview'/);
+
+  assert.doesNotMatch(raw, /publish_mobile_local:/);
+  assert.doesNotMatch(raw, /uses:\s*\.\/\.github\/workflows\/publish-ui-release\.yml/);
+  assert.doesNotMatch(raw, /needs\.promote\.outputs\.app_version/);
+});
+
+test('promote-ui labels mobile releases as UI Mobile for clarity', async () => {
+  const raw = await loadWorkflow('promote-ui.yml');
+
+  assert.match(raw, /uses:\s*\.\/\.github\/workflows\/build-ui-mobile-local\.yml/);
+
+  const { resolveMobileReleaseMetadata } = await loadMobileReleaseEnvironmentsModule();
+  assert.equal(resolveMobileReleaseMetadata({ environment: 'production', appVersion: '1.2.3' }).title, 'Happier UI Mobile Stable');
+  assert.equal(resolveMobileReleaseMetadata({ environment: 'preview', appVersion: '1.2.3' }).title, 'Happier UI Mobile Preview');
+  assert.equal(resolveMobileReleaseMetadata({ environment: 'publicdev', appVersion: '1.2.3' }).title, 'Happier UI Mobile Dev');
+
+  assert.doesNotMatch(raw, /echo "title=Happier UI v/);
+  assert.doesNotMatch(raw, /echo "title=Happier UI Preview"/);
+  assert.doesNotMatch(raw, /format\('Happier UI v\{0\}'/);
+  assert.doesNotMatch(raw, /'Happier UI Preview'/);
+});
+
+test('promote-ui runs a dedicated public APK release build for preview and production lanes', async () => {
+  const raw = await loadWorkflow('promote-ui.yml');
+
+  assert.match(raw, /uses:\s*\.\/\.github\/workflows\/build-ui-mobile-local\.yml/);
+  assert.match(raw, /platform:\s*android/);
+  assert.match(raw, /profile:\s*\$\{\{\s*inputs\.environment == 'production' && 'production-apk' \|\| 'preview-apk'\s*\}\}/);
+  assert.match(raw, /mobile_native:[\s\S]*?publish_apk_release:\s*\$\{\{\s*'false'\s*\}\}/);
+  assert.match(raw, /mobile_apk_release:[\s\S]*?publish_apk_release:\s*\$\{\{\s*'true'\s*\}\}/);
+});
+
+test('promote-ui passes the exact candidate release-note projection to desktop and APK publishers', async () => {
+  const source = await loadWorkflow('promote-ui.yml');
+  const workflow = YAML.parse(source);
+  const raw = JSON.stringify(workflow);
+  const promote = workflow.jobs?.promote;
+  assert.equal(promote?.outputs?.release_notes_github_markdown, '${{ needs.validate_candidate.outputs.release_notes_github_markdown }}');
+  assert.equal(promote?.outputs?.release_notes_expo_message, '${{ needs.validate_candidate.outputs.release_notes_expo_message }}');
+  assert.match(raw, /Project approved release notes from exact candidate/);
+  assert.equal(
+    workflow.jobs?.mobile_apk_release?.with?.release_message,
+    '${{ needs.promote.outputs.release_notes_github_markdown }}',
+  );
+  assert.equal(
+    workflow.jobs?.desktop?.with?.release_message,
+    '${{ needs.promote.outputs.release_notes_github_markdown }}',
+  );
+  assert.equal(
+    source.includes('appendFileSync(process.env.GITHUB_OUTPUT, `${key}<<${delimiter}\\n${value}\\n${delimiter}\\n`);'),
+    true,
+    'multiline GitHub outputs must contain newline bytes around their delimiter',
+  );
+  assert.equal(
+    source.includes('appendFileSync(process.env.GITHUB_OUTPUT, `${key}<<${delimiter}\\\\n${value}\\\\n${delimiter}\\\\n`);'),
+    false,
+    'literal backslash-n sequences make GitHub reject the multiline output',
+  );
+});
+
+test('promote-ui publishes OTA updates with release notes from its direct validation dependency', async () => {
+  const workflow = YAML.parse(await loadWorkflow('promote-ui.yml'));
+  const promote = workflow.jobs?.promote;
+  const otaPublishSteps = (promote?.steps ?? []).filter((step) =>
+    String(step?.name ?? '').startsWith('Publish ') && String(step?.name ?? '').endsWith(' OTA from validated bytes'),
+  );
+
+  assert.equal(otaPublishSteps.length, 2, 'promote-ui must publish the prepared Android and iOS OTA artifacts');
+  for (const step of otaPublishSteps) {
+    assert.equal(
+      step?.env?.UPDATE_MESSAGE,
+      '${{ needs.validate_candidate.outputs.release_notes_expo_message }}',
+      `${step.name} must read release notes from the direct validate_candidate dependency`,
+    );
+  }
+});
+
+test('production mobile APK publishing keeps an immutable version tag alongside the rolling stable tag', async () => {
+  const { resolveMobileImmutableReleaseMetadata, resolveMobileReleaseMetadata } = await loadMobileReleaseEnvironmentsModule();
+  const meta = resolveMobileReleaseMetadata({ environment: 'production', appVersion: '1.2.3' });
+  const immutableMeta = resolveMobileImmutableReleaseMetadata({ environment: 'production', appVersion: '1.2.3' });
+
+  assert.equal(meta.rollingTag, true);
+  assert.equal(meta.prerelease, false);
+  assert.equal(meta.generateNotes, false);
+  assert.equal(immutableMeta?.tag, 'ui-mobile-v1.2.3');
+  assert.equal(immutableMeta?.rollingTag, false);
+  assert.equal(immutableMeta?.generateNotes, true);
+});

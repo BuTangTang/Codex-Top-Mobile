@@ -1,0 +1,149 @@
+---
+title: Continue with another Agent
+description: Switch the coding Agent running a session in place, keep the same session, and see what context was handed over.
+---
+
+A Happier session normally runs under one coding Agent for its whole life. **Continue with another Agent** lets you change that Agent in place, mid-conversation, without starting a new session.
+
+## Development status
+
+This capability exists in the current development source and is **not yet available in released Happier builds**. It has not passed an integrated live gate, so treat the behavior described below as the current development contract rather than as shipped behavior. Availability, copy, and failure handling can still change.
+
+The promise is narrow and worth stating exactly:
+
+- the session stays the same session, with the same id, history and settings
+- the current Agent is stopped, and the Agent you chose takes over
+- a bounded summary of the recent conversation is handed to the arriving Agent as text
+- the message you send is what commits the switch
+
+This is different from:
+
+- [Session handoff](/sessions/session-handoff), which moves a session to a **different machine** and keeps the same Agent
+- [Session forking & replay](/sessions/session-forking), which creates a **new** session branched from this one
+- [Model and engine selection](/agents/model-and-engine-selection), which chooses the engine and model for a **new** session
+
+## Where to find it
+
+Open a running session and use the Agent picker in the message composer — the same picker that shows the current engine and model.
+
+The picker lists the Agents the current CLI can run for this session. The Agent currently running the session is marked as such and stays selectable, because that row is also where you edit its model and configuration.
+
+## Arm an Agent, then send
+
+Selecting another Agent **arms** it. There is no separate confirm step:
+
+1. Pick the Agent you want. Its row shows the same model, thinking and configuration options that the new-session picker shows for that Agent, so engine and model stay one decision.
+2. The detail pane states what will happen: *"Your recent conversation carries over as text; images and files don't. Nothing is sent until your next message."*
+3. The composer's send control changes to **Continue with `{Agent}`**.
+4. Type your message and send. That send stops the current Agent and starts the chosen one.
+
+To cancel, reselect the Agent that is currently running the session. Leaving the session is not required, and nothing has been sent until you press send.
+
+An armed choice is scoped to this session and to the Agent that was running it when you armed. If the session's Agent changes underneath you, or the feature is turned off on your server, the arm is discarded rather than silently surviving.
+
+## When it is available
+
+The switch works only for a **hosted** session whose current Agent Happier can name and is **strictly idle**. The Session's recorded machine is not a switch gate: the stop and activation owners determine whether this CLI can perform their work. A cold inactive Session counts as stopped once its canonical Session state confirms that fact.
+
+It is not available when:
+
+- **The session's transcript is not hosted by Happier.** A [direct session](/sessions/continuing-a-session), where the Agent owns its own store, has no Happier conversation for another Agent to continue.
+- **You have read-only access to the session.** The picker says so once for the session rather than once per Agent.
+- **The current Agent is still working.** Send is refused with *"`{Agent}` is still working. Nothing was sent — try again once it finishes."* Wait for the turn to finish and send again.
+- **No reachable CLI can perform the operation, or its CLI is older than the feature.** Happier distinguishes the two where it can, and says "update or reconnect" when it genuinely cannot tell.
+- **The target is a Custom ACP backend.** Configured ACP backends stay visible in the picker so the catalog reads the same everywhere, but in-place switching to them is not supported yet rather than failing at send time.
+
+The switch never moves a session to another machine. If you want that, use [session handoff](/sessions/session-handoff).
+
+## Switching back to an Agent you used before
+
+If you switch back to an Agent that already ran this session **on the same machine**, it resumes its own conversation instead of starting a fresh one. Happier then replays only what happened while that Agent was away, so it is not re-told history it already holds.
+
+Two things follow from that:
+
+- It only happens when that Agent's own provider-session resume is supported and allowed for you. An Agent you have disabled in settings, a provider that does not support resume at all, and — for Codex — a backend mode that does not offer it, all fall back to a fresh start with the **full** carried-over context instead. See [Continuing a session](/sessions/continuing-a-session).
+- The Agent's own vendor session can be gone by the time you return: providers prune, rotate and expire their session stores. Happier does not pre-check it. The recorded boundary advances only when the provider accepts the requested native identity, including when no replay seed is needed; prompt delivery or replay-seed retirement alone is not that proof. A failed strict return leaves the earlier boundary unchanged and invalidates that identity instead of offering it again as a valid native return.
+
+## What the arriving Agent is given
+
+The arriving Agent gets a bounded, text-only brief. Depending on what exists, it can include:
+
+- a short header saying this is the same Happier session under a new Agent, and naming the Agent that just left
+- the session title
+- for a fresh arriving Agent, an explicit note that the previous Agent's own conversation state does **not** carry over, so what follows is a replay; a returning Agent instead resumes its own native conversation and receives only the away-delta
+- what the previous Agent was tracking — its in-flight plan — attributed to it and marked as past
+- your last instruction, pinned when it falls outside the replayed window
+- the tail of the conversation
+- a note when part of the window could not be read
+- pointers for reading the rest: how to fetch the full transcript, and the previous Agent's own session log when it is still on disk
+
+The brief is bounded by **characters**, not by message count, so it is a tail of the conversation rather than all of it — that is why the pointers matter.
+
+Images and files from the earlier conversation are not part of the brief. Attachments on the message you send with the switch are unaffected.
+
+If you switch before sending anything, there is simply nothing to carry over, and the picker says so instead of the usual disclosure.
+
+## The transcript divider and the "Context handed over" card
+
+Every switch leaves a divider in the transcript reading **"Continued this Session from `{A}` to `{B}`"**. It marks the attribution boundary: messages above it are the previous Agent's, messages below are the new one's.
+
+Tap the divider to open **Context handed over**.
+
+Read this card knowing one thing about it: **nothing was stored to show you.** The brief is discarded as soon as the arriving Agent accepts it. The card rebuilds it on open, on the CLI performing the rebuild, by running the same context pass over the same point in the transcript that the switch recorded.
+
+The card states this itself, because it changes how you should read it:
+
+> Rebuilt now from this Session's transcript, not stored at the time — so it can differ from what was sent. What the previous Agent was tracking, and its own log, can't be rebuilt, so they are left out.
+
+Both omissions are deliberate. The previous Agent's tracked work and its session log are that Agent's own live state; the switch cleared them and the next Agent republishes into the same place. Showing today's values would claim they crossed the boundary.
+
+The card also offers **Go to the last message included**, which scrolls the transcript to the newest message the brief could have carried.
+
+If the machine is unreachable, or the rebuild fails for a reason that might not repeat, the card offers **Try again**.
+
+## When something goes wrong
+
+Happier is explicit about whether your message was sent and whether the switch happened.
+
+- **Nothing was sent, nothing changed.** Wrong permissions, an unsupported session, a target that is not available to the CLI performing the operation, a session that changed while you were choosing, an Agent that was still working, or an Agent that could not be stopped. Fix the cause and send again — your draft is kept.
+- **The previous Agent stopped, but the switch did not complete.** Your message was not sent. Happier reconciles the current Session facts automatically; your draft stays available and the ordinary send is the retry when the Session is still the source.
+- **The session switched but the target did not start.** Your exact message is already queued and will be delivered when the Session resumes; do not send it again. The existing **Resume session** action is offered only when the Session is already the target and inactive.
+- **Happier could not confirm what happened.** While this is unresolved, the composer performs one automatic reconciliation and refuses new sends rather than risk sending your message twice.
+
+There is no *Check status*, *Resume source*, or *Resume target* control, recovery panel, polling, or
+second recovery state machine. Apart from **Resume session** for an inactive target, the composer
+banner offers no recovery action.
+
+Retrying the same armed switch reuses the same identity, so a retry admits one message rather than a duplicate.
+
+One send has one destination. If the composer is already addressing something else — a voice adapter, or a delegated run — Happier refuses instead of quietly delivering the message to the wrong place, and tells you to clear one of the two.
+
+## For operators
+
+The feature is **server-advertised and on by default**. Clients fail closed: if a server does not advertise it, the picker offers no switch targets at all.
+
+To turn it off for every client connected to a server:
+
+```bash
+HAPPIER_FEATURE_SESSIONS_AGENT_SWITCHING__ENABLED=0
+```
+
+Restart the server after changing this setting. Disabled or malformed server bits fail closed, and the mutation route rejects direct calls as unavailable rather than relying only on the picker.
+
+The size of the carried-over brief is a daemon-side setting on the machine running the session. It is shared with forking and other replay-seeded flows, so changing it affects those too:
+
+```bash
+# Character budget for the carried-over context.
+# Default 120000. Minimum 1024, maximum 200000.
+HAPPIER_REPLAY_MAX_SEED_CHARS=120000
+```
+
+The minimum is not arbitrary. Below roughly 800 characters the prompt builder correctly produces **no** brief at all rather than a frame with no conversation under it, so `1024` is the smallest value that can still deliver a usable brief.
+
+## Related
+
+- [Session handoff](/sessions/session-handoff)
+- [Session forking & replay](/sessions/session-forking)
+- [Model and engine selection](/agents/model-and-engine-selection)
+- [Continuing a session](/sessions/continuing-a-session)
+- [Server feature flags](/extras/feature-flags)

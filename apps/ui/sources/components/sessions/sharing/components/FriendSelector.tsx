@@ -1,0 +1,352 @@
+import React, { memo, useCallback, useMemo, useState } from 'react';
+import { View, FlatList, ScrollView, Platform, Switch } from 'react-native';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+
+import { UserProfile, getDisplayName } from '@/sync/domains/social/friendTypes';
+import { ShareAccessLevel } from '@/sync/domains/social/sharingTypes';
+import { UserCard } from '@/components/ui/cards/UserCard';
+import { Item } from '@/components/ui/lists/Item';
+import { t } from '@/text';
+import type { CustomModalInjectedProps } from '@/modal';
+import { useModalCardChrome } from '@/modal/components/card/useModalCardChrome';
+import { Typography } from '@/constants/Typography';
+import { RoundButton } from '@/components/ui/buttons/RoundButton';
+import { Modal } from '@/modal';
+import { HappyError } from '@/utils/errors/errors';
+import { Text, TextInput } from '@/components/ui/text/Text';
+import { useScrollViewWheelScrollTo } from '@/components/ui/scroll/useScrollViewWheelScrollTo';
+import { resolveSessionShareRecipientEligibility } from '@/sync/domains/social/sessionShareRecipientEligibility';
+
+
+/**
+ * Props for FriendSelector component
+ */
+export interface FriendSelectorProps {
+    /** List of friends to choose from */
+    friends: UserProfile[];
+    /** IDs of users already having access */
+    excludedUserIds: string[];
+    /** Callback when a friend is selected */
+    onSelect: (userId: string, accessLevel: ShareAccessLevel, canApprovePermissions?: boolean) => Promise<void> | void;
+    /** Whether the current user can grant permission approvals to recipients */
+    canManagePermissionDelegation?: boolean;
+    /** Currently selected user ID (optional) */
+    selectedUserId?: string | null;
+    /** Currently selected access level (optional) */
+    selectedAccessLevel?: ShareAccessLevel;
+}
+
+/**
+ * Friend selector component for sharing
+ *
+ * @remarks
+ * Displays a searchable list of friends and allows selecting
+ * an access level. This is a controlled component - parent
+ * manages the modal and button states.
+ */
+export const FriendSelector = memo(function FriendSelector({
+    friends,
+    excludedUserIds,
+    onSelect,
+    onClose,
+    setChrome,
+    canManagePermissionDelegation = false,
+    selectedUserId: initialSelectedUserId = null,
+    selectedAccessLevel: initialSelectedAccessLevel = 'view',
+}: FriendSelectorProps & CustomModalInjectedProps) {
+    useUnistyles();
+    const styles = stylesheet;
+
+    const [searchQuery, setSearchQuery] = useState('');
+    const [selectedUserId, setSelectedUserId] = useState<string | null>(initialSelectedUserId);
+    const [selectedAccessLevel, setSelectedAccessLevel] = useState<ShareAccessLevel>(initialSelectedAccessLevel);
+    const [canApprovePermissions, setCanApprovePermissions] = useState(false);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+
+    // Filter friends based on search and exclusions
+    const filteredFriends = useMemo(() => {
+        const excluded = new Set(excludedUserIds);
+        return friends.filter(friend => {
+            if (excluded.has(friend.id)) return false;
+            if (!searchQuery) return true;
+
+            const displayName = getDisplayName(friend).toLowerCase();
+            const username = friend.username.toLowerCase();
+            const query = searchQuery.toLowerCase();
+
+            return displayName.includes(query) || username.includes(query);
+        });
+    }, [friends, excludedUserIds, searchQuery]);
+
+    const selectedFriend = useMemo(() => {
+        return friends.find(f => f.id === selectedUserId);
+    }, [friends, selectedUserId]);
+
+    const scrollRef = React.useRef<ScrollView>(null);
+    const wheelScrollHandlers = useScrollViewWheelScrollTo(scrollRef);
+
+    const handleConfirm = useCallback(async () => {
+        if (!selectedUserId) return;
+        if (isSubmitting) return;
+        setIsSubmitting(true);
+        try {
+            await Promise.resolve(onSelect(
+                selectedUserId,
+                selectedAccessLevel,
+                canManagePermissionDelegation ? canApprovePermissions : undefined,
+            ));
+            onClose();
+        } catch (e) {
+            const message =
+                e instanceof HappyError ? e.message :
+                e instanceof Error ? e.message :
+                t('errors.operationFailed');
+            Modal.alert(t('common.error'), message);
+        } finally {
+            setIsSubmitting(false);
+        }
+    }, [
+        canApprovePermissions,
+        canManagePermissionDelegation,
+        isSubmitting,
+        onClose,
+        onSelect,
+        selectedAccessLevel,
+        selectedUserId,
+    ]);
+
+    const footer = useMemo(() => (
+        <View style={styles.footer}>
+            <RoundButton
+                title={t('session.sharing.addShare')}
+                onPress={handleConfirm}
+                disabled={!selectedUserId || isSubmitting}
+                size="large"
+                style={{ width: '100%', maxWidth: 420, alignSelf: 'center' }}
+            />
+        </View>
+    ), [handleConfirm, isSubmitting, selectedUserId, styles.footer]);
+
+    useModalCardChrome(setChrome, useMemo(() => ({
+        kind: 'card' as const,
+        footer,
+    }), [footer]));
+
+    return (
+        <View
+            style={styles.body}
+            {...(Platform.OS === 'web' ? ({ onWheel: wheelScrollHandlers.onWheel } as any) : {})}
+        >
+            <ScrollView
+                ref={scrollRef}
+                style={styles.scroll}
+                contentContainerStyle={styles.scrollContent}
+                keyboardShouldPersistTaps="handled"
+                onScroll={wheelScrollHandlers.onScroll}
+                scrollEventThrottle={16}
+            >
+                    <TextInput
+                        style={styles.searchInput}
+                        placeholder={t('friends.searchPlaceholder')}
+                        value={searchQuery}
+                        onChangeText={setSearchQuery}
+                        autoFocus
+                    />
+
+                    <View style={styles.friendList}>
+                        <FlatList
+                            data={filteredFriends}
+                            keyExtractor={(item) => item.id}
+                            renderItem={({ item }) => {
+                                const eligibility = resolveSessionShareRecipientEligibility(item);
+                                const canShare = eligibility.eligible;
+                                const isSelected = selectedUserId === item.id;
+                                const unavailableReason = eligibility.eligible
+                                    ? undefined
+                                    : eligibility.reason === 'relationship-pending'
+                                        ? t('friends.status.pending')
+                                        : eligibility.reason === 'relationship-requested'
+                                            ? t('friends.status.requested')
+                                            : eligibility.reason === 'relationship-unavailable'
+                                                ? t(`friends.status.${item.status}`)
+                                                : t('session.sharing.recipientMissingKeys');
+                                return (
+                                    <View style={styles.friendItem}>
+                                        <UserCard
+                                            user={item}
+                                            onPress={canShare ? () => setSelectedUserId(item.id) : undefined}
+                                            disabled={!canShare}
+                                            subtitle={unavailableReason}
+                                        />
+                                        {isSelected ? <View style={styles.selectedIndicator} /> : null}
+                                    </View>
+                                );
+                            }}
+                            ListEmptyComponent={
+                                <View style={styles.emptyState}>
+                                    <Text style={styles.emptyText}>
+                                        {searchQuery ? t('common.noMatches') : t('friends.noFriendsYet')}
+                                    </Text>
+                                </View>
+                            }
+                            scrollEnabled={false}
+                        />
+                    </View>
+
+                    {selectedFriend ? (
+                        <View style={styles.accessLevelSection}>
+                            <Text style={styles.sectionTitle}>{t('session.sharing.accessLevel')}</Text>
+                            <Item
+                                title={t('session.sharing.viewOnly')}
+                                subtitle={t('session.sharing.viewOnlyDescription')}
+                                onPress={() => {
+                                    setSelectedAccessLevel('view');
+                                    setCanApprovePermissions(false);
+                                }}
+                                rightElement={
+                                    selectedAccessLevel === 'view' ? (
+                                        <View style={styles.radioSelected}>
+                                            <View style={styles.radioDot} />
+                                        </View>
+                                    ) : (
+                                        <View style={styles.radioUnselected} />
+                                    )
+                                }
+                            />
+                            <Item
+                                title={t('session.sharing.canEdit')}
+                                subtitle={t('session.sharing.canEditDescription')}
+                                onPress={() => setSelectedAccessLevel('edit')}
+                                rightElement={
+                                    selectedAccessLevel === 'edit' ? (
+                                        <View style={styles.radioSelected}>
+                                            <View style={styles.radioDot} />
+                                        </View>
+                                    ) : (
+                                        <View style={styles.radioUnselected} />
+                                    )
+                                }
+                            />
+                            <Item
+                                title={t('session.sharing.canManage')}
+                                subtitle={t('session.sharing.canManageDescription')}
+                                onPress={() => setSelectedAccessLevel('admin')}
+                                rightElement={
+                                    selectedAccessLevel === 'admin' ? (
+                                        <View style={styles.radioSelected}>
+                                            <View style={styles.radioDot} />
+                                        </View>
+                                    ) : (
+                                        <View style={styles.radioUnselected} />
+                                    )
+                                }
+                            />
+
+                            {canManagePermissionDelegation && selectedAccessLevel !== 'view' ? (
+                                <View style={styles.permissionToggle}>
+                                    <Item
+                                        title={t('session.sharing.allowPermissionApprovals')}
+                                        subtitle={t('session.sharing.allowPermissionApprovalsDescription')}
+                                        rightElement={
+                                            <Switch
+                                                value={canApprovePermissions}
+                                                onValueChange={setCanApprovePermissions}
+                                            />
+                                        }
+                                        showChevron={false}
+                                        showDivider={false}
+                                    />
+                                </View>
+                            ) : null}
+                        </View>
+                    ) : null}
+            </ScrollView>
+        </View>
+    );
+});
+
+const stylesheet = StyleSheet.create((theme) => ({
+    body: {
+        flex: 1,
+        minHeight: 0,
+    },
+    scroll: {
+        flex: 1,
+    },
+    scrollContent: {
+        padding: 16,
+        paddingBottom: 18,
+        flexGrow: 1,
+    },
+    searchInput: {
+        height: 40,
+        borderRadius: 8,
+        backgroundColor: theme.colors.surface.inset,
+        paddingHorizontal: 12,
+        marginBottom: 16,
+        fontSize: 16,
+        color: theme.colors.text.primary,
+    },
+    friendList: {
+        marginBottom: 16,
+    },
+    friendItem: {
+        position: 'relative',
+    },
+    selectedIndicator: {
+        position: 'absolute',
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: 4,
+        backgroundColor: theme.colors.text.link,
+    },
+    emptyState: {
+        padding: 32,
+        alignItems: 'center',
+    },
+    emptyText: {
+        fontSize: 16,
+        color: theme.colors.text.secondary,
+        textAlign: 'center',
+    },
+    accessLevelSection: {
+        marginTop: 4,
+    },
+    sectionTitle: {
+        fontSize: 17,
+        color: theme.colors.text.primary,
+        marginBottom: 12,
+        paddingHorizontal: 4,
+        ...Typography.default('semiBold'),
+    },
+    radioSelected: {
+        width: 20,
+        height: 20,
+        borderRadius: 10,
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        borderColor: theme.colors.radio.active,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    radioDot: {
+        width: 10,
+        height: 10,
+        borderRadius: 5,
+        backgroundColor: theme.colors.radio.dot,
+    },
+    radioUnselected: {
+        width: 20,
+        height: 20,
+        borderRadius: 10,
+        borderWidth: 2,
+        borderColor: theme.colors.radio.inactive,
+    },
+    permissionToggle: {
+        marginTop: 8,
+    },
+    footer: {
+        marginTop: 16,
+    },
+}));

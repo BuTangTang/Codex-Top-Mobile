@@ -1,0 +1,145 @@
+import * as React from 'react';
+import { Pressable, View, Platform } from 'react-native';
+
+import type { AgentInputExtraActionChip, AgentInputExtraActionChipRenderContext } from '@/components/sessions/agentInput/agentInputContracts';
+import { Text } from '@/components/ui/text/Text';
+import { normalizeNodeForView } from '@/components/ui/rendering/normalizeNodeForView';
+import { ActionListSection } from '@/components/ui/lists/ActionListSection';
+import { t } from '@/text';
+import { blurActiveElementOnWeb } from '@/utils/platform/deferOnWeb';
+import { runAfterInteractionsWithFallback } from '@/utils/timing/runAfterInteractionsWithFallback';
+import { Icon, ICON_SIZE } from '@/components/ui/icons/Icon';
+import { AGENT_INPUT_CHIP_ICON_SIZE_PX, AGENT_INPUT_CHIP_ICON_STYLE, AGENT_INPUT_MENU_ICON_SIZE_PX } from '../definitions/agentInputChipIconMetrics';
+
+const WEB_PICKER_DOUBLE_OPEN_COOLDOWN_MS = 500;
+const NATIVE_PICKER_OPEN_AFTER_POPOVER_DISMISS_DELAY_MS = 250;
+
+function runAfterNativePopoverDismiss(action: () => void): void {
+    if (Platform.OS !== 'ios' && Platform.OS !== 'android') {
+        action();
+        return;
+    }
+    // On RN 0.81 New Arch this is a microtask, not a real deferral (see the helper's doc comment):
+    // InteractionManager is the no-op stub, so nothing can starve it and nothing waits for the
+    // popover's exit animation. The bounded `setTimeout` below is what actually lets the popover
+    // dismiss before the OS picker takes over the screen.
+    runAfterInteractionsWithFallback(() => {
+        setTimeout(action, NATIVE_PICKER_OPEN_AFTER_POPOVER_DISMISS_DELAY_MS);
+    });
+}
+
+export function createAttachmentActionChip(params: Readonly<{
+    onPickFile: () => void;
+    onPickImage: () => void;
+    onPasteImage?: () => void;
+    disabled?: boolean;
+}>): AgentInputExtraActionChip {
+    const showChooser = Platform.OS === 'ios' || Platform.OS === 'android';
+    // Per-chip instance guard (avoid cross-screen/test interference from module-level state).
+    let lastWebPickerOpenAtMs = 0;
+    const runPickerOpenWithWebCooldown = (action: () => void) => {
+        if (Platform.OS !== 'web') {
+            action();
+            return;
+        }
+
+        const now = Date.now();
+        // If the system clock moves backwards (or tests use fake timers), don't let a future
+        // `lastWebPickerOpenAtMs` value block picker opens indefinitely.
+        if (now < lastWebPickerOpenAtMs) {
+            lastWebPickerOpenAtMs = 0;
+        }
+        if (now - lastWebPickerOpenAtMs < WEB_PICKER_DOUBLE_OPEN_COOLDOWN_MS) return;
+        lastWebPickerOpenAtMs = now;
+
+        // When the OS file chooser closes, some browsers can dispatch a follow-up "press" (key/mouse)
+        // to the previously focused element, which re-opens the picker immediately. Blurring and
+        // applying a short cooldown makes the flow deterministic.
+        blurActiveElementOnWeb();
+        action();
+    };
+
+    return {
+        key: 'attachments-add',
+        controlId: 'attachments',
+        labelPolicy: 'auto-hide',
+        ...(showChooser ? {
+            collapsedContentPopover: {
+                title: t('common.attach'),
+                label: t('common.attach'),
+                icon: (tint: string) =>
+                    normalizeNodeForView(<Icon name="paperclip" size={AGENT_INPUT_MENU_ICON_SIZE_PX} color={tint} />),
+                renderContent: ({ requestClose }) => {
+                    const pasteImage = params.onPasteImage;
+                    return (
+                        <ActionListSection
+                            actions={[
+                                ...(pasteImage ? [{
+                                    id: 'paste-image',
+                                    testID: 'attachments-action-paste-image',
+                                    label: t('common.pasteImage'),
+                                    onPress: () => {
+                                        requestClose();
+                                        runAfterNativePopoverDismiss(pasteImage);
+                                    },
+                                }] : []),
+                                {
+                                    id: 'add-image',
+                                    testID: 'attachments-action-add-image',
+                                    label: t('common.addImage'),
+                                    onPress: () => {
+                                        requestClose();
+                                        runAfterNativePopoverDismiss(params.onPickImage);
+                                    },
+                                },
+                                {
+                                    id: 'add-file',
+                                    testID: 'attachments-action-add-file',
+                                    label: t('common.addFile'),
+                                    onPress: () => {
+                                        requestClose();
+                                        runAfterNativePopoverDismiss(params.onPickFile);
+                                    },
+                                },
+                            ]}
+                        />
+                    );
+                },
+                maxWidthCap: 360,
+                maxHeightCap: 260,
+                scrollEnabled: false,
+            },
+        } : {
+            collapsedAction: ({ tint, dismiss, blurInput }) => ({
+                id: 'attachments',
+                label: t('common.attach'),
+                icon: normalizeNodeForView(<Icon name="paperclip" size={AGENT_INPUT_MENU_ICON_SIZE_PX} color={tint} />),
+                onPress: () => {
+                    blurInput();
+                    runPickerOpenWithWebCooldown(params.onPickFile);
+                    dismiss();
+                },
+            }),
+        }),
+        render: (ctx: AgentInputExtraActionChipRenderContext) => (
+            <Pressable
+                ref={ctx.chipAnchorRef}
+                testID="agent-input-attachments-chip"
+                onPress={() => {
+                    if (showChooser) {
+                        ctx.toggleCollapsedPopover?.('attachments-add');
+                    } else {
+                        runPickerOpenWithWebCooldown(params.onPickFile);
+                    }
+                }}
+                disabled={params.disabled}
+                style={({ pressed }) => ctx.chipStyle(Boolean(pressed))}
+            >
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    {normalizeNodeForView(<Icon name="paperclip" size={AGENT_INPUT_CHIP_ICON_SIZE_PX} color={ctx.iconColor} style={AGENT_INPUT_CHIP_ICON_STYLE} />)}
+                    {ctx.showLabel ? <Text style={ctx.textStyle}>{t('common.attach')}</Text> : null}
+                </View>
+            </Pressable>
+        ),
+    };
+}

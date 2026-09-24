@@ -1,0 +1,178 @@
+import * as React from 'react';
+import { act } from 'react-test-renderer';
+import { describe, expect, it, vi } from 'vitest';
+import { renderScreen } from '@/dev/testkit';
+import { createThemeFixture } from '@/dev/testkit/fixtures/themeFixtures';
+import { installSessionGitPaneCommonModuleMocks } from './sessionGitPaneTestHelpers';
+
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+const gitCommitTabTheme = createThemeFixture();
+
+installSessionGitPaneCommonModuleMocks({
+    reactNative: async () => {
+        const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
+        return createReactNativeWebMock({
+            View: 'View',
+            FlatList: 'FlatList',
+            ScrollView: 'ScrollView',
+            Pressable: 'Pressable',
+            Platform: {
+                select: (value: any) => value?.default ?? null,
+                OS: 'web',
+            },
+            AppState: {
+                currentState: 'active',
+                addEventListener: () => ({ remove: () => {} }),
+            },
+        });
+    },
+    typography: () => ({
+        Typography: {
+            default: () => ({}),
+            mono: () => ({}),
+            eyebrow: () => ({}),
+            keyHint: () => ({}),
+        },
+    }),
+});
+
+vi.mock('@expo/vector-icons', () => ({
+    Octicons: 'Octicons',
+}));
+
+vi.mock('@/components/sessions/files/SourceControlBranchSummary', () => ({
+    SourceControlBranchSummary: (props: any) => React.createElement('SourceControlBranchSummary', props),
+}));
+
+vi.mock('@/components/sessions/sourceControl/commitSelection/ScmChangesSelectionHeaderRow', () => ({
+    ScmChangesSelectionHeaderRow: (props: any) => React.createElement('ScmChangesSelectionHeaderRow', props),
+}));
+
+vi.mock('@/components/sessions/sourceControl/commitComposer/ScmCommitComposerCard', () => ({
+    ScmCommitComposerCard: (props: any) => React.createElement('ScmCommitComposerCard', props),
+}));
+
+vi.mock('@/components/sessions/sourceControl/changes/ScmChangeRow', () => ({
+    ScmChangeRow: (props: any) => React.createElement('ScmChangeRow', props),
+    resolveScmChangeStatsColumnWidth: () => 38,
+}));
+
+describe('SessionRightPanelGitCommitTab (draft debounce)', () => {
+    it('debounces commit draft persistence so typing does not update pane state on every keystroke', async () => {
+        const onCommitDraftMessageChange = vi.fn();
+        const { SessionRightPanelGitCommitTab } = await import('./SessionRightPanelGitCommitTab');
+
+        const screen = await renderScreen(<SessionRightPanelGitCommitTab
+            theme={gitCommitTabTheme}
+            sessionId="s1"
+            sessionPath="/workspace"
+            backendLabel="Git"
+            commitActionLabel="Commit"
+            scmSnapshot={null}
+            hasConflicts={false}
+            scmOperationBusy={false}
+            scmOperationStatus={null}
+            hasGlobalOperationInFlight={false}
+            inFlightScmOperation={null}
+            commitAllowed={false}
+            commitBlockedMessage={null}
+            changedFilesViewMode="repository"
+            attributionReliability="high"
+            allRepositoryChangedFiles={[] as any}
+            sessionAttributedFiles={[] as any}
+            repositoryOnlyFiles={[] as any}
+            suppressedInferredCount={0}
+            repositorySelectedCount={0}
+            onSelectAll={() => {}}
+            onSelectNone={() => {}}
+            disableSelectAll={true}
+            disableSelectNone={true}
+            onFilePress={() => {}}
+            onFilePressPinned={() => {}}
+            onToggleSelectionForFile={() => {}}
+            renderFileActions={() => null}
+            renderFileTrailingActions={() => null}
+            commitDraftMessage=""
+            onCommitDraftMessageChange={onCommitDraftMessageChange}
+            onCommitFromMessage={() => {}}
+            commitMessageGeneratorEnabled={false}
+            onGenerateCommitMessageSuggestion={async () => ({ ok: true, message: '' })}
+            scmStatusFiles={null}
+            showCommitComposer={true}
+        />);
+
+        const composer = screen.findByProps({ variant: 'railFooter' });
+
+        act(() => {
+            composer.props.onDraftMessageChange('h');
+            composer.props.onDraftMessageChange('he');
+            composer.props.onDraftMessageChange('hel');
+        });
+
+        expect(onCommitDraftMessageChange).toHaveBeenCalledTimes(0);
+
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+        });
+
+        expect(onCommitDraftMessageChange).toHaveBeenCalledTimes(1);
+        expect(onCommitDraftMessageChange).toHaveBeenCalledWith('hel');
+    });
+
+    it('passes the commit-adjacent push action through to the composer', async () => {
+        const pushAction = {
+            visible: true,
+            disabled: false,
+            busy: false,
+            accessibilityLabel: 'Push to origin/main',
+            onPress: vi.fn(),
+        };
+        const { SessionRightPanelGitCommitTab } = await import('./SessionRightPanelGitCommitTab');
+
+        const screen = await renderScreen(<SessionRightPanelGitCommitTab
+            theme={gitCommitTabTheme}
+            sessionId="s1"
+            sessionPath="/workspace"
+            backendLabel="Git"
+            commitActionLabel="Commit"
+            scmSnapshot={null}
+            hasConflicts={false}
+            scmOperationBusy={false}
+            scmOperationStatus={null}
+            hasGlobalOperationInFlight={false}
+            inFlightScmOperation={null}
+            commitAllowed={false}
+            commitBlockedMessage={null}
+            changedFilesViewMode="repository"
+            attributionReliability="high"
+            allRepositoryChangedFiles={[] as any}
+            sessionAttributedFiles={[] as any}
+            repositoryOnlyFiles={[] as any}
+            suppressedInferredCount={0}
+            repositorySelectedCount={0}
+            onSelectAll={() => {}}
+            onSelectNone={() => {}}
+            disableSelectAll={true}
+            disableSelectNone={true}
+            onFilePress={() => {}}
+            onFilePressPinned={() => {}}
+            onToggleSelectionForFile={() => {}}
+            renderFileActions={() => null}
+            renderFileTrailingActions={() => null}
+            commitDraftMessage=""
+            onCommitDraftMessageChange={() => {}}
+            onCommitFromMessage={() => {}}
+            commitMessageGeneratorEnabled={false}
+            onGenerateCommitMessageSuggestion={async () => ({ ok: true, message: '' })}
+            scmStatusFiles={null}
+            showCommitComposer={true}
+            commitAdjacentPushAction={pushAction}
+        />);
+
+        const composer = screen.findByProps({ variant: 'railFooter' });
+
+        expect(composer.props.pushAction).toBe(pushAction);
+    });
+});

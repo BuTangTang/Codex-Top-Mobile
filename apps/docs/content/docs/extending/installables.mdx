@@ -1,0 +1,176 @@
+---
+title: Installables
+description: Let Happier manage machine-local tools like Codex ACP and GitHub CLI, with install and update policies per machine.
+---
+
+Some Happier features depend on **machine-local tools** being present on the connected machine.
+
+Happier calls these **Installables**.
+
+Today, the main user-facing installables are:
+
+- **Codex ACP** — used when you explicitly run Codex in ACP mode instead of the default App Server path
+- **GitHub CLI (`gh`)** — optional helper for GitHub source-control workflows when you want to use local GitHub CLI authentication instead of a connected GitHub token
+
+## Why Installables exist
+
+Some features need more than the main Happier app and daemon. For example, Codex ACP needs a machine-local `codex-acp` binary when you explicitly run Codex in ACP mode rather than the default App Server path.
+
+Without Installables management, this usually turns into:
+
+- manual setup on every machine
+- version drift between machines
+- slower cold starts when a tool has to be fetched on demand
+
+Installables gives you one place to see and control those tools per machine.
+
+## Where to manage them
+
+Open:
+
+- **Machine Details → Installables**
+
+This screen shows the installables Happier knows how to manage for that specific machine.
+
+For each installable, you can see:
+
+- whether it is installed
+- the installed version
+- whether an update is available
+- the latest known version (when Happier checks it)
+- the current auto-install and auto-update policy
+
+## Auto-install when needed
+
+Each installable has an **Auto-install when needed** setting.
+
+When this is on, Happier can install the tool in the background when you use a feature that depends on it.
+
+Example:
+
+- you start a new Codex session with the **ACP backend**
+- Happier sees that **Codex ACP** is relevant for that session
+- if Codex ACP is missing and auto-install is enabled, Happier starts a background install on that machine
+
+This is designed to improve the **next** relevant session without blocking the current one.
+
+## Auto-update modes
+
+Each installable also has an **Auto-update** policy:
+
+- **Off**: never update automatically
+- **Notify**: show that an update is available, but do not upgrade automatically
+- **Auto**: upgrade automatically in the background when Happier checks and sees that a newer version is available
+
+Default behavior varies by installable.
+
+For Codex ACP, the default is:
+
+- **Auto-install when needed**: on
+- **Auto-update**: auto
+
+For optional helper tools such as `gh`, Happier can use a more conservative policy such as "do not auto-install" and "notify about updates."
+
+## What happens for Codex-related installables
+
+### App Server default path
+
+Normal Codex sessions and resume on the default **App Server** path do not depend on the Codex ACP installable.
+
+That means:
+
+- you do not need Codex ACP installed just to use default Codex App Server sessions
+- you do not need any extra Codex installable for normal App Server resume
+
+### Codex ACP mode
+
+Codex ACP still matters only when you explicitly choose the ACP backend.
+
+### New Codex sessions
+
+If you start a new Codex session and select the ACP backend:
+
+- Happier tries to keep the session usable immediately
+- if Codex ACP is already installed, it uses the installed binary
+- if Codex ACP is missing, Happier can still fall back to the existing fresh-session path while it installs Codex ACP in the background for future sessions
+
+This means the first ACP-related session on a machine may still be slower than later ones.
+
+### Resuming Codex sessions in ACP mode
+
+Codex resume is stricter:
+
+- resume requires **Codex ACP**
+- if ACP is unavailable, Happier does **not** silently replace resume with a fresh session
+
+If resume is important on a machine, leave Codex ACP installed and let Happier keep it updated.
+
+### Plain MCP note
+
+If you switch Codex to plain `mcp`, Happier can still start fresh Codex sessions there, but vendor resume is not available on that path in current builds.
+
+## What happens for GitHub CLI (`gh`)
+
+GitHub CLI is a generic installable dependency, not an agent backend.
+
+Happier can use `gh` for GitHub source-control workflows when:
+
+- you have not connected a GitHub token in Happier, or
+- the local `gh` path is the most appropriate way to use an already-authenticated machine
+
+Workflows that can use `gh` include:
+
+- publishing a local repository to GitHub
+- opening or reusing a GitHub pull request
+- checking out a GitHub pull request
+
+Resolution order:
+
+1. Happier prefers a working system `gh` if it is already installed.
+2. If a Happier-managed `gh` exists for the machine, Happier can use it.
+3. If neither exists, Happier can show installation/remediation guidance.
+
+Installing `gh` does not authenticate it. To use the CLI path, authenticate it on that machine with GitHub CLI's normal auth flow, such as:
+
+```bash
+gh auth login
+```
+
+For cross-machine workflows, a connected GitHub token is usually more portable because it travels through Happier's connected-service model. The `gh` path is best when the machine is already set up and authenticated.
+
+Default policy for `gh` differs from Codex ACP:
+
+- **Auto-install when needed**: off
+- **Auto-update**: notify
+
+That keeps GitHub CLI installation explicit. Happier does not silently install a new GitHub CLI binary just because you opened a source-control screen.
+
+GitLab note: GitLab merge-request workflows can use an authenticated `glab` CLI when it is already available, but `glab` is not currently a Happier-managed installable.
+
+## Scope and expectations
+
+Installables are managed **per machine**.
+
+That means:
+
+- one machine can have Codex ACP installed while another does not
+- policies are stored per machine
+- updates happen on the machine that owns the installable
+
+This is especially useful if you use:
+
+- a laptop and a desktop
+- multiple remote devboxes
+- separate personal and work machines
+
+## What Installables do not change
+
+Installables management does **not** force you to use a managed copy when you already have your own tool installed.
+
+In general, Happier still prefers a working user/system install by default when the provider resolution logic supports that.
+
+Installables mainly gives Happier a reliable managed path so that:
+
+- required tools can be present without manual setup
+- supported features keep working on fresh machines
+- background installs and updates reduce cold-start surprises

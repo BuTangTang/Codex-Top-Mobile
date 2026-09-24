@@ -1,0 +1,83 @@
+---
+title: Session forking & replay
+description: Branch Happier sessions safely, keep context via hidden replay seeds, and understand current Codex app-server fork and rollback behavior.
+---
+
+Session forking lets you branch a session without losing the original conversation. This page explains how Happier session forks work, how replay seeds keep context hidden but intact, and what Codex app-server currently supports for native fork and rollback.
+
+## What you get
+
+- **Fork from any message**: hover a committed message and fork into a new session.
+- **Fork the latest conversation**: use the session action (header/menu/command palette) to branch from the current tip.
+- **Hidden replay seed**: the replay prompt is sent only to the model on the first user turn and never shown in the transcript.
+- **Ancestor context without duplication**: the child renders read-only ancestor messages inline; scrolling pages parent segments automatically.
+- **Branch-and-edit**: when you fork on a user message, the child composer is prefilled with that message so you can revise and resend.
+- **Recognizable child titles**: when the parent has a session title, the child keeps it with `(fork 1)` appended. Forking that child increments the number instead of stacking another suffix.
+- **Provider-native when available**: Codex app-server supports native fork-at-latest plus rollback-to-point, and ACP can support fork-at-latest. OpenCode's legacy V1 server has a native fork route, but pure V2 does not; current server-mode admission therefore uses replay instead of making a dialect-ambiguous native claim.
+
+## How fork selection works
+
+In the current development flow, each fork entry point opens a strategy chooser before it starts any
+work. You can choose a **Native fork** when the Agent and fork point support one, **Replay fork** to
+start a child with a bounded transcript seed, or **Configure a new session** to continue through the
+normal new-session screen.
+
+An explicit Native choice is strict: if the provider-native fork is unavailable or fails, Happier
+reports that outcome instead of silently creating a replay child. Existing callers that explicitly
+use the compatibility `auto` strategy may still let the daemon choose its established native-or-replay
+policy. Native forks stay in progress until the provider resolves them; Happier does not abandon one
+after an arbitrary deadline or run a fork-specific readiness poll.
+
+## What replay does
+
+- Pulls the transcript up to your fork point (or latest for session-level fork).
+- Builds a replay seed prompt (optionally with a summary if you enable **summary + recent** in Settings).
+- Applies the seed **once** to the first user message sent in the child session; no draft injection and no transcript pollution.
+- Keeps the new provider session fresh so tools and policies use the child session, not the parent.
+
+### Replay strategies
+
+- **Recent messages** (default): sends the recent dialog window.
+- **Summary + recent**: if enabled and `execution.runs` is available, Happier first generates a structured summary (Goal/Instructions/Discoveries/Accomplished/Relevant files) then appends recent messages. If execution runs are disabled, Happier falls back to recent-only.
+
+You can adjust the replay seed budget in Settings (`max seed characters`) to trade context vs. size.
+
+## Ancestor transcript rendering
+
+- The child session shows its own messages plus read-only ancestor context inline, with a “Forked from …” divider.
+- Scrolling upward fetches older parent pages automatically without duplicating messages in storage.
+- Ancestor messages are non-interactive (no approvals/tool actions), but copy/deep-link remains.
+
+## Branch-and-edit semantics
+
+- Forking on a **user message** forks **before** that message (exclusive cutoff) and restores that exact text into the child composer as an editable draft.
+- Forking on assistant/tool messages forks **after** that message (inclusive cutoff) and does not prefill a draft.
+
+## Codex app-server behavior
+
+- **Native session-level fork**: Codex app-server supports the session action that forks from the latest committed conversation state.
+- **No native fork-from-message**: hovering an older message still requires Happier replay; if replay is disabled, that control is unavailable.
+- **Rollback to point**: Codex app-server supports rolling back the active conversation suffix before any committed user message. Happier restores that user message into the composer draft so you can edit and resend it, and marks rolled-back messages as historical in the transcript instead of deleting them from view.
+- **Legacy Codex flavors**: older session metadata may still say `openai` or `gpt`; Happier now treats those as Codex for fork/rollback UI support.
+
+## OpenCode specifics
+
+- Two backends:
+  - **Server-native (default)**: negotiates either the legacy V1 or pure V2 server API. V1 has native fork-at-message, while pure V2 has no fork route. Because this client cannot publish that distinction per live server, it fails closed and does not offer native server fork; use replay instead. It uses a managed local OpenCode server unless you set an explicit server URL.
+  - **ACP (legacy fallback)**: best-effort fork-at-latest when the ACP backend exposes `session/fork`; otherwise replay is used.
+- Explicit external server URL (Settings) is opt-in; only loopback `http` or `https` origins without credentials are accepted. Happier persists this URL per session when you explicitly set it; managed servers are not persisted.
+- Managed OpenCode server is shared per machine; if it dies, Happier restarts it automatically instead of blocking new sessions.
+
+## AskUserQuestion (user actions)
+
+- OpenCode server emits `question.*` events as structured **AskUserQuestion** requests.
+- These render as user-action cards (not permissions); answering resumes the run. Stale historical questions are read-only to avoid stuck runs.
+
+## Tips and troubleshooting
+
+- If a forked session lacks context, verify the fork point (hover fork vs. session-level fork) and that replay seeds are allowed in Settings.
+- For summary mode, ensure `execution.runs` is enabled; otherwise Happier uses recent-only.
+- If an explicitly chosen native fork fails, select **Replay fork** yourself; it is never silently
+  substituted. Compatibility callers that use `auto` retain their established daemon-selected
+  fallback behavior.
+- For direct OpenCode server overrides, use loopback origins without paths/queries to avoid invalid base URLs.

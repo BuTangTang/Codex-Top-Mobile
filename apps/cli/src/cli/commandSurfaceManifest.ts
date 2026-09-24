@@ -1,0 +1,157 @@
+export type CliCommandSurfaceEntry = Readonly<{
+  command: string | null;
+  rootHelpLabel?: string;
+  rootHelpDescription?: string;
+  rootHelpDetail?: string;
+  allowTmux: boolean;
+}>;
+
+export const RESUME_COMMAND_USAGE = 'happier resume [<session-id-or-prefix>]';
+
+const COMMAND_SURFACE_MANIFEST: readonly CliCommandSurfaceEntry[] = [
+  {
+    command: null,
+    rootHelpLabel: 'happier [options]',
+    rootHelpDescription: 'Start the default backend with mobile control',
+    allowTmux: true,
+  },
+  {
+    command: 'setup',
+    rootHelpLabel: 'happier setup',
+    rootHelpDescription: 'Connect this computer to your Happier account',
+    rootHelpDetail: 'choose where your relay lives, then sign in',
+    allowTmux: false,
+  },
+  {
+    command: 'auth',
+    rootHelpLabel: 'happier auth',
+    rootHelpDescription: 'Manage authentication',
+    allowTmux: false,
+  },
+  {
+    command: 'automation',
+    rootHelpLabel: 'happier automation',
+    rootHelpDescription: 'Trigger and manage automations',
+    allowTmux: false,
+  },
+  {
+    command: 'mcp',
+    rootHelpLabel: 'happier mcp',
+    rootHelpDescription: 'Expose the MCP server and manage MCP clients',
+    allowTmux: false,
+  },
+  {
+    command: 'codex',
+    rootHelpLabel: 'happier codex',
+    rootHelpDescription: 'Start Codex mode',
+    allowTmux: true,
+  },
+  {
+    command: 'opencode',
+    rootHelpLabel: 'happier opencode',
+    rootHelpDescription: 'Start OpenCode mode (ACP)',
+    allowTmux: true,
+  },
+  {
+    command: 'gemini',
+    rootHelpLabel: 'happier gemini',
+    rootHelpDescription: 'Start Gemini mode (ACP)',
+    allowTmux: true,
+  },
+  {
+    command: 'connect',
+    rootHelpLabel: 'happier connect',
+    rootHelpDescription: 'Connect AI vendor API keys',
+    allowTmux: false,
+  },
+  {
+    command: 'notify',
+    rootHelpLabel: 'happier notify',
+    rootHelpDescription: 'Send push notification',
+    allowTmux: false,
+  },
+  {
+    command: 'install',
+    rootHelpLabel: 'happier install',
+    rootHelpDescription: 'Install provider CLIs and helpers',
+    allowTmux: false,
+  },
+  {
+    command: 'status',
+    rootHelpLabel: 'happier status',
+    rootHelpDescription: 'Show system status and recommended repairs',
+    allowTmux: false,
+  },
+  {
+    command: 'service',
+    rootHelpLabel: 'happier service',
+    rootHelpDescription: 'Manage automatic startup',
+    rootHelpDetail: 'background services on this computer',
+    allowTmux: false,
+  },
+  {
+    command: 'daemon',
+    rootHelpLabel: 'happier daemon',
+    rootHelpDescription: 'Manage the local daemon process',
+    rootHelpDetail: 'started manually or via automatic startup',
+    allowTmux: false,
+  },
+  {
+    command: 'doctor',
+    rootHelpLabel: 'happier doctor',
+    rootHelpDescription: 'System diagnostics & troubleshooting',
+    allowTmux: false,
+  },
+  {
+    command: 'uninstall',
+    allowTmux: false,
+  },
+  {
+    command: 'logout',
+    allowTmux: false,
+  },
+  {
+    command: 'attach',
+    allowTmux: false,
+  },
+  {
+    command: 'self',
+    allowTmux: false,
+  },
+  {
+    command: 'server',
+    allowTmux: false,
+  },
+  {
+    command: 'session',
+    allowTmux: false,
+    rootHelpLabel: 'happier session',
+    rootHelpDescription: 'Manage sessions and execution runs',
+  },
+  {
+    command: 'resume',
+    allowTmux: true,
+    rootHelpLabel: RESUME_COMMAND_USAGE,
+    rootHelpDescription: 'Resume an inactive session',
+  },
+  {
+    // Compatibility alias: intentionally accepted but omitted from root help.
+    command: 'sessions',
+    allowTmux: false,
+  },
+  {
+    // Compatibility alias: intentionally accepted but omitted from root help.
+    command: 'automations',
+    allowTmux: false,
+  },
+];
+
+export function listRootHelpCommands(): readonly CliCommandSurfaceEntry[] {
+  return COMMAND_SURFACE_MANIFEST.filter((entry) => typeof entry.rootHelpLabel === 'string');
+}
+
+export function isTmuxAllowedCommand(command: string | null | undefined): boolean {
+  if (!command) return true;
+  const entry = COMMAND_SURFACE_MANIFEST.find((candidate) => candidate.command === command);
+  return entry ? entry.allowTmux : true;
+}

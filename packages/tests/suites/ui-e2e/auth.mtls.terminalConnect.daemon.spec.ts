@@ -1,0 +1,205 @@
+import { test, expect, type Page } from '@playwright/test';
+import { mkdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } from '../../src/testkit/uiE2e/cliTerminalConnect';
+import { acknowledgeTerminalConnectSuccessIfPresent } from '../../src/testkit/uiE2e/acknowledgeTerminalConnectSuccessIfPresent';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
+import { startForwardedHeaderProxy } from '../../src/testkit/uiE2e/forwardedHeaderProxy';
+import { withTimeoutMs } from '../../src/testkit/timing/withTimeout';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+test.describe('ui e2e: mTLS login + terminal connect', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('auth-mtls-terminal-connect-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+  let proxyBaseUrl: string | null = null;
+  let proxyStop: (() => Promise<void>) | null = null;
+  let daemon: StartedDaemon | null = null;
+
+  async function stopBestEffort(label: string, stop: (() => Promise<void>) | null | undefined): Promise<void> {
+    if (!stop) return;
+    await withTimeoutMs({
+      promise: stop(),
+      timeoutMs: 90_000,
+      label,
+    }).catch(() => {});
+  }
+
+  async function waitForWelcomeAuthenticated(page: Page, baseUrl: string, authResponse: Promise<unknown>): Promise<void> {
+    await gotoDomContentLoadedWithRetries(page, baseUrl);
+    await waitForInitialAppUi({ page, timeoutMs: 120_000 });
+    await authResponse;
+    await expect.poll(() => new URL(page.url()).pathname, { timeout: 120_000 }).toBe('/');
+    await expect(page.getByTestId('welcome-create-account')).toHaveCount(0, { timeout: 120_000 });
+    await expect.poll(async () => await page.getByTestId('session-getting-started-kind-connect_machine').count(), { timeout: 120_000 }).toBeGreaterThan(0);
+  }
+
+  test.beforeAll(async () => {
+    const uiWebEnv = {
+      ...process.env,
+      EXPO_PUBLIC_DEBUG: '1',
+      EXPO_PUBLIC_HAPPY_SERVER_URL: proxyBaseUrl ?? '',
+      EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
+      HAPPIER_E2E_UI_WEB_MODE: 'export',
+      HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS ?? '900000',
+      HAPPIER_E2E_UI_WEB_EXPORT_FALLBACK_TO_METRO: '0',
+      HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS ?? '480000',
+    };
+    test.setTimeout(resolveUiWebBeforeAllTimeoutMs(uiWebEnv));
+    await mkdir(cliHomeDir, { recursive: true });
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
+
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '0',
+        AUTH_ANONYMOUS_SIGNUP_ENABLED: '0',
+        AUTH_SIGNUP_PROVIDERS: '',
+
+        HAPPIER_FEATURE_E2EE__KEYLESS_ACCOUNTS_ENABLED: '1',
+        HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
+        HAPPIER_FEATURE_ENCRYPTION__DEFAULT_ACCOUNT_MODE: 'plain',
+
+        HAPPIER_FEATURE_AUTH_MTLS__ENABLED: '1',
+        HAPPIER_FEATURE_AUTH_MTLS__MODE: 'forwarded',
+        HAPPIER_FEATURE_AUTH_MTLS__TRUST_FORWARDED_HEADERS: '1',
+        HAPPIER_FEATURE_AUTH_MTLS__AUTO_PROVISION: '1',
+        HAPPIER_FEATURE_AUTH_MTLS__IDENTITY_SOURCE: 'san_email',
+        HAPPIER_FEATURE_AUTH_MTLS__ALLOWED_EMAIL_DOMAINS: 'example.com',
+        HAPPIER_FEATURE_AUTH_MTLS__ALLOWED_ISSUERS: 'CN=Example Root CA',
+        HAPPIER_FEATURE_AUTH_MTLS__FORWARDED_EMAIL_HEADER: 'x-happier-client-cert-email',
+        HAPPIER_FEATURE_AUTH_MTLS__FORWARDED_ISSUER_HEADER: 'x-happier-client-cert-issuer',
+        HAPPIER_FEATURE_AUTH_MTLS__FORWARDED_FINGERPRINT_HEADER: 'x-happier-client-cert-sha256',
+
+        HAPPIER_FEATURE_AUTH_UI__AUTO_REDIRECT_ENABLED: '1',
+        HAPPIER_FEATURE_AUTH_UI__AUTO_REDIRECT_PROVIDER_ID: 'mtls',
+
+      },
+    });
+
+    const proxy = await startForwardedHeaderProxy({
+      targetBaseUrl: server.baseUrl,
+      identityHeaders: {
+        'x-happier-client-cert-email': 'alice@example.com',
+        'x-happier-client-cert-issuer': 'CN=Example Root CA',
+        'x-happier-client-cert-sha256': 'sha256:abc123',
+      },
+    });
+    proxyBaseUrl = proxy.baseUrl;
+    proxyStop = proxy.stop;
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...uiWebEnv,
+        EXPO_PUBLIC_HAPPY_SERVER_URL: proxy.baseUrl,
+      },
+    });
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(180_000);
+    await Promise.allSettled([
+      stopBestEffort('mTLS terminal connect daemon stop', daemon?.stop),
+      stopBestEffort('mTLS terminal connect UI web stop', ui?.stop),
+      stopBestEffort('mTLS terminal connect forwarded proxy stop', proxyStop),
+      stopBestEffort('mTLS terminal connect server stop', server?.stop),
+    ]);
+  });
+
+  test('logs in via mTLS, approves terminal connect, and daemon becomes online', async ({ page }) => {
+    test.setTimeout(600_000);
+    if (!server) throw new Error('missing server fixture');
+    if (!uiBaseUrl) throw new Error('missing ui base url');
+    if (!proxyBaseUrl) throw new Error('missing proxy base url');
+
+    const mtlsOk = page.waitForResponse(
+      (resp) => resp.url().startsWith(`${proxyBaseUrl}/v1/auth/mtls`) && resp.request().method() === 'POST' && resp.status() === 200,
+      { timeout: 120_000 },
+    );
+
+    await waitForWelcomeAuthenticated(page, uiBaseUrl, mtlsOk);
+
+    const testDir = resolve(join(suiteDir, 't1-mtls-terminal-connect'));
+    await mkdir(testDir, { recursive: true });
+
+    let cliLogin: StartedCliTerminalConnect | null = null;
+    try {
+      cliLogin = await startCliAuthLoginForTerminalConnect({
+        testDir,
+        cliHomeDir,
+        // Keep the CLI terminal-connect "server" param aligned with the UI's active server URL
+        // (which is the forwarded-header proxy) so the web app doesn't switch servers mid-flow.
+        serverUrl: proxyBaseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          CI: '1',
+          HAPPIER_DISABLE_CAFFEINATE: '1',
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+          HAPPIER_VARIANT: 'dev',
+        },
+      });
+
+      await gotoDomContentLoadedWithRetries(page, cliLogin.connectUrl, 90_000);
+      await expect(page.getByTestId('terminal-connect-approve')).toHaveCount(1, { timeout: 60_000 });
+      await page.getByTestId('terminal-connect-approve').click();
+      await cliLogin.waitForSuccess();
+      await acknowledgeTerminalConnectSuccessIfPresent(page);
+
+      const fakeClaudeLogPath = resolve(join(testDir, 'fake-claude.jsonl'));
+      const fakeClaudePath = fakeClaudeFixturePath();
+
+      daemon = await startTestDaemon({
+        testDir,
+        happyHomeDir: cliHomeDir,
+        env: {
+          ...process.env,
+          CI: '1',
+          HAPPIER_HOME_DIR: cliHomeDir,
+          // Use the same server URL the CLI authenticated against so the daemon can find credentials.
+          // This is the forwarded-header proxy; it forwards to the real server.
+          HAPPIER_SERVER_URL: proxyBaseUrl,
+          HAPPIER_WEBAPP_URL: uiBaseUrl,
+          HAPPIER_DISABLE_CAFFEINATE: '1',
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+          HAPPIER_VARIANT: 'dev',
+          HAPPIER_CLAUDE_PATH: fakeClaudePath,
+          HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+          HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+          HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+        },
+      });
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/`);
+      await expect
+        .poll(
+          async () => {
+            const createCount = await page.getByTestId('session-getting-started-kind-create_session').count();
+            const selectCount = await page.getByTestId('session-getting-started-kind-select_session').count();
+            return createCount > 0 || selectCount > 0;
+          },
+          { timeout: 180_000 },
+        )
+        .toBe(true);
+    } finally {
+      await cliLogin?.stop().catch(() => {});
+    }
+  });
+});

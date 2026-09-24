@@ -1,0 +1,24 @@
+{
+    "name": "happier-hardware-keyboard-shortcuts",
+    "version": "0.0.0",
+    "private": true,
+    "description": "Local Expo module for native hardware keyboard shortcuts.",
+    "files": [
+        "android",
+        "app.plugin.js",
+        "ios",
+        "expo-module.config.json",
+        "package.json"
+    ],
+    "devDependencies": {
+        "expo-modules-core": "3.0.29"
+    },
+    "peerDependencies": {
+        "expo": "*"
+    },
+    "peerDependenciesMeta": {
+        "expo": {
+            "optional": true
+        }
+    }
+}

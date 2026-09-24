@@ -1,0 +1,328 @@
+import React from 'react';
+import { Platform, View, useWindowDimensions, Pressable } from 'react-native';
+import { Stack, useRouter, useLocalSearchParams, useNavigation } from 'expo-router';
+import { StyleSheet } from 'react-native-unistyles';
+import { useUnistyles } from 'react-native-unistyles';
+import { useHeaderHeight } from '@react-navigation/elements';
+import Constants from 'expo-constants';
+import { t } from '@/text';
+import { ProfileEditForm } from '@/components/profiles/edit';
+import { type AIBackendProfile } from '@/sync/domains/profiles/profileCompatibility';
+import { layout } from '@/components/ui/layout/layout';
+import { useSetting, useSettingMutable } from '@/sync/domains/state/storage';
+import { DEFAULT_PROFILES, getBuiltInProfile, getBuiltInProfileNameKey, resolveProfileById } from '@/sync/domains/profiles/profileUtils';
+import { buildProfileSaveSettingsDelta, convertBuiltInProfileToCustom, createEmptyCustomProfile, duplicateProfileForEdit, type ProfileSecretBindings } from '@/sync/domains/profiles/profileMutations';
+import { Modal } from '@/modal';
+import { promptUnsavedChangesAlert } from '@/utils/ui/promptUnsavedChangesAlert';
+import { PopoverScope } from '@/components/ui/popover';
+import { KeyboardAwareScreen } from '@/components/ui/keyboardAvoidance';
+import { fireAndForget } from '@/utils/system/fireAndForget';
+import { safeRouterBack } from '@/utils/navigation/safeRouterBack';
+import { useUnsavedChangesBeforeRemoveGuard } from '@/utils/navigation/useUnsavedChangesBeforeRemoveGuard';
+import { buildNewSessionPickerFallbackHref, setNewSessionPickerReturnParams } from '@/components/sessions/new/navigation/setNewSessionPickerReturnParams';
+import { Icon } from '@/components/ui/icons/Icon';
+import { useApplySettings } from '@/sync/store/settingsWriters';
+
+export default React.memo(function ProfileEditScreen() {
+    const { theme } = useUnistyles();
+    const router = useRouter();
+    const navigation = useNavigation();
+    const params = useLocalSearchParams<{
+        profileId?: string | string[];
+        cloneFromProfileId?: string | string[];
+        profileData?: string | string[];
+        machineId?: string | string[];
+        draftId?: string | string[];
+    }>();
+    const pickerFallbackHref = React.useMemo(() => buildNewSessionPickerFallbackHref(params), [params]);
+    const profileIdParam = Array.isArray(params.profileId) ? params.profileId[0] : params.profileId;
+    const cloneFromProfileIdParam = Array.isArray(params.cloneFromProfileId) ? params.cloneFromProfileId[0] : params.cloneFromProfileId;
+    const profileDataParam = Array.isArray(params.profileData) ? params.profileData[0] : params.profileData;
+    const machineIdParam = Array.isArray(params.machineId) ? params.machineId[0] : params.machineId;
+    const draftIdParam = Array.isArray(params.draftId) ? params.draftId[0] : params.draftId;
+    const screenWidth = useWindowDimensions().width;
+    const headerHeight = useHeaderHeight();
+    const profiles = useSetting('profiles');
+    const secretBindingsByProfileId = useSetting('secretBindingsByProfileId');
+    const [, setLastUsedProfile] = useSettingMutable('lastUsedProfile');
+    const applySettings = useApplySettings();
+    const [isDirty, setIsDirty] = React.useState(false);
+    const isDirtyRef = React.useRef(false);
+    const saveRef = React.useRef<(() => boolean) | null>(null);
+
+    React.useEffect(() => {
+        isDirtyRef.current = isDirty;
+    }, [isDirty]);
+
+    React.useEffect(() => {
+        // On iOS native-stack modals, swipe-down dismissal can bypass `beforeRemove` in practice.
+        // The only reliable way to ensure unsaved edits aren't lost is to disable the gesture
+        // while the form is dirty, and rely on the header back/cancel flow (which we guard).
+        const setOptions = (navigation as any)?.setOptions;
+        if (typeof setOptions !== 'function') return;
+        setOptions({ gestureEnabled: !isDirty });
+    }, [isDirty, navigation]);
+
+    React.useEffect(() => {
+        const setOptions = (navigation as any)?.setOptions;
+        if (typeof setOptions !== 'function') return;
+        return () => {
+            // Always re-enable the gesture when leaving this screen.
+            setOptions({ gestureEnabled: true });
+        };
+    }, [navigation]);
+
+    // Deserialize profile from URL params
+    const profile: AIBackendProfile = React.useMemo(() => {
+        if (profileDataParam) {
+            try {
+                // Params may arrive already decoded (native) or URL-encoded (web / manual encodeURIComponent).
+                // Try raw JSON first, then fall back to decodeURIComponent.
+                try {
+                    return JSON.parse(profileDataParam);
+                } catch {
+                    return JSON.parse(decodeURIComponent(profileDataParam));
+                }
+            } catch (error) {
+                console.error('Failed to parse profile data:', error);
+            }
+        }
+        const resolveById = (id: string) => resolveProfileById(id, profiles);
+
+        if (cloneFromProfileIdParam) {
+            const base = resolveById(cloneFromProfileIdParam);
+            if (base) {
+                return duplicateProfileForEdit(base, { copySuffix: t('profiles.copySuffix') });
+            }
+        }
+
+        if (profileIdParam) {
+            const existing = resolveById(profileIdParam);
+            if (existing) {
+                return existing;
+            }
+        }
+
+        // Return empty profile for new profile creation
+        return createEmptyCustomProfile();
+    }, [cloneFromProfileIdParam, profileDataParam, profileIdParam, profiles]);
+
+    const confirmDiscard = React.useCallback(async () => {
+        const saveText = profile.isBuiltIn ? t('common.saveAs') : t('common.save');
+        const message = profile.isBuiltIn
+            ? `${t('common.unsavedChangesWarning')}\n\n${t('profiles.builtInSaveAsHint')}`
+            : t('common.unsavedChangesWarning');
+        return promptUnsavedChangesAlert(
+            (title, message, buttons) => Modal.alert(title, message, buttons),
+            {
+                title: t('common.discardChanges'),
+                message,
+                discardText: t('common.discard'),
+                saveText,
+                keepEditingText: t('common.keepEditing'),
+            },
+        );
+    }, [profile.isBuiltIn]);
+
+    useUnsavedChangesBeforeRemoveGuard({
+        navigation,
+        isDirtyRef,
+        requestDecision: confirmDiscard,
+        onSave: () => saveRef.current?.() ?? false,
+        continueOnSave: false,
+        onContinue: (action) => {
+            if (!action) return;
+            (navigation as any)?.dispatch?.(action);
+        },
+        tag: 'ProfileEditScreen.beforeRemove',
+    });
+
+    const handleSave = (savedProfile: AIBackendProfile, profileSecretBindings: ProfileSecretBindings): boolean => {
+        if (!savedProfile.name || savedProfile.name.trim() === '') {
+            Modal.alert(t('common.error'), t('profiles.nameRequired'));
+            return false;
+        }
+
+        const isBuiltIn =
+            savedProfile.isBuiltIn === true ||
+            DEFAULT_PROFILES.some((bp) => bp.id === savedProfile.id) ||
+            getBuiltInProfileNameKey(savedProfile.id) !== null;
+
+        let profileToSave = savedProfile;
+        if (isBuiltIn) {
+            profileToSave = convertBuiltInProfileToCustom(savedProfile);
+        }
+
+        const builtInNames = DEFAULT_PROFILES
+            .map((bp) => {
+                const key = getBuiltInProfileNameKey(bp.id);
+                return key ? t(key).trim() : null;
+            })
+            .filter((name): name is string => Boolean(name));
+        const hasBuiltInNameConflict = builtInNames.includes(profileToSave.name.trim());
+
+        // Duplicate name guard (same behavior as settings/profiles)
+        const isDuplicateName = profiles.some((p: AIBackendProfile) => {
+            if (isBuiltIn) {
+                return p.name.trim() === profileToSave.name.trim();
+            }
+            return p.id !== profileToSave.id && p.name.trim() === profileToSave.name.trim();
+        });
+        if (isDuplicateName || hasBuiltInNameConflict) {
+            Modal.alert(t('common.error'), t('profiles.duplicateName'));
+            return false;
+        }
+
+        const isNewProfile = !profiles.some((profile) => profile.id === profileToSave.id);
+        profileToSave = {
+            ...profileToSave,
+            updatedAt: Date.now(),
+        };
+        applySettings(buildProfileSaveSettingsDelta({
+            profiles,
+            secretBindingsByProfileId,
+            profile: profileToSave,
+            profileSecretBindings,
+        }));
+
+        // Update last used profile for convenience in other screens.
+        if (isNewProfile) {
+            setLastUsedProfile(profileToSave.id);
+            // For newly created profiles (including "Save As" from a built-in profile), prefer passing the id
+            // back to the previous picker route (if present). The picker already knows how to forward the
+            // selection to /new and close itself. This avoids stacking /new on top of /new (wizard case).
+            isDirtyRef.current = false;
+            setIsDirty(false);
+            const returnMode = setNewSessionPickerReturnParams({
+                navigation: navigation as any,
+                router,
+                routeParams: { profileId: profileToSave.id },
+                currentParams: { draftId: draftIdParam },
+            });
+            if (returnMode === 'dispatch') {
+                safeRouterBack({ router, navigation, fallbackHref: pickerFallbackHref });
+            }
+            return true;
+        }
+
+        // Pass selection back to the /new screen via navigation params (unmount-safe).
+        const returnMode = setNewSessionPickerReturnParams({
+            navigation: navigation as any,
+            router,
+            routeParams: { profileId: profileToSave.id },
+            currentParams: { draftId: draftIdParam },
+        });
+        if (returnMode === 'dispatch') {
+            safeRouterBack({ router, navigation, fallbackHref: pickerFallbackHref });
+        }
+        // Prevent the unsaved-changes guard from triggering on successful save.
+        isDirtyRef.current = false;
+        setIsDirty(false);
+        return true;
+    };
+
+    const handleCancel = React.useCallback(() => {
+        fireAndForget((async () => {
+            if (!isDirtyRef.current) {
+                safeRouterBack({ router, navigation, fallbackHref: pickerFallbackHref });
+                return;
+            }
+            const decision = await confirmDiscard();
+            if (decision === 'discard') {
+                isDirtyRef.current = false;
+                safeRouterBack({ router, navigation, fallbackHref: pickerFallbackHref });
+            } else if (decision === 'save') {
+                saveRef.current?.();
+            }
+        })(), { tag: 'ProfileEditScreen.cancel' });
+    }, [confirmDiscard, navigation, pickerFallbackHref, router]);
+
+    const headerTitle = profile.name ? t('profiles.editProfile') : t('profiles.addProfile');
+    const headerBackTitle = t('common.back');
+
+    const headerLeft = React.useCallback(() => {
+        return (
+            <Pressable
+                onPress={handleCancel}
+                accessibilityRole="button"
+                accessibilityLabel={t('common.cancel')}
+                hitSlop={12}
+                style={({ pressed }) => ({
+                    opacity: pressed ? 0.7 : 1,
+                    padding: 4,
+                })}
+            >
+                <Icon name="x" size={24} color={theme.colors.chrome.header.foreground} />
+            </Pressable>
+        );
+    }, [handleCancel, theme.colors.chrome.header.foreground]);
+
+    const handleSavePress = React.useCallback(() => {
+        saveRef.current?.();
+    }, []);
+
+    const headerRight = React.useCallback(() => {
+        return (
+            <Pressable
+                onPress={handleSavePress}
+                disabled={!isDirty}
+                accessibilityRole="button"
+                accessibilityLabel={t('common.save')}
+                hitSlop={12}
+                style={({ pressed }) => ({
+                    opacity: !isDirty ? 0.35 : pressed ? 0.7 : 1,
+                    padding: 4,
+                })}
+            >
+                <Icon name="check" size={24} color={theme.colors.chrome.header.foreground} />
+            </Pressable>
+        );
+    }, [handleSavePress, isDirty, theme.colors.chrome.header.foreground]);
+
+    const screenOptions = React.useMemo(() => {
+        return {
+            headerTitle,
+            headerBackTitle,
+            headerLeft,
+            headerRight,
+        } as const;
+    }, [headerBackTitle, headerLeft, headerRight, headerTitle]);
+
+    return (
+        <PopoverScope>
+            <KeyboardAwareScreen
+                mode="form"
+                keyboardVerticalOffset={Platform.OS === 'ios' ? Constants.statusBarHeight + headerHeight : 0}
+                style={profileEditScreenStyles.container}
+            >
+                <Stack.Screen
+                    options={screenOptions}
+                />
+                <View style={[
+                    { flex: 1, paddingHorizontal: screenWidth > 700 ? 16 : 8 }
+                ]}>
+                    <View style={[
+                        { maxWidth: layout.maxWidth, flex: 1, width: '100%', alignSelf: 'center' }
+                    ]}>
+                        <ProfileEditForm
+                            profile={profile}
+                            machineId={machineIdParam || null}
+                            onSave={handleSave}
+                            onCancel={handleCancel}
+                            onDirtyChange={setIsDirty}
+                            saveRef={saveRef}
+                        />
+                    </View>
+                </View>
+            </KeyboardAwareScreen>
+        </PopoverScope>
+    );
+});
+
+const profileEditScreenStyles = StyleSheet.create((theme, rt) => ({
+    container: {
+        flex: 1,
+        backgroundColor: theme.colors.background.canvas,
+        paddingBottom: rt.insets.bottom,
+    },
+}));

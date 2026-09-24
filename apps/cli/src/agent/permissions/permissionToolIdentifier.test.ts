@@ -1,0 +1,131 @@
+import { describe, it, expect } from 'vitest';
+import { extractShellCommand, isToolAllowedForSession, makeToolIdentifier } from './permissionToolIdentifier';
+
+describe('permissionToolIdentifier', () => {
+  it('extracts command from bash -lc wrapper arrays', () => {
+    expect(extractShellCommand({ command: ['bash', '-lc', 'echo hello'] })).toBe('echo hello');
+  });
+
+  it('joins command arrays when not a shell wrapper', () => {
+    expect(extractShellCommand({ command: ['git', 'status', '--porcelain'] })).toBe('git status --porcelain');
+  });
+
+  it('extracts command from items[] wrapper', () => {
+    expect(extractShellCommand({ items: ['bash', '-lc', 'echo hello'] })).toBe('echo hello');
+  });
+
+  it('extracts command from execute tool titles', () => {
+    expect(
+      extractShellCommand({
+        toolCall: {
+          kind: 'execute',
+          title: "node apps/cli/src/index.ts tools call --source happier --tool change_title --args-json '{\"title\":\"Done\"}' --json",
+        },
+      }),
+    ).toBe(
+      "node apps/cli/src/index.ts tools call --source happier --tool change_title --args-json '{\"title\":\"Done\"}' --json",
+    );
+  });
+
+  it('normalizes shell-prefixed execute titles before building identifiers', () => {
+    expect(
+      makeToolIdentifier('bash', {
+        toolCall: {
+          kind: 'execute',
+          title: 'Shell: sleep 999',
+        },
+      }),
+    ).toBe('bash(sleep 999)');
+  });
+
+  it('extracts command from titles when the resolved tool name is shell-like', () => {
+    expect(
+      extractShellCommand({
+        toolCall: {
+          kind: 'other',
+          toolName: 'Bash',
+          title: 'git status --porcelain',
+        },
+      }),
+    ).toBe('git status --porcelain');
+  });
+
+  it('does not extract commands from generic execute titles', () => {
+    expect(
+      extractShellCommand({
+        toolCall: {
+          kind: 'execute',
+          title: 'Run shell command',
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it('builds a specific identifier for bash with a command', () => {
+    expect(makeToolIdentifier('bash', { command: ['bash', '-lc', 'echo hello'] })).toBe('bash(echo hello)');
+  });
+
+  it('keeps non-shell tool identifiers as toolName only', () => {
+    expect(makeToolIdentifier('read', { path: 'foo' })).toBe('read');
+  });
+
+  it('treats non-shell tool names as case-insensitive for allowlist matching (legacy → canonical)', () => {
+    const allowed = new Set(['read']);
+    expect(isToolAllowedForSession(allowed, 'Read', { path: 'foo' })).toBe(true);
+  });
+
+  it('treats non-shell tool names as case-insensitive for allowlist matching (canonical → legacy)', () => {
+    const allowed = new Set(['Read']);
+    expect(isToolAllowedForSession(allowed, 'read', { path: 'foo' })).toBe(true);
+  });
+
+  it('accepts shell-tool synonyms for exact matches', () => {
+    const allowed = new Set(['execute(git status)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git status' })).toBe(true);
+  });
+
+  it('accepts direct shell tool-name identifiers for tool-wide session approvals', () => {
+    const allowed = new Set(['Bash']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git status' })).toBe(true);
+  });
+
+  it('accepts shell-tool synonyms for prefix matches', () => {
+    const allowed = new Set(['execute(git status:*)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git status --porcelain' })).toBe(true);
+  });
+
+  it('requires explicit approval for leading env assignments', () => {
+    const allowed = new Set(['execute(git:*)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'FOO=bar git status --porcelain' })).toBe(false);
+  });
+
+  it('requires explicit approval for a leading unset prelude segment', () => {
+    const allowed = new Set(['execute(pwd:*)']);
+    expect(
+      isToolAllowedForSession(allowed, 'bash', {
+        command:
+          'unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_SETUP_TOKEN; pwd',
+      }),
+    ).toBe(false);
+  });
+
+  it('does not treat chained commands as allowed unless each segment is allowed', () => {
+    const allowed = new Set(['execute(git:*)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git status && rm -rf /tmp/x' })).toBe(false);
+  });
+
+  it('allows chained commands when each segment is allowed', () => {
+    const allowed = new Set(['execute(git:*)', 'execute(rm:*)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git status && rm -rf /tmp/x' })).toBe(true);
+  });
+
+  it('does not treat pipelines as allowed unless each segment is allowed', () => {
+    const allowed = new Set(['execute(git:*)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git diff | cat' })).toBe(false);
+  });
+
+  it('allows pipelines when each segment is allowed', () => {
+    const allowed = new Set(['execute(git:*)', 'execute(cat:*)']);
+    expect(isToolAllowedForSession(allowed, 'bash', { command: 'git diff | cat' })).toBe(true);
+  });
+});

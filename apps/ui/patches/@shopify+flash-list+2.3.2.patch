@@ -1,0 +1,553 @@
+diff --git a/node_modules/@shopify/flash-list/dist/FlashListProps.d.ts b/node_modules/@shopify/flash-list/dist/FlashListProps.d.ts
+index 5e90a5c..13a44d7 100644
+--- a/node_modules/@shopify/flash-list/dist/FlashListProps.d.ts
++++ b/node_modules/@shopify/flash-list/dist/FlashListProps.d.ts
+@@ -312,6 +312,11 @@ export interface FlashListProps<TItem> extends Omit<ScrollViewProps, "maintainVi
+          */
+         startRenderingFromBottom?: boolean;
+     };
++    /**
++     * HAPPIER PATCH(flash-list-offset-correction-hook): keep native MVCP enabled while pausing only
++     * FlashList's JS applyOffsetCorrection/scrollBy path during app-owned carve windows.
++     */
++    happierPauseOffsetCorrection?: boolean;
+     /**
+      * New arch only
+      * Called when the layout is committed. Can be used to measure list.
+diff --git a/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerView.js b/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerView.js
+index 6799c8a..e505a79 100644
+--- a/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerView.js
++++ b/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerView.js
+@@ -28,7 +28,8 @@ import { RenderTimeTracker } from "./helpers/RenderTimeTracker";
+ const RecyclerViewComponent = (props, ref) => {
+     var _a, _b, _c, _d, _e;
+     // Destructure props and initialize refs
+-    const { horizontal, renderItem, data, extraData, onLoad, CellRendererComponent, overrideProps, refreshing, onRefresh, progressViewOffset, ListEmptyComponent, ListHeaderComponent, ListHeaderComponentStyle, ListFooterComponent, ListFooterComponentStyle, ItemSeparatorComponent, renderScrollComponent, style, stickyHeaderIndices, maintainVisibleContentPosition, onCommitLayoutEffect, onChangeStickyIndex, stickyHeaderConfig, inverted, ...rest } = props;
++    const { horizontal, renderItem, data, extraData, onLoad, CellRendererComponent, overrideProps, refreshing, onRefresh, progressViewOffset, ListEmptyComponent, ListHeaderComponent, ListHeaderComponentStyle, ListFooterComponent, ListFooterComponentStyle, ItemSeparatorComponent, renderScrollComponent, style, stickyHeaderIndices, maintainVisibleContentPosition, happierPauseOffsetCorrection, onCommitLayoutEffect, onChangeStickyIndex, stickyHeaderConfig, inverted, ...rest } = props;
++    void happierPauseOffsetCorrection;
+     const [renderTimeTracker] = useState(() => new RenderTimeTracker());
+     renderTimeTracker.startTracking();
+     // Sticky header config
+@@ -62,6 +63,11 @@ const RecyclerViewComponent = (props, ref) => {
+     const { applyOffsetCorrection, computeFirstVisibleIndexForOffsetCorrection, applyInitialScrollIndex, handlerMethods, } = useRecyclerViewController(recyclerViewManager, ref, scrollViewRef, scrollAnchorRef);
+     // Initialize view holder collection ref
+     const viewHolderCollectionRef = useRef(null);
++    // HAPPIER PATCH(flash-list-commit-layout-guard): track whether a layout commit is actually
++    // pending, and whether the post-measure commit has landed at least once. Used below to stop the
++    // layout effect from calling commitLayout() (an unconditional setState) on every pass.
++    const hasPendingCommitRef = useRef(true);
++    const hasCommittedOnceRef = useRef(false);
+     // Hook to handle list loading
+     useOnListLoad(recyclerViewManager, onLoad);
+     // Hook to detect when scrolling reaches list bounds
+@@ -125,13 +131,46 @@ const RecyclerViewComponent = (props, ref) => {
+         if (hasExceededMaxRendersWithoutCommit) {
+             console.warn(WarningMessages.exceededMaxRendersWithoutCommit);
+         }
+-        if (recyclerViewManager.modifyChildrenLayout(layoutInfo, (_a = data === null || data === void 0 ? void 0 : data.length) !== null && _a !== void 0 ? _a : 0) &&
+-            !hasExceededMaxRendersWithoutCommit) {
++        const dataLength = (_a = data === null || data === void 0 ? void 0 : data.length) !== null && _a !== void 0 ? _a : 0;
++        const didModifyChildrenLayout = recyclerViewManager.modifyChildrenLayout(layoutInfo, dataLength);
++        if (didModifyChildrenLayout && !hasExceededMaxRendersWithoutCommit) {
+             // Trigger re-render if layout modifications were made
++            hasPendingCommitRef.current = true;
+             setRenderId((prev) => prev + 1);
+         }
+         else {
+-            (_b = viewHolderCollectionRef.current) === null || _b === void 0 ? void 0 : _b.commitLayout();
++            // HAPPIER PATCH(flash-list-commit-layout-guard): upstream calls commitLayout() here on
++            // EVERY layout pass. commitLayout() always calls setState, so when item measurements
++            // never settle (estimated-vs-measured height flip-flop after prepends) this ping-pongs
++            // with ViewHolderCollection re-renders inside one synchronous layout-effect cascade and
++            // exceeds React's nested update limit ("Maximum update depth exceeded").
++            // Guarded behavior:
++            // - only commit when a layout modification is actually pending;
++            // - when the renders-without-commit budget is exceeded AND we already revealed once,
++            //   skip the commit and settle the tracker so the cascade dies and the pending commit
++            //   lands on the next natural render instead.
++            if (didModifyChildrenLayout) {
++                hasPendingCommitRef.current = true;
++            }
++            const shouldBlockCommitToBreakUpdateLoop = hasExceededMaxRendersWithoutCommit && hasCommittedOnceRef.current;
++            // HAPPIER PATCH(flash-list-nonempty-render-stack-commit): never reveal a
++            // data-bearing list before RecyclerViewManager has placed at least one holder.
++            // A zero-height web mount can exhaust the render budget with an empty renderStack;
++            // keep the commit pending so the next measurable layout reveals real rows instead
++            // of opacity: 1 blank content.
++            const hasRenderableCommitContent = dataLength === 0 || recyclerViewManager.getRenderStack().size > 0;
++            if (hasPendingCommitRef.current &&
++                !shouldBlockCommitToBreakUpdateLoop &&
++                hasRenderableCommitContent) {
++                hasPendingCommitRef.current = false;
++                hasCommittedOnceRef.current = true;
++                (_b = viewHolderCollectionRef.current) === null || _b === void 0 ? void 0 : _b.commitLayout();
++            }
++            else {
++                // No commit this pass: count the pass as settled so rendersWithoutCommit does not
++                // accumulate across stable renders (commits are rarer with this guard in place).
++                renderTimeTracker.markRenderComplete();
++            }
+             applyOffsetCorrection();
+         }
+         if (horizontal &&
+diff --git a/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerViewManager.js b/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerViewManager.js
+index 1aa651d..f99c8e9 100644
+--- a/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerViewManager.js
++++ b/node_modules/@shopify/flash-list/dist/recyclerview/RecyclerViewManager.js
+@@ -316,8 +316,10 @@ export class RecyclerViewManager {
+             this.applyInitialScrollAdjustment();
+             const visibleIndices = this.computeVisibleIndices();
+             // console.log("---------> visibleIndices", visibleIndices);
+-            this.hasRenderedProgressively = visibleIndices.every((index) => layoutManager.getLayout(index).isHeightMeasured &&
+-                layoutManager.getLayout(index).isWidthMeasured);
++            this.hasRenderedProgressively =
++                visibleIndices.length > 0 &&
++                    visibleIndices.every((index) => layoutManager.getLayout(index).isHeightMeasured &&
++                        layoutManager.getLayout(index).isWidthMeasured);
+             if (this.hasRenderedProgressively) {
+                 this.isFirstLayoutComplete = true;
+             }
+diff --git a/node_modules/@shopify/flash-list/dist/recyclerview/ViewHolderCollection.js b/node_modules/@shopify/flash-list/dist/recyclerview/ViewHolderCollection.js
+index 8e3db51..0815c52 100644
+--- a/node_modules/@shopify/flash-list/dist/recyclerview/ViewHolderCollection.js
++++ b/node_modules/@shopify/flash-list/dist/recyclerview/ViewHolderCollection.js
+@@ -53,6 +53,18 @@ export const ViewHolderCollection = (props) => {
+         },
+     }), [setRenderId]);
+     const hasData = data && data.length > 0;
++    const shouldRevealMeasuredContent = Boolean(hasData && containerLayout && renderStack.size > 0);
++    useLayoutEffect(() => {
++        if (renderId === 0 && shouldRevealMeasuredContent) {
++            // HAPPIER PATCH(flash-list-view-holder-self-reveal): the opacity gate is owned
++            // by ViewHolderCollection, so the first reveal must be owned here too. On iOS
++            // navigation remounts we observed populated data/renderStack with the native
++            // row container stuck at alpha: 0 because the parent commit guard did not call
++            // commitLayout(). Reveal exactly once after measured content exists; later layout
++            // commits still flow through the parent guard.
++            setRenderId(1);
++        }
++    }, [renderId, shouldRevealMeasuredContent]);
+     const containerStyle = {
+         width: horizontal ? containerLayout === null || containerLayout === void 0 ? void 0 : containerLayout.width : undefined,
+         height: containerLayout === null || containerLayout === void 0 ? void 0 : containerLayout.height,
+diff --git a/node_modules/@shopify/flash-list/dist/recyclerview/hooks/useRecyclerViewController.js b/node_modules/@shopify/flash-list/dist/recyclerview/hooks/useRecyclerViewController.js
+index 08724d1..3cfa37b 100644
+--- a/node_modules/@shopify/flash-list/dist/recyclerview/hooks/useRecyclerViewController.js
++++ b/node_modules/@shopify/flash-list/dist/recyclerview/hooks/useRecyclerViewController.js
+@@ -5,6 +5,23 @@ import { PlatformConfig } from "../../native/config/PlatformHelper";
+ import { WarningMessages } from "../../errors/WarningMessages";
+ import { useUnmountFlag } from "./useUnmountFlag";
+ import { useUnmountAwareTimeout } from "./useUnmountAwareCallbacks";
++// HAPPIER PATCH(flash-list-offset-correction-hook): dev-only observability for the MVCP offset
++// corrector. When the app installs a function at this global slot, it is notified on every
++// pauseOffsetCorrection transition and on every nonzero correction decision, so corrector pause
++// windows can be correlated with app-side scroll writes and prepend commits. When the slot is
++// empty this is a single property read; failures are swallowed so observability can never break
++// the scroll path.
++const notifyHappierOffsetCorrectionHook = (event) => {
++    try {
++        const hook = globalThis.__HAPPIER_FLASHLIST_OFFSET_CORRECTION_HOOK__;
++        if (typeof hook === "function") {
++            hook(event);
++        }
++    }
++    catch (_unused) {
++        // Never let observability break scrolling.
++    }
++};
+ /**
+  * Comprehensive hook that manages RecyclerView scrolling behavior and provides
+  * imperative methods for controlling the RecyclerView.
+@@ -80,6 +97,7 @@ export function useRecyclerViewController(recyclerViewManager, ref, scrollViewRe
+     const applyOffsetCorrection = useCallback(() => {
+         var _a, _b, _c;
+         const { horizontal, data } = recyclerViewManager.props;
++        const happierPauseOffsetCorrection = recyclerViewManager.props.happierPauseOffsetCorrection === true;
+         // Execute all pending callbacks from previous scroll offset updates
+         // This ensures any scroll operations that were waiting for render are completed
+         const callbacks = pendingScrollCallbacks.current;
+@@ -121,7 +139,23 @@ export function useRecyclerViewController(recyclerViewManager, ref, scrollViewRe
+                     firstVisibleItemLayout.current = {
+                         ...recyclerViewManager.getLayout(currentIndexOfFirstVisibleItem),
+                     };
++                    // HAPPIER PATCH(flash-list-offset-correction-hook): report every nonzero
++                    // correction decision (applied vs skipped and why) to the dev hook.
++                    if (diff !== 0) {
++                        notifyHappierOffsetCorrectionHook({
++                            type: happierPauseOffsetCorrection
++                                ? "correction-skipped-happier-paused"
++                                : pauseOffsetCorrection.current
++                                ? "correction-skipped-paused"
++                                : recyclerViewManager.animationOptimizationsEnabled
++                                    ? "correction-skipped-animation"
++                                    : "correction-applied",
++                            diffPx: diff,
++                            timestampMs: Date.now(),
++                        });
++                    }
+                     if (diff !== 0 &&
++                        !happierPauseOffsetCorrection &&
+                         !pauseOffsetCorrection.current &&
+                         !recyclerViewManager.animationOptimizationsEnabled) {
+                         // console.log("diff", diff, firstVisibleItemKey.current);
+@@ -252,6 +286,12 @@ export function useRecyclerViewController(recyclerViewManager, ref, scrollViewRe
+                         index < recyclerViewManager.getDataLength()) {
+                         // Pause the scroll offset adjustments
+                         pauseOffsetCorrection.current = true;
++                        // HAPPIER PATCH(flash-list-offset-correction-hook)
++                        notifyHappierOffsetCorrectionHook({
++                            type: "pause-set",
++                            source: "scroll-to-index",
++                            timestampMs: Date.now(),
++                        });
+                         recyclerViewManager.setOffsetProjectionEnabled(false);
+                         const getFinalOffset = () => {
+                             const layout = recyclerViewManager.getLayout(index);
+@@ -381,6 +421,12 @@ export function useRecyclerViewController(recyclerViewManager, ref, scrollViewRe
+                             // Longer delay for animated scrolls to allow animation to complete
+                             setTimeout(() => {
+                                 pauseOffsetCorrection.current = false;
++                                // HAPPIER PATCH(flash-list-offset-correction-hook)
++                                notifyHappierOffsetCorrectionHook({
++                                    type: "pause-cleared",
++                                    source: "scroll-to-index",
++                                    timestampMs: Date.now(),
++                                });
+                                 recyclerViewManager.setOffsetProjectionEnabled(true);
+                                 resolve(); // Resolve the promise after re-enabling corrections
+                             }, animated ? 300 : 200);
+@@ -471,8 +517,20 @@ export function useRecyclerViewController(recyclerViewManager, ref, scrollViewRe
+             setTimeout(() => {
+                 recyclerViewManager.isInitialScrollComplete = true;
+                 pauseOffsetCorrection.current = false;
++                // HAPPIER PATCH(flash-list-offset-correction-hook)
++                notifyHappierOffsetCorrectionHook({
++                    type: "pause-cleared",
++                    source: "initial-scroll-index",
++                    timestampMs: Date.now(),
++                });
+             }, 100);
+             pauseOffsetCorrection.current = true;
++            // HAPPIER PATCH(flash-list-offset-correction-hook)
++            notifyHappierOffsetCorrectionHook({
++                type: "pause-set",
++                source: "initial-scroll-index",
++                timestampMs: Date.now(),
++            });
+             const additionalOffset = (_c = initialScrollIndexParams === null || initialScrollIndexParams === void 0 ? void 0 : initialScrollIndexParams.viewOffset) !== null && _c !== void 0 ? _c : 0;
+             const offset = horizontal
+                 ? recyclerViewManager.getLayout(initialScrollIndex).x + additionalOffset
+diff --git a/node_modules/@shopify/flash-list/dist/recyclerview/viewability/ViewabilityManager.js b/node_modules/@shopify/flash-list/dist/recyclerview/viewability/ViewabilityManager.js
+index 67e342b..fdd2caa 100644
+--- a/node_modules/@shopify/flash-list/dist/recyclerview/viewability/ViewabilityManager.js
++++ b/node_modules/@shopify/flash-list/dist/recyclerview/viewability/ViewabilityManager.js
+@@ -33,7 +33,12 @@ export default class ViewabilityManager {
+                 this.rvManager.firstItemOffset;
+             this.viewabilityHelpers.forEach((viewabilityHelper) => {
+                 var _a;
+-                viewabilityHelper.updateViewableItems((_a = this.rvManager.props.horizontal) !== null && _a !== void 0 ? _a : false, scrollOffset, listSize, (index) => this.rvManager.getLayout(index), newViewableIndices);
++                // HAPPIER PATCH(flash-list-viewability-stale-index-guard): ViewabilityHelper caches
++                // possiblyViewableIndices across data updates; after the dataset shrinks those stale
++                // indices exceed the truncated layouts array and the throwing getLayout crashes release
++                // builds ("index out of bounds, not enough layouts"). tryGetLayout is the library's own
++                // bounds-safe accessor and isItemViewable already treats undefined as not viewable.
++                viewabilityHelper.updateViewableItems((_a = this.rvManager.props.horizontal) !== null && _a !== void 0 ? _a : false, scrollOffset, listSize, (index) => this.rvManager.tryGetLayout(index), newViewableIndices);
+             });
+         };
+         this.clearLastReportedViewableIndices = () => {
+diff --git a/node_modules/@shopify/flash-list/src/FlashListProps.ts b/node_modules/@shopify/flash-list/src/FlashListProps.ts
+index 1dba06c..e101b75 100644
+--- a/node_modules/@shopify/flash-list/src/FlashListProps.ts
++++ b/node_modules/@shopify/flash-list/src/FlashListProps.ts
+@@ -408,6 +408,12 @@ export interface FlashListProps<TItem>
+     startRenderingFromBottom?: boolean;
+   };
+ 
++  /**
++   * HAPPIER PATCH(flash-list-offset-correction-hook): keep native MVCP enabled while pausing only
++   * FlashList's JS applyOffsetCorrection/scrollBy path during app-owned carve windows.
++   */
++  happierPauseOffsetCorrection?: boolean;
++
+   /**
+    * New arch only
+    * Called when the layout is committed. Can be used to measure list.
+diff --git a/node_modules/@shopify/flash-list/src/recyclerview/RecyclerView.tsx b/node_modules/@shopify/flash-list/src/recyclerview/RecyclerView.tsx
+index 3c25e7e..ac460c8 100644
+--- a/node_modules/@shopify/flash-list/src/recyclerview/RecyclerView.tsx
++++ b/node_modules/@shopify/flash-list/src/recyclerview/RecyclerView.tsx
+@@ -84,12 +84,14 @@ const RecyclerViewComponent = <T,>(
+     style,
+     stickyHeaderIndices,
+     maintainVisibleContentPosition,
++    happierPauseOffsetCorrection,
+     onCommitLayoutEffect,
+     onChangeStickyIndex,
+     stickyHeaderConfig,
+     inverted,
+     ...rest
+   } = props;
++  void happierPauseOffsetCorrection;
+ 
+   const [renderTimeTracker] = useState(() => new RenderTimeTracker());
+ 
+@@ -151,6 +153,12 @@ const RecyclerViewComponent = <T,>(
+   // Initialize view holder collection ref
+   const viewHolderCollectionRef = useRef<ViewHolderCollectionRef>(null);
+ 
++  // HAPPIER PATCH(flash-list-commit-layout-guard): track whether a layout commit is actually
++  // pending, and whether the post-measure commit has landed at least once. Used below to stop the
++  // layout effect from calling commitLayout() (an unconditional setState) on every pass.
++  const hasPendingCommitRef = useRef(true);
++  const hasCommittedOnceRef = useRef(false);
++
+   // Hook to handle list loading
+   useOnListLoad(recyclerViewManager, onLoad);
+ 
+@@ -234,14 +242,51 @@ const RecyclerViewComponent = <T,>(
+       console.warn(WarningMessages.exceededMaxRendersWithoutCommit);
+     }
+ 
+-    if (
+-      recyclerViewManager.modifyChildrenLayout(layoutInfo, data?.length ?? 0) &&
+-      !hasExceededMaxRendersWithoutCommit
+-    ) {
++    const dataLength = data?.length ?? 0;
++    const didModifyChildrenLayout = recyclerViewManager.modifyChildrenLayout(
++      layoutInfo,
++      dataLength
++    );
++    if (didModifyChildrenLayout && !hasExceededMaxRendersWithoutCommit) {
+       // Trigger re-render if layout modifications were made
++      hasPendingCommitRef.current = true;
+       setRenderId((prev) => prev + 1);
+     } else {
+-      viewHolderCollectionRef.current?.commitLayout();
++      // HAPPIER PATCH(flash-list-commit-layout-guard): upstream calls commitLayout() here on
++      // EVERY layout pass. commitLayout() always calls setState, so when item measurements
++      // never settle (estimated-vs-measured height flip-flop after prepends) this ping-pongs
++      // with ViewHolderCollection re-renders inside one synchronous layout-effect cascade and
++      // exceeds React's nested update limit ("Maximum update depth exceeded").
++      // Guarded behavior:
++      // - only commit when a layout modification is actually pending;
++      // - when the renders-without-commit budget is exceeded AND we already revealed once,
++      //   skip the commit and settle the tracker so the cascade dies and the pending commit
++      //   lands on the next natural render instead.
++      if (didModifyChildrenLayout) {
++        hasPendingCommitRef.current = true;
++      }
++      const shouldBlockCommitToBreakUpdateLoop =
++        hasExceededMaxRendersWithoutCommit && hasCommittedOnceRef.current;
++      // HAPPIER PATCH(flash-list-nonempty-render-stack-commit): never reveal a
++      // data-bearing list before RecyclerViewManager has placed at least one holder.
++      // A zero-height web mount can exhaust the render budget with an empty renderStack;
++      // keep the commit pending so the next measurable layout reveals real rows instead
++      // of opacity: 1 blank content.
++      const hasRenderableCommitContent =
++        dataLength === 0 || recyclerViewManager.getRenderStack().size > 0;
++      if (
++        hasPendingCommitRef.current &&
++        !shouldBlockCommitToBreakUpdateLoop &&
++        hasRenderableCommitContent
++      ) {
++        hasPendingCommitRef.current = false;
++        hasCommittedOnceRef.current = true;
++        viewHolderCollectionRef.current?.commitLayout();
++      } else {
++        // No commit this pass: count the pass as settled so rendersWithoutCommit does not
++        // accumulate across stable renders (commits are rarer with this guard in place).
++        renderTimeTracker.markRenderComplete();
++      }
+       applyOffsetCorrection();
+     }
+ 
+diff --git a/node_modules/@shopify/flash-list/src/recyclerview/RecyclerViewManager.ts b/node_modules/@shopify/flash-list/src/recyclerview/RecyclerViewManager.ts
+index 41704d0..f34cab5 100644
+--- a/node_modules/@shopify/flash-list/src/recyclerview/RecyclerViewManager.ts
++++ b/node_modules/@shopify/flash-list/src/recyclerview/RecyclerViewManager.ts
+@@ -409,11 +409,13 @@ export class RecyclerViewManager<T> {
+       this.applyInitialScrollAdjustment();
+       const visibleIndices = this.computeVisibleIndices();
+       // console.log("---------> visibleIndices", visibleIndices);
+-      this.hasRenderedProgressively = visibleIndices.every(
+-        (index) =>
+-          layoutManager.getLayout(index).isHeightMeasured &&
+-          layoutManager.getLayout(index).isWidthMeasured
+-      );
++      this.hasRenderedProgressively =
++        visibleIndices.length > 0 &&
++        visibleIndices.every(
++          (index) =>
++            layoutManager.getLayout(index).isHeightMeasured &&
++            layoutManager.getLayout(index).isWidthMeasured
++        );
+ 
+       if (this.hasRenderedProgressively) {
+         this.isFirstLayoutComplete = true;
+diff --git a/node_modules/@shopify/flash-list/src/recyclerview/ViewHolderCollection.tsx b/node_modules/@shopify/flash-list/src/recyclerview/ViewHolderCollection.tsx
+index a652beb..db3313b 100644
+--- a/node_modules/@shopify/flash-list/src/recyclerview/ViewHolderCollection.tsx
++++ b/node_modules/@shopify/flash-list/src/recyclerview/ViewHolderCollection.tsx
+@@ -149,6 +149,21 @@ export const ViewHolderCollection = <TItem,>(
+   );
+ 
+   const hasData = data && data.length > 0;
++  const shouldRevealMeasuredContent = Boolean(
++    hasData && containerLayout && renderStack.size > 0
++  );
++
++  useLayoutEffect(() => {
++    if (renderId === 0 && shouldRevealMeasuredContent) {
++      // HAPPIER PATCH(flash-list-view-holder-self-reveal): the opacity gate is owned
++      // by ViewHolderCollection, so the first reveal must be owned here too. On iOS
++      // navigation remounts we observed populated data/renderStack with the native
++      // row container stuck at alpha: 0 because the parent commit guard did not call
++      // commitLayout(). Reveal exactly once after measured content exists; later layout
++      // commits still flow through the parent guard.
++      setRenderId(1);
++    }
++  }, [renderId, shouldRevealMeasuredContent]);
+ 
+   const containerStyle = {
+     width: horizontal ? containerLayout?.width : undefined,
+diff --git a/node_modules/@shopify/flash-list/src/recyclerview/hooks/useRecyclerViewController.tsx b/node_modules/@shopify/flash-list/src/recyclerview/hooks/useRecyclerViewController.tsx
+index 3689830..06f52f4 100644
+--- a/node_modules/@shopify/flash-list/src/recyclerview/hooks/useRecyclerViewController.tsx
++++ b/node_modules/@shopify/flash-list/src/recyclerview/hooks/useRecyclerViewController.tsx
+@@ -42,6 +42,32 @@ import { useUnmountAwareTimeout } from "./useUnmountAwareCallbacks";
+  * @param scrollAnchorRef - Reference to the scroll anchor component
+  * @param props - The RecyclerViewProps containing configuration
+  */
++// HAPPIER PATCH(flash-list-offset-correction-hook): dev-only observability for the MVCP offset
++// corrector. When the app installs a function at this global slot, it is notified on every
++// pauseOffsetCorrection transition and on every nonzero correction decision, so corrector pause
++// windows can be correlated with app-side scroll writes and prepend commits. When the slot is
++// empty this is a single property read; failures are swallowed so observability can never break
++// the scroll path.
++const notifyHappierOffsetCorrectionHook = (event: {
++  type: string;
++  source?: string;
++  diffPx?: number;
++  timestampMs?: number;
++}): void => {
++  try {
++    const hook = (
++      globalThis as {
++        __HAPPIER_FLASHLIST_OFFSET_CORRECTION_HOOK__?: (event: unknown) => void;
++      }
++    ).__HAPPIER_FLASHLIST_OFFSET_CORRECTION_HOOK__;
++    if (typeof hook === "function") {
++      hook(event);
++    }
++  } catch {
++    // Never let observability break scrolling.
++  }
++};
++
+ export function useRecyclerViewController<T>(
+   recyclerViewManager: RecyclerViewManager<T>,
+   ref: React.Ref<FlashListRef<T>>,
+@@ -118,6 +144,8 @@ export function useRecyclerViewController<T>(
+    */
+   const applyOffsetCorrection = useCallback(() => {
+     const { horizontal, data } = recyclerViewManager.props;
++    const happierPauseOffsetCorrection =
++      recyclerViewManager.props.happierPauseOffsetCorrection === true;
+ 
+     // Execute all pending callbacks from previous scroll offset updates
+     // This ensures any scroll operations that were waiting for render are completed
+@@ -175,8 +203,24 @@ export function useRecyclerViewController<T>(
+           firstVisibleItemLayout.current = {
+             ...recyclerViewManager.getLayout(currentIndexOfFirstVisibleItem),
+           };
++          // HAPPIER PATCH(flash-list-offset-correction-hook): report every nonzero
++          // correction decision (applied vs skipped and why) to the dev hook.
++          if (diff !== 0) {
++            notifyHappierOffsetCorrectionHook({
++              type: happierPauseOffsetCorrection
++                ? "correction-skipped-happier-paused"
++                : pauseOffsetCorrection.current
++                ? "correction-skipped-paused"
++                : recyclerViewManager.animationOptimizationsEnabled
++                ? "correction-skipped-animation"
++                : "correction-applied",
++              diffPx: diff,
++              timestampMs: Date.now(),
++            });
++          }
+           if (
+             diff !== 0 &&
++            !happierPauseOffsetCorrection &&
+             !pauseOffsetCorrection.current &&
+             !recyclerViewManager.animationOptimizationsEnabled
+           ) {
+@@ -332,6 +376,12 @@ export function useRecyclerViewController<T>(
+           ) {
+             // Pause the scroll offset adjustments
+             pauseOffsetCorrection.current = true;
++            // HAPPIER PATCH(flash-list-offset-correction-hook)
++            notifyHappierOffsetCorrectionHook({
++              type: "pause-set",
++              source: "scroll-to-index",
++              timestampMs: Date.now(),
++            });
+             recyclerViewManager.setOffsetProjectionEnabled(false);
+ 
+             const getFinalOffset = () => {
+@@ -485,6 +535,12 @@ export function useRecyclerViewController<T>(
+               setTimeout(
+                 () => {
+                   pauseOffsetCorrection.current = false;
++                  // HAPPIER PATCH(flash-list-offset-correction-hook)
++                  notifyHappierOffsetCorrectionHook({
++                    type: "pause-cleared",
++                    source: "scroll-to-index",
++                    timestampMs: Date.now(),
++                  });
+                   recyclerViewManager.setOffsetProjectionEnabled(true);
+                   resolve(); // Resolve the promise after re-enabling corrections
+                 },
+@@ -589,9 +645,21 @@ export function useRecyclerViewController<T>(
+       setTimeout(() => {
+         recyclerViewManager.isInitialScrollComplete = true;
+         pauseOffsetCorrection.current = false;
++        // HAPPIER PATCH(flash-list-offset-correction-hook)
++        notifyHappierOffsetCorrectionHook({
++          type: "pause-cleared",
++          source: "initial-scroll-index",
++          timestampMs: Date.now(),
++        });
+       }, 100);
+ 
+       pauseOffsetCorrection.current = true;
++      // HAPPIER PATCH(flash-list-offset-correction-hook)
++      notifyHappierOffsetCorrectionHook({
++        type: "pause-set",
++        source: "initial-scroll-index",
++        timestampMs: Date.now(),
++      });
+ 
+       const additionalOffset = initialScrollIndexParams?.viewOffset ?? 0;
+       const offset = horizontal
+diff --git a/node_modules/@shopify/flash-list/src/recyclerview/viewability/ViewabilityManager.ts b/node_modules/@shopify/flash-list/src/recyclerview/viewability/ViewabilityManager.ts
+index 972c20f..d5510d7 100644
+--- a/node_modules/@shopify/flash-list/src/recyclerview/viewability/ViewabilityManager.ts
++++ b/node_modules/@shopify/flash-list/src/recyclerview/viewability/ViewabilityManager.ts
+@@ -79,11 +79,16 @@ export default class ViewabilityManager<T> {
+       (this.rvManager.getAbsoluteLastScrollOffset() ?? 0) -
+       this.rvManager.firstItemOffset;
+     this.viewabilityHelpers.forEach((viewabilityHelper) => {
++      // HAPPIER PATCH(flash-list-viewability-stale-index-guard): ViewabilityHelper caches
++      // possiblyViewableIndices across data updates; after the dataset shrinks those stale
++      // indices exceed the truncated layouts array and the throwing getLayout crashes release
++      // builds ("index out of bounds, not enough layouts"). tryGetLayout is the library's own
++      // bounds-safe accessor and isItemViewable already treats undefined as not viewable.
+       viewabilityHelper.updateViewableItems(
+         this.rvManager.props.horizontal ?? false,
+         scrollOffset,
+         listSize,
+-        (index: number) => this.rvManager.getLayout(index),
++        (index: number) => this.rvManager.tryGetLayout(index),
+         newViewableIndices
+       );
+     });

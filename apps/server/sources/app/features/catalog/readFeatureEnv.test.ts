@@ -1,0 +1,212 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  readAuthFeatureEnv,
+  readAuthMtlsFeatureEnv,
+  readChannelBridgesFeatureEnv,
+  readConnectedServicesFeatureEnv,
+  readMachineTransferFeatureEnv,
+  readPetsFeatureEnv,
+  readSessionAgentSwitchingFeatureEnv,
+  readSessionDraftsFeatureEnv,
+  readSessionHandoffFeatureEnv,
+  readSessionUsageLimitRecoveryFeatureEnv,
+  readTerminalFeatureEnv,
+} from './readFeatureEnv';
+
+describe('readSessionDraftsFeatureEnv', () => {
+  it('defaults the server capability on and honors an explicit disable', () => {
+    expect(readSessionDraftsFeatureEnv({}).draftsEnabled).toBe(true);
+    expect(readSessionDraftsFeatureEnv({
+      HAPPIER_FEATURE_SESSIONS_DRAFTS__ENABLED: '0',
+    }).draftsEnabled).toBe(false);
+  });
+});
+
+describe('readConnectedServicesFeatureEnv', () => {
+  it('defaults child gates to true when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readConnectedServicesFeatureEnv(env);
+    expect(res.quotasEnabled).toBe(true);
+    expect(res.accountGroupsEnabled).toBe(true);
+    expect(res.accountFallbackEnabled).toBe(true);
+  });
+
+  it('reads account group and fallback gates independently', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_FEATURE_CONNECTED_SERVICES_ACCOUNT_GROUPS__ENABLED: '0',
+      HAPPIER_FEATURE_CONNECTED_SERVICES_ACCOUNT_FALLBACK__ENABLED: '1',
+    };
+    const res = readConnectedServicesFeatureEnv(env);
+    expect(res.accountGroupsEnabled).toBe(false);
+    expect(res.accountFallbackEnabled).toBe(true);
+  });
+});
+
+describe('readChannelBridgesFeatureEnv', () => {
+  it('defaults enabled to true when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readChannelBridgesFeatureEnv(env);
+    expect(res.enabled).toBe(true);
+  });
+
+  it('defaults telegramEnabled to true when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readChannelBridgesFeatureEnv(env);
+    expect(res.telegramEnabled).toBe(true);
+  });
+});
+
+describe('readPetsFeatureEnv', () => {
+  it('reads the encrypted custom pet sync policy from env', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_FEATURE_PETS_SYNC__ENCRYPTED_CUSTOM_PET_SYNC_POLICY: 'allowedWithClientValidation',
+    };
+    const res = readPetsFeatureEnv(env);
+
+    expect(res.encryptedCustomPetSyncPolicy).toBe('allowedWithClientValidation');
+  });
+});
+
+describe('readAuthFeatureEnv', () => {
+  it('falls back to legacy AUTH_UI_* env vars for auto-redirect', () => {
+    const env: NodeJS.ProcessEnv = {
+      AUTH_UI_AUTO_REDIRECT: 'true',
+      AUTH_UI_AUTO_REDIRECT_PROVIDER_ID: 'mTLS',
+    };
+    const res = readAuthFeatureEnv(env);
+    expect(res.uiAutoRedirectEnabled).toBe(true);
+    expect(res.uiAutoRedirectProviderId).toBe('mtls');
+  });
+
+  it('prefers HAPPIER_FEATURE_AUTH_UI__* env vars over legacy AUTH_UI_* aliases', () => {
+    const env: NodeJS.ProcessEnv = {
+      AUTH_UI_AUTO_REDIRECT: 'true',
+      AUTH_UI_AUTO_REDIRECT_PROVIDER_ID: 'mtls',
+      HAPPIER_FEATURE_AUTH_UI__AUTO_REDIRECT_ENABLED: 'false',
+      HAPPIER_FEATURE_AUTH_UI__AUTO_REDIRECT_PROVIDER_ID: 'github',
+    };
+    const res = readAuthFeatureEnv(env);
+    expect(res.uiAutoRedirectEnabled).toBe(false);
+    expect(res.uiAutoRedirectProviderId).toBe('github');
+  });
+
+  it('falls back to legacy auth recovery env vars', () => {
+    const env: NodeJS.ProcessEnv = {
+      AUTH_RECOVERY_PROVIDER_RESET_ENABLED: 'false',
+      AUTH_UI_RECOVERY_KEY_REMINDER_ENABLED: 'false',
+    };
+    const res = readAuthFeatureEnv(env);
+    expect(res.recoveryProviderResetEnabled).toBe(false);
+    expect(res.uiRecoveryKeyReminderEnabled).toBe(false);
+  });
+});
+
+describe('readAuthMtlsFeatureEnv', () => {
+  it('derives the default return-to allow prefixes from the local served web UI when HAPPIER_WEBAPP_URL is unset', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_PUBLIC_SERVER_URL: 'https://stack.example.test/base/',
+      HAPPIER_SERVER_UI_DIR: '/tmp/ui',
+      HAPPIER_SERVER_UI_PREFIX: '/ui/',
+    };
+
+    const res = readAuthMtlsFeatureEnv(env);
+    expect(res.returnToAllowPrefixes).toEqual([
+      'happier://',
+      'https://stack.example.test/base/ui',
+    ]);
+  });
+});
+
+describe('readTerminalFeatureEnv', () => {
+  it('defaults embeddedPtyEnabled to true when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readTerminalFeatureEnv(env);
+    expect(res.embeddedPtyEnabled).toBe(true);
+  });
+});
+
+describe('readSessionHandoffFeatureEnv', () => {
+  it('defaults session handoff enabled when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readSessionHandoffFeatureEnv(env);
+
+    expect(res.handoffEnabled).toBe(true);
+  });
+});
+
+describe('readSessionUsageLimitRecoveryFeatureEnv', () => {
+  it('defaults usage-limit recovery enabled when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readSessionUsageLimitRecoveryFeatureEnv(env);
+
+    expect(res.usageLimitRecoveryEnabled).toBe(true);
+  });
+
+  it('reads disabled usage-limit recovery env values', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_FEATURE_SESSIONS_USAGE_LIMIT_RECOVERY__ENABLED: '0',
+    };
+    const res = readSessionUsageLimitRecoveryFeatureEnv(env);
+
+    expect(res.usageLimitRecoveryEnabled).toBe(false);
+  });
+});
+
+describe('readSessionAgentSwitchingFeatureEnv', () => {
+  it('defaults agent switching enabled when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readSessionAgentSwitchingFeatureEnv(env);
+
+    expect(res.agentSwitchingEnabled).toBe(true);
+  });
+
+  it('reads the opt-out env value', () => {
+    for (const raw of ['0', 'false', 'no', 'off']) {
+      const res = readSessionAgentSwitchingFeatureEnv({
+        HAPPIER_FEATURE_SESSIONS_AGENT_SWITCHING__ENABLED: raw,
+      });
+
+      expect(res.agentSwitchingEnabled).toBe(false);
+    }
+  });
+
+  it('falls back to the default for an unparseable env value', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_FEATURE_SESSIONS_AGENT_SWITCHING__ENABLED: 'maybe',
+    };
+    const res = readSessionAgentSwitchingFeatureEnv(env);
+
+    expect(res.agentSwitchingEnabled).toBe(true);
+  });
+});
+
+describe('readMachineTransferFeatureEnv', () => {
+  it('defaults direct-peer and server-routed transfer enabled when env is unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const res = readMachineTransferFeatureEnv(env);
+
+    expect(res.directPeerEnabled).toBe(true);
+    expect(res.serverRoutedEnabled).toBe(true);
+    // Must be bounded even when env is unset (prevents implicit unlimited server-routed streaming).
+    expect(res.serverRoutedMaxBytes).toBe(2 * 1024 * 1024 * 1024);
+  });
+
+  it('reads server-routed transfer max-bytes when configured', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_FEATURE_MACHINES_TRANSFER_SERVER_ROUTED__MAX_BYTES: '8192',
+    };
+    const res = readMachineTransferFeatureEnv(env);
+
+    expect(res.serverRoutedMaxBytes).toBe(8192);
+  });
+
+  it('hard-clamps server-routed max-bytes to a bounded ceiling', () => {
+    const env: NodeJS.ProcessEnv = {
+      HAPPIER_FEATURE_MACHINES_TRANSFER_SERVER_ROUTED__MAX_BYTES: String(999 * 1024 * 1024 * 1024),
+    };
+    const res = readMachineTransferFeatureEnv(env);
+
+    expect(res.serverRoutedMaxBytes).toBe(8 * 1024 * 1024 * 1024);
+  });
+});

@@ -1,0 +1,240 @@
+import { describe, expect, it } from 'vitest';
+
+import { resolveSpawnChildEnvironment } from './resolveSpawnChildEnvironment';
+import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
+import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
+import { HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY } from '@/agent/runtime/sessionConnectedServicesBindingsEnv';
+
+const HAPPIER_SESSION_CONNECTED_SERVICE_MATERIALIZATION_IDENTITY_ENV_KEY =
+  'HAPPIER_SESSION_CONNECTED_SERVICE_MATERIALIZATION_IDENTITY_V1_JSON';
+
+describe('resolveSpawnChildEnvironment (connected services)', () => {
+  it('injects connected service materialization env when provided', async () => {
+    const options: SpawnSessionOptions = {
+      directory: '.',
+      environmentVariables: {},
+    };
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {},
+      daemonSpawnHooks: null,
+      processEnv: {},
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { XDG_DATA_HOME: '/tmp/xdg' },
+        cleanupOnFailure: null,
+        cleanupOnExit: null,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.expandedEnvironmentVariables.XDG_DATA_HOME).toBe('/tmp/xdg');
+    }
+  });
+
+  it('exports validated connected service bindings for session metadata seeding', async () => {
+    const options: SpawnSessionOptions = {
+      directory: '.',
+      environmentVariables: {},
+      connectedServices: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': {
+            source: 'connected',
+            selection: 'profile',
+            profileId: 'happier',
+          },
+        },
+      },
+    };
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {},
+      daemonSpawnHooks: null,
+      processEnv: {},
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { CODEX_HOME: '/tmp/codex-connected-home' },
+        cleanupOnFailure: null,
+        cleanupOnExit: null,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(JSON.parse(result.extraEnvForChild[HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY]!)).toEqual(
+        options.connectedServices,
+      );
+    }
+  });
+
+  it('exports validated connected service materialization identity for session metadata seeding', async () => {
+    const identity = {
+      v: 1,
+      id: 'csm_child_env_1',
+      createdAtMs: 123,
+    } as const;
+    const options = {
+      directory: '.',
+      environmentVariables: {},
+      connectedServiceMaterializationIdentityV1: identity,
+    } satisfies SpawnSessionOptions & {
+      connectedServiceMaterializationIdentityV1: typeof identity;
+    };
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {},
+      daemonSpawnHooks: null,
+      processEnv: {},
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { XDG_DATA_HOME: '/tmp/xdg' },
+        cleanupOnFailure: null,
+        cleanupOnExit: null,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(JSON.parse(result.extraEnvForChild[HAPPIER_SESSION_CONNECTED_SERVICE_MATERIALIZATION_IDENTITY_ENV_KEY]!))
+        .toEqual(identity);
+    }
+  });
+
+  it('keeps connected service cleanup hooks when connected auth is used', async () => {
+    const connectedCleanups: string[] = [];
+    const options: SpawnSessionOptions = {
+      directory: '.',
+      environmentVariables: {},
+    };
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {},
+      daemonSpawnHooks: null,
+      processEnv: {},
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { XDG_DATA_HOME: '/tmp/xdg' },
+        cleanupOnFailure: () => connectedCleanups.push('failure'),
+        cleanupOnExit: () => connectedCleanups.push('exit'),
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.cleanupOnExit).not.toBeNull();
+    result.cleanupOnExit?.();
+    expect(connectedCleanups).toEqual(['exit']);
+  });
+
+  it('propagates connected-service materialization diagnostics for downstream tracked-session visibility', async () => {
+    const options: SpawnSessionOptions = {
+      directory: '.',
+      environmentVariables: {},
+    };
+    const diagnostics = [{
+      code: 'state_sharing_degraded',
+      providerId: 'claude',
+      serviceId: 'anthropic',
+      requestedStateMode: 'shared',
+      effectiveStateMode: 'isolated',
+      reason: 'provider_state_unavailable',
+    }] as const;
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {},
+      daemonSpawnHooks: null,
+      processEnv: {},
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { XDG_DATA_HOME: '/tmp/xdg' },
+        cleanupOnFailure: null,
+        cleanupOnExit: null,
+        diagnostics,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.materializationDiagnostics).toEqual(diagnostics);
+    }
+  });
+
+  it('does not let daemon spawn hooks override a materialized Claude auth root', async () => {
+    const options: SpawnSessionOptions = {
+      directory: '.',
+      environmentVariables: {},
+    };
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {},
+      daemonSpawnHooks: {
+        buildExtraEnvForChild: () => ({
+          CLAUDE_CONFIG_DIR: '/tmp/source-claude-config',
+        }),
+      },
+      processEnv: {
+        CLAUDE_CONFIG_DIR: '/tmp/source-claude-config',
+      },
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { CLAUDE_CONFIG_DIR: '/tmp/materialized-claude-config' },
+        cleanupOnFailure: null,
+        cleanupOnExit: null,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.expandedEnvironmentVariables.CLAUDE_CONFIG_DIR).toBe('/tmp/materialized-claude-config');
+      expect(result.extraEnvForChild.CLAUDE_CONFIG_DIR).toBe('/tmp/materialized-claude-config');
+    }
+  });
+
+  it('fails closed when profile env references connected service env injected for the child', async () => {
+    const options: SpawnSessionOptions = {
+      directory: '.',
+      environmentVariables: {},
+    };
+
+    const result = await resolveSpawnChildEnvironment({
+      options,
+      profileEnvironmentVariables: {
+        ANTHROPIC_AUTH_TOKEN: '${DEEPSEEK_AUTH_TOKEN}',
+      },
+      daemonSpawnHooks: null,
+      processEnv: {},
+      logDebug: () => {},
+      logInfo: () => {},
+      logWarn: () => {},
+      connectedServiceAuth: {
+        env: { DEEPSEEK_AUTH_TOKEN: 'sk-connected-secret' },
+        cleanupOnFailure: null,
+        cleanupOnExit: null,
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errorCode).toBe(SPAWN_SESSION_ERROR_CODES.AUTH_ENV_UNEXPANDED);
+    expect(result.errorMessage).toContain('ANTHROPIC_AUTH_TOKEN references ${DEEPSEEK_AUTH_TOKEN}');
+  });
+});

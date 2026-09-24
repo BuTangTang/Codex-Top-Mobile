@@ -1,0 +1,385 @@
+import { createHash } from 'node:crypto';
+
+import type { ACPProvider } from '@/api/session/sessionMessageTypes';
+import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
+import { logger } from '@/ui/logger';
+import { updateMetadataBestEffort } from '@/api/session/sessionWritesBestEffort';
+import type { AcpReplayHistorySessionClient } from '@/agent/acp/sessionClient';
+import { extractThinkingTextFromThinkToolInput, isThinkingToolName } from '@/agent/acp/bridge/thinkingToolCall';
+import { CHANGE_TITLE_INSTRUCTION } from '@/agent/runtime/changeTitleInstruction';
+
+type TranscriptTextItem = { role: 'user' | 'agent'; text: string };
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function normalizeTextForMatch(text: string): string {
+  // Providers may see internal prompt suffixes that are intentionally not persisted in the Happy transcript.
+  // Strip these so overlap detection compares user-visible text only.
+  const withoutInternalSuffixes = (() => {
+    const raw = typeof text === 'string' ? text : '';
+    const trimmed = raw.trimEnd();
+    if (!trimmed.endsWith(CHANGE_TITLE_INSTRUCTION)) return raw;
+    return trimmed.slice(0, trimmed.length - CHANGE_TITLE_INSTRUCTION.length).trimEnd();
+  })();
+  return withoutInternalSuffixes.replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
+}
+
+function fingerprintItem(item: TranscriptTextItem): string {
+  return `${item.role}:${normalizeTextForMatch(item.text)}`;
+}
+
+function sha256(input: string): string {
+  return createHash('sha256').update(input).digest('hex');
+}
+
+function computeBestTailOverlap(existing: TranscriptTextItem[], replay: TranscriptTextItem[]): {
+  ok: true;
+  replayStartIndex: number;
+  matchedCount: number;
+} | {
+  ok: false;
+  reason: 'no_overlap' | 'ambiguous_overlap';
+} {
+  if (existing.length === 0) {
+    return { ok: true, replayStartIndex: 0, matchedCount: 0 };
+  }
+
+  const existingFp = existing.map(fingerprintItem);
+  const replayFp = replay.map(fingerprintItem);
+
+  const maxK = Math.min(30, existingFp.length, replayFp.length);
+  const minRequired = Math.min(3, existingFp.length);
+
+  for (let k = maxK; k >= 1; k--) {
+    const needle = existingFp.slice(-k);
+    const matches: number[] = [];
+    for (let i = 0; i <= replayFp.length - k; i++) {
+      let ok = true;
+      for (let j = 0; j < k; j++) {
+        if (replayFp[i + j] !== needle[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) matches.push(i);
+    }
+
+    if (matches.length === 0) continue;
+    if (matches.length > 1) {
+      return { ok: false, reason: 'ambiguous_overlap' };
+    }
+
+    if (k < minRequired) {
+      return { ok: false, reason: 'no_overlap' };
+    }
+
+    const startIndex = matches[0] + k;
+    return { ok: true, replayStartIndex: startIndex, matchedCount: k };
+  }
+
+  return { ok: false, reason: 'no_overlap' };
+}
+
+function extractReplayTextItems(replay: ReadonlyArray<unknown>): {
+  messages: TranscriptTextItem[];
+  hasToolEvents: boolean;
+} {
+  const messages: TranscriptTextItem[] = [];
+  let hasToolEvents = false;
+  for (const event of replay) {
+    const record = asRecord(event);
+    if (!record) continue;
+    const type = record.type;
+    if (type === 'message') {
+      const role = record.role;
+      const text = record.text;
+      if ((role === 'user' || role === 'agent') && typeof text === 'string') {
+        messages.push({ role, text });
+      }
+    } else if (type === 'tool_call' || type === 'tool_result') {
+      hasToolEvents = true;
+    }
+  }
+  return { messages, hasToolEvents };
+}
+
+function makeImportLocalId(params: { provider: string; remoteSessionId: string; index: number; role: string; text: string }): string {
+  const textHash = sha256(`${params.role}:${normalizeTextForMatch(params.text)}`).slice(0, 12);
+  return `acp-import:v1:${params.provider}:${params.remoteSessionId}:${params.index}:${textHash}`;
+}
+
+function makeImportEventLocalId(params: { provider: string; remoteSessionId: string; index: number; key: string }): string {
+  const short = sha256(params.key).slice(0, 12);
+  return `acp-import:v1:${params.provider}:${params.remoteSessionId}:e${params.index}:${short}`;
+}
+
+function isSafeRemoteSessionId(remoteSessionId: string): boolean {
+  const raw = String(remoteSessionId ?? '');
+  if (raw.length === 0) return false;
+  if (raw.length > 128) return false;
+  // Avoid ambiguous/unsafe identifiers: reject whitespace and path separators.
+  if (/\s/.test(raw)) return false;
+  if (raw.includes('/') || raw.includes('\\')) return false;
+  return true;
+}
+
+function safeStringifyForKey(value: unknown): string {
+  try {
+    const seen = new WeakSet<object>();
+    return JSON.stringify(value, (_key, current) => {
+      if (!current || typeof current !== 'object') return current;
+      if (seen.has(current as object)) return '[Circular]';
+      seen.add(current as object);
+      return current;
+    });
+  } catch {
+    return '[Unserializable]';
+  }
+}
+
+export async function importAcpReplayHistoryV1(params: {
+  session: AcpReplayHistorySessionClient;
+  provider: ACPProvider;
+  remoteSessionId: string;
+  replay: ReadonlyArray<unknown>;
+  permissionHandler: AcpPermissionHandler;
+}): Promise<void> {
+  if (!isSafeRemoteSessionId(params.remoteSessionId)) {
+    logger.debug('[ACP History] Invalid remoteSessionId; skipping history import', {
+      provider: params.provider,
+      remoteSessionId: String(params.remoteSessionId ?? '').slice(0, 80),
+    });
+    return;
+  }
+
+  const { messages: replayMessages } = extractReplayTextItems(params.replay);
+  if (replayMessages.length === 0) return;
+
+  const existing = await params.session.fetchRecentTranscriptTextItemsForAcpImport({ take: 150 });
+  const overlap = computeBestTailOverlap(existing, replayMessages);
+
+  if (!overlap.ok) {
+    // Divergence: prompt user, do nothing automatically.
+    const remoteHash = sha256(replayMessages.map(fingerprintItem).join('|')).slice(0, 12);
+    const permissionId = `AcpHistoryImport:v1:${params.provider}:${params.remoteSessionId}:${remoteHash}`;
+
+    const localTail = existing.slice(-3).map((m) => ({ role: m.role, text: normalizeTextForMatch(m.text).slice(0, 200) }));
+    const remoteTail = replayMessages.slice(-3).map((m) => ({ role: m.role, text: normalizeTextForMatch(m.text).slice(0, 200) }));
+
+    logger.debug('[ACP History] Divergence detected; prompting user', {
+      provider: params.provider,
+      remoteSessionId: params.remoteSessionId,
+      overlapReason: overlap.reason,
+      localCount: existing.length,
+      remoteCount: replayMessages.length,
+    });
+
+    // Use the standard permission flow so UI can render it as a tool card.
+    const decisionPromise = params.permissionHandler.handleToolCall(permissionId, 'AcpHistoryImport', {
+      provider: params.provider,
+      remoteSessionId: params.remoteSessionId,
+      localCount: existing.length,
+      remoteCount: replayMessages.length,
+      localTail,
+      remoteTail,
+      reason: overlap.reason,
+      note: 'History differs from this session. Importing may duplicate messages.',
+    });
+
+    void decisionPromise.then(async (decision) => {
+      if (decision.decision !== 'approved' && decision.decision !== 'approved_for_session' && decision.decision !== 'approved_execpolicy_amendment') {
+        logger.debug('[ACP History] User skipped divergent history import', { provider: params.provider });
+        return;
+      }
+
+      logger.debug('[ACP History] User approved divergent history import; importing full remote history', { provider: params.provider });
+      await importFullReplay(params, params.replay);
+    }).catch((error) => {
+      logger.debug('[ACP History] Divergent history import prompt failed', { error });
+    });
+
+    return;
+  }
+
+  const startIndex = overlap.replayStartIndex;
+  if (startIndex >= replayMessages.length) {
+    return;
+  }
+
+  const newMessages = replayMessages.slice(startIndex);
+  if (newMessages.length === 0) return;
+
+  logger.debug('[ACP History] Importing new replay messages', {
+    provider: params.provider,
+    remoteSessionId: params.remoteSessionId,
+    newCount: newMessages.length,
+    matchedCount: overlap.matchedCount,
+  });
+
+  await importMessageDeltas(params, replayMessages, startIndex);
+}
+
+async function importMessageDeltas(
+  params: {
+    session: AcpReplayHistorySessionClient;
+    provider: ACPProvider;
+    remoteSessionId: string;
+  },
+  replayMessages: TranscriptTextItem[],
+  startIndex: number,
+): Promise<void> {
+  for (let i = startIndex; i < replayMessages.length; i++) {
+    const msg = replayMessages[i];
+    const localId = makeImportLocalId({
+      provider: params.provider,
+      remoteSessionId: params.remoteSessionId,
+      index: i,
+      role: msg.role,
+      text: msg.text,
+    });
+
+    if (msg.role === 'user') {
+      await params.session.sendUserTextMessageCommitted(msg.text, { localId, meta: { importedFrom: 'acp-history' } });
+    } else {
+      await params.session.sendAgentMessageCommitted(
+        params.provider,
+        { type: 'message', message: msg.text },
+        { localId, meta: { importedFrom: 'acp-history', remoteSessionId: params.remoteSessionId } },
+      );
+    }
+  }
+
+  // Best-effort metadata watermark; failure is non-fatal.
+  updateMetadataBestEffort(
+    params.session,
+    (m) => {
+      const last = replayMessages[replayMessages.length - 1];
+      return {
+        ...m,
+        acpHistoryImportV1: {
+          v: 1,
+          provider: params.provider,
+          remoteSessionId: params.remoteSessionId,
+          importedAt: Date.now(),
+          lastImportedFingerprint: sha256(fingerprintItem(last)).slice(0, 16),
+        },
+      };
+    },
+    '[ACP History]',
+    'import_watermark',
+  );
+}
+
+async function importFullReplay(
+  params: {
+    session: AcpReplayHistorySessionClient;
+    provider: ACPProvider;
+    remoteSessionId: string;
+  },
+  replay: ReadonlyArray<unknown>,
+): Promise<void> {
+  const suppressedThinkToolCallIds = new Set<string>();
+  for (let i = 0; i < replay.length; i++) {
+    const record = asRecord(replay[i]);
+    if (!record) continue;
+    const type = record.type;
+    if (type === 'message') {
+      const role = record.role;
+      const text = record.text;
+      if (typeof role !== 'string' || typeof text !== 'string') continue;
+      const localId = makeImportEventLocalId({
+        provider: params.provider,
+        remoteSessionId: params.remoteSessionId,
+        index: i,
+        key: `${role}:${text}`,
+      });
+      if (role === 'user') {
+        await params.session.sendUserTextMessageCommitted(text, { localId, meta: { importedFrom: 'acp-history' } });
+      } else {
+        await params.session.sendAgentMessageCommitted(
+          params.provider,
+          { type: 'message', message: text },
+          { localId, meta: { importedFrom: 'acp-history', remoteSessionId: params.remoteSessionId } },
+        );
+      }
+      continue;
+    }
+
+    if (type === 'tool_call') {
+      const toolCallId = record.toolCallId;
+      if (typeof toolCallId !== 'string' || toolCallId.trim().length === 0) continue;
+      const kind = typeof record.kind === 'string' ? record.kind : null;
+      const title = typeof record.title === 'string' ? record.title : null;
+      const rawInput = record.rawInput ?? {};
+      const name = (kind ?? title ?? 'tool').trim() || 'tool';
+      if (isThinkingToolName(name)) {
+        suppressedThinkToolCallIds.add(toolCallId);
+        const text = extractThinkingTextFromThinkToolInput(rawInput);
+        if (text) {
+          const localId = makeImportEventLocalId({
+            provider: params.provider,
+            remoteSessionId: params.remoteSessionId,
+            index: i,
+            key: `thinking:${toolCallId}:${safeStringifyForKey(text)}`,
+          });
+          await params.session.sendAgentMessageCommitted(
+            params.provider,
+            { type: 'thinking', text },
+            { localId, meta: { importedFrom: 'acp-history', remoteSessionId: params.remoteSessionId } },
+          );
+        }
+        continue;
+      }
+      const localId = makeImportEventLocalId({
+        provider: params.provider,
+        remoteSessionId: params.remoteSessionId,
+        index: i,
+        key: `tool_call:${toolCallId}:${kind ?? ''}:${safeStringifyForKey(rawInput ?? null)}`,
+      });
+      await params.session.sendAgentMessageCommitted(
+        params.provider,
+        {
+          type: 'tool-call',
+          callId: toolCallId,
+          name,
+          input: rawInput ?? {},
+          id: `import-${toolCallId}`,
+        },
+        { localId, meta: { importedFrom: 'acp-history', remoteSessionId: params.remoteSessionId } },
+      );
+      continue;
+    }
+
+    if (type === 'tool_result') {
+      const toolCallId = record.toolCallId;
+      if (typeof toolCallId !== 'string' || toolCallId.trim().length === 0) continue;
+      if (suppressedThinkToolCallIds.has(toolCallId)) {
+        suppressedThinkToolCallIds.delete(toolCallId);
+        continue;
+      }
+      const status = typeof record.status === 'string' ? record.status : '';
+      const rawOutput = record.rawOutput ?? record.content ?? null;
+      const localId = makeImportEventLocalId({
+        provider: params.provider,
+        remoteSessionId: params.remoteSessionId,
+        index: i,
+        key: `tool_result:${toolCallId}:${status}:${safeStringifyForKey(rawOutput)}`,
+      });
+      const isError = status === 'error' || status === 'failed' || status === 'cancelled';
+      await params.session.sendAgentMessageCommitted(
+        params.provider,
+        {
+          type: 'tool-result',
+          callId: toolCallId,
+          output: rawOutput,
+          id: `import-${toolCallId}-result`,
+          isError,
+        },
+        { localId, meta: { importedFrom: 'acp-history', remoteSessionId: params.remoteSessionId } },
+      );
+    }
+  }
+}

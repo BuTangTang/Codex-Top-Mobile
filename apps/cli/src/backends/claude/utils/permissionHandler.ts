@@ -1,0 +1,1005 @@
+/**
+ * Permission Handler for canCallTool integration
+ * 
+ * Replaces the MCP permission server with direct SDK integration.
+ * Handles tool permission requests, responses, and state management.
+ */
+
+import { isDeepStrictEqual } from 'node:util';
+import { logger } from "@/lib";
+import type { SDKAssistantMessage, SDKMessage, SDKUserMessage } from "../sdk";
+import type { PermissionResult } from "../sdk/types";
+import type { Session } from "../session";
+import type { EnhancedMode, PermissionMode } from "../loop";
+import { getToolDescriptor } from "./getToolDescriptor";
+import { delay } from "@/utils/time";
+import { recordToolTraceEvent } from '@/agent/tools/trace/toolTrace';
+import { extractAgentIdFromTaskResultText } from '@/backends/claude/remote/sidechains/extractAgentIdFromTaskResult';
+import { resolveClaudeSdkPermissionModeFromEnhancedMode } from '@/backends/claude/utils/permissionMode';
+import { syncClaudePermissionModeFromMetadata } from '@/backends/claude/utils/syncPermissionModeFromMetadata';
+import type { PermissionRpcPayload } from './permissionRpc';
+import { updateAgentStateBestEffort, updateMetadataBestEffort } from '@/api/session/sessionWritesBestEffort';
+import { configuration } from '@/configuration';
+import { waitForSessionMetadataRetryBackoff } from '@/agent/runtime/sessionMetadataWaitRetryBackoff';
+import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
+import { readPendingLocalId } from '@happier-dev/protocol';
+import { cloneStringKeyedRecordToNullProto } from '@/api/session/agentStateRecords';
+import type { Metadata } from '@/api/types';
+import { resolveAgentRequestKind } from '@/agent/permissions/requestKind';
+import { isToolAllowedForSession } from '@/agent/permissions/permissionToolIdentifier';
+import {
+    isSafeFirstPartyHappierActionToolCall,
+} from '@/agent/tools/happierTools/resolveHappierActionForMcpToolName';
+import { applyAllowedToolsToAllowlist, applyUpdatedPermissionsToAllowlist, seedAllowlistFromCompletedRequests } from '@/agent/permissions/applyPermissionAllowlistUpdates';
+import {
+    AgentStateRequestStore,
+    hasPermissionResponseClaimV1,
+    type AgentStateOutstandingRequest,
+} from '@/agent/permissions/agentStateRequestStore';
+import {
+    createPermissionRequestCoordinator,
+    type PermissionRequestCoordinator,
+    type PermissionRequestCoordinatorCompletion,
+    type PermissionRequestCoordinatorContext,
+    type PermissionRequestCoordinatorStore,
+} from '@/agent/permissions/permissionRequestCoordinator';
+import {
+    computeNextMetadataStringOverrideV1,
+    isClaudeLocalPermissionBridgeAgentStateRequest,
+    isClaudeUnifiedTerminalDialogChoiceAgentStateRequest,
+    SESSION_MODE_OVERRIDE_KEY,
+} from '@happier-dev/agents';
+import { isChangeTitleToolLikeName } from '@happier-dev/protocol/tools/v2';
+import { isAskUserQuestionToolName, type StructuredQuestionAnswersV1 } from '@happier-dev/protocol';
+import {
+    normalizeLegacyStructuredQuestionAnswers,
+    normalizeStructuredQuestionAnswersV1,
+    type StructuredQuestionLike,
+} from '@/agent/questions/normalizeStructuredQuestionAnswersV1';
+import { buildAskUserQuestionAnswersForClaude } from './askUserQuestionAnswersForClaude';
+import { normalizeClaudeAskUserQuestionInputForPublication } from './normalizeClaudeAskUserQuestionInput';
+
+type PermissionResponse = PermissionRpcPayload;
+
+function isInteractiveTool(toolName: string): boolean {
+    return (
+        isAskUserQuestionToolName(toolName) ||
+        toolName === 'ExitPlanMode' ||
+        toolName === 'exit_plan_mode'
+    );
+}
+
+type PendingPermissionMetadata = {
+    toolName: string;
+    input: unknown;
+    sourceLocalId: string | null;
+};
+
+function isRequestOwnedOutsideRemotePermissionHandler(request: unknown): boolean {
+    return isClaudeLocalPermissionBridgeAgentStateRequest(request)
+        || isClaudeUnifiedTerminalDialogChoiceAgentStateRequest(request);
+}
+
+export class PermissionHandler {
+    private toolCalls: { id: string, name: string, input: any, used: boolean }[] = [];
+    private responses = new Map<string, PermissionResponse>();
+    private pendingRequestMetadata = new Map<string, PendingPermissionMetadata>();
+    private readonly agentStateRequestStore: AgentStateRequestStore;
+    private readonly permissionCoordinator: PermissionRequestCoordinator<PermissionResult>;
+    private session: Session;
+    private allowedToolIdentifiers = new Set<string>();
+    private permissionMode: PermissionMode = 'default';
+    private onPermissionRequestCallback?: (toolCallId: string) => void;
+    private agentIdByTaskId = new Map<string, string>();
+    private exitedPlanModeLocalIds = new Map<string, number>();
+    private exitedPlanModeFallbackUntilMs: number = 0;
+    private metadataWatcherAbort: AbortController | null = null;
+    private permissionModeUpdatedAt = 0;
+
+    constructor(session: Session) {
+        this.session = session;
+        this.agentStateRequestStore = new AgentStateRequestStore({
+            session: this.session.client,
+            logPrefix: '[Claude]',
+            pushSender: this.session.pushSender,
+            getAccountSettings: () => this.session.accountSettings ?? null,
+            getAccountSettingsSecretsReadKeys: () => this.session.accountSettingsSecretsReadKeys,
+        });
+        this.permissionCoordinator = createPermissionRequestCoordinator<PermissionResult>({
+            store: this.createCoordinatorStore(),
+        });
+        this.session.getOrCreatePermissionRpcRouter().registerConsumer({
+            name: 'claude-remote-permission-handler',
+            tryHandlePermissionRpc: (payload) => this.tryHandlePermissionRpc(payload),
+        });
+        this.advertiseCapabilities();
+        this.seedAllowlistFromAgentState();
+        this.startMetadataWatcher();
+    }
+
+    private startMetadataWatcher(): void {
+        if (this.metadataWatcherAbort) return;
+        if (typeof this.session.client.waitForMetadataUpdate !== 'function') return;
+
+        const controller = new AbortController();
+        this.metadataWatcherAbort = controller;
+        const signal = controller.signal;
+
+        const backoffMs = configuration.claudeMetadataWatcherIdleBackoffMs;
+        const waitForAbortOrBackoff = async (): Promise<void> => {
+            await waitForSessionMetadataRetryBackoff({ abortSignal: signal, backoffMs });
+        };
+
+        void (async () => {
+            while (!signal.aborted) {
+                const updated = await this.session.client.waitForMetadataUpdate(signal).catch(() => false);
+                if (!updated || signal.aborted) {
+                    // `waitForMetadataUpdate` can fail closed when the session client is detached/disconnected.
+                    // Back off to avoid a tight loop that can OOM.
+                    await waitForAbortOrBackoff();
+                    continue;
+                }
+                try {
+                    const next = syncClaudePermissionModeFromMetadata({ session: this.session, permissionHandler: this });
+                    if (next) {
+                        logger.debug(`[Claude] Permission mode updated from metadata while waiting: ${next}`);
+                    }
+                } catch (error) {
+                    logger.debug('[Claude] Failed to sync permission mode from metadata (non-fatal)', error);
+                }
+            }
+        })();
+    }
+
+    private isToolExplicitlyAllowed(toolName: string, input: unknown): boolean {
+        return isToolAllowedForSession(this.allowedToolIdentifiers, toolName, input);
+    }
+
+    private tryAutoApprovePendingRequests(): void {
+        if (this.pendingRequestMetadata.size === 0) return;
+
+        const idsToApprove: string[] = [];
+        for (const [id, pending] of this.pendingRequestMetadata.entries()) {
+            const context = this.permissionCoordinator.getResponseContext(id);
+            if (!context) {
+                this.pendingRequestMetadata.delete(id);
+                continue;
+            }
+            if (context.status !== 'live') continue;
+            if (isInteractiveTool(pending.toolName)) continue;
+            if (this.isToolExplicitlyAllowed(pending.toolName, pending.input)) {
+                idsToApprove.push(id);
+            }
+        }
+
+        for (const id of idsToApprove) {
+            const context = this.permissionCoordinator.getResponseContext(id);
+            if (!context || context.status !== 'live') continue;
+            this.applyPermissionResponse({ id, approved: true });
+        }
+    }
+
+    private applyUpdatedPermissionsAllowlist(updatedPermissions: unknown): void {
+        applyUpdatedPermissionsToAllowlist(this.allowedToolIdentifiers, updatedPermissions);
+    }
+
+    private pruneExitPlanModeLocalIds(nowMs: number): void {
+        const ttlMs = configuration.claudeExitPlanModeLatchMs;
+        for (const [localId, approvedAt] of this.exitedPlanModeLocalIds.entries()) {
+            if (nowMs - approvedAt > ttlMs) {
+                this.exitedPlanModeLocalIds.delete(localId);
+            }
+        }
+
+        const maxEntries = configuration.claudeExitPlanModeLatchMaxEntries;
+        if (this.exitedPlanModeLocalIds.size <= maxEntries) return;
+
+        const entries = Array.from(this.exitedPlanModeLocalIds.entries());
+        entries.sort((a, b) => a[1] - b[1]);
+        const overflow = entries.length - maxEntries;
+        for (let i = 0; i < overflow; i++) {
+            this.exitedPlanModeLocalIds.delete(entries[i]![0]);
+        }
+    }
+
+    private noteExitPlanModeApproved(sourceLocalId: string | null): void {
+        const nowMs = Date.now();
+        const localId = readPendingLocalId(sourceLocalId) ?? '';
+        if (localId.length > 0) {
+            this.exitedPlanModeLocalIds.set(localId, nowMs);
+            this.pruneExitPlanModeLocalIds(nowMs);
+            return;
+        }
+
+        const ttlMs = configuration.claudeExitPlanModeLatchMs;
+        this.exitedPlanModeFallbackUntilMs = Math.max(this.exitedPlanModeFallbackUntilMs, nowMs + ttlMs);
+    }
+
+    private shouldIgnorePlanModeForCall(localId: string | null): boolean {
+        const nowMs = Date.now();
+        this.pruneExitPlanModeLocalIds(nowMs);
+
+        const normalized = readPendingLocalId(localId) ?? '';
+        if (normalized.length > 0) {
+            const approvedAt = this.exitedPlanModeLocalIds.get(normalized);
+            if (!approvedAt) return false;
+            return nowMs - approvedAt <= configuration.claudeExitPlanModeLatchMs;
+        }
+
+        return nowMs <= this.exitedPlanModeFallbackUntilMs;
+    }
+
+    private clearAcpSessionModeOverrideBestEffort(): void {
+        const updatedAt = Date.now();
+        updateMetadataBestEffort(
+            this.session.client,
+            (metadata): Metadata =>
+                computeNextMetadataStringOverrideV1({
+                    metadata: cloneStringKeyedRecordToNullProto(metadata),
+                    overrideKey: SESSION_MODE_OVERRIDE_KEY,
+                    valueKey: 'modeId',
+                    value: '',
+                    updatedAt,
+                }) as unknown as Metadata,
+            '[Claude]',
+            'exit_plan_mode_clear_session_mode_override',
+        );
+    }
+
+    private isToolTraceEnabled(): boolean {
+        const isTruthy = (value: string | undefined): boolean =>
+            typeof value === 'string' && ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+        return isTruthy(process.env.HAPPIER_STACK_TOOL_TRACE);
+    }
+
+    private redactToolTraceValue(value: unknown, key?: string): unknown {
+        const REDACT_KEYS = new Set(['content', 'text', 'old_string', 'new_string', 'oldText', 'newText', 'oldContent', 'newContent']);
+
+        if (typeof value === 'string') {
+            if (key && REDACT_KEYS.has(key)) return `[redacted ${value.length} chars]`;
+            if (value.length <= 1_000) return value;
+            return `${value.slice(0, 1_000)}…(truncated ${value.length - 1_000} chars)`;
+        }
+
+        if (typeof value !== 'object' || value === null) return value;
+
+        if (Array.isArray(value)) {
+            const sliced = value.slice(0, 50).map((v) => this.redactToolTraceValue(v));
+            if (value.length <= 50) return sliced;
+            return [...sliced, `…(truncated ${value.length - 50} items)`];
+        }
+
+        const entries = Object.entries(value as Record<string, unknown>);
+        const out: Record<string, unknown> = {};
+        const sliced = entries.slice(0, 200);
+        for (const [k, v] of sliced) out[k] = this.redactToolTraceValue(v, k);
+        if (entries.length > 200) out._truncatedKeys = entries.length - 200;
+        return out;
+    }
+
+    private seedAllowlistFromAgentState(): void {
+        try {
+            const snapshot = (this.session.client as any).getAgentStateSnapshot?.() ?? null;
+            const completed = snapshot?.completedRequests;
+            if (!completed) return;
+            seedAllowlistFromCompletedRequests(this.allowedToolIdentifiers, completed);
+        } catch (error) {
+            logger.debug('[Claude] Failed to seed allowlist from agentState', error);
+        }
+    }
+
+    private advertiseCapabilities(): void {
+        // Capability negotiation for app ↔ agent compatibility.
+        // Older agents won't set this, so clients can safely fall back to legacy behavior.
+        updateAgentStateBestEffort(
+            this.session.client,
+            (currentState) => {
+                const currentCaps = (currentState as any).capabilities;
+                if (currentCaps
+                    && currentCaps.askUserQuestionAnswersInPermission === true
+                    && currentCaps.structuredQuestionAnswersV1Supported === true) {
+                    return currentState;
+                }
+                return {
+                    ...currentState,
+                    capabilities: {
+                        ...(currentCaps && typeof currentCaps === 'object' ? currentCaps : {}),
+                        askUserQuestionAnswersInPermission: true,
+                        structuredQuestionAnswersV1Supported: true,
+                    },
+                };
+            },
+            '[Claude]',
+            'advertise_capabilities',
+        );
+    }
+
+    approveToolCall(toolCallId: string, opts?: { answers?: StructuredQuestionAnswersV1 }): void {
+        this.applyPermissionResponse({ id: toolCallId, approved: true, structuredAnswersV1: opts?.answers });
+    }
+
+    private tryHandlePermissionRpc(message: PermissionResponse): boolean {
+        const id = typeof message?.id === 'string' ? message.id : '';
+        if (!id) {
+            return false;
+        }
+        const hasStructuredAnswers = message.answers !== undefined || message.structuredAnswersV1 !== undefined;
+        const context = hasStructuredAnswers
+            ? this.permissionCoordinator.getLocallyOwnedLiveResponseContext(id)
+            : this.permissionCoordinator.getResponseContext(id);
+        if (!context) {
+            return false;
+        }
+
+        const isAskUserQuestion = isAskUserQuestionToolName(context.toolName);
+        if (hasStructuredAnswers && (!this.pendingRequestMetadata.has(id) || !isAskUserQuestion)) return false;
+
+        const structuredAnswersV1 = message.structuredAnswersV1 !== undefined
+            ? normalizeStructuredQuestionAnswersV1(
+                message.structuredAnswersV1,
+                this.readStructuredQuestions(context),
+            )
+            : message.answers !== undefined
+                ? normalizeLegacyStructuredQuestionAnswers({
+                    answers: message.answers,
+                    questions: this.readStructuredQuestions(context),
+                })
+                : undefined;
+
+        this.applyPermissionResponse({ ...message, ...(structuredAnswersV1 ? { structuredAnswersV1 } : {}) }, context);
+        return true;
+    }
+
+    private readStructuredQuestions(context: PermissionRequestCoordinatorContext): readonly StructuredQuestionLike[] {
+        const input = context.toolInput;
+        if (!input || typeof input !== 'object' || Array.isArray(input)) return [];
+        const questions = (input as { questions?: unknown }).questions;
+        return Array.isArray(questions) ? questions as readonly StructuredQuestionLike[] : [];
+    }
+
+    private createCoordinatorStore(): PermissionRequestCoordinatorStore {
+        return {
+            publishRequest: (params) => this.agentStateRequestStore.publishRequest({
+                ...params,
+                updateState: (state) => ({
+                    ...state,
+                    capabilities: {
+                        ...(state.capabilities && typeof state.capabilities === 'object'
+                            ? state.capabilities
+                            : {}),
+                        askUserQuestionAnswersInPermission: true,
+                        structuredQuestionAnswersV1Supported: true,
+                    },
+                }),
+            }),
+            completeRequest: (params) => this.agentStateRequestStore.completeRequest(params),
+            cancelAllRequests: (params) => this.cancelRemoteOutstandingRequests(params.reason),
+            hasOutstandingRequest: (requestId) => this.readOutstandingRemoteRequest(requestId) !== null,
+            isOutstandingRequestClaimed: (requestId) => {
+                const rawRequest = (this.session.client as any).getAgentStateSnapshot?.()?.requests?.[requestId] ?? null;
+                return !isRequestOwnedOutsideRemotePermissionHandler(rawRequest)
+                    && this.agentStateRequestStore.isOutstandingRequestClaimed(requestId);
+            },
+            readOutstandingRequest: (requestId) => this.readOutstandingRemoteRequest(requestId),
+        };
+    }
+
+    private readOutstandingRemoteRequest(id: string): AgentStateOutstandingRequest | null {
+        try {
+            const outstanding = this.agentStateRequestStore.readOutstandingRequest(id);
+            if (!outstanding) return null;
+            const snapshot = (this.session.client as any).getAgentStateSnapshot?.() ?? null;
+            const rawRequest = snapshot?.requests?.[id] ?? null;
+            if (isRequestOwnedOutsideRemotePermissionHandler(rawRequest)) return null;
+            return outstanding;
+        } catch {
+            return null;
+        }
+    }
+
+    private cancelRemoteOutstandingRequests(reason: string): void {
+        updateAgentStateBestEffort(
+            this.session.client,
+            (currentState) => {
+                const requests = cloneStringKeyedRecordToNullProto(currentState.requests);
+                const completedRequests = cloneStringKeyedRecordToNullProto(currentState.completedRequests);
+                const now = Date.now();
+
+                for (const [id, request] of Object.entries(requests)) {
+                    if (isRequestOwnedOutsideRemotePermissionHandler(request)) continue;
+                    if (hasPermissionResponseClaimV1(request)) continue;
+                    delete requests[id];
+                    const completedEntry = { ...(request && typeof request === 'object' ? request : {}) } as Record<string, unknown>;
+                    completedEntry.completedAt = now;
+                    completedEntry.status = 'canceled';
+                    completedEntry.reason = reason;
+                    completedEntry.decision = 'abort';
+                    completedRequests[id] = completedEntry as never;
+                    this.agentStateRequestStore.markPermissionRequestCompletedBestEffort(id);
+                }
+
+                return {
+                    ...currentState,
+                    requests,
+                    completedRequests,
+                };
+            },
+            '[Claude]',
+            'cancel_remote_permission_requests',
+        );
+    }
+
+    private applyPermissionResponseSideEffects(params: {
+        response: PermissionResponse;
+        toolName: string | null;
+        sourceLocalId: string | null;
+    }): void {
+        const { response, toolName, sourceLocalId } = params;
+        if (response.approved) {
+            if (response.mode) {
+                this.handleModeChange(response.mode);
+            }
+            const updatedPermissions = response.updatedPermissions;
+            this.applyUpdatedPermissionsAllowlist(updatedPermissions);
+
+            const allowedTools = response.allowedTools ?? response.allowTools;
+            applyAllowedToolsToAllowlist(this.allowedToolIdentifiers, allowedTools);
+            this.tryAutoApprovePendingRequests();
+        }
+
+        if (
+            response.approved
+            && (toolName === 'ExitPlanMode' || toolName === 'exit_plan_mode')
+        ) {
+            if (sourceLocalId) {
+                this.noteExitPlanModeApproved(sourceLocalId);
+            }
+            this.clearAcpSessionModeOverrideBestEffort();
+        }
+    }
+
+    private applyPermissionResponse(message: PermissionResponse, responseContext?: PermissionRequestCoordinatorContext): void {
+        const id = message.id;
+        const context = responseContext ?? this.permissionCoordinator.getResponseContext(id);
+        if (!context) {
+            logger.debug('Permission request not found or already resolved');
+            return;
+        }
+
+        logger.debug('[Claude] Permission response received', {
+            id,
+            approved: message.approved,
+            mode: message.mode,
+            hasReason: typeof message.reason === 'string' && message.reason.length > 0,
+            allowedToolsCount: Array.isArray(message.allowedTools ?? message.allowTools)
+                ? (message.allowedTools ?? message.allowTools)!.length
+                : 0,
+            answersCount: message.answers ? Object.keys(message.answers).length : 0,
+        });
+
+        const completion = this.buildPermissionCompletion(message, context);
+
+        if (!this.permissionCoordinator.completeResponse({ context, completion })) {
+            logger.debug('[Claude] Permission response did not complete an outstanding request');
+            return;
+        }
+
+        if (this.isToolTraceEnabled()) {
+            recordToolTraceEvent({
+                direction: 'inbound',
+                sessionId: this.session.client.sessionId,
+                protocol: 'claude',
+                provider: 'claude',
+                kind: 'permission-response',
+                payload: {
+                    type: 'permission-response',
+                    permissionId: id,
+                    approved: message.approved,
+                    reason: typeof message.reason === 'string' ? message.reason : undefined,
+                    mode: message.mode,
+                    allowedTools: this.redactToolTraceValue(message.allowedTools ?? message.allowTools, 'allowedTools'),
+                    answers: this.redactToolTraceValue(message.answers, 'answers'),
+                    updatedPermissions: this.redactToolTraceValue(message.updatedPermissions, 'updatedPermissions'),
+                },
+            });
+        }
+
+        // Store the response with timestamp only after the canonical coordinator completed it.
+        this.responses.set(id, { ...message, receivedAt: Date.now() });
+
+        this.pendingRequestMetadata.delete(id);
+        this.applyPermissionResponseSideEffects({
+            response: message,
+            toolName: context.toolName,
+            sourceLocalId: context.sourceLocalId,
+        });
+
+    }
+    
+    /**
+     * Set callback to trigger when permission request is made
+     */
+    setOnPermissionRequest(callback: (toolCallId: string) => void) {
+        this.onPermissionRequestCallback = callback;
+    }
+
+    handleModeChange(mode: PermissionMode, updatedAt?: number) {
+        const hasUpdatedAt = typeof updatedAt === 'number' && Number.isFinite(updatedAt);
+        if (hasUpdatedAt && updatedAt < this.permissionModeUpdatedAt) {
+            return;
+        }
+        if (!hasUpdatedAt && mode === 'default' && this.permissionMode !== 'default' && this.permissionModeUpdatedAt > 0) {
+            return;
+        }
+        this.permissionMode = mode;
+        if (hasUpdatedAt) {
+            this.permissionModeUpdatedAt = updatedAt;
+        } else if (mode !== 'default' && this.permissionModeUpdatedAt === 0) {
+            this.permissionModeUpdatedAt = Date.now();
+        }
+        this.tryAutoApprovePendingRequestsForPermissionMode(mode);
+    }
+
+    private resolveEffectivePermissionModeForToolCall(mode: EnhancedMode): PermissionMode {
+        const requestedMode = mode?.permissionMode ?? this.permissionMode;
+        if (requestedMode === 'default' && this.permissionMode !== 'default' && this.permissionModeUpdatedAt > 0) {
+            return this.permissionMode;
+        }
+        return requestedMode;
+    }
+
+    private tryAutoApprovePendingRequestsForPermissionMode(mode: PermissionMode): void {
+        if (this.pendingRequestMetadata.size === 0) return;
+
+        const effectiveMode = resolveClaudeSdkPermissionModeFromEnhancedMode({ permissionMode: mode });
+        const isEditAutoApproveMode = effectiveMode === 'acceptEdits';
+        if (effectiveMode !== 'bypassPermissions' && !isEditAutoApproveMode) return;
+
+        const idsToApprove: string[] = [];
+        for (const [id, pending] of this.pendingRequestMetadata.entries()) {
+            const context = this.permissionCoordinator.getResponseContext(id);
+            if (!context) {
+                this.pendingRequestMetadata.delete(id);
+                continue;
+            }
+            if (context.status !== 'live') continue;
+            if (isInteractiveTool(pending.toolName)) continue;
+            if (effectiveMode === 'bypassPermissions') {
+                idsToApprove.push(id);
+                continue;
+            }
+
+            const descriptor = getToolDescriptor(pending.toolName);
+            if (descriptor.edit) idsToApprove.push(id);
+        }
+
+        for (const id of idsToApprove) {
+            const context = this.permissionCoordinator.getResponseContext(id);
+            if (!context || context.status !== 'live') continue;
+            this.applyPermissionResponse({ id, approved: true, mode });
+        }
+    }
+
+    private buildPermissionCompletion(
+        response: PermissionResponse,
+        context: PermissionRequestCoordinatorContext,
+    ): PermissionRequestCoordinatorCompletion<PermissionResult> {
+        const updatedPermissions = response.updatedPermissions;
+        const allowedTools = response.allowedTools ?? response.allowTools;
+        const completedRequest = {
+            status: response.approved ? 'approved' : 'denied',
+            ...(typeof response.reason === 'string' ? { reason: response.reason } : {}),
+            ...(typeof response.mode === 'string' ? { mode: response.mode } : {}),
+            ...(Array.isArray(allowedTools) ? { allowedTools } : {}),
+            ...(typeof updatedPermissions !== 'undefined' ? { updatedPermissions } : {}),
+            ...(response.structuredAnswersV1
+                ? { extraCompletedFields: { structuredAnswersV1: response.structuredAnswersV1 } }
+                : {}),
+        };
+
+        if (isAskUserQuestionToolName(context.toolName) && response.approved && response.structuredAnswersV1) {
+            const providerInput = this.pendingRequestMetadata.get(context.requestId)?.input ?? context.toolInput;
+            const baseInput =
+                providerInput && typeof providerInput === 'object' && !Array.isArray(providerInput)
+                    ? (providerInput as Record<string, unknown>)
+                    : {};
+            logger.debug(
+                `[AskUserQuestion] Resolving canCallTool with ${Object.keys(response.structuredAnswersV1).length} answer(s) via updatedInput`,
+            );
+            return {
+                result: {
+                    behavior: 'allow',
+                    updatedInput: {
+                        ...baseInput,
+                        answers: buildAskUserQuestionAnswersForClaude(response.structuredAnswersV1),
+                    },
+                },
+                completedRequest,
+            };
+        }
+
+        const result: PermissionResult = response.approved
+            ? {
+                behavior: 'allow',
+                updatedInput: (context.toolInput as Record<string, unknown>) || {},
+                ...(typeof updatedPermissions !== 'undefined' ? { updatedPermissions } : {}),
+            }
+            : {
+                behavior: 'deny',
+                message:
+                    response.reason ||
+                    `The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.`,
+            };
+
+        return { result, completedRequest };
+    }
+
+    /**
+     * Creates the canCallTool callback for the SDK
+     */
+    handleToolCall = async (
+        toolName: string,
+        input: unknown,
+        mode: EnhancedMode,
+        options: {
+            signal: AbortSignal;
+            /**
+             * Optional tool use id supplied by upstream runtimes (e.g. Agent SDK).
+             * When provided, we must use it directly instead of trying to infer it
+             * from transcript/tool_use events (which may not have been observed yet).
+             */
+            toolUseId?: string | null;
+            agentId?: string | null;
+            suggestions?: unknown;
+            blockedPath?: string | null;
+            decisionReason?: string | null;
+        },
+    ): Promise<PermissionResult> => {
+        const rewrittenInput = this.rewriteToolInput(toolName, input);
+        const providedToolUseId = readNonBlankOpaqueIdentifier(options?.toolUseId) ?? '';
+        const claimedToolUseId = providedToolUseId || this.findUnusedToolCallId(toolName, input);
+        if (claimedToolUseId && this.agentStateRequestStore.isOutstandingRequestClaimed(claimedToolUseId)) {
+            return this.handlePermissionRequest(claimedToolUseId, toolName, rewrittenInput, options.signal, {
+                suggestions: options.suggestions,
+                sourceLocalId: mode?.localId ?? null,
+            });
+        }
+
+        // Check if tool is explicitly allowed
+        if (this.isToolExplicitlyAllowed(toolName, rewrittenInput)) {
+            return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
+        }
+
+        if (isChangeTitleToolLikeName(toolName)) {
+            return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
+        }
+
+        // Calculate descriptor
+        const descriptor = getToolDescriptor(toolName);
+
+        //
+        // Handle special cases
+        //
+
+        // Use the per-message mode to avoid races where the handler's instance mode
+        // hasn't been updated yet (e.g. metadata update arrives slightly later).
+        const agentModeId =
+            mode?.agentModeId === 'plan' && this.shouldIgnorePlanModeForCall(mode?.localId ?? null)
+                ? null
+                : mode?.agentModeId;
+        const effectiveMode = resolveClaudeSdkPermissionModeFromEnhancedMode({
+            permissionMode: this.resolveEffectivePermissionModeForToolCall(mode),
+            agentModeId,
+        });
+
+        if (effectiveMode === 'bypassPermissions' && !isInteractiveTool(toolName)) {
+            return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
+        }
+
+        if (effectiveMode === 'acceptEdits' && descriptor.edit) {
+            return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
+        }
+
+        if (
+            !isInteractiveTool(toolName)
+            && isSafeFirstPartyHappierActionToolCall({ toolName, input: rewrittenInput })
+        ) {
+            return { behavior: 'allow', updatedInput: rewrittenInput as Record<string, unknown> };
+        }
+
+        //
+        // Approval flow
+        //
+
+        let toolCallId = providedToolUseId.length > 0 ? providedToolUseId : this.resolveToolCallId(toolName, input);
+        if (!toolCallId) { // What if we got permission before tool call
+            await delay(1000);
+            toolCallId = providedToolUseId.length > 0 ? providedToolUseId : this.resolveToolCallId(toolName, input);
+            if (!toolCallId) {
+                throw new Error(`Could not resolve tool call ID for ${toolName}`);
+            }
+        }
+        return this.handlePermissionRequest(toolCallId, toolName, rewrittenInput, options.signal, {
+            suggestions: options.suggestions,
+            sourceLocalId: mode?.localId ?? null,
+        });
+    }
+
+    private rewriteToolInput(toolName: string, input: unknown): unknown {
+        if (toolName === 'task' || isGenericSubAgentToolName(toolName)) {
+            if (configuration.claudeTaskAllowRunInBackground) return input;
+            if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+
+            const record = input as Record<string, unknown>;
+            const requestedBackground =
+                record.run_in_background === true || (record as any).runInBackground === true;
+            if (!requestedBackground) return input;
+
+            const next: Record<string, unknown> = { ...record, run_in_background: false };
+            if ('runInBackground' in next) {
+                delete (next as any).runInBackground;
+            }
+            return next;
+        }
+
+        // TaskOutput is a provider tool; models sometimes pass TaskOutput the Task's "taskId" instead of its "agentId".
+        // We can deterministically rewrite when we observed the Task tool_result that includes both ids.
+        if (toolName !== 'TaskOutput' && toolName !== 'task_output') return input;
+        if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+
+        const record = input as Record<string, unknown>;
+        const taskIdRaw = typeof record.task_id === 'string' ? record.task_id.trim() : '';
+        if (!taskIdRaw) return input;
+
+        const agentId = this.agentIdByTaskId.get(taskIdRaw) ?? null;
+        if (!agentId || agentId === taskIdRaw) return input;
+
+        return { ...record, task_id: agentId };
+    }
+
+    private coerceToolResultText(content: unknown): string {
+        if (typeof content === 'string') return content;
+        if (content == null) return '';
+
+        if (Array.isArray(content)) {
+            const chunks: string[] = [];
+            for (const item of content) {
+                if (!item || typeof item !== 'object') continue;
+                if ((item as any).type !== 'text') continue;
+                const text = (item as any).text;
+                if (typeof text === 'string' && text.trim().length > 0) {
+                    chunks.push(text);
+                }
+            }
+            return chunks.join('\n');
+        }
+
+        return '';
+    }
+
+    /**
+     * Handles individual permission requests
+     */
+    private async handlePermissionRequest(
+        id: string,
+        toolName: string,
+        input: unknown,
+        signal: AbortSignal,
+        opts?: { suggestions?: unknown; sourceLocalId?: string | null }
+    ): Promise<PermissionResult> {
+        const publicationInput = normalizeClaudeAskUserQuestionInputForPublication(toolName, input);
+        if (signal.aborted) {
+            return this.permissionCoordinator.requestDecision(
+                {
+                    requestId: id,
+                    toolName,
+                    toolInput: publicationInput,
+                    kind: resolveAgentRequestKind(toolName),
+                    sourceLocalId: typeof opts?.sourceLocalId === 'string' ? opts.sourceLocalId : null,
+                    permissionSuggestions: Array.isArray(opts?.suggestions) ? opts.suggestions : null,
+                },
+                { signal },
+            );
+        }
+
+        const hadContext = this.permissionCoordinator.getResponseContext(id) !== null;
+        if (!this.pendingRequestMetadata.has(id)) {
+            this.pendingRequestMetadata.set(id, {
+                toolName,
+                input,
+                sourceLocalId: typeof opts?.sourceLocalId === 'string' ? opts.sourceLocalId : null,
+            });
+        }
+
+        const promise = this.permissionCoordinator.requestDecision(
+            {
+                requestId: id,
+                toolName,
+                toolInput: publicationInput,
+                kind: resolveAgentRequestKind(toolName),
+                sourceLocalId: typeof opts?.sourceLocalId === 'string' ? opts.sourceLocalId : null,
+                permissionSuggestions: Array.isArray(opts?.suggestions) ? opts.suggestions : null,
+            },
+            { signal },
+        );
+
+        const hasContext = this.permissionCoordinator.getResponseContext(id) !== null;
+        if (!hasContext) {
+            this.pendingRequestMetadata.delete(id);
+            return promise;
+        }
+
+        if (!hadContext) {
+            // Trigger callback to send delayed messages immediately
+            if (this.onPermissionRequestCallback) {
+                this.onPermissionRequestCallback(id);
+            }
+
+            if (this.isToolTraceEnabled()) {
+                recordToolTraceEvent({
+                    direction: 'outbound',
+                    sessionId: this.session.client.sessionId,
+                    protocol: 'claude',
+                    provider: 'claude',
+                    kind: 'permission-request',
+                    payload: {
+                        type: 'permission-request',
+                        permissionId: id,
+                        toolName,
+                        input: this.redactToolTraceValue(input),
+                    },
+                });
+            }
+
+            logger.debug(`Permission request sent for tool call ${id}: ${toolName}`);
+        }
+
+        return promise;
+    }
+    /**
+     * Resolves tool call ID based on tool name and input
+     */
+    private resolveToolCallId(name: string, args: any): string | null {
+        const toolCall = this.findUnusedToolCall(name, args);
+        if (!toolCall) return null;
+        toolCall.used = true;
+        return toolCall.id;
+    }
+
+    private findUnusedToolCallId(name: string, args: unknown): string | null {
+        return this.findUnusedToolCall(name, args)?.id ?? null;
+    }
+
+    private findUnusedToolCall(name: string, args: unknown): (typeof this.toolCalls)[number] | null {
+        // Search in reverse (most recent first) without consuming the record.
+        for (let i = this.toolCalls.length - 1; i >= 0; i--) {
+            const call = this.toolCalls[i];
+            if (call.name === name && isDeepStrictEqual(call.input, args)) {
+                if (!call.used) return call;
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Handles messages to track tool calls
+     */
+    onMessage(message: SDKMessage): void {
+        if (message.type === 'assistant') {
+            const assistantMsg = message as SDKAssistantMessage;
+            if (assistantMsg.message && assistantMsg.message.content) {
+                for (const block of assistantMsg.message.content) {
+                    if (block.type === 'tool_use') {
+                        this.toolCalls.push({
+                            id: block.id!,
+                            name: block.name!,
+                            input: block.input,
+                            used: false
+                        });
+                    }
+                }
+            }
+        }
+        if (message.type === 'user') {
+            const userMsg = message as SDKUserMessage;
+            if (userMsg.message && userMsg.message.content && Array.isArray(userMsg.message.content)) {
+                for (const block of userMsg.message.content) {
+                    if (block.type === 'tool_result' && block.tool_use_id) {
+                        const toolCall = this.toolCalls.find(tc => tc.id === block.tool_use_id);
+                        if (toolCall && !toolCall.used) {
+                            toolCall.used = true;
+                        }
+                        if (toolCall && (toolCall.name === 'task' || isGenericSubAgentToolName(toolCall.name))) {
+                            const text = this.coerceToolResultText((block as any).content);
+                            const ids = extractAgentIdFromTaskResultText(text);
+                            if (ids.agentId && ids.taskId) {
+                                this.agentIdByTaskId.set(ids.taskId, ids.agentId);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Checks if a tool call is rejected
+     */
+    isAborted(toolCallId: string): boolean {
+
+        const toolCall = this.toolCalls.find(tc => tc.id === toolCallId);
+        if (toolCall && isInteractiveTool(toolCall.name)) {
+            return false;
+        }
+
+        // If tool not approved, it's aborted
+        if (this.responses.get(toolCallId)?.approved === false) {
+            return true;
+        }
+
+        // Tool call is not aborted
+        return false;
+    }
+
+    /**
+     * Resets all state for new sessions
+     */
+    reset(): void {
+        this.toolCalls = [];
+        this.responses.clear();
+        this.allowedToolIdentifiers.clear();
+        this.agentStateRequestStore.dispose();
+        this.permissionMode = 'default';
+        this.exitedPlanModeLocalIds.clear();
+        this.exitedPlanModeFallbackUntilMs = 0;
+
+        this.cancelPendingRequests('Session reset', 'reset_pending_requests');
+    }
+
+    private cancelPendingRequests(
+        reason: string,
+        _logReason: string,
+        _opts?: {
+            completedReason?: string;
+            decision?: 'abort';
+        },
+    ): void {
+        this.pendingRequestMetadata.clear();
+        this.permissionCoordinator.cancelAll(reason);
+    }
+
+    async abortPendingRequestsAndFlush(reason: string = 'Aborted by user'): Promise<void> {
+        this.cancelPendingRequests(reason, 'abort_pending_requests', { decision: 'abort' });
+        try {
+            await this.session.client.flush?.();
+        } catch (error) {
+            logger.debug('[Claude] Failed to flush session after aborting pending permissions (non-fatal)', error);
+        }
+    }
+
+    async resetAndFlush(): Promise<void> {
+        this.reset();
+        try {
+            await this.session.client.flush?.();
+        } catch (error) {
+            logger.debug('[Claude] Failed to flush session after permission reset (non-fatal)', error);
+        }
+    }
+
+    dispose(): void {
+        this.metadataWatcherAbort?.abort();
+        this.metadataWatcherAbort = null;
+        this.agentStateRequestStore.dispose();
+        this.cancelPendingRequests('Session disposed', 'dispose_pending_requests');
+    }
+
+    /**
+     * Gets the responses map (for compatibility with existing code)
+     */
+    getResponses(): Map<string, PermissionResponse> {
+        return this.responses;
+    }
+}
+import { isGenericSubAgentToolName } from '@happier-dev/protocol/tools/v2';

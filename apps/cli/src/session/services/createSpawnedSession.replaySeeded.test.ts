@@ -1,0 +1,450 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { Credentials } from '@/persistence';
+import { ConnectedServiceMaterializationIdentityV1Schema } from '@happier-dev/protocol';
+
+import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
+
+const spawnDaemonSession = vi.hoisted(() => vi.fn());
+const resolveDaemonSpawnSessionByNonce = vi.hoisted(() => vi.fn());
+const fetchSessionById = vi.hoisted(() => vi.fn());
+const getOrCreateSessionByTag = vi.hoisted(() => vi.fn());
+const archiveSessionByIdBestEffort = vi.hoisted(() => vi.fn(async () => {}));
+const updateSessionMetadataWithRetry = vi.hoisted(() => vi.fn(async () => {}));
+
+vi.mock('@/daemon/controlClient', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/daemon/controlClient')>(),
+  spawnDaemonSession,
+  resolveDaemonSpawnSessionByNonce,
+}));
+
+vi.mock('@/session/transport/http/sessionsHttp', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/session/transport/http/sessionsHttp')>(),
+  fetchSessionById,
+  getOrCreateSessionByTag,
+}));
+
+vi.mock('@/session/services/setSessionArchivedState', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/session/services/setSessionArchivedState')>(),
+  archiveSessionByIdBestEffort,
+}));
+
+vi.mock('@/session/metadata/updateSessionMetadataWithRetry', () => ({
+  updateSessionMetadataWithRetry,
+}));
+
+import { createSpawnedSession, type CreateSpawnedSessionParams } from './createSpawnedSession';
+
+const credentials: Credentials = {
+  token: 'token',
+  encryption: { type: 'legacy', secret: new Uint8Array([1, 2, 3, 4]) },
+};
+
+const CANONICAL_METADATA: Record<string, unknown> = {
+  inheritedFromParent: 'kept',
+  forkV1: {
+    v: 1,
+    parentSessionId: 'sess_parent',
+    parentCutoffSeqInclusive: 42,
+    createdAtMs: 1_000,
+    strategy: 'replay',
+    providerHint: { providerId: 'claude' },
+  },
+  replaySeedV1: {
+    v: 1,
+    seedText: 'seed text',
+    sourceSessionId: 'sess_parent',
+    sourceCutoffSeqInclusive: 42,
+    createdAtMs: 1_000,
+  },
+};
+
+function rawSession(metadata: Record<string, unknown> | string | null): Record<string, unknown> {
+  return {
+    id: 'sess_child',
+    seq: 0,
+    createdAt: 10,
+    updatedAt: 10,
+    active: false,
+    activeAt: 0,
+    encryptionMode: 'plain',
+    metadata: typeof metadata === 'string' || metadata === null ? metadata : JSON.stringify(metadata),
+    metadataVersion: 0,
+    agentState: null,
+    agentStateVersion: 0,
+    dataEncryptionKey: null,
+  };
+}
+
+function replaySeededParams(
+  overrides: Partial<CreateSpawnedSessionParams> = {},
+): CreateSpawnedSessionParams {
+  return {
+    credentials,
+    directory: '/repo',
+    backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+    replaySeededCreation: {
+      tag: 'replay:sess_parent:42:attempt-1',
+      agentId: 'claude',
+      metadata: CANONICAL_METADATA,
+      sourceRecipe: { sourceSessionId: 'sess_parent', cutoffSeqInclusive: 42 },
+    },
+    ...overrides,
+  } as CreateSpawnedSessionParams;
+}
+
+describe('createSpawnedSession — Replay-seeded creation', () => {
+  beforeEach(() => {
+    spawnDaemonSession.mockReset();
+    resolveDaemonSpawnSessionByNonce.mockReset();
+    fetchSessionById.mockReset();
+    getOrCreateSessionByTag.mockReset();
+    archiveSessionByIdBestEffort.mockClear();
+    updateSessionMetadataWithRetry.mockClear();
+  });
+
+  it('commits the row from the caller tag and attaches the launched runner to it', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA) });
+    spawnDaemonSession.mockResolvedValue({ success: true, sessionId: 'sess_child' });
+
+    const created = await createSpawnedSession(replaySeededParams());
+
+    expect(created).toMatchObject({ created: true, sessionId: 'sess_child' });
+    // The invoking ingress owns the retry identity; the creator never rewrites it.
+    expect(getOrCreateSessionByTag).toHaveBeenCalledTimes(1);
+    const creation = getOrCreateSessionByTag.mock.calls[0]![0] as {
+      tag: string;
+      metadata: Record<string, unknown>;
+      agentState: unknown;
+    };
+    expect(creation.tag).toBe('replay:sess_parent:42:attempt-1');
+    expect(creation.agentState).toBeNull();
+    expect(creation.metadata).toMatchObject({
+      tag: 'replay:sess_parent:42:attempt-1',
+      path: '/repo',
+      flavor: 'claude',
+      inheritedFromParent: 'kept',
+      forkV1: { parentSessionId: 'sess_parent', parentCutoffSeqInclusive: 42, strategy: 'replay' },
+      replaySeedV1: { sourceSessionId: 'sess_parent', sourceCutoffSeqInclusive: 42 },
+    });
+
+    expect(spawnDaemonSession).toHaveBeenCalledTimes(1);
+    expect(spawnDaemonSession.mock.calls[0]![0]).toMatchObject({ existingSessionId: 'sess_child' });
+
+    // The row is already known and its tag was written at creation.
+    expect(fetchSessionById).not.toHaveBeenCalled();
+    expect(updateSessionMetadataWithRetry).not.toHaveBeenCalled();
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('does not compose a media-continuity envelope this tree has no contract for', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA) });
+    spawnDaemonSession.mockResolvedValue({ success: true, sessionId: 'sess_child' });
+
+    await createSpawnedSession(replaySeededParams());
+
+    const creation = getOrCreateSessionByTag.mock.calls[0]![0] as { metadata: Record<string, unknown> };
+    expect(creation.metadata).not.toHaveProperty('sessionMediaContinuityV1');
+  });
+
+  it('settles the orphaned row exactly once when the launch is rejected', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA), created: true });
+    spawnDaemonSession.mockResolvedValue({
+      type: 'error',
+      errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+      errorMessage: 'spawn failed',
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+      message: 'spawn failed',
+    });
+
+    expect(archiveSessionByIdBestEffort).toHaveBeenCalledTimes(1);
+    expect(archiveSessionByIdBestEffort).toHaveBeenCalledWith({ token: 'token', sessionId: 'sess_child' });
+  });
+
+  it('never archives a row when an older server omits the atomic create resolution', async () => {
+    // Older create-or-load responses have no additive `resolution` field. The
+    // client therefore treats ownership as unknown (`created: false`) and must
+    // preserve the row even if this retry receives a definite rejection.
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA) });
+    spawnDaemonSession.mockResolvedValue({
+      type: 'error',
+      errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+      errorMessage: 'runner validation failed',
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+    });
+
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('rejects a reused creation identity whose persisted recipe names another source', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({
+      session: rawSession({
+        ...CANONICAL_METADATA,
+        replaySeedV1: {
+          v: 1,
+          seedText: 'seed text',
+          sourceSessionId: 'sess_other_parent',
+          sourceCutoffSeqInclusive: 42,
+          createdAtMs: 1_000,
+        },
+      }),
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+
+    // A conflicting rejoin never launches and never archives the pre-existing row.
+    expect(spawnDaemonSession).not.toHaveBeenCalled();
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('rejects a reused creation identity whose persisted cutoff contradicts the request', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({
+      session: rawSession({
+        ...CANONICAL_METADATA,
+        replaySeedV1: {
+          v: 1,
+          seedText: 'seed text',
+          sourceSessionId: 'sess_parent',
+          sourceCutoffSeqInclusive: 7,
+          createdAtMs: 1_000,
+        },
+      }),
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+  });
+
+  // POSITIVE lineage, not merely the absence of a contradiction. Creation is
+  // get-or-create, so the returned row may be one this call never created, and a
+  // row that names no source recipe contradicts nothing — the conflict check has
+  // nothing to compare and answers `false`. Proceeding there attaches the
+  // caller's seed and runner to a Session whose lineage was never authenticated.
+  // A row this call DID create always carries the recipe, because this call just
+  // wrote it, so requiring the recipe costs the create path nothing.
+  it('refuses a creation candidate that carries no source recipe at all', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(null) });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+
+    expect(spawnDaemonSession).not.toHaveBeenCalled();
+    // Never created here, so never settled here.
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('refuses an ordinary pre-existing Session that happens to answer this tag', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({
+      session: rawSession({ path: '/repo', summary: { text: 'somebody else', updatedAt: 1 } }),
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+
+    expect(spawnDaemonSession).not.toHaveBeenCalled();
+  });
+
+  it('accepts a rejoin whose persisted recipe names the requested source', async () => {
+    // Consumption blanks `seedText` and keeps the rest, so an exact retry after
+    // the child has already run still rejoins rather than creating a second row.
+    getOrCreateSessionByTag.mockResolvedValue({
+      session: rawSession({
+        ...CANONICAL_METADATA,
+        replaySeedV1: { ...(CANONICAL_METADATA.replaySeedV1 as Record<string, unknown>), seedText: '' },
+      }),
+    });
+    spawnDaemonSession.mockResolvedValue({ success: true, sessionId: 'sess_child' });
+
+    await expect(createSpawnedSession(replaySeededParams())).resolves.toMatchObject({
+      sessionId: 'sess_child',
+    });
+    expect(spawnDaemonSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses raw latest source intent when an existing tag replays a persisted cutoff', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA), created: false });
+    spawnDaemonSession.mockResolvedValue({ success: true, sessionId: 'sess_child' });
+
+    await expect(createSpawnedSession({
+      ...replaySeededParams({
+        replaySeededCreation: {
+          tag: 'replay:sess_parent:42:attempt-1',
+          agentId: 'claude',
+          metadata: CANONICAL_METADATA,
+          // This is a newly resolved head, not the prior attempt's immutable
+          // snapshot. `latest` must authenticate source, not reinterpret its
+          // stored cutoff.
+          sourceRecipe: { sourceSessionId: 'sess_parent', cutoffSeqInclusive: 43 },
+        },
+      }),
+      sourceContext: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_parent',
+        forkPoint: { type: 'latest' },
+      },
+    })).resolves.toMatchObject({
+      sessionId: 'sess_child',
+    });
+  });
+
+  it('rejects raw source-context lineage conflicts before attaching a rejoined child', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA), created: false });
+
+    await expect(createSpawnedSession({
+      ...replaySeededParams(),
+      sourceContext: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_other_parent',
+        forkPoint: { type: 'latest' },
+      },
+    })).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+
+    await expect(createSpawnedSession({
+      ...replaySeededParams(),
+      sourceContext: {
+        v: 1,
+        kind: 'session_replay',
+        sourceSessionId: 'sess_parent',
+        forkPoint: { type: 'seq', upToSeqInclusive: 41 },
+      },
+    })).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+
+    expect(spawnDaemonSession).not.toHaveBeenCalled();
+  });
+
+  it('refuses a row whose stored metadata cannot be authenticated', async () => {
+    // Stored bytes this daemon cannot decode mean a pre-existing row whose
+    // lineage cannot be verified — a row this call created would always decode,
+    // because this call encoded it. Attaching would seed the caller from an
+    // unverified source, so fail closed instead.
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession('{not-decodable') });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: 'creation_conflict',
+    });
+
+    expect(spawnDaemonSession).not.toHaveBeenCalled();
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('settles the orphaned row when the launch transport throws instead of answering', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA), created: true });
+    spawnDaemonSession.mockRejectedValue(new Error('transport exploded'));
+
+    // A transport error after dispatch is outcome-unknown: the daemon may have
+    // accepted the request and a child may already be running.
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      message: 'transport exploded',
+    });
+
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    SPAWN_SESSION_ERROR_CODES.SPAWN_NO_PID,
+    SPAWN_SESSION_ERROR_CODES.CHILD_EXITED_BEFORE_WEBHOOK,
+    SPAWN_SESSION_ERROR_CODES.SESSION_WEBHOOK_TIMEOUT,
+    SPAWN_SESSION_ERROR_CODES.ACCOUNT_SCOPE_CHANGED,
+    SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED,
+    SPAWN_SESSION_ERROR_CODES.DAEMON_RPC_UNAVAILABLE,
+    SPAWN_SESSION_ERROR_CODES.DAEMON_UPGRADE_REQUIRED,
+    SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+    // A machine-RPC timeout is outside the protocol enum, but can follow an
+    // accepted write whose response was lost.
+    'MACHINE_RPC_TIMEOUT',
+  ])('never archives a fresh row for a possibly-admitted or ambiguous %s result', async (errorCode) => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA), created: true });
+    spawnDaemonSession.mockResolvedValue({
+      type: 'error',
+      errorCode,
+      errorMessage: 'spawn outcome is not definitely pre-admission',
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({ code: errorCode });
+
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('never archives a rejoined child, even when the daemon definitely rejects this retry', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA), created: false });
+    spawnDaemonSession.mockResolvedValue({
+      type: 'error',
+      errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+      errorMessage: 'runner validation failed',
+    });
+
+    await expect(createSpawnedSession(replaySeededParams())).rejects.toMatchObject({
+      code: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+    });
+
+    expect(archiveSessionByIdBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('commits a fresh materialization identity when the spawn carries connected bindings', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA) });
+    spawnDaemonSession.mockResolvedValue({ success: true, sessionId: 'sess_child' });
+
+    await createSpawnedSession(replaySeededParams({
+      connectedServices: {
+        v: 1,
+        bindingsByServiceId: {
+          'claude-subscription': { source: 'connected', selection: 'profile', profileId: 'codex1' },
+        },
+      },
+    }));
+
+    // The row this owner commits is brand new, and the launch attaches to it through
+    // `existingSessionId`. The daemon refuses such a spawn when it carries connected bindings
+    // with no materialization identity, so the identity has to be on the committed row.
+    const creation = getOrCreateSessionByTag.mock.calls[0]![0] as { metadata: Record<string, unknown> };
+    const parsed = ConnectedServiceMaterializationIdentityV1Schema.safeParse(
+      creation.metadata.connectedServiceMaterializationIdentityV1,
+    );
+    expect(parsed.success).toBe(true);
+  });
+
+  it('writes no materialization identity when the spawn carries no connected binding', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA) });
+    spawnDaemonSession.mockResolvedValue({ success: true, sessionId: 'sess_child' });
+
+    await createSpawnedSession(replaySeededParams({
+      connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'native' } } },
+    }));
+
+    const creation = getOrCreateSessionByTag.mock.calls[0]![0] as { metadata: Record<string, unknown> };
+    expect(creation.metadata.connectedServiceMaterializationIdentityV1).toBeUndefined();
+  });
+
+  it('launches through an injected in-daemon transport instead of the control client', async () => {
+    getOrCreateSessionByTag.mockResolvedValue({ session: rawSession(CANONICAL_METADATA) });
+    const directSpawn = vi.fn(
+      async (_request: { existingSessionId?: string }) => ({ type: 'success', sessionId: 'sess_child' }),
+    );
+
+    const created = await createSpawnedSession(replaySeededParams({
+      directTransport: { spawn: directSpawn },
+    }));
+
+    expect(created.sessionId).toBe('sess_child');
+    expect(directSpawn).toHaveBeenCalledTimes(1);
+    expect(directSpawn.mock.calls[0]![0]).toMatchObject({ existingSessionId: 'sess_child' });
+    expect(spawnDaemonSession).not.toHaveBeenCalled();
+  });
+});

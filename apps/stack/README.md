@@ -1,0 +1,505 @@
+# hstack (Happier Stack)
+
+Run [**Happier**](https://cloud.happier.dev) locally and access it remotely and securely (using Tailscale).
+
+## What is Happier?
+
+Happier is an UI/CLI stack (server + web UI + CLI + daemon) who let you monitor and interact with Claude Code, Codex and Gemini sessions from your mobile, from a web UI and/or from a desktop app.
+
+## What is hstack?
+
+hstack is a guided installer + local orchestration CLI for Happier.
+
+If you only want to **use Happier** and self-host it on your computer, start with the **Self-host** section below.
+If you want to **develop Happier** (worktrees, multiple stacks, upstream PR workflows), see the **Development** section further down.
+
+## Self-host Happier (install + run)
+
+### Quickstart
+
+```bash
+curl -fsSL https://happier.dev/install | bash
+happier relay host install
+```
+
+Legacy hstack wrapper (optional):
+
+```bash
+hstack self-host install
+```
+
+Follow the guided instructions to install Happier and launch it.
+
+### Daily use
+
+#### Configure provider API keys for the daemon
+
+If you want the daemon to have access to provider API keys (for example OpenAI), you can set them so they are automatically loaded when the daemon starts:
+
+```bash
+hstack env set OPENAI_API_KEY=sk-...
+```
+
+Then restart so the daemon picks up the new environment:
+
+```bash
+hstack start --restart
+```
+
+### Start Happier
+
+Starts the local server, CLI daemon, and serves the pre-built UI.
+
+```bash
+hstack start
+```
+
+### Authentication
+
+On a **fresh machine**, the daemon needs to authenticate once before it can register a “machine”.
+
+```bash
+hstack auth login
+```
+
+By default (in a TTY), `hstack auth login` is **local-first**: it guides you through authenticating against your **local stack UI**
+instead of the hosted Happier web app. Advanced targeting:
+
+```bash
+hstack auth login --webapp=auto|stack|expo|public|hosted
+hstack auth login --webapp-url=http://localhost:8081
+hstack auth login --start-if-needed
+```
+
+If you want a quick diagnosis:
+
+```bash
+hstack auth status
+```
+
+### Enable Tailscale Serve (recommended for mobile/remote)
+
+```bash
+hstack tailscale enable
+hstack tailscale url
+```
+
+### Mobile access
+
+Make sure Tailscale is [installed and running](https://tailscale.com/kb/1347/installation) on your 
+phone, then either:
+
+- Open the URL from `hstack tailscale url` on your phone and “Add to Home Screen”, or
+- [Download the Happier mobile app]
+([https://cloud.happier.dev](https://cloud.happier.dev)) and [configure it to use
+your local server](docs/remote-access.md).
+
+Details (secure context, phone instructions, automation knobs): `[docs/remote-access.md](docs/remote-access.md)`.
+
+## Development (worktrees, stacks, contributor workflows)
+
+If you want to **develop Happier** (worktrees, multiple stacks, upstream PR workflows), you can install hstack for development with:
+
+### Setup (guided)
+
+```bash
+npx --yes -p @happier-dev/stack hstack setup-from-source --profile=dev
+```
+
+During setup, you’ll be guided through:
+
+- where to store your **workspace** (the folder that will contain `main/`, `dev/`, `pr/`, `local/`, `tmp/`)
+- bootstrapping/cloning the Happier monorepo
+- **recommended**: setting up a dedicated `dev-auth` seed stack (authenticate once, then new stacks can reuse it)
+- **recommended**: creating a dedicated dev stack (keep `main` stable)
+- optional: installing the iOS dev-client app (for phone testing)
+
+Manual shortcuts (if you want to do it yourself):
+
+```bash
+# Create the dev-auth seed stack (recommended) and do the guided login now:
+hstack auth seed
+
+# Create a dev stack and pin it to the dev checkout:
+hstack stack new dev
+hstack stack wt dev -- use dev
+```
+
+You can also set it non-interactively:
+
+```bash
+npx --yes -p @happier-dev/stack hstack setup-from-source --profile=dev --workspace-dir=~/Documents/Development/happier
+```
+
+### Why this exists
+
+- **Automated setup (from source)**: `hstack setup-from-source` + `hstack start` gets the whole stack up and running.
+- **No hosted dependency**: run the full stack on your own computer.
+- **Lower latency**: localhost/LAN is typically much faster than remote hosted servers.
+- **Custom forks**: easily use forks while still contributing upstream to `happier-dev/happier`.
+- **Worktrees**: clean upstream PR branches without mixing fork-only patches.
+- **Stacks**: run multiple isolated instances in parallel (ports + dirs + repo pinning).
+- **Remote access**: `hstack tailscale ...` helps you get an HTTPS URL for mobile/remote devices.
+
+### How hstack wires “local” URLs
+
+There are two “URLs” to understand:
+
+- **Internal URL**: used by local processes on this machine (server/daemon/CLI)
+  - typically `http://127.0.0.1:<port>`
+- **Public URL**: used by other devices (phone/laptop) and embedded links/QR codes
+  - recommended: `https://<machine>.<tailnet>.ts.net` via Tailscale Serve
+
+Diagram:
+
+```text
+             other device (phone/laptop)
+                   |
+                   |  HTTPS (secure context)
+                   v
+        https://<machine>.<tailnet>.ts.net
+                   |
+                   | (tailscale serve)
+                   v
+           local machine (this repo)
+     +--------------------------------+
+     | happier-server-light OR         |
+     | happier-server (via UI gateway) |
+     |  - listens on :PORT            |
+     |  - serves UI at /              |
+     +--------------------------------+
+                   ^
+                   | internal loopback
+                   |
+            http://127.0.0.1:<port>
+               (daemon / CLI)
+```
+
+More details + automation: `[docs/remote-access.md](docs/remote-access.md)`.
+
+### How it’s organized
+
+- **Scripts**: `scripts/*.mjs` (bootstrap/dev/start/build/stacks/worktrees/service/tailscale/mobile)
+- **Stable checkout**: `<workspace>/main` (the monorepo clone; treated as read-only)
+- **Dev checkout**: `<workspace>/dev` (created by `hstack setup-from-source --profile=dev`)
+- **Worktrees**:
+  - PRs: `<workspace>/pr/...`
+  - locals: `<workspace>/local/<owner>/...`
+  - tmp: `<workspace>/tmp/<owner>/...`
+- **CWD-scoped commands**: if you run `hstack test/typecheck/lint` from inside `apps/ui` / `apps/cli` / `apps/server` and omit a target, hstack infers the “service” automatically; `hstack build/dev/start` also prefer the checkout you’re currently inside.
+
+### Quickstarts (feature-focused)
+
+#### Remote access (Tailscale Serve)
+
+```bash
+hstack tailscale enable
+hstack tailscale url
+```
+
+Details: `[docs/remote-access.md](docs/remote-access.md)`.
+
+#### Worktrees + forks (clean upstream PRs)
+
+Create a clean local worktree:
+
+```bash
+hstack wt new my-feature --use
+hstack wt push active --remote=origin
+```
+
+Test an upstream PR locally:
+
+```bash
+hstack wt pr https://github.com/happier-dev/happier/pull/123 --use
+hstack wt pr 123 --update --stash
+```
+
+##### Developer quickstart: create a PR stack (isolated ports/dirs; idempotent updates)
+
+This creates (or reuses) a named stack, checks out the monorepo PR worktree, optionally seeds auth, and starts the stack.
+Re-run with `--reuse` to update the existing worktrees when the PR changes.
+
+```bash
+  hstack stack pr pr123 \
+  --repo=https://github.com/happier-dev/happier/pull/123 \
+  --seed-auth --copy-auth-from=dev-auth --link-auth \
+  --dev
+```
+
+Optional: enable Expo dev-client for mobile reviewers (reuses the same Expo dev server; no second Metro process):
+
+```bash
+hstack stack pr pr123 --repo=123 --dev --mobile
+```
+
+Optional: run it in a self-contained sandbox folder (delete it to uninstall completely):
+
+```bash
+SANDBOX="$(mktemp -d /tmp/hstack-sandbox.XXXXXX)"
+hstack --sandbox-dir "$SANDBOX" stack pr pr123 --repo=123 --dev
+rm -rf "$SANDBOX"
+```
+
+Update when the PR changes:
+
+- Re-run with `--reuse` to fast-forward worktrees when possible.
+- If the PR was force-pushed, add `--force`.
+
+```bash
+hstack stack pr pr123 --repo=123 --reuse
+hstack stack pr pr123 --repo=123 --reuse --force
+```
+
+##### Maintainer quickstart: one-shot “install + run PR stack” (idempotent)
+
+This is the maintainer-friendly entrypoint. It is safe to re-run and will keep the PR stack wiring intact.
+
+```bash
+npx --yes -p @happier-dev/stack hstack tools setup-pr \
+  --repo=https://github.com/happier-dev/happier/pull/123 \
+  --dev
+```
+
+Optional: enable Expo dev-client for mobile reviewers (works with both default `--dev` and `--start`):
+
+```bash
+npx --yes -p @happier-dev/stack hstack tools setup-pr --repo=123 --dev --mobile
+```
+
+Optional: run it in a sandbox folder (auto-cleaned).
+
+Note: `review-pr` uses a persistent sandbox workspace cache by default to speed up repeat runs (default: `~/.happier-stack/cache/sandbox/workspace`). Add `--no-workspace-cache` for a fully self-contained sandbox, or `--workspace-cache-dir=...` to customize the location.
+
+```bash
+SANDBOX="$(mktemp -d /tmp/hstack-review-pr.XXXXXX)"
+npx --yes -p @happier-dev/stack hstack tools review-pr --repo=123 --dev --sandbox-dir "$SANDBOX"
+rm -rf "$SANDBOX"
+```
+
+Short form (PR numbers):
+
+```bash
+npx --yes -p @happier-dev/stack hstack tools setup-pr --repo=123 --dev
+```
+
+Override stack name (optional):
+
+```bash
+npx --yes -p @happier-dev/stack hstack tools setup-pr --name=pr123 --repo=123 --dev
+```
+
+Update when the PR changes:
+
+- Re-run the same command to fast-forward the PR worktrees.
+- If the PR was force-pushed, add `--force`.
+
+```bash
+npx --yes -p @happier-dev/stack hstack tools setup-pr --repo=123 --dev
+npx --yes -p @happier-dev/stack hstack tools setup-pr --repo=123 --dev --force
+```
+
+Details: `[docs/worktrees-and-forks.md](docs/worktrees-and-forks.md)`.
+
+#### Server presets (light vs full)
+
+- Use `happier-server-light` for local, no-Docker topology defaults: SQLite, local files, and UI serving from the server.
+- Use `happier-server` for production-like topology defaults: managed Postgres + Redis + S3-compatible storage and the UI gateway.
+  - hstack can **manage the required infra automatically per stack** (via Docker Compose) and runs a **UI gateway** so you still get a single `https://...ts.net` URL that serves the UI + proxies API/websockets/files.
+- The database is an independent choice. Set `HAPPIER_DB_PROVIDER=postgres|mysql|pglite|sqlite`; the preset supplies only the default (`sqlite` for light, `postgres` for full).
+
+Switch globally:
+
+```bash
+hstack srv status
+hstack srv use --interactive
+```
+
+Switch per-stack:
+
+```bash
+hstack stack srv exp1 -- use --interactive
+```
+
+Details: `[docs/server-flavors.md](docs/server-flavors.md)`.
+
+#### Stacks (multiple isolated instances)
+
+```bash
+hstack stack new exp1 --interactive
+hstack stack dev exp1
+```
+
+Point a stack at a PR worktree:
+
+```bash
+hstack wt pr 123 --use
+hstack stack wt exp1 -- use pr/123-fix-thing
+hstack stack dev exp1
+```
+
+Details: `[docs/stacks.md](docs/stacks.md)`.
+
+#### Dev stacks: browser origin isolation (IMPORTANT)
+
+Non-main stacks use a stack-specific localhost hostname (no `/etc/hosts` changes required):
+
+- `http://happier-<stack>.localhost:<uiPort>` (default; set `HAPPIER_STACK_LOCALHOST_SUBDOMAIN_PREFIX=happy` for legacy)
+
+This avoids browser auth/session collisions between stacks (separate origin per stack).
+
+#### Menu bar (SwiftBar)
+
+```bash
+hstack menubar install
+hstack menubar open
+```
+
+Details: `[docs/menubar.md](docs/menubar.md)`.
+
+#### Mobile iOS dev (optional)
+
+```bash
+# Install the shared hstack dev-client app on your iPhone:
+hstack mobile-dev-client --install
+
+# Install an isolated per-stack app (Release config, unique bundle id + scheme):
+hstack stack mobile:install <stack> --name="Happier (<stack>)"
+```
+
+Details: `[docs/mobile-ios.md](docs/mobile-ios.md)`.
+
+#### Reviewing PRs in an isolated sandbox
+
+- **Unique hostname per run (default)**: `hstack tools review-pr` generates a unique stack name by default, which results in a unique `happier-<stack>.localhost` hostname. This prevents browser storage collisions when the sandbox is deleted between runs.
+- **Reuse an existing sandbox**: if a previous run preserved a sandbox (e.g. `--keep-sandbox` or a failure in verbose mode), re-running `hstack tools review-pr` offers an interactive choice to reuse it (keeping the same hostname + on-disk auth), or create a fresh sandbox.
+
+#### Tauri desktop app (optional)
+
+```bash
+hstack build --tauri
+```
+
+Details: `[docs/tauri.md](docs/tauri.md)`.
+
+### Commands (high-signal)
+
+- **Setup**:
+  - `hstack setup-from-source` (guided; selfhost or dev)
+  - (deprecated alias) `hstack setup`
+  - (advanced) `hstack init` (plumbing: shims/runtime/pointer env)
+  - (advanced) `hstack bootstrap --interactive` (workspace bootstrap wizard)
+- **Run**:
+  - `hstack start` (production-like; serves built UI via server-light)
+  - `hstack dev` (dev; Expo dev server for UI, optional dev-client via `--mobile`)
+- **Server flavor**:
+  - `hstack srv status`
+  - `hstack srv use --interactive`
+- **Worktrees**:
+  - `hstack wt use --interactive`
+  - `hstack wt pr <pr-url|number> --use [--update] [--stash] [--force]`
+  - `hstack wt sync-all`
+  - `hstack wt update-all --dry-run` / `hstack wt update-all --stash`
+- **Stacks**:
+  - `hstack stack new --interactive`
+  - `hstack stack dev <name>` / `hstack stack start <name>`
+  - `hstack stack edit <name> --interactive`
+  - `hstack stack wt <name> -- use --interactive`
+  - `hstack stack happier <name> -- <happier-cli args...>`
+- **Tools (maintainer / automation)**:
+  - `hstack tools setup-pr --repo=<pr-url|number> [--dev|--start]`
+  - `hstack tools review-pr --repo=<pr-url|number> [--dev|--start]`
+  - `hstack tools review` (local diff review)
+  - `hstack tools import` (split repos → monorepo porting helpers)
+- **Menu bar (SwiftBar)**:
+  - `hstack menubar install`
+
+### Docs (deep dives)
+
+- **Remote access (Tailscale + phone)**: `[docs/remote-access.md](docs/remote-access.md)`
+- **Server flavors (server-light vs server)**: `[docs/server-flavors.md](docs/server-flavors.md)`
+- **Worktrees + forks workflow**: `[docs/worktrees-and-forks.md](docs/worktrees-and-forks.md)`
+- **Stacks (multiple instances)**: `[docs/stacks.md](docs/stacks.md)`
+- **Paths + env precedence (home/workspace/runtime/stacks)**: `[docs/paths-and-env.md](docs/paths-and-env.md)`
+- **Menu bar (SwiftBar)**: `[docs/menubar.md](docs/menubar.md)`
+- **Mobile iOS dev**: `[docs/mobile-ios.md](docs/mobile-ios.md)`
+- **Tauri desktop app**: `[docs/tauri.md](docs/tauri.md)`
+
+### Configuration
+
+Where config lives by default:
+
+- `~/.happier-stack/.env`: stable “pointer” file (home/workspace/runtime)
+- `~/.happier-stack/env.local`: optional global overrides
+- `~/.happier/stacks/main/env`: main stack config (port, server flavor, repo/worktree override)
+
+Notes:
+
+- Canonical env prefix is `HAPPIER_STACK_*` (no legacy aliases).
+- Canonical stack storage is `~/.happier/stacks`.
+- To edit per-stack environment variables (including provider keys like `OPENAI_API_KEY`), use:
+
+  ```bash
+  hstack stack env <stack> set KEY=VALUE
+  hstack stack env <stack> unset KEY
+  hstack stack env <stack> get KEY
+  hstack stack env <stack> list
+  ```
+
+- **Repo env templates**:
+  - **Use `.env.example` as the canonical template** (copy it to `.env` if you’re running this repo directly).
+  - If an LLM tool refuses to read/edit `.env.example` due to safety restrictions, **do not create an `env.example` workaround**—instead, ask the user to apply the change manually.
+
+### Breaking changes (vs “Happy Stacks”)
+
+- No compatibility/migration for previous installs: uninstall old setups and run `hstack setup-from-source` again.
+- Env prefix is now `HAPPIER_STACK_*` (no legacy aliases like `HAPPY_STACKS_*` / `HAPPY_LOCAL_*`).
+- Workspace/worktrees are monorepo-first (default workspace: `~/.happier-stack/workspace`, with `main/`, `dev/`, `pr/`, `local/`, `tmp/`).
+- Yarn-only (no pnpm support).
+
+### Sandbox / test installs (fully isolated)
+
+If you want to test the full setup flow (including PR stacks) without impacting your “real” install, run everything with `--sandbox-dir`.
+To fully uninstall the test run, stop the sandbox stacks and delete the sandbox folder.
+
+```bash
+SANDBOX="$(mktemp -d /tmp/hstack-sandbox.XXXXXX)"
+
+# Run a PR stack (fully isolated install)
+npx --yes -p @happier-dev/stack hstack --sandbox-dir "$SANDBOX" tools setup-pr --repo=123 --dev
+
+# Tear down + uninstall
+npx --yes -p @happier-dev/stack hstack --sandbox-dir "$SANDBOX" stop --yes --no-service
+rm -rf "$SANDBOX"
+```
+
+Notes:
+
+- Sandbox mode disables global OS side effects (**PATH edits**, **SwiftBar plugin install**, **LaunchAgents/systemd services**, **Tailscale Serve enable/disable**) by default.
+- To explicitly allow those for testing, set `HAPPIER_STACK_SANDBOX_ALLOW_GLOBAL=1` (still recommended to clean up after).
+
+For contributor/LLM workflow expectations: `[AGENTS.md](AGENTS.md)`.
+
+### Developing hstack itself
+
+```bash
+git clone https://github.com/happier-dev/happier.git
+cd happier-dev
+
+node ./apps/stack/bin/hstack.mjs setup --profile=dev
+```
+
+Notes:
+
+- For local dev, prefer running stack commands via the `hstack` entrypoint (it applies stack-scoped env and safety gates).
+- To make the installed `~/.happier-stack/bin/hstack` shim (LaunchAgents / SwiftBar) run your local checkout without publishing to npm, set:
+
+```bash
+echo 'HAPPIER_STACK_CLI_ROOT_DIR=/path/to/your/happier-dev-checkout' >> ~/.happier-stack/.env
+```
+
+Or (recommended) persist it via init:
+
+```bash
+hstack init --cli-root-dir=/path/to/your/happier-dev-checkout
+```

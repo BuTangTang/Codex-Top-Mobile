@@ -1,0 +1,189 @@
+import type { ChatListItem } from '@/components/sessions/chatListItems';
+import type { TranscriptTurn, TranscriptTurnContent } from '@/components/sessions/transcript/turnGrouping/buildTranscriptTurns';
+import type { ForkedTranscriptSnapshot } from '@/sync/domains/sessionFork/forkedTranscriptSnapshot';
+
+export type ForkDividerTranscriptItem = ChatListItem | {
+    kind: 'turn';
+    id: string;
+    turn: TranscriptTurn;
+};
+
+type SourceSpan = Readonly<{
+    firstMessageId: string;
+    lastMessageId: string;
+}>;
+
+function firstMessageIdFromTurnContent(content: TranscriptTurnContent): string | null {
+    if (content.kind === 'message') return content.messageId;
+    return content.toolMessageIds[0] ?? null;
+}
+
+function lastMessageIdFromTurnContent(content: TranscriptTurnContent): string | null {
+    if (content.kind === 'message') return content.messageId;
+    return content.toolMessageIds[content.toolMessageIds.length - 1] ?? null;
+}
+
+function getItemSourceSpan(item: ForkDividerTranscriptItem): SourceSpan | null {
+    if (item.kind === 'message') {
+        return { firstMessageId: item.messageId, lastMessageId: item.messageId };
+    }
+
+    if (item.kind === 'tool-calls-group') {
+        const firstMessageId = item.toolMessageIds[0] ?? null;
+        const lastMessageId = item.toolMessageIds[item.toolMessageIds.length - 1] ?? null;
+        return firstMessageId && lastMessageId ? { firstMessageId, lastMessageId } : null;
+    }
+
+    if (item.kind === 'turn') {
+        const firstContent = item.turn.content[0] ?? null;
+        const lastContent = item.turn.content[item.turn.content.length - 1] ?? null;
+        const firstMessageId = item.turn.userMessageId ?? (firstContent ? firstMessageIdFromTurnContent(firstContent) : null);
+        const lastMessageId = lastContent ? lastMessageIdFromTurnContent(lastContent) : item.turn.userMessageId;
+        return firstMessageId && lastMessageId ? { firstMessageId, lastMessageId } : null;
+    }
+
+    return null;
+}
+
+function annotateItemOrigin<T extends ForkDividerTranscriptItem>(item: T, fork: ForkedTranscriptSnapshot): T {
+    if (item.kind !== 'message') return item;
+    const origin = fork.messageOriginById[item.messageId];
+    if (!origin) return item;
+    return {
+        ...item,
+        originSessionId: origin.sessionId,
+        isReadOnlyContext: origin.isReadOnlyContext,
+    };
+}
+
+function buildDivider(params: Readonly<{
+    parentSessionId: string;
+    childSessionId: string;
+    parentCutoffSeqInclusive: number;
+}>): Extract<ChatListItem, { kind: 'fork-divider' }> {
+    return {
+        kind: 'fork-divider',
+        id: `fork-divider:${params.parentSessionId}:${params.childSessionId}`,
+        parentSessionId: params.parentSessionId,
+        childSessionId: params.childSessionId,
+        parentCutoffSeqInclusive: params.parentCutoffSeqInclusive,
+    };
+}
+
+export function insertForkDividersIntoTranscriptItems<T extends ForkDividerTranscriptItem>(params: Readonly<{
+    items: readonly T[];
+    fork: ForkedTranscriptSnapshot;
+    /** All loaded source rows have been derived; absent rows were filtered, not deferred. */
+    sourceWindowComplete?: boolean;
+}>): Array<T | Extract<ChatListItem, { kind: 'fork-divider' }>> {
+    // A boundary divider is CHROME FOR CONTENT: it labels the seam between an ancestor
+    // segment and its child. With no rows there is no seam to label, and emitting one anyway
+    // publishes a NON-EMPTY transcript before a single message exists. Measured live on web
+    // (session cms4aenky5lnktm72sfmya6uk, cold route load, 2026-07-30): the first published
+    // list was `[fork-divider]` alone (1 mounted row, 324px), so Legend completed its
+    // bootstrap against that placeholder and flipped its row container from `opacity: 0` to
+    // `opacity: 1` — every later hydration wave (2291 -> 2253 -> 12241px) then happened in
+    // front of the reader. The unforked control published an EMPTY list, stayed covered
+    // through placement, and revealed once, already at the tail. Staying empty until the
+    // first real row lands is what restores that behaviour for forked transcripts; it is a
+    // data-shape decision at the producer, NOT a reveal delay or a cover.
+    if (params.items.length === 0) return [];
+
+    const boundaries: Array<{
+        childSegmentIndex: number;
+        parentSessionId: string;
+        childSessionId: string;
+        parentCutoffSeqInclusive: number;
+    }> = [];
+    const segmentIndexByMessageId = new Map<string, number>();
+
+    params.fork.segments.forEach((segment, segmentIndex) => {
+        for (const messageId of segment.messageIdsOldestFirst) {
+            segmentIndexByMessageId.set(messageId, segmentIndex);
+        }
+    });
+
+    let firstSourceSpan: SourceSpan | null = null;
+    let firstSourceSegmentIndex: number | undefined;
+    for (const item of params.items) {
+        const span = getItemSourceSpan(item);
+        const segmentIndex = span ? segmentIndexByMessageId.get(span.firstMessageId) : undefined;
+        if (span && segmentIndex !== undefined) {
+            firstSourceSpan = span;
+            firstSourceSegmentIndex = segmentIndex;
+            break;
+        }
+    }
+    if (firstSourceSegmentIndex === undefined || !firstSourceSpan) return [...params.items];
+
+    // Ancestry may be cached outside the currently derived row window. Its dividers
+    // belong there too; never move them to the first available descendant row.
+    let firstBoundaryParentIndex = firstSourceSegmentIndex;
+    const firstSegment = params.fork.segments[firstSourceSegmentIndex]!;
+    if (
+        firstSegment.isHistoryStartLoaded === true
+        && (params.sourceWindowComplete === true || firstSourceSpan.firstMessageId === firstSegment.messageIdsOldestFirst[0])
+    ) {
+        firstBoundaryParentIndex = Math.max(0, firstSourceSegmentIndex - 1);
+        // Known empty segments have coincident boundaries. An unloaded segment is
+        // not empty, so it cannot pull earlier ancestry into the visible window.
+        while (firstBoundaryParentIndex > 0) {
+            const segment = params.fork.segments[firstBoundaryParentIndex]!;
+            if (
+                segment.messageIdsOldestFirst.length > 0
+                || (segment.isHistoryStartLoaded !== true && segment.cutoffSeqInclusive !== 0)
+            ) break;
+            firstBoundaryParentIndex -= 1;
+        }
+    }
+
+    for (let i = firstBoundaryParentIndex; i < params.fork.segments.length - 1; i += 1) {
+        const parent = params.fork.segments[i]!;
+        const child = params.fork.segments[i + 1]!;
+        boundaries.push({
+            childSegmentIndex: i + 1,
+            parentSessionId: parent.sessionId,
+            childSessionId: child.sessionId,
+            parentCutoffSeqInclusive: parent.cutoffSeqInclusive ?? 0,
+        });
+    }
+
+    const output: Array<T | Extract<ChatListItem, { kind: 'fork-divider' }>> = [];
+    let boundaryIndex = 0;
+    const flushBoundary = () => {
+        const boundary = boundaries[boundaryIndex];
+        if (!boundary) return false;
+        output.push(buildDivider(boundary));
+        boundaryIndex += 1;
+        return true;
+    };
+    const flushBoundariesThroughSegment = (segmentIndex: number) => {
+        while (true) {
+            const boundary = boundaries[boundaryIndex];
+            if (!boundary || boundary.childSegmentIndex > segmentIndex) break;
+            flushBoundary();
+        }
+    };
+    const flushRemainingBoundaries = () => {
+        while (flushBoundary()) {
+            // Keep empty descendant segment dividers ahead of pending/action rows.
+        }
+    };
+
+    for (const item of params.items) {
+        const span = getItemSourceSpan(item);
+        if (span) {
+            const segmentIndex = segmentIndexByMessageId.get(span.firstMessageId);
+            if (segmentIndex != null) {
+                flushBoundariesThroughSegment(segmentIndex);
+            }
+        } else if (boundaryIndex < boundaries.length) {
+            flushRemainingBoundaries();
+        }
+        output.push(annotateItemOrigin(item, params.fork));
+    }
+
+    flushRemainingBoundaries();
+
+    return output;
+}

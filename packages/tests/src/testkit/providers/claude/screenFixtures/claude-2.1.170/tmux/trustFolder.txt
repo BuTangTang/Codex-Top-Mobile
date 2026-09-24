@@ -1,0 +1,7 @@
+Claude Code v2.1.170
+
+Do you trust the files in this folder?
+  /Users/dev/project
+
+  1. Yes, proceed
+  2. No, exit

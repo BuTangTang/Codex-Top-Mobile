@@ -1,0 +1,205 @@
+import { test, expect } from '@playwright/test';
+import { appendFile, mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } from '../../src/testkit/uiE2e/cliTerminalConnect';
+import { enableDirectSessionsFeature } from '../../src/testkit/uiE2e/enableDirectSessionsFeature';
+import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
+import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
+import { appendBrowserDiagnostics, collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+function jsonlLine(value: unknown): string {
+  return `${JSON.stringify(value)}\n`;
+}
+
+function responseItemLine(params: { timestamp: string; payload: Record<string, unknown> }): string {
+  return jsonlLine({ type: 'response_item', timestamp: params.timestamp, payload: params.payload });
+}
+
+test.describe('ui e2e: direct Codex sessions browse/open/tail', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('session-direct-codex-browse-open-tail-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+  const codexHomeDir = resolve(join(suiteDir, '.codex'));
+  const remoteSessionId = '11111111-1111-1111-1111-111111111111';
+  const rolloutFile = resolve(join(codexHomeDir, 'sessions', '2026', '03', '06', `rollout-2026-03-06T00-00-00-${remoteSessionId}.jsonl`));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+  let daemon: StartedDaemon | null = null;
+
+  test.beforeAll(async () => {
+    test.setTimeout(540_000);
+    await mkdir(cliHomeDir, { recursive: true });
+    await mkdir(resolve(join(codexHomeDir, 'sessions', '2026', '03', '06')), { recursive: true });
+    await writeFile(
+      rolloutFile,
+      [
+        jsonlLine({
+          type: 'session_meta',
+          payload: {
+            id: remoteSessionId,
+            timestamp: '2026-03-06T00:00:00.000Z',
+            cwd: '/tmp/direct-codex-ui-project',
+          },
+        }),
+        responseItemLine({
+          timestamp: '2026-03-06T00:00:01.000Z',
+          payload: { type: 'message', role: 'user', content: [{ type: 'text', text: 'older direct codex ui message' }] },
+        }),
+        responseItemLine({
+          timestamp: '2026-03-06T00:00:02.000Z',
+          payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'latest direct codex ui reply' }] },
+        }),
+      ].join(''),
+      'utf8',
+    );
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
+        HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
+      },
+    });
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...process.env,
+        EXPO_PUBLIC_DEBUG: '1',
+        EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
+        EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}-codex`,
+      },
+    });
+
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterEach(async () => {
+    await daemon?.stop().catch(() => {});
+    daemon = null;
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(120_000);
+    await daemon?.stop().catch(() => {});
+    await ui?.stop().catch(() => {});
+    await server?.stop().catch(() => {});
+  });
+
+  // 验证现有浏览与跟随流程，并确认没有桌面拥有者时保留草稿；失败附上浏览器边界诊断。
+  test('links a provider-backed Codex direct session and follows appended rollout lines', async ({ page }) => {
+    test.setTimeout(540_000);
+    const browserDiagnostics = collectBrowserDiagnostics({ page });
+    try {
+      if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
+
+      const testDir = resolve(join(suiteDir, 't1-direct-codex-browse-open-tail'));
+      await mkdir(testDir, { recursive: true });
+
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.goto(uiBaseUrl, { waitUntil: 'domcontentloaded' });
+      await ensureAccountReadyForConnect({ page, timeoutMs: 120_000 });
+
+      const cliLogin: StartedCliTerminalConnect = await startCliAuthLoginForTerminalConnect({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          CI: '1',
+          HAPPIER_DISABLE_CAFFEINATE: '1',
+          HAPPIER_VARIANT: 'dev',
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+      });
+
+      await page.goto(cliLogin.connectUrl, { waitUntil: 'domcontentloaded' });
+      await expect(page.getByTestId('terminal-connect-approve')).toHaveCount(1, { timeout: 60_000 });
+      await page.getByTestId('terminal-connect-approve').click();
+      await cliLogin.waitForSuccess();
+
+      daemon = await startTestDaemon({
+        testDir,
+        happyHomeDir: cliHomeDir,
+        env: {
+          ...process.env,
+          CI: '1',
+          HAPPIER_HOME_DIR: cliHomeDir,
+          HAPPIER_SERVER_URL: server.baseUrl,
+          HAPPIER_WEBAPP_URL: uiBaseUrl,
+          HAPPIER_DISABLE_CAFFEINATE: '1',
+          HAPPIER_VARIANT: 'dev',
+          CODEX_HOME: codexHomeDir,
+          HAPPIER_DIRECT_SESSIONS_PAGE_MAX_ITEMS: '2',
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+      });
+
+      await enableDirectSessionsFeature(page, uiBaseUrl);
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/`);
+      await expect(page.getByTestId('sessions-list-storage-tab:direct')).toHaveCount(1, { timeout: 120_000 });
+      await page.getByTestId('sessions-list-storage-tab:direct').click();
+
+      await expect(page.getByTestId('direct-sessions-browse-button')).toHaveCount(1, { timeout: 60_000 });
+      await page.getByTestId('direct-sessions-browse-button').click();
+      await expect(page.getByTestId('direct-sessions-browse-modal')).toHaveCount(1, { timeout: 60_000 });
+
+      const searchInput = page.getByTestId('direct-session-candidates-search-input');
+      await expect(searchInput).toHaveCount(1, { timeout: 60_000 });
+      await searchInput.fill('older direct codex');
+
+      const candidate = page.getByTestId(`direct-session-candidate:${remoteSessionId}`);
+      await expect(candidate).toHaveCount(1, { timeout: 120_000 });
+      await expect(candidate).toContainText('older direct codex ui message', { timeout: 120_000 });
+      await page.getByTestId(`direct-session-candidate:${remoteSessionId}`).click();
+
+      const transcript = page.getByTestId('transcript-chat-list');
+      await expect(transcript).toHaveCount(1, { timeout: 120_000 });
+      await expect(transcript.getByText('older direct codex ui message')).toHaveCount(1, { timeout: 60_000 });
+      await expect(transcript.getByText('latest direct codex ui reply')).toHaveCount(1, { timeout: 60_000 });
+
+      await appendFile(
+        rolloutFile,
+        responseItemLine({
+          timestamp: '2026-03-06T00:00:03.000Z',
+          payload: { type: 'message', role: 'user', content: [{ type: 'text', text: 'tail appended direct codex ui message' }] },
+        }),
+        'utf8',
+      );
+
+      await expect(transcript.getByText('tail appended direct codex ui message')).toHaveCount(1, { timeout: 60_000 });
+
+      // 此夹具只有可读原生日志，没有桌面 owner；手机普通发送必须保留草稿，不能自动接管。
+      const composer = page.getByTestId('session-composer-input');
+      await composer.fill('keep this draft until the desktop is available');
+      const sendButton = page.getByTestId('session-composer-send');
+      await expect(sendButton).toBeEnabled();
+      await sendButton.click();
+      // 等待本次发送的可见拒绝反馈，不能只用按钮已启用推断异步刷新结束。
+      const dismissUnavailable = page.getByTestId('web-modal-button-0');
+      await expect(dismissUnavailable).toBeVisible();
+      await expect(page.getByTestId('direct-session-takeover-dialog')).toHaveCount(0);
+      await dismissUnavailable.click();
+      await expect(sendButton).toBeEnabled();
+      await expect(composer).toHaveValue('keep this draft until the desktop is available');
+      await expect(page.getByTestId('direct-session-takeover-dialog')).toHaveCount(0);
+      await expect(page.getByTestId('agent-input-permission-chip')).toHaveCount(0);
+    } catch (error) {
+      throw appendBrowserDiagnostics(error, browserDiagnostics());
+    }
+  });
+});

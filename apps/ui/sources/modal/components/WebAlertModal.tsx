@@ -1,0 +1,250 @@
+import React from 'react';
+import { View, Pressable } from 'react-native';
+import { BaseModal } from './BaseModal';
+import { AlertModalConfig, ConfirmModalConfig } from '../types';
+import { Typography } from '@/constants/Typography';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+import { t } from '@/text';
+import { Text } from '@/components/ui/text/Text';
+import { ModalCardFrame } from './card/ModalCardFrame';
+
+
+interface WebAlertModalProps {
+    config: AlertModalConfig | ConfirmModalConfig;
+    onClose: () => void;
+    onConfirm?: (value: boolean) => void;
+    showBackdrop?: boolean;
+    zIndexBase?: number;
+}
+
+const stylesheet = StyleSheet.create((theme) => ({
+    content: {
+        paddingHorizontal: 16,
+        paddingTop: 20,
+        paddingBottom: 16,
+        alignItems: 'center',
+    },
+    title: {
+        fontSize: 17,
+        textAlign: 'center',
+        color: theme.colors.text.primary,
+        marginBottom: 4,
+    },
+    message: {
+        fontSize: 13,
+        textAlign: 'center',
+        color: theme.colors.text.primary,
+        marginTop: 4,
+        lineHeight: 18,
+    },
+    buttonContainer: {
+        borderTopWidth: 1,
+        borderTopColor: theme.colors.border.default,
+    },
+    buttonRow: {
+        flexDirection: 'row',
+    },
+    buttonColumn: {
+        flexDirection: 'column',
+    },
+    button: {
+        flex: 1,
+        paddingVertical: 11,
+        paddingHorizontal: 14,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    buttonPressed: {
+        backgroundColor: theme.colors.border.default,
+    },
+    separatorVertical: {
+        width: 1,
+        backgroundColor: theme.colors.border.default,
+    },
+    separatorHorizontal: {
+        height: 1,
+        backgroundColor: theme.colors.border.default,
+    },
+    buttonText: {
+        fontSize: 17,
+        color: theme.colors.text.link,
+        textAlign: 'center',
+        lineHeight: 20,
+        flexShrink: 1,
+        paddingHorizontal: 2,
+    },
+    primaryText: {
+        color: theme.colors.text.primary,
+    },
+    cancelText: {
+        fontWeight: '400',
+    },
+    destructiveText: {
+        color: theme.colors.state.danger.foreground,
+    },
+}));
+
+export function WebAlertModal({ config, onClose, onConfirm, showBackdrop = true, zIndexBase }: WebAlertModalProps) {
+    useUnistyles();
+    const styles = stylesheet;
+    const isConfirm = config.type === 'confirm';
+    
+    const handleButtonPress = (buttonIndex: number) => {
+        if (isConfirm && onConfirm) {
+            onConfirm(buttonIndex === 1);
+        } else if (!isConfirm && config.buttons?.[buttonIndex]?.onPress) {
+            config.buttons[buttonIndex].onPress!();
+        }
+        onClose();
+    };
+
+    const buttons = isConfirm
+        ? [
+            { text: config.cancelText || t('common.cancel'), style: 'cancel' as const },
+            { text: config.confirmText || t('common.ok'), style: config.destructive ? 'destructive' as const : 'default' as const }
+        ]
+        : (config.buttons && config.buttons.length > 0)
+            ? config.buttons
+            : [{ text: t('common.ok'), style: 'default' as const }];
+
+    const buttonLayout = buttons.length === 3 ? 'twoPlusOne' : buttons.length > 3 ? 'column' : 'row';
+
+    const resolveButtonTestId = (index: number): string => {
+        if (isConfirm) {
+            if (index === 0) return 'web-modal-cancel';
+            if (index === 1) return 'web-modal-confirm';
+        }
+        return `web-modal-button-${index}`;
+    };
+
+    return (
+        <BaseModal
+            visible={true}
+            onClose={onClose}
+            closeOnBackdrop={false}
+            showBackdrop={showBackdrop}
+            zIndexBase={zIndexBase}
+        >
+            <ModalCardFrame dimensions={{ width: 270, maxHeightRatio: 0.48 }}>
+                <View style={styles.content}>
+                    <Text style={[styles.title, Typography.default('semiBold')]}>
+                        {config.title}
+                    </Text>
+                    {config.message && (
+                        <Text style={[styles.message, Typography.default()]}>
+                            {config.message}
+                        </Text>
+                    )}
+                </View>
+                
+                {buttonLayout === 'twoPlusOne' ? (
+                    <View style={styles.buttonContainer}>
+                        <View style={styles.buttonRow}>
+                            <Pressable
+                                style={({ pressed }) => [
+                                    styles.button,
+                                    pressed && styles.buttonPressed
+                                ]}
+                                testID={resolveButtonTestId(0)}
+                                accessibilityRole="button"
+                                accessibilityLabel={buttons[0]?.text}
+                                onPress={() => handleButtonPress(0)}
+                            >
+                                <Text style={[
+                                    styles.buttonText,
+                                    buttons[0]?.style === 'cancel' && styles.cancelText,
+                                    buttons[0]?.style === 'destructive' && styles.destructiveText,
+                                    Typography.default(buttons[0]?.style === 'cancel' ? undefined : 'semiBold')
+                                ]}>
+                                    {buttons[0]?.text}
+                                </Text>
+                            </Pressable>
+
+                            <View style={styles.separatorVertical} />
+
+                            <Pressable
+                                style={({ pressed }) => [
+                                    styles.button,
+                                    pressed && styles.buttonPressed
+                                ]}
+                                testID={resolveButtonTestId(2)}
+                                accessibilityRole="button"
+                                accessibilityLabel={buttons[2]?.text}
+                                onPress={() => handleButtonPress(2)}
+                            >
+                                <Text style={[
+                                    styles.buttonText,
+                                    buttons[2]?.style === 'cancel' && styles.cancelText,
+                                    buttons[2]?.style === 'destructive' && styles.destructiveText,
+                                    Typography.default(buttons[2]?.style === 'cancel' ? undefined : 'semiBold')
+                                ]}>
+                                    {buttons[2]?.text}
+                                </Text>
+                            </Pressable>
+                        </View>
+
+                        <View style={styles.separatorHorizontal} />
+
+                        <Pressable
+                            style={({ pressed }) => [
+                                styles.button,
+                                pressed && styles.buttonPressed
+                            ]}
+                            testID={resolveButtonTestId(1)}
+                            accessibilityRole="button"
+                            accessibilityLabel={buttons[1]?.text}
+                            onPress={() => handleButtonPress(1)}
+                        >
+                            <Text style={[
+                                styles.buttonText,
+                                (buttons[1]?.style === 'default' || !buttons[1]?.style) && styles.primaryText,
+                                buttons[1]?.style === 'cancel' && styles.cancelText,
+                                buttons[1]?.style === 'destructive' && styles.destructiveText,
+                                Typography.default(buttons[1]?.style === 'cancel' ? undefined : 'semiBold')
+                            ]}>
+                                {buttons[1]?.text}
+                            </Text>
+                        </Pressable>
+                    </View>
+                ) : (
+                    <View
+                        style={[
+                            styles.buttonContainer,
+                            buttonLayout === 'row' ? styles.buttonRow : styles.buttonColumn,
+                        ]}
+                    >
+                        {buttons.map((button, index) => (
+                            <React.Fragment key={index}>
+                                {index > 0 && (
+                                    <View style={buttonLayout === 'row' ? styles.separatorVertical : styles.separatorHorizontal} />
+                                )}
+                                <Pressable
+                                    style={({ pressed }) => [
+                                        styles.button,
+                                        pressed && styles.buttonPressed
+                                    ]}
+                                    testID={resolveButtonTestId(index)}
+                                    accessibilityRole="button"
+                                    accessibilityLabel={button.text}
+                                    onPress={() => handleButtonPress(index)}
+                                >
+                                    <Text style={[
+                                        styles.buttonText,
+                                        buttonLayout === 'column' && (button.style === 'default' || !button.style) && styles.primaryText,
+                                        button.style === 'cancel' && styles.cancelText,
+                                        button.style === 'destructive' && styles.destructiveText,
+                                        Typography.default(button.style === 'cancel' ? undefined : 'semiBold')
+                                    ]}>
+                                        {button.text}
+                                    </Text>
+                                </Pressable>
+                            </React.Fragment>
+                        ))}
+                    </View>
+                )}
+            </ModalCardFrame>
+        </BaseModal>
+    );
+}
+
+export { ModalCardFrame } from './card/ModalCardFrame';

@@ -1,0 +1,189 @@
+import { createServer, type IncomingMessage, type ServerResponse, request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { connect as netConnect } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
+import { once } from 'node:events';
+
+type ProxyStop = () => Promise<void>;
+type TrackedConnection = {
+  destroy: () => void;
+  once: (event: 'close', listener: () => void) => unknown;
+};
+
+function setCors(res: ServerResponse) {
+  res.setHeader('access-control-allow-origin', '*');
+  res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader(
+    'access-control-allow-headers',
+    'authorization,content-type',
+  );
+  res.setHeader('access-control-max-age', '600');
+}
+
+function coerceHeaders(headers: IncomingMessage['headers']): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (!k) continue;
+    if (k.toLowerCase() === 'host') continue;
+    if (typeof v === 'string') out[k] = v;
+    else if (Array.isArray(v)) out[k] = v.join(', ');
+  }
+  return out;
+}
+
+export async function startForwardedHeaderProxy(params: {
+  targetBaseUrl: string;
+  identityHeaders: Record<string, string>;
+}): Promise<{ baseUrl: string; stop: ProxyStop }> {
+  const targetUrl = new URL(params.targetBaseUrl);
+  const isHttps = targetUrl.protocol === 'https:';
+  const targetPort = Number(targetUrl.port || (isHttps ? 443 : 80));
+  const requestFn = isHttps ? httpsRequest : httpRequest;
+  const trackedConnections = new Set<Pick<TrackedConnection, 'destroy'>>();
+
+  function trackConnection<T extends TrackedConnection>(connection: T): T {
+    trackedConnections.add(connection);
+    connection.once('close', () => {
+      trackedConnections.delete(connection);
+    });
+    return connection;
+  }
+
+  const srv = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.method === 'OPTIONS') {
+      setCors(res);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    const upstreamUrl = new URL(req.url ?? '/', targetUrl);
+    const headers = coerceHeaders(req.headers);
+    for (const [k, v] of Object.entries(params.identityHeaders)) {
+      headers[k] = v;
+    }
+
+    const upstreamReq = requestFn(
+      {
+        protocol: targetUrl.protocol,
+        hostname: targetUrl.hostname,
+        port: targetPort,
+        method: req.method,
+        path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+        headers: {
+          ...headers,
+          host: targetUrl.host,
+        },
+      },
+      (upstreamRes) => {
+        setCors(res);
+        res.statusCode = upstreamRes.statusCode ?? 502;
+        for (const [k, v] of Object.entries(upstreamRes.headers)) {
+          if (!k) continue;
+          if (k.toLowerCase() === 'access-control-allow-origin') continue;
+          if (typeof v === 'string') res.setHeader(k, v);
+          else if (Array.isArray(v)) res.setHeader(k, v);
+        }
+        upstreamRes.pipe(res);
+      },
+    );
+
+    upstreamReq.on('error', () => {
+      setCors(res);
+      res.statusCode = 502;
+      res.end('bad_gateway');
+    });
+
+    req.pipe(upstreamReq);
+  });
+
+  srv.on('connection', (socket) => {
+    trackConnection(socket);
+  });
+
+  srv.on('upgrade', (req, socket, head) => {
+    // Tunnel websocket upgrades directly to the upstream server to support daemon + UI socket clients.
+    trackConnection(socket);
+    let upstream: ReturnType<typeof netConnect> | ReturnType<typeof tlsConnect>;
+    const onConnect = () => {
+        const headers = coerceHeaders(req.headers);
+        for (const [k, v] of Object.entries(params.identityHeaders)) {
+          headers[k] = v;
+        }
+
+        const lines: string[] = [];
+        lines.push(`${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/1.1`);
+        lines.push(`Host: ${targetUrl.host}`);
+        for (const [k, v] of Object.entries(headers)) {
+          lines.push(`${k}: ${v}`);
+        }
+        lines.push('\r\n');
+        upstream.write(lines.join('\r\n'));
+        if (head && head.length > 0) upstream.write(head);
+
+        socket.pipe(upstream);
+        upstream.pipe(socket);
+    };
+
+    upstream = isHttps
+      ? tlsConnect(
+          {
+            host: targetUrl.hostname,
+            port: targetPort,
+            servername: targetUrl.hostname,
+          },
+          onConnect,
+        )
+      : netConnect(
+          {
+            host: targetUrl.hostname,
+            port: targetPort,
+          },
+          onConnect,
+        );
+    trackConnection(upstream);
+
+    socket.once('error', () => {
+      upstream.destroy();
+    });
+    socket.once('close', () => {
+      upstream.destroy();
+    });
+    upstream.once('close', () => {
+      socket.destroy();
+    });
+
+    upstream.on('error', () => {
+      try {
+        socket.destroy();
+      } catch {
+        // ignore
+      }
+    });
+  });
+
+  srv.listen(0, '127.0.0.1');
+  await once(srv, 'listening');
+  const addr = srv.address();
+  if (!addr || typeof addr !== 'object') throw new Error('proxy missing address');
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  return {
+    baseUrl,
+    stop: async () => {
+      for (const connection of [...trackedConnections]) {
+        connection.destroy();
+      }
+      if (!srv.listening) return;
+      await new Promise<void>((resolve, reject) => {
+        srv.close((error?: Error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+    },
+  };
+}

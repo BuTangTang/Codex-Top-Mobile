@@ -1,0 +1,256 @@
+import { AGENTS_CORE } from '../../manifest.js';
+import { AGENT_IDS, type AgentId } from '../../types.js';
+
+/**
+ * The one place a Session's decrypted metadata is rewritten to name a different
+ * current Agent.
+ *
+ * Every consumer of that metadata resolves "which Agent is this Session?" from
+ * the same three signals — declared `flavor`, the runtime descriptor, and the
+ * flat per-Agent vendor resume keys — and
+ * `buildInactiveSessionResumeSpawnOptions` REFUSES to build resume options when
+ * those signals disagree (it requires exactly one identity candidate). So a
+ * cutover that writes the target's identity without removing the source's key
+ * produces a Session that still reports an Agent but can never be reactivated
+ * from its own committed metadata. That failure is silent at the identity
+ * resolver and loud only at resume, which is why the removal lives here, beside
+ * the manifest that enumerates the keys, rather than in a caller.
+ *
+ * This projector is intentionally CLEAR-LIST driven rather than carry-list
+ * driven: session metadata is an open record shared by many owners, so an
+ * allow-list would silently drop unrelated facts (workspace location, handoff
+ * lineage, fork/replay metadata) the transition must preserve. What it removes
+ * is exactly the set of Agent-scoped facts and current-runtime projections that
+ * describe a runtime which no longer exists.
+ */
+
+/** Agent-scoped continuity/proof facts that are not the flat resume key itself. */
+const AGENT_SCOPED_CONTINUITY_KEYS = [
+  'claudeTranscriptPath',
+  'claudeLastCheckpointId',
+  'claudeLastAssistantUuid',
+  'claudeSubscriptionAccessTokenRefreshV1',
+  'piSessionFile',
+  'codexBackendMode',
+  'opencodeBackendMode',
+  'opencodeServerBaseUrl',
+  'opencodeServerBaseUrlExplicit',
+  'auggieAllowIndexing',
+  'agentRuntimeDescriptorV1',
+  'acpConfiguredBackendV1',
+  'acpTransportV1',
+  'acpHistoryImportV1',
+  'providerSessionInfoV1',
+] as const;
+
+/**
+ * The Session's connected-service auth binding and the materialized credential
+ * home that carries it.
+ *
+ * These are Agent-scoped, not Session-global: a binding names a `serviceId`
+ * the SOURCE Agent's catalog declares, and every reader resolves it against the
+ * Session's CURRENT Agent. Left in place across a transition, the Session
+ * declares the target while still bound to a service the target cannot apply —
+ * observed live as `openai-codex`/`codex6` surviving a switch to `claude`:
+ * the daemon spawn-preflighted the wrong service's credential, the target's
+ * runtime registration reconciled to
+ * `generation_application_scope_service_unsupported`, and `/session-started`
+ * answered 503 until the freshly started target died.
+ *
+ * The target's own binding is established by the caller through the canonical
+ * creation-time resolver, because it comes from the account's per-Agent stored
+ * default and this projector is pure.
+ */
+const AGENT_SCOPED_CONNECTED_SERVICE_KEYS = [
+  'connectedServices',
+  'connectedServicesUpdatedAt',
+  'connectedServiceMaterializationIdentityV1',
+] as const;
+
+/**
+ * Current-runtime projections. Each is republished by whichever runtime is
+ * attached; none is Session history. Historical facts — transcript, turns,
+ * usage, rollback ranges, fork/replay lineage, handoff lineage — are NOT here.
+ */
+const CURRENT_RUNTIME_PROJECTION_KEYS = [
+  'tools',
+  'slashCommands',
+  'slashCommandDetails',
+  'capabilities',
+  'localControl',
+  'controlledByUser',
+  'sessionWorkStateV1',
+  'sessionWorkflowActivityHeadlineV1',
+  'sessionAgentActivityHeadlineV1',
+  'acpSessionModesV1',
+  'sessionModesV1',
+  'acpSessionModelsV1',
+  'sessionModelsV1',
+  'sessionAppliedModelV1',
+  'acpConfigOptionsV1',
+  'sessionConfigOptionsV1',
+  // Both describe the DEPARTED runtime: a usage-limit recovery record names the
+  // source Agent's provider account and its retry window, and an MCP selection
+  // is a per-Agent choice the target never made. dev clears both (the recovery
+  // record through its session-state field owner); the predecessor projector
+  // had simply never listed them. The restart marker describes the same
+  // departed Agent's applied MCP baseline and must travel with the selection.
+  'sessionUsageLimitRecoveryV1',
+  'mcpSelectionV1',
+  'mcpSelectionRestartRequiredV1',
+] as const;
+
+/**
+ * Agent-specific selections. Cleared unconditionally, then rewritten from the
+ * target selection when one was supplied: a source Agent's model id or session
+ * mode id is meaningless to a different Agent, and carrying it over would let a
+ * stale value survive as the target's "intent".
+ */
+const AGENT_SELECTION_KEYS = [
+  'modelOverrideV1',
+  'acpSessionModeOverrideV1',
+  'sessionModeOverrideV1',
+  'acpConfigOptionOverridesV1',
+  'sessionConfigOptionOverridesV1',
+] as const;
+
+export type CurrentAgentSessionViewTargetV1 = Readonly<{
+  agentId: AgentId;
+  /** Target model intent. Omitted/null means "the target's own default". */
+  modelId?: string | null;
+  /** Target session/ACP mode intent. Omitted/null means "the target's own default". */
+  sessionModeId?: string | null;
+  /** Target config overrides, already validated by the caller's catalog. */
+  sessionConfigOptionOverrides?: unknown;
+  /** Timestamp stamped on every rewritten override so cross-device ordering holds. */
+  updatedAtMs: number;
+}>;
+
+/**
+ * Disposition of the Agent-scoped facts the source runtime left behind.
+ *
+ * - `clear` (default) is the Agent TRANSITION: a different Agent takes over, so
+ *   its predecessor's continuity facts, current projections and selections are
+ *   dropped and the target republishes its own.
+ * - `carry` is physical Session HANDOFF: the SAME Agent moves to another
+ *   machine, so those facts are still true and only the identity rewrite
+ *   applies.
+ *
+ * Both modes enforce the one-flat-key invariant. That is precisely why handoff
+ * routes through this owner rather than writing a resume key of its own: a
+ * second writer reintroduces the multi-key state that makes a Session
+ * unresumable, because `buildInactiveSessionResumeSpawnOptions` can only build
+ * options from an unambiguous identity.
+ */
+export type CurrentAgentSessionViewStatePolicyV1 = 'carry' | 'clear';
+
+function vendorResumeIdFieldsByAgent(): readonly string[] {
+  const fields: string[] = [];
+  for (const agentId of AGENT_IDS) {
+    const resume = AGENTS_CORE[agentId].resume;
+    const field = 'vendorResumeIdField' in resume ? resume.vendorResumeIdField ?? null : null;
+    if (field) fields.push(field);
+  }
+  return fields;
+}
+
+/** Every flat metadata key that names an Agent's native conversation. */
+export function listVendorResumeIdMetadataKeys(): readonly string[] {
+  return vendorResumeIdFieldsByAgent();
+}
+
+/**
+ * Produces the target Agent's current view from the source's decrypted metadata.
+ *
+ * The result satisfies the one-identity invariant by construction: exactly one
+ * declared identity (`flavor`) and at most one flat vendor resume key — the
+ * target's. Under the default `clear` policy it additionally carries no runtime
+ * descriptor or configured-backend record from the source.
+ */
+export function projectCurrentAgentSessionView(params: Readonly<{
+  metadata: Record<string, unknown>;
+  target: CurrentAgentSessionViewTargetV1;
+  /**
+   * Native resume id to write for the target, and the ONLY writer of a flat
+   * vendor resume key — which is what keeps the one-identity invariant true by
+   * construction rather than by convention.
+   *
+   * Three callers supply one:
+   *
+   * - the same-Session Agent transition, on a NATIVE RETURN — the target ran
+   *   this Session on this machine before, so its own recorded conversation id
+   *   is republished here and the ordinary inactive-resume owner reads it back
+   *   out (`AM-24`);
+   * - physical Session handoff, with the id it just established on the target
+   *   machine;
+   * - nobody else.
+   *
+   * Omitted or empty means a FRESH target: the source Agent's key is dropped
+   * above and nothing replaces it. That is what every target with no record
+   * gets, including every target that never ran this Session.
+   */
+  nativeResumeId?: string | null;
+  /** Defaults to `clear`; physical Session handoff passes `carry`. */
+  agentScopedCurrentState?: CurrentAgentSessionViewStatePolicyV1;
+}>): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...params.metadata };
+
+  // Always: no Session may carry a second Agent's flat resume key, in either mode.
+  for (const key of vendorResumeIdFieldsByAgent()) delete next[key];
+
+  if ((params.agentScopedCurrentState ?? 'clear') === 'clear') {
+    for (const key of AGENT_SCOPED_CONTINUITY_KEYS) delete next[key];
+    for (const key of CURRENT_RUNTIME_PROJECTION_KEYS) delete next[key];
+    for (const key of AGENT_SELECTION_KEYS) delete next[key];
+    for (const key of AGENT_SCOPED_CONNECTED_SERVICE_KEYS) delete next[key];
+  }
+
+  next.flavor = params.target.agentId;
+
+  const nativeResumeId = typeof params.nativeResumeId === 'string' ? params.nativeResumeId.trim() : '';
+  if (nativeResumeId) {
+    const resume = AGENTS_CORE[params.target.agentId].resume;
+    const field = 'vendorResumeIdField' in resume ? resume.vendorResumeIdField ?? null : null;
+    // An Agent with no declared resume field simply has nowhere to record one;
+    // it stays a fresh target rather than borrowing another Agent's key.
+    if (field) next[field] = nativeResumeId;
+  }
+
+  const updatedAt = params.target.updatedAtMs;
+  const modelId = typeof params.target.modelId === 'string' ? params.target.modelId.trim() : '';
+  if (modelId) {
+    next.modelOverrideV1 = { v: 1, updatedAt, modelId };
+  } else if ((params.agentScopedCurrentState ?? 'clear') === 'clear') {
+    // A DELETED key is indistinguishable from "never set", and the model
+    // selection is the one Agent-scoped intent that ALSO lives as a
+    // client-local pending value arbitrated by timestamp against this key. So
+    // deleting it left the source Agent's model id as the newest surviving
+    // opinion: the composer kept naming it and the target's resume was handed
+    // it, which is how an armed switch that chose no model started the target
+    // on the previous Agent's model — and the target then refused every
+    // message.
+    //
+    // The canonical clear tombstone (`ModelOverrideV1Schema` declares
+    // `modelId` nullable for exactly this) is an observable fact carrying the
+    // cutover's timestamp: set-only readers still see "no model chosen" — the
+    // target's own default — while every timestamp arbiter can now see that
+    // the selection was cleared, and when.
+    next.modelOverrideV1 = { v: 1, updatedAt, modelId: null };
+  }
+
+  const modeId = typeof params.target.sessionModeId === 'string' ? params.target.sessionModeId.trim() : '';
+  if (modeId) {
+    // Both keys are written because readers are split across the legacy and
+    // current alias in this tree; a single key would leave one reader blind.
+    const override = { v: 1, updatedAt, modeId };
+    next.sessionModeOverrideV1 = override;
+    next.acpSessionModeOverrideV1 = override;
+  }
+
+  if (params.target.sessionConfigOptionOverrides !== undefined && params.target.sessionConfigOptionOverrides !== null) {
+    next.sessionConfigOptionOverridesV1 = params.target.sessionConfigOptionOverrides;
+    next.acpConfigOptionOverridesV1 = params.target.sessionConfigOptionOverrides;
+  }
+
+  return next;
+}

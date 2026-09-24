@@ -1,0 +1,168 @@
+import { describe, expect, it } from 'vitest';
+
+import { normalizeAcpSessionMessageBody } from './sessionOutboundMessageNormalization';
+
+describe('normalizeAcpSessionMessageBody', () => {
+  it('ensures ACP tool-call input includes opaque _acp and locations keys (even when provider omits them)', () => {
+    const toolCallCanonicalNameByProviderAndId = new Map<string, { rawToolName: string; canonicalToolName: string }>();
+    const permissionToolCallRawInputByProviderAndId = new Map<string, unknown>();
+    const toolCallInputByProviderAndId = new Map<string, unknown>();
+
+    const normalized = normalizeAcpSessionMessageBody({
+      provider: 'opencode',
+      body: { type: 'tool-call', callId: 'call_1', name: 'bash', input: {}, id: 'msg_1' },
+      toolCallCanonicalNameByProviderAndId,
+      permissionToolCallRawInputByProviderAndId,
+      toolCallInputByProviderAndId,
+    });
+
+    expect(normalized.type).toBe('tool-call');
+    if (normalized.type !== 'tool-call') throw new Error('expected tool-call');
+    expect(normalized.name).toBe('Bash');
+    expect(normalized.input).toMatchObject({
+      locations: [],
+      _acp: expect.anything(),
+      _happier: expect.objectContaining({
+        protocol: 'acp',
+        provider: 'opencode',
+        rawToolName: 'bash',
+        canonicalToolName: 'Bash',
+      }),
+    });
+  });
+
+  it('ensures ACP tool-result output includes opaque _acp key (even when provider omits it)', () => {
+    const toolCallCanonicalNameByProviderAndId = new Map<string, { rawToolName: string; canonicalToolName: string }>();
+    const permissionToolCallRawInputByProviderAndId = new Map<string, unknown>();
+    const toolCallInputByProviderAndId = new Map<string, unknown>();
+
+    normalizeAcpSessionMessageBody({
+      provider: 'opencode',
+      body: { type: 'tool-call', callId: 'call_1', name: 'bash', input: {}, id: 'msg_1' },
+      toolCallCanonicalNameByProviderAndId,
+      permissionToolCallRawInputByProviderAndId,
+      toolCallInputByProviderAndId,
+    });
+
+    const normalized = normalizeAcpSessionMessageBody({
+      provider: 'opencode',
+      body: {
+        type: 'tool-result',
+        callId: 'call_1',
+        output: {
+          output: 'TRACE_OK\n',
+          title: 'Echo TRACE_OK',
+          metadata: { output: 'TRACE_OK\n', exit: 0, description: 'Echo TRACE_OK', truncated: false },
+        },
+        id: 'msg_2',
+      } as any,
+      toolCallCanonicalNameByProviderAndId,
+      permissionToolCallRawInputByProviderAndId,
+      toolCallInputByProviderAndId,
+    });
+
+    expect(normalized.type).toBe('tool-result');
+    if (normalized.type !== 'tool-result') throw new Error('expected tool-result');
+    expect(normalized.output).toMatchObject({
+      _acp: expect.anything(),
+      _happier: expect.objectContaining({
+        protocol: 'acp',
+        provider: 'opencode',
+        rawToolName: 'bash',
+        canonicalToolName: 'Bash',
+      }),
+    });
+  });
+
+  it('marks bash tool results as errors when the normalized exit code is non-zero', () => {
+    const toolCallCanonicalNameByProviderAndId = new Map<string, { rawToolName: string; canonicalToolName: string }>();
+    const permissionToolCallRawInputByProviderAndId = new Map<string, unknown>();
+    const toolCallInputByProviderAndId = new Map<string, unknown>();
+
+    normalizeAcpSessionMessageBody({
+      provider: 'copilot',
+      body: {
+        type: 'tool-call',
+        callId: 'call_1',
+        name: 'bash',
+        input: {
+          command: `happier tools call --source happier --tool change_title --args-json '{"title":"QA"}' --json`,
+        },
+        id: 'msg_1',
+      } as any,
+      toolCallCanonicalNameByProviderAndId,
+      permissionToolCallRawInputByProviderAndId,
+      toolCallInputByProviderAndId,
+    });
+
+    const normalized = normalizeAcpSessionMessageBody({
+      provider: 'copilot',
+      body: {
+        type: 'tool-result',
+        callId: 'call_1',
+        output: {
+          stdout: 'SyntaxError: missing export\n<exited with exit code 1>',
+          exit_code: 1,
+        },
+        id: 'msg_2',
+      } as any,
+      toolCallCanonicalNameByProviderAndId,
+      permissionToolCallRawInputByProviderAndId,
+      toolCallInputByProviderAndId,
+    });
+
+    expect(normalized.type).toBe('tool-result');
+    if (normalized.type !== 'tool-result') throw new Error('expected tool-result');
+    expect(normalized.isError).toBe(true);
+    expect(normalized.output).toMatchObject({
+      exit_code: 1,
+      errorMessage: 'SyntaxError: missing export\n<exited with exit code 1>',
+      _happier: expect.objectContaining({
+        canonicalToolName: 'change_title',
+      }),
+    });
+  });
+
+  it('normalizes Pi edit tool calls with top-level paths into non-empty transcript input', () => {
+    const toolCallCanonicalNameByProviderAndId = new Map<string, { rawToolName: string; canonicalToolName: string }>();
+    const permissionToolCallRawInputByProviderAndId = new Map<string, unknown>();
+    const toolCallInputByProviderAndId = new Map<string, unknown>();
+
+    const normalized = normalizeAcpSessionMessageBody({
+      provider: 'pi',
+      body: {
+        type: 'tool-call',
+        callId: 'pi_edit_1',
+        name: 'edit',
+        input: {
+          path: 'apps/cli/src/example.ts',
+          edits: [{ oldText: 'old text', newText: 'new text' }],
+        },
+        id: 'msg_1',
+      },
+      toolCallCanonicalNameByProviderAndId,
+      permissionToolCallRawInputByProviderAndId,
+      toolCallInputByProviderAndId,
+    });
+
+    expect(normalized.type).toBe('tool-call');
+    if (normalized.type !== 'tool-call') throw new Error('expected tool-call');
+    expect(normalized.name).toBe('MultiEdit');
+    expect(normalized.input).toMatchObject({
+      file_path: 'apps/cli/src/example.ts',
+      locations: [],
+      edits: [
+        {
+          file_path: 'apps/cli/src/example.ts',
+          old_string: 'old text',
+          new_string: 'new text',
+        },
+      ],
+      _happier: expect.objectContaining({
+        provider: 'pi',
+        rawToolName: 'edit',
+        canonicalToolName: 'MultiEdit',
+      }),
+    });
+  });
+});

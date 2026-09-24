@@ -1,0 +1,265 @@
+name: Release Actor Guard
+description: Verify the triggering actor is authorized to run release/deploy workflows (team membership via GitHub App token).
+
+inputs:
+  team_slug:
+    description: GitHub team slug allowed to run the workflow
+    required: false
+    default: release-admins
+  org:
+    description: GitHub organization that owns the team (defaults to repository owner)
+    required: false
+    default: ""
+  app_id:
+    description: GitHub App ID used to check team membership (optional; when omitted, guard falls back to repo-admin check)
+    required: false
+    default: ""
+  private_key:
+    description: GitHub App private key used to check team membership (optional; when omitted, guard falls back to repo-admin check)
+    required: false
+    default: ""
+  trusted_actors:
+    description: "Comma-separated list of explicitly trusted actors (e.g. a release bot) that can bypass team membership checks"
+    required: false
+    # Scheduled workflows run as `github-actions` / `github-actions[bot]`. We treat these as trusted
+    # so nightly release automation can run, while workflow_dispatch still requires team membership.
+    default: "github-actions[bot],github-actions"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve guard inputs
+      id: params
+      shell: bash
+      env:
+        INPUT_ORG: ${{ inputs.org }}
+        INPUT_TEAM_SLUG: ${{ inputs.team_slug }}
+        INPUT_TRUSTED_ACTORS: ${{ inputs.trusted_actors }}
+      run: |
+        set -euo pipefail
+
+        actor="${GITHUB_TRIGGERING_ACTOR:-${GITHUB_ACTOR:-}}"
+        if [ -z "${actor}" ]; then
+          echo "Unable to resolve triggering actor." >&2
+          exit 1
+        fi
+
+        team_slug="${INPUT_TEAM_SLUG:-release-admins}"
+        org="${INPUT_ORG:-${GITHUB_REPOSITORY_OWNER}}"
+        if [ -z "${org}" ]; then
+          echo "Unable to resolve organization owner." >&2
+          exit 1
+        fi
+
+        echo "actor=${actor}" >> "$GITHUB_OUTPUT"
+        echo "org=${org}" >> "$GITHUB_OUTPUT"
+        echo "team_slug=${team_slug}" >> "$GITHUB_OUTPUT"
+
+        trusted_actor=false
+        IFS=',' read -r -a trusted <<< "${INPUT_TRUSTED_ACTORS:-}"
+        for raw in "${trusted[@]}"; do
+          candidate="$(echo "${raw}" | xargs)"
+          if [ -n "${candidate}" ] && [ "${candidate}" = "${actor}" ]; then
+            trusted_actor=true
+            break
+          fi
+        done
+        echo "trusted_actor=${trusted_actor}" >> "$GITHUB_OUTPUT"
+
+        echo "Authorizing actor '${actor}' against team '${org}/${team_slug}'."
+
+    - name: Create GitHub App token for guard checks
+      id: app_token
+      uses: actions/create-github-app-token@v1
+      if: ${{ steps.params.outputs.trusted_actor != 'true' && inputs.app_id != '' && inputs.private_key != '' }}
+      with:
+        app-id: ${{ inputs.app_id }}
+        private-key: ${{ inputs.private_key }}
+        owner: ${{ steps.params.outputs.org }}
+        repositories: ${{ github.event.repository.name }}
+        permission-members: read
+
+    - name: Verify triggering actor is in release admin team
+      shell: bash
+      env:
+        ACTOR: ${{ steps.params.outputs.actor }}
+        ORG: ${{ steps.params.outputs.org }}
+        TEAM_SLUG: ${{ steps.params.outputs.team_slug }}
+        INPUT_TRUSTED_ACTORS: ${{ inputs.trusted_actors }}
+        APP_TOKEN: ${{ steps.app_token.outputs.token }}
+        REPO: ${{ github.repository }}
+        REPO_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        trusted_csv="${INPUT_TRUSTED_ACTORS:-}"
+        if [ -n "${trusted_csv}" ]; then
+          IFS=',' read -r -a trusted <<< "${trusted_csv}"
+          for raw in "${trusted[@]}"; do
+            actor="$(echo "${raw}" | xargs)"
+            if [ -n "${actor}" ] && [ "${actor}" = "${ACTOR}" ]; then
+              echo "Actor '${ACTOR}' is explicitly trusted; allowing release workflow."
+              exit 0
+            fi
+          done
+        fi
+
+        github_api_status() {
+          local endpoint="$1"
+          local token="$2"
+          local response_file="$3"
+          local request_body="${4:-}"
+          local curl_args=(
+            -sS
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 1 \
+            --retry-max-time 90 \
+            --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${token}" \
+          )
+          if [ -n "$request_body" ]; then
+            curl_args+=(-H "Content-Type: application/json" --data "$request_body")
+          fi
+          curl "${curl_args[@]}" \
+            "$endpoint" \
+            -o "$response_file" \
+            -w "%{http_code}"
+        }
+
+        fallback_repo_admin_graphql() {
+          case "$REPO" in
+            */*) ;;
+            *) echo "Invalid repository name for GraphQL permission fallback: '${REPO}'." >&2; exit 1 ;;
+          esac
+
+          local owner="${REPO%%/*}"
+          local name="${REPO#*/}"
+          local query='query($owner:String!,$name:String!,$login:String!){repository(owner:$owner,name:$name){collaborators(query:$login,first:20){edges{permission node{login}}}}}'
+          local payload
+          payload="$(jq -nc \
+            --arg query "$query" \
+            --arg owner "$owner" \
+            --arg name "$name" \
+            --arg login "$ACTOR" \
+            '{query:$query,variables:{owner:$owner,name:$name,login:$login}}')"
+          local resp_file
+          resp_file="$(mktemp)"
+          local status
+          if ! status="$(github_api_status "https://api.github.com/graphql" "$REPO_TOKEN" "$resp_file" "$payload")"; then
+            echo "Unable to reach GitHub GraphQL while determining repo permission for '${ACTOR}'." >&2
+            cat "$resp_file" >&2 || true
+            rm -f "$resp_file"
+            exit 1
+          fi
+          if [ "$status" != "200" ]; then
+            echo "Unable to determine repo permission for '${ACTOR}' via GraphQL (HTTP ${status})." >&2
+            cat "$resp_file" >&2 || true
+            rm -f "$resp_file"
+            exit 1
+          fi
+
+          local permission
+          permission="$(jq -r --arg actor "$ACTOR" \
+            '[.data.repository.collaborators.edges[]? | select((.node.login | ascii_downcase) == ($actor | ascii_downcase)) | .permission][0] // ""' \
+            "$resp_file" 2>/dev/null || true)"
+          rm -f "$resp_file"
+          if [ "$permission" != "ADMIN" ]; then
+            echo "Actor '${ACTOR}' is not authorized by exact GraphQL collaborator evidence (permission='${permission}')." >&2
+            exit 1
+          fi
+
+          echo "Actor '${ACTOR}' is a repo admin; allowing release workflow via GraphQL evidence."
+        }
+
+        fallback_repo_admin() {
+          if [ -z "${REPO_TOKEN:-}" ]; then
+            echo "Missing repo token for release actor guard fallback." >&2
+            exit 1
+          fi
+          if [ -z "${REPO:-}" ]; then
+            echo "Missing repo name for release actor guard fallback." >&2
+            exit 1
+          fi
+
+          actor_enc="$(jq -nr --arg v "${ACTOR}" '$v|@uri')"
+          endpoint="https://api.github.com/repos/${REPO}/collaborators/${actor_enc}/permission"
+          resp_file="$(mktemp)"
+          if ! status="$(github_api_status "$endpoint" "$REPO_TOKEN" "$resp_file")"; then
+            echo "Unable to reach GitHub while determining repo permission for '${ACTOR}'." >&2
+            cat "$resp_file" >&2 || true
+            rm -f "$resp_file"
+            exit 1
+          fi
+
+          case "$status" in
+            200) ;;
+            429|5??)
+              echo "Collaborator REST permission remained unavailable (HTTP ${status}); checking exact GraphQL admin evidence." >&2
+              cat "$resp_file" >&2 || true
+              rm -f "$resp_file"
+              fallback_repo_admin_graphql
+              return
+              ;;
+            *)
+              echo "Unable to determine repo permission for '${ACTOR}' (HTTP ${status})." >&2
+              cat "$resp_file" >&2 || true
+              rm -f "$resp_file"
+              exit 1
+              ;;
+          esac
+
+          perm="$(jq -r '.permission // ""' "$resp_file" 2>/dev/null || true)"
+          rm -f "$resp_file"
+
+          if [ "$perm" != "admin" ]; then
+            echo "Actor '${ACTOR}' is not authorized (team membership check failed and repo permission='${perm}')." >&2
+            exit 1
+          fi
+
+          echo "Actor '${ACTOR}' is a repo admin; allowing release workflow."
+        }
+
+        if [ -z "${APP_TOKEN:-}" ]; then
+          echo "No GitHub App credentials provided; authorizing via repo-admin check."
+          fallback_repo_admin
+          exit 0
+        fi
+
+        actor_enc="$(jq -nr --arg v "${ACTOR}" '$v|@uri')"
+        endpoint="https://api.github.com/orgs/${ORG}/teams/${TEAM_SLUG}/memberships/${actor_enc}"
+        resp_file="$(mktemp)"
+        if ! status="$(github_api_status "$endpoint" "$APP_TOKEN" "$resp_file")"; then
+          echo "Unable to reach GitHub while checking team membership for '${ACTOR}'." >&2
+          cat "$resp_file" >&2 || true
+          rm -f "$resp_file"
+          exit 1
+        fi
+
+        case "$status" in
+          200)
+            echo "Actor '${ACTOR}' is a member of '${ORG}/${TEAM_SLUG}'."
+            ;;
+          404)
+            echo "Actor '${ACTOR}' is not a member of '${ORG}/${TEAM_SLUG}' (or team is not visible to the app)." >&2
+            cat "$resp_file" >&2 || true
+            rm -f "$resp_file"
+            fallback_repo_admin
+            ;;
+          401|403)
+            echo "Release actor guard app token is not authorized to read team memberships for '${ORG}/${TEAM_SLUG}'." >&2
+            cat "$resp_file" >&2 || true
+            rm -f "$resp_file"
+            fallback_repo_admin
+            ;;
+          *)
+            echo "Unexpected response from team membership check (HTTP ${status})." >&2
+            cat "$resp_file" >&2 || true
+            rm -f "$resp_file"
+            exit 1
+            ;;
+        esac
+
+        rm -f "$resp_file"

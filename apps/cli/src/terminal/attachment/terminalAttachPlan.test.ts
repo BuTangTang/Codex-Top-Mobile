@@ -1,0 +1,220 @@
+import { describe, expect, it } from 'vitest';
+import { join } from 'node:path';
+
+import type { Metadata } from '@/api/types';
+
+import { createTerminalAttachPlan } from './terminalAttachPlan';
+
+describe('createTerminalAttachPlan', () => {
+  it('returns not-attachable when terminal mode is plain', () => {
+    const terminal: NonNullable<Metadata['terminal']> = { mode: 'plain' };
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan.type).toBe('not-attachable');
+  });
+
+  it('returns a hidden Windows attach error when a Windows host was requested but plain mode was used', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'plain',
+      requested: 'windows_terminal',
+    };
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan).toEqual({
+      type: 'not-attachable',
+      reason: 'This Windows session was started hidden and cannot be attached later.',
+    });
+  });
+
+  it('returns a Windows Terminal focus plan for windows_terminal mode', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'windows_terminal',
+      requested: 'windows_terminal',
+      windows: {
+        host: 'windows_terminal',
+        windowId: 'happy-session-1',
+      },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan).toEqual({
+      type: 'windows_terminal_host',
+      windowId: 'happy-session-1',
+    });
+  });
+
+  it('returns a console foreground plan for windows_console mode', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'windows_console',
+      requested: 'console',
+      windows: {
+        host: 'console',
+        pid: 123,
+      },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan).toEqual({
+      type: 'windows_console_host',
+      pid: 123,
+    });
+  });
+
+  it('returns a zellij foreground attach plan for zellij mode', () => {
+    const terminal = {
+      mode: 'zellij',
+      requested: 'zellij',
+      zellij: {
+        sessionName: 'happier-claude-unified-zellij',
+        paneId: 'terminal_7',
+      },
+    } as unknown as NonNullable<Metadata['terminal']>;
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan).toEqual({
+      type: 'zellij',
+      sessionName: 'happier-claude-unified-zellij',
+      paneId: 'terminal_7',
+    });
+  });
+
+  it('returns not-attachable when zellij mode has no session name', () => {
+    const terminal = {
+      mode: 'zellij',
+      zellij: { paneId: 'terminal_7' },
+    } as unknown as NonNullable<Metadata['terminal']>;
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan).toEqual({
+      type: 'not-attachable',
+      reason: 'Session does not include a zellij session name.',
+    });
+  });
+
+  it('returns not-attachable when tmux mode has no target', () => {
+    const terminal: NonNullable<Metadata['terminal']> = { mode: 'tmux' };
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan.type).toBe('not-attachable');
+  });
+
+  it('returns not-attachable when tmux target is invalid', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'bad*:window' },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan.type).toBe('not-attachable');
+  });
+
+  it('returns not-attachable when tmux target is blank', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: '   ' },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan.type).toBe('not-attachable');
+  });
+
+  it('plans select-window + attach when outside tmux', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:window-1' },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
+    expect(plan).toEqual({
+      type: 'tmux',
+      sessionName: 'happy',
+      target: 'happy:window-1',
+      shouldAttach: true,
+      shouldUnsetTmuxEnv: false,
+      tmuxCommandEnv: {},
+      selectWindowArgs: ['select-window', '-t', 'happy:window-1'],
+      attachSessionArgs: ['attach-session', '-t', 'happy'],
+    });
+  });
+
+  it('plans attach against an immutable tmux window id', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:@7' },
+    };
+
+    expect(createTerminalAttachPlan({ terminal, insideTmux: false })).toMatchObject({
+      type: 'tmux',
+      sessionName: 'happy',
+      target: '@7',
+      selectWindowArgs: ['select-window', '-t', '@7'],
+    });
+  });
+
+  it('plans select-window only when already in tmux shared server', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:window-2' },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: true });
+    expect(plan.type).toBe('tmux');
+    if (plan.type !== 'tmux') throw new Error('expected tmux plan');
+    expect(plan.shouldAttach).toBe(false);
+  });
+
+  it('forces attach when tmux uses a custom tmpDir (isolated server)', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:window-3', tmpDir: '/custom/tmux' },
+    };
+
+    const plan = createTerminalAttachPlan({ terminal, insideTmux: true });
+    expect(plan.type).toBe('tmux');
+    if (plan.type !== 'tmux') throw new Error('expected tmux plan');
+    expect(plan.shouldUnsetTmuxEnv).toBe(true);
+    expect(plan.tmuxCommandEnv).toEqual({ TMUX_TMPDIR: '/custom/tmux' });
+    expect(plan.shouldAttach).toBe(true);
+  });
+
+  it('does not force attach when already inside the same isolated tmux server', () => {
+    const uid = 501;
+    const tmpDir = '/custom/tmux';
+    const socketPath = join(tmpDir, `tmux-${uid}`, 'default');
+
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:window-4', tmpDir },
+    };
+
+    const plan = createTerminalAttachPlan({
+      terminal,
+      insideTmux: true,
+      currentTmuxSocketPath: socketPath,
+      currentUid: uid,
+    });
+    expect(plan.type).toBe('tmux');
+    if (plan.type !== 'tmux') throw new Error('expected tmux plan');
+    expect(plan.shouldUnsetTmuxEnv).toBe(false);
+    expect(plan.tmuxCommandEnv).toEqual({});
+    expect(plan.shouldAttach).toBe(false);
+  });
+
+  it('keeps attach flow when inside tmux but socket does not match isolated server', () => {
+    const tmpDir = '/custom/tmux';
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:window-4', tmpDir },
+    };
+
+    const plan = createTerminalAttachPlan({
+      terminal,
+      insideTmux: true,
+      currentTmuxSocketPath: '/different/socket/path',
+      currentUid: 501,
+    });
+
+    expect(plan.type).toBe('tmux');
+    if (plan.type !== 'tmux') throw new Error('expected tmux plan');
+    expect(plan.shouldUnsetTmuxEnv).toBe(true);
+    expect(plan.shouldAttach).toBe(true);
+    expect(plan.tmuxCommandEnv).toEqual({ TMUX_TMPDIR: '/custom/tmux' });
+  });
+});

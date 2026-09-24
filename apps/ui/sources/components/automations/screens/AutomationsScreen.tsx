@@ -1,0 +1,105 @@
+import React from 'react';
+import { View } from 'react-native';
+import { useRouter } from 'expo-router';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+
+import { Modal } from '@/modal';
+import { useAllMachines, useAutomations } from '@/sync/domains/state/storage';
+import { sync } from '@/sync/sync';
+import { Text } from '@/components/ui/text/Text';
+import { layout } from '@/components/ui/layout/layout';
+import { ItemList } from '@/components/ui/lists/ItemList';
+import { AutomationListGroup } from '@/components/automations/list/AutomationListGroup';
+import { AutomationsEmptyState } from '@/components/automations/shared/AutomationsEmptyState';
+import { FAB } from '@/components/ui/buttons/FAB';
+import { SessionGettingStartedGuidance } from '@/components/sessions/guidance/SessionGettingStartedGuidance';
+import { t } from '@/text';
+import { resolveNewSessionDraftRouteIdentity } from '@/components/sessions/new/navigation/newSessionDraftRouteIdentity';
+import { buildNewSessionLaunchRouteParams } from '@/components/sessions/new/navigation/newSessionRouteParams';
+
+const stylesheet = StyleSheet.create((theme) => ({
+    container: {
+        flex: 1,
+        backgroundColor: theme.colors.background.canvas,
+    },
+    loadingContainer: {
+        flex: 1,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+}));
+
+export function AutomationsScreen() {
+    const { theme } = useUnistyles();
+    const styles = stylesheet;
+    const router = useRouter();
+    const automations = useAutomations();
+    const machines = useAllMachines();
+    const [loading, setLoading] = React.useState(true);
+
+    const refresh = React.useCallback(async () => {
+        try {
+            setLoading(true);
+            await sync.refreshAutomations();
+        } catch (error) {
+            await Modal.alert(
+                t('common.error'),
+                error instanceof Error ? error.message : t('automations.session.failedToLoad')
+            );
+        } finally {
+            setLoading(false);
+        }
+    }, []);
+
+    React.useEffect(() => {
+        void refresh();
+    }, [refresh]);
+
+    // Keep an already-hydrated catalog visible while the authoritative refresh
+    // is pending. Slow, non-time-sensitive reads must not temporarily turn a
+    // usable list into a blank loading surface.
+    if (loading && automations.length === 0) {
+        return (
+            <View style={styles.loadingContainer}>
+                <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+            </View>
+        );
+    }
+
+    return (
+        <View style={styles.container}>
+            <ItemList style={{ paddingTop: 0 }}>
+                <View style={{ maxWidth: layout.maxWidth, alignSelf: 'center', width: '100%' }}>
+                    {automations.length === 0 ? (
+                        machines.length === 0 ? (
+                            <SessionGettingStartedGuidance variant="primaryPane" />
+                        ) : (
+                            <AutomationsEmptyState
+                                title={t('automations.screen.emptyTitle')}
+                                body={t('automations.screen.emptyBody')}
+                            />
+                        )
+                    ) : (
+                        <AutomationListGroup title={t('sessionInfo.automationsTitle')} automations={automations} />
+                    )}
+                </View>
+            </ItemList>
+            {machines.length > 0 ? (
+                <FAB
+                    onPress={() => {
+                        const draftId = resolveNewSessionDraftRouteIdentity({ routeDraftId: undefined }).draftId;
+                        router.push({
+                            pathname: '/new',
+                            params: {
+                                ...buildNewSessionLaunchRouteParams({ draftId }),
+                                automation: '1',
+                            },
+                        } as any);
+                    }}
+                    accessibilityLabel={t('automations.screen.createAutomationA11y')}
+                />
+            ) : null}
+        </View>
+    );
+}

@@ -1,0 +1,380 @@
+import { test, expect, type Page } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
+import { mkdir } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+
+import { createRunDirs } from '../../src/testkit/runDir';
+import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
+import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
+import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
+import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
+import { runCliJson } from '../../src/testkit/uiE2e/cliJson';
+import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
+import { collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
+
+const run = createRunDirs({ runLabel: 'ui-e2e' });
+
+type DraftMigrationItem = Readonly<{
+  address?: Readonly<{ kind?: unknown; draftId?: unknown }>;
+  expectedRevision?: unknown;
+  content?: Readonly<{ t?: unknown }>;
+}>;
+
+type AccountMigrationRequest = Readonly<{
+  toMode?: unknown;
+  sessionDrafts?: Readonly<{ items?: readonly DraftMigrationItem[] }>;
+}>;
+
+async function toggleAccountEncryptionMode(params: Readonly<{
+  page: Page;
+  uiBaseUrl: string;
+  expectedMode: 'plain' | 'e2ee';
+}>): Promise<AccountMigrationRequest> {
+  await params.page.goto(`${params.uiBaseUrl}/settings/account`, { waitUntil: 'domcontentloaded' });
+  await expect(params.page.getByTestId('settings-account-encryption-mode-switch')).toHaveCount(1, { timeout: 120_000 });
+  const migrateOk = params.page.waitForResponse(
+    (resp) =>
+      resp.url().endsWith('/v1/account/encryption/migrate') && resp.request().method() === 'POST' && resp.status() === 200,
+    { timeout: 60_000 },
+  );
+  await params.page.getByTestId('settings-account-encryption-mode-switch').click();
+  const migrateResp = await migrateOk;
+  const migrationRequest = migrateResp.request().postDataJSON() as AccountMigrationRequest;
+  const migrateJson = (await migrateResp.json()) as { success?: unknown; mode?: unknown };
+  expect(migrateJson?.success).toBe(true);
+  expect(migrateJson?.mode).toBe(params.expectedMode);
+  expect(migrationRequest.toMode).toBe(params.expectedMode);
+  return migrationRequest;
+}
+
+async function createNewSessionDraft(params: Readonly<{
+  page: Page;
+  uiBaseUrl: string;
+  text: string;
+}>): Promise<string> {
+  const requestedDraftId = randomUUID();
+  await gotoDomContentLoadedWithRetries(
+    params.page,
+    `${params.uiBaseUrl}/new?draftId=${encodeURIComponent(requestedDraftId)}&happier_hmr=0`,
+    120_000,
+  );
+  const composer = params.page.getByTestId('new-session-composer-input');
+  await expect(composer).toBeVisible({ timeout: 120_000 });
+  await expect.poll(() => new URL(params.page.url()).searchParams.get('draftId'), { timeout: 60_000 })
+    .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  const draftId = new URL(params.page.url()).searchParams.get('draftId');
+  if (!draftId) throw new Error('new-session draft route did not establish a draftId');
+  expect(draftId).toBe(requestedDraftId);
+  const mutation = params.page.waitForResponse(
+    (response) => response.url().endsWith('/v1/account/session-drafts/mutate')
+      && response.request().method() === 'POST'
+      && response.status() === 200,
+    { timeout: 60_000 },
+  );
+  await composer.fill(params.text);
+  await composer.blur();
+  await mutation;
+  return draftId;
+}
+
+async function expectNewSessionDraftReadable(params: Readonly<{
+  page: Page;
+  uiBaseUrl: string;
+  draftId: string;
+  text: string;
+}>): Promise<void> {
+  await gotoDomContentLoadedWithRetries(
+    params.page,
+    `${params.uiBaseUrl}/new?draftId=${encodeURIComponent(params.draftId)}&happier_hmr=0`,
+    120_000,
+  );
+  await expect(params.page.getByTestId('new-session-composer-input')).toHaveValue(params.text, { timeout: 60_000 });
+}
+
+async function createExistingSessionDraft(params: Readonly<{
+  page: Page;
+  text: string;
+}>): Promise<Readonly<{ envelope: unknown }>> {
+  const composer = params.page.getByTestId('session-composer-input');
+  await expect(composer).toBeVisible({ timeout: 60_000 });
+  const mutation = params.page.waitForResponse(
+    (response) => response.url().endsWith('/v1/account/session-drafts/mutate')
+      && response.request().method() === 'POST'
+      && response.status() === 200,
+    { timeout: 60_000 },
+  );
+  await composer.fill(params.text);
+  await composer.blur();
+  const response = await mutation;
+  const body = response.request().postDataJSON() as { content?: Readonly<{ t?: unknown }> };
+  return { envelope: body.content?.t };
+}
+
+function expectCompleteDraftMigration(params: Readonly<{
+  request: AccountMigrationRequest;
+  draftIds: readonly string[];
+  envelope: 'plain' | 'encrypted';
+}>): void {
+  const items = params.request.sessionDrafts?.items;
+  expect(items).toHaveLength(params.draftIds.length);
+  expect(new Set(items?.map((item) => item.address?.draftId))).toEqual(new Set(params.draftIds));
+  for (const item of items ?? []) {
+    expect(item.address?.kind).toBe('newSession');
+    expect(item.expectedRevision).toEqual(expect.any(Number));
+    expect(item.content?.t).toBe(params.envelope);
+  }
+}
+
+test.describe('ui e2e: encryption opt-out mode switching', () => {
+  test.describe.configure({ mode: 'serial' });
+
+  const suiteDir = run.testDir('encryption-optout-mode-switch-suite');
+  const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+
+  let server: StartedServer | null = null;
+  let ui: StartedUiWeb | null = null;
+  let uiBaseUrl: string | null = null;
+
+  test.beforeAll(async () => {
+    const uiWebEnv = {
+      ...process.env,
+      EXPO_PUBLIC_DEBUG: '1',
+      EXPO_PUBLIC_HAPPY_SERVER_URL: server?.baseUrl ?? '',
+      EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
+      HAPPIER_E2E_UI_WEB_MODE: 'export',
+      HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS ?? '900000',
+      HAPPIER_E2E_UI_WEB_EXPORT_FALLBACK_TO_METRO: '0',
+      HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS ?? '480000',
+    };
+    test.setTimeout(resolveUiWebBeforeAllTimeoutMs(uiWebEnv));
+    await mkdir(cliHomeDir, { recursive: true });
+
+    server = await startServerLight({
+      testDir: suiteDir,
+      dbProvider: 'sqlite',
+      extraEnv: {
+        // Keep web create-account stable (binding signature is not reliably available on web).
+        HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
+        HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
+        HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
+        HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
+        HAPPIER_FEATURE_SESSIONS_DRAFTS__ENABLED: '1',
+      },
+    });
+
+    ui = await startUiWeb({
+      testDir: suiteDir,
+      env: {
+        ...uiWebEnv,
+        EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
+      },
+    });
+
+    uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+  });
+
+  test.afterAll(async () => {
+    test.setTimeout(120_000);
+    await ui?.stop().catch(() => {});
+    await server?.stop().catch(() => {});
+  });
+
+  test('switches modes and keeps old sessions readable (e2ee → plain → e2ee)', async ({ page }, testInfo) => {
+    // This scenario performs two real account migrations and three daemon-backed session create/send flows.
+    test.setTimeout(600_000);
+    if (!server || !ui) throw new Error('missing server/ui fixtures');
+    if (!uiBaseUrl) throw new Error('missing ui base url');
+
+    const testDir = resolve(join(suiteDir, 't1-mode-switch'));
+    await mkdir(testDir, { recursive: true });
+
+    const diagnostics = collectBrowserDiagnostics({ page });
+
+    let daemon: StartedDaemon | null = null;
+    let thrown: unknown = null;
+    try {
+      daemon = await authenticateAndStartDaemon({
+        page,
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        uiBaseUrl,
+        extraEnv: {
+          HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+        },
+      });
+
+      const draftAText = `account-mode draft A ${run.runId}`;
+      const draftBText = `account-mode draft B ${run.runId}`;
+      const draftAId = await createNewSessionDraft({ page, uiBaseUrl, text: draftAText });
+      const draftBId = await createNewSessionDraft({ page, uiBaseUrl, text: draftBText });
+      expect(draftBId).not.toBe(draftAId);
+
+      const tagA = `ui-e2e-e2ee-a-${run.runId}`;
+      const msgA = `hello e2ee A ${run.runId}`;
+
+      const createA = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-create-a',
+        args: ['session', 'create', '--tag', tagA, '--no-load-existing', '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(createA.ok).toBe(true);
+      expect(createA.kind).toBe('session_create');
+      expect((createA as any)?.data?.session?.encryptionMode).toBe('e2ee');
+      const sessionAId = String((createA as any)?.data?.session?.id ?? '');
+      expect(sessionAId).toMatch(/\S+/);
+
+      const sendA = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-send-a',
+        args: ['session', 'send', sessionAId, msgA, '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(sendA.ok).toBe(true);
+      expect(sendA.kind).toBe('session_send');
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionAId}`, 120_000);
+      const transcript = page.getByTestId('transcript-chat-list');
+      await expect(transcript).toHaveCount(1, { timeout: 120_000 });
+      await expect(transcript.getByText(msgA, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
+      const sessionADraftText = `session-encrypted draft ${run.runId}`;
+      const sessionADraft = await createExistingSessionDraft({ page, text: sessionADraftText });
+      expect(sessionADraft.envelope).toBe('encrypted');
+
+      const migrateDraftsToPlain = await toggleAccountEncryptionMode({ page, uiBaseUrl, expectedMode: 'plain' });
+      expectCompleteDraftMigration({
+        request: migrateDraftsToPlain,
+        draftIds: [draftAId, draftBId],
+        envelope: 'plain',
+      });
+      await expectNewSessionDraftReadable({ page, uiBaseUrl, draftId: draftAId, text: draftAText });
+      await expectNewSessionDraftReadable({ page, uiBaseUrl, draftId: draftBId, text: draftBText });
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionAId}`, 120_000);
+      await expect(page.getByTestId('session-composer-input')).toHaveValue(sessionADraftText, { timeout: 60_000 });
+
+      const tagB = `ui-e2e-plain-b-${run.runId}`;
+      const msgB = `hello plain B ${run.runId}`;
+
+      const createB = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-create-b',
+        args: ['session', 'create', '--tag', tagB, '--no-load-existing', '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(createB.ok).toBe(true);
+      expect(createB.kind).toBe('session_create');
+      expect((createB as any)?.data?.session?.encryptionMode).toBe('plain');
+      const sessionBId = String((createB as any)?.data?.session?.id ?? '');
+      expect(sessionBId).toMatch(/\S+/);
+
+      const sendB = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-send-b',
+        args: ['session', 'send', sessionBId, msgB, '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(sendB.ok).toBe(true);
+      expect(sendB.kind).toBe('session_send');
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionBId}`, 120_000);
+      await expect(page.getByText(msgB, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
+
+      const migrateDraftsToE2ee = await toggleAccountEncryptionMode({ page, uiBaseUrl, expectedMode: 'e2ee' });
+      expectCompleteDraftMigration({
+        request: migrateDraftsToE2ee,
+        draftIds: [draftAId, draftBId],
+        envelope: 'encrypted',
+      });
+      await expectNewSessionDraftReadable({ page, uiBaseUrl, draftId: draftAId, text: draftAText });
+      await expectNewSessionDraftReadable({ page, uiBaseUrl, draftId: draftBId, text: draftBText });
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionAId}`, 120_000);
+      await expect(page.getByTestId('session-composer-input')).toHaveValue(sessionADraftText, { timeout: 60_000 });
+
+      const tagC = `ui-e2e-e2ee-c-${run.runId}`;
+      const msgC = `hello e2ee C ${run.runId}`;
+
+      const createC = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-create-c',
+        args: ['session', 'create', '--tag', tagC, '--no-load-existing', '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(createC.ok).toBe(true);
+      expect(createC.kind).toBe('session_create');
+      expect((createC as any)?.data?.session?.encryptionMode).toBe('e2ee');
+      const sessionCId = String((createC as any)?.data?.session?.id ?? '');
+      expect(sessionCId).toMatch(/\S+/);
+
+      const sendC = await runCliJson({
+        testDir,
+        cliHomeDir,
+        serverUrl: server.baseUrl,
+        webappUrl: uiBaseUrl,
+        env: {
+          ...process.env,
+          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+        },
+        label: 'session-send-c',
+        args: ['session', 'send', sessionCId, msgC, '--json'],
+        timeoutMs: 120_000,
+      });
+      expect(sendC.ok).toBe(true);
+      expect(sendC.kind).toBe('session_send');
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionCId}`, 120_000);
+      await expect(page.getByText(msgC, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
+
+      // Ensure older sessions remain readable after toggling account mode.
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionAId}`, 120_000);
+      await expect(page.getByText(msgA, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
+
+      await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionBId}`, 120_000);
+      await expect(page.getByText(msgB, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
+    } catch (error) {
+      thrown = error;
+      throw error;
+    } finally {
+      await daemon?.stop().catch(() => {});
+      if (thrown) {
+        await testInfo.attach('browser-diagnostics.md', { body: diagnostics(), contentType: 'text/markdown' });
+      }
+    }
+  });
+});

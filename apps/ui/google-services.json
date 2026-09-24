@@ -1,0 +1,143 @@
+{
+  "project_info": {
+    "project_number": "427065718939",
+    "project_id": "happier-4a4fd",
+    "storage_bucket": "happier-4a4fd.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:4f30a784735abfe97aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:d95397b56dcecbe17aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app.internaldev"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:d95397b56dcecbe17aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app.internaldev.devclient"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:fc6fcb803976fb987aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app.preview"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:fc6fcb803976fb987aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app.internalpreview"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:c44eecd728ca4f997aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app.publicdev"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427065718939:android:fc6fcb803976fb987aee3e",
+        "android_client_info": {
+          "package_name": "dev.happier.app.publicdev.devclient"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC2umIeyGh-dCBrBhB3p2Z7FTjMCzqwUag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

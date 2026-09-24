@@ -1,0 +1,243 @@
+import * as React from 'react';
+import { Pressable, View } from 'react-native';
+import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
+import { useUnistyles } from 'react-native-unistyles';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+
+import type { ExecutionRunPublicState } from '@happier-dev/protocol';
+import { isRpcMethodNotAvailableError } from '@happier-dev/protocol/rpcErrors';
+import { sessionExecutionRunList } from '@/sync/ops/sessionExecutionRuns';
+import { useSessionRouteServerScope, type SessionRouteServerScope } from '@/hooks/session/sessionRouteServerScope';
+import { useHydrateSessionForRoute } from '@/hooks/session/useHydrateSessionForRoute';
+import { useSessionExecutionRunLaunchability } from '@/hooks/session/useSessionExecutionRunLaunchability';
+import type { ExecutionRunBackendCapabilityMap } from '@/sync/domains/executionRuns/resolveExecutionRunAvailableBackends';
+import { isSessionRouteHydrationAvailable, isSessionRouteHydrationMissing } from '@/sync/domains/session/sessionRouteHydrationState';
+import { t } from '@/text';
+import { ExecutionRunList } from '@/components/sessions/runs/ExecutionRunList';
+import { SessionInvalidLinkFallback } from '@/components/sessions/shell/SessionInvalidLinkFallback';
+import { resolveExecutionRunLauncherIntents } from '@/components/sessions/runs/launcher/executionRunLauncherModel';
+import { ConstrainedScreenContent } from '@/components/ui/layout/ConstrainedScreenContent';
+import { Text } from '@/components/ui/text/Text';
+import { getErrorMessage } from '@/utils/errors/getErrorMessage';
+import { useSession } from '@/sync/domains/state/storage';
+import { Icon } from '@/components/ui/icons/Icon';
+
+
+type LoadState =
+  | { status: 'loading' }
+  | { status: 'error'; error: string }
+  | { status: 'loaded'; runs: readonly ExecutionRunPublicState[] };
+
+function normalizeSessionId(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+  if (Array.isArray(value) && typeof value[0] === 'string' && value[0].trim().length > 0) return value[0].trim();
+  return null;
+}
+
+function readExecutionRunsErrorMessage(result: Readonly<{ error?: string; errorCode?: string }> | null | undefined): string {
+  const message = getErrorMessage({
+    message: typeof result?.error === 'string' ? result.error : undefined,
+    rpcErrorCode: typeof result?.errorCode === 'string' ? result.errorCode : undefined,
+  });
+  return message || String(result?.error ?? 'failed_to_list_runs');
+}
+
+export default function SessionRunsScreen() {
+  const { theme } = useUnistyles();
+  const params = useLocalSearchParams();
+  const routeScope = useSessionRouteServerScope(params as Record<string, unknown>);
+  const sessionId = normalizeSessionId((params as any)?.id);
+  const headerTitle = t('runs.title');
+  const screenOptions = React.useMemo(() => {
+    return { headerShown: true, headerTitle };
+  }, [headerTitle]);
+  const routeHydrationState = useHydrateSessionForRoute(
+    sessionId ?? '',
+    'SessionRunsScreen.hydrate',
+    routeScope.hydrationOptions,
+  );
+  const hydrateReady = isSessionRouteHydrationAvailable(routeHydrationState);
+  const hydrateMissing = isSessionRouteHydrationMissing(routeHydrationState);
+  if (!sessionId || hydrateMissing) {
+    return (
+      <View testID="session-runs-screen" style={{ flex: 1, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}>
+        <Stack.Screen options={screenOptions} />
+        <ConstrainedScreenContent
+          style={{
+            flex: 1,
+            paddingHorizontal: 16,
+            paddingTop: 12,
+            paddingBottom: 16,
+            gap: 12,
+          }}
+        >
+          <SessionInvalidLinkFallback />
+        </ConstrainedScreenContent>
+      </View>
+    );
+  }
+
+  if (!hydrateReady) {
+    return (
+      <View testID="session-runs-screen" style={{ flex: 1, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}>
+        <Stack.Screen options={screenOptions} />
+        <ConstrainedScreenContent
+          style={{
+            flex: 1,
+            paddingHorizontal: 16,
+            paddingTop: 12,
+            paddingBottom: 16,
+            gap: 12,
+          }}
+        >
+          <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+        </ConstrainedScreenContent>
+      </View>
+    );
+  }
+
+  return <SessionRunsScreenContent routeScope={routeScope} sessionId={sessionId} />;
+}
+
+function SessionRunsScreenContent(props: Readonly<{
+  sessionId: string;
+  routeScope: SessionRouteServerScope;
+}>) {
+  const { theme } = useUnistyles();
+  const router = useRouter();
+  const session = useSession(props.sessionId);
+
+  const [state, setState] = React.useState<LoadState>({ status: 'loading' });
+  const loadGenerationRef = React.useRef(0);
+  const headerTint = theme.colors.chrome?.header?.foreground ?? theme.colors.text.primary;
+  const { canLaunchExecutionRuns, executionRunsBackends } = useSessionExecutionRunLaunchability(props.sessionId, session);
+  const launchIntents = React.useMemo(
+    () => resolveExecutionRunLauncherIntents(executionRunsBackends as ExecutionRunBackendCapabilityMap),
+    [executionRunsBackends],
+  );
+  const canShowLaunchButtons = canLaunchExecutionRuns && launchIntents.length > 0;
+
+  const load = React.useCallback(async () => {
+    const loadGeneration = ++loadGenerationRef.current;
+    const commitState = (nextState: LoadState) => {
+      if (loadGenerationRef.current !== loadGeneration) return;
+      setState(nextState);
+    };
+
+    if (!props.sessionId) {
+      commitState({ status: 'error', error: 'missing_session_id' });
+      return;
+    }
+
+    commitState({ status: 'loading' });
+    const first = await sessionExecutionRunList(props.sessionId, {});
+    if ((first as any)?.ok === false) {
+      if (!isRpcMethodNotAvailableError({
+        message: typeof (first as any).error === 'string' ? (first as any).error : undefined,
+        rpcErrorCode: typeof (first as any).errorCode === 'string' ? (first as any).errorCode : undefined,
+      })) {
+        commitState({ status: 'error', error: readExecutionRunsErrorMessage(first as any) });
+        return;
+      }
+      const retry = await sessionExecutionRunList(props.sessionId, {});
+      if ((retry as any)?.ok === false) {
+        commitState({ status: 'error', error: readExecutionRunsErrorMessage(retry as any) });
+        return;
+      }
+      commitState({ status: 'loaded', runs: (retry as any).runs ?? [] });
+      return;
+    }
+    commitState({ status: 'loaded', runs: (first as any).runs ?? [] });
+  }, [props.sessionId]);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  useFocusEffect(
+    React.useCallback(() => {
+      void load();
+    }, [load]),
+  );
+
+  const headerRight = React.useCallback(() => {
+    return (
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        {canShowLaunchButtons ? (
+          <>
+            {launchIntents.map((nextIntent) => {
+              const iconName = nextIntent === 'review'
+                ? 'search-outline'
+                : nextIntent === 'plan'
+                    ? 'list-outline'
+                    : 'person-add-outline';
+              return (
+                <Pressable
+                  key={nextIntent}
+                  accessibilityRole="button"
+                  accessibilityLabel={t(`executionRuns.newRun.intents.${nextIntent}`)}
+                  onPress={() => {
+                    if (!props.sessionId) return;
+                    router.push(props.routeScope.buildHref(props.sessionId, {
+                      suffix: '/runs/new',
+                      query: { intent: nextIntent },
+                    }) as any);
+                  }}
+                  hitSlop={10}
+                  style={({ pressed }) => ({ padding: 4, opacity: pressed ? 0.7 : 1 })}
+                >
+                  <Icon name={iconName as any} size={20} color={headerTint} />
+                </Pressable>
+              );
+            })}
+          </>
+        ) : null}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={t('common.refresh')}
+          onPress={() => void load()}
+          hitSlop={10}
+          style={({ pressed }) => ({ padding: 4, opacity: pressed ? 0.7 : 1 })}
+        >
+          <Icon name="arrow-clockwise" size={20} color={headerTint} />
+        </Pressable>
+      </View>
+    );
+  }, [canShowLaunchButtons, headerTint, launchIntents, load, props.routeScope, props.sessionId, router]);
+
+  const screenOptions = React.useMemo(() => ({
+    headerShown: true,
+    headerTitle: t('runs.title'),
+    headerRight,
+  }), [headerRight]);
+
+  return (
+    <View testID="session-runs-screen" style={{ flex: 1, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}>
+      <Stack.Screen options={screenOptions} />
+      <ConstrainedScreenContent
+        style={{
+          flex: 1,
+          paddingHorizontal: 16,
+          paddingTop: 12,
+          paddingBottom: 16,
+          gap: 12,
+        }}
+      >
+        {state.status === 'loading' ? (
+          <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+        ) : state.status === 'error' ? (
+          <Text style={{ color: theme.colors.text.secondary }}>{state.error}</Text>
+        ) : (
+          <ExecutionRunList
+            runs={state.runs}
+            onPressRun={(run) => {
+              router.push(props.routeScope.buildHref(props.sessionId, {
+                suffix: `/runs/${encodeURIComponent(run.runId)}`,
+              }) as any);
+            }}
+          />
+        )}
+      </ConstrainedScreenContent>
+    </View>
+  );
+}

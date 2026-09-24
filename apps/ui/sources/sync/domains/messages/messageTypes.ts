@@ -1,0 +1,88 @@
+import { AgentEvent } from '../../typesRaw';
+import { MessageMeta } from './messageMetaTypes';
+import type { TranscriptObservationMetadata } from './transcriptObservationProvenance';
+
+export type ToolCall = {
+    // Provider-side identifier for this tool call (e.g. ACP callId, Claude tool_use id).
+    // Optional for backward compatibility with older sessions and unit tests.
+    id?: string;
+    name: string;
+    state: 'running' | 'completed' | 'error' | 'unavailable';
+    input: any;
+    createdAt: number;
+    startedAt: number | null;
+    completedAt: number | null;
+    description: string | null;
+    result?: any;
+    permission?: {
+        id: string;
+        status: 'pending' | 'approved' | 'denied' | 'canceled';
+        kind?: string;
+        reason?: string;
+        mode?: string;
+        allowedTools?: string[];
+        decision?: 'approved' | 'approved_for_session' | 'approved_execpolicy_amendment' | 'denied' | 'abort';
+        date?: number;
+        /**
+         * Provider-suggested permission updates that can be applied by the user when approving.
+         *
+         * Opaque by default so provider-specific schemas can flow through without core coupling.
+         * (e.g. Claude Agent SDK `permission_suggestions` / `PermissionUpdate[]`).
+         */
+        suggestions?: unknown;
+    };
+}
+
+// Flattened message types - each message represents a single block
+export type UserTextMessage = {
+    kind: 'user-text';
+    id: string;
+    realID?: string | null;
+    seq?: number;
+    transcriptBlockIndex?: number;
+    localId: string | null;
+    createdAt: number;
+    text: string;
+    displayText?: string; // Optional text to display in UI instead of actual text
+    meta?: MessageMeta;
+} & TranscriptObservationMetadata;
+
+export type ModeSwitchMessage = {
+    kind: 'agent-event';
+    id: string;
+    realID?: string | null;
+    seq?: number;
+    transcriptBlockIndex?: number;
+    localId?: string | null;
+    createdAt: number;
+    event: AgentEvent;
+    meta?: MessageMeta;
+} & TranscriptObservationMetadata;
+
+export type AgentTextMessage = {
+    kind: 'agent-text';
+    id: string;
+    realID?: string | null;
+    seq?: number;
+    transcriptBlockIndex?: number;
+    localId: string | null;
+    createdAt: number;
+    text: string;
+    isThinking?: boolean;
+    meta?: MessageMeta;
+} & TranscriptObservationMetadata;
+
+export type ToolCallMessage = {
+    kind: 'tool-call';
+    id: string;
+    realID?: string | null;
+    seq?: number;
+    transcriptBlockIndex?: number;
+    localId: string | null;
+    createdAt: number;
+    tool: ToolCall;
+    children: Message[];
+    meta?: MessageMeta;
+} & TranscriptObservationMetadata;
+
+export type Message = UserTextMessage | AgentTextMessage | ToolCallMessage | ModeSwitchMessage;

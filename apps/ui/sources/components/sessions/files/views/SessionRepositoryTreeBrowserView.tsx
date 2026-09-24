@@ -1,0 +1,870 @@
+import { useRepositoryTreeRevealedPaths } from '@/hooks/session/files/useRepositoryTreeRevealedPaths';
+import * as React from 'react';
+import { Platform, Pressable, StyleSheet, View } from 'react-native';
+import { useUnistyles } from 'react-native-unistyles';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+
+import { RepositoryTreeList } from '@/components/sessions/files/content/RepositoryTreeList';
+import { SearchResultsList } from '@/components/sessions/files/content/SearchResultsList';
+import { DropdownMenu } from '@/components/ui/forms/dropdown/DropdownMenu';
+import type { ItemAction } from '@/components/ui/lists/itemActions';
+import { FileBrowserToolbarIconButton } from '@/components/ui/filesystemBrowser/FileBrowserToolbar';
+import { FilesystemBrowserToolbarChrome, type FilesystemBrowserToolbarAction } from '@/components/ui/filesystemBrowser/FilesystemBrowserToolbarChrome';
+import { RepositoryTreeDropOverlay } from '@/components/sessions/files/repositoryTree/RepositoryTreeDropOverlay';
+import { RepositoryTreeTransferStatusBar } from '@/components/sessions/files/repositoryTree/RepositoryTreeTransferStatusBar';
+import { WebDropTargetView } from '@/components/sessions/files/repositoryTree/WebDropTargetView';
+import { useSessionMachineReachability } from '@/components/sessions/model/useSessionMachineReachability';
+import { useSessionFileUploadAvailability } from '@/components/sessions/files/useSessionFileUploadAvailability';
+import type { FileItem } from '@/sync/domains/input/suggestionFile';
+import { fileSearchCache, searchFiles } from '@/sync/domains/input/suggestionFile';
+import { resolveSessionFileSuggestionScope } from '@/sync/ops/resolveSessionFileSuggestionScope';
+import { clearCachedRepositoryDirectoryEntries } from '@/sync/domains/input/repositoryDirectory';
+import { storage, useSessionProjectScmSnapshot, useSessionRepositoryTreeExpandedPaths } from '@/sync/domains/state/storage';
+import { t } from '@/text';
+import { Modal } from '@/modal';
+import { sessionCreateDirectory, sessionWriteFile } from '@/sync/ops';
+import { isSafeWorkspaceRelativePath } from '@/utils/path/isSafeWorkspaceRelativePath';
+import { computeExpandedPathsForReveal } from '@/components/sessions/files/repositoryTree/computeExpandedPathsForReveal';
+import { scmStatusSync } from '@/scm/scmStatusSync';
+import { useScrollEdgeFades } from '@/components/ui/scroll/useScrollEdgeFades';
+import { ScrollEdgeFades } from '@/components/ui/scroll/ScrollEdgeFades';
+import { ScrollEdgeIndicators } from '@/components/ui/scroll/ScrollEdgeIndicators';
+import { useWebFileDropZone } from '@/hooks/ui/useWebFileDropZone';
+import { readWebDroppedEntries } from '@/utils/files/webDroppedEntries';
+import { nativePickFiles, type NativePickedFile } from '@/utils/files/nativePickFiles';
+import { applyWebDirectoryInputAttributes } from '@/utils/files/applyWebDirectoryInputAttributes';
+import { useWorkspaceFileTransfers, type WorkspaceUploadEntry } from '@/hooks/session/files/useWorkspaceFileTransfers';
+import { showUploadConflictResolutionDialog } from '@/components/sessions/files/repositoryTree/showUploadConflictResolutionDialog';
+import { shouldUseRepositoryRootDropTarget } from '@/components/sessions/files/repositoryTree/shouldUseRepositoryRootDropTarget';
+import { createRepositoryTreeUploadMenuConfig } from '@/components/sessions/files/repositoryTree/createRepositoryTreeUploadMenuConfig';
+import { useRepositoryTreeWebDropState } from '@/components/sessions/files/repositoryTree/useRepositoryTreeWebDropState';
+import { promptRepositoryUploadDestination } from '@/components/sessions/files/views/promptRepositoryUploadDestination';
+import { RepositoryTreeChangedFilesPane } from '@/components/sessions/files/views/repositoryTreeBrowser/RepositoryTreeChangedFilesPane';
+import { SegmentedTabBar } from '@/components/ui/navigation/SegmentedTabBar';
+import { Text } from '@/components/ui/text/Text';
+import { Icon } from '@/components/ui/icons/Icon';
+
+export type SessionRepositoryTreeBrowserViewProps = Readonly<{
+    sessionId: string;
+    onOpenFile: (fullPath: string) => void;
+    onOpenFilePinned?: (fullPath: string) => void;
+    density?: 'panel' | 'screen' | 'modal';
+    searchQuery?: string;
+    onSearchQueryChange?: (value: string) => void;
+    showSearchBar?: boolean;
+    onRequestClose?: () => void;
+    revealRequest?: Readonly<{ path: string }>;
+}>;
+
+type ToolbarActionId =
+    | 'repository-tree-filter-changed'
+    | 'repository-tree-toggle-details'
+    | 'repository-tree-upload'
+    | 'repository-tree-create-file'
+    | 'repository-tree-create-folder'
+    | 'repository-tree-clear-search'
+    | 'repository-tree-refresh'
+    | 'repository-tree-collapse-all'
+    | 'repository-tree-close';
+
+type ToolbarActionConfig = FilesystemBrowserToolbarAction;
+
+const repositoryTreeBrowserStyles = StyleSheet.create({
+    root: {
+        flex: 1,
+    },
+    dropZone: {
+        flex: 1,
+    },
+    content: {
+        flex: 1,
+        position: 'relative',
+    },
+});
+
+function useStableFileOpenCallback(handler: (file: FileItem) => void) {
+    const handlerRef = React.useRef(handler);
+    React.useLayoutEffect(() => {
+        handlerRef.current = handler;
+    }, [handler]);
+
+    return React.useCallback((file: FileItem) => {
+        handlerRef.current(file);
+    }, []);
+}
+
+function useStablePathCallback(handler: (path: string) => void) {
+    const handlerRef = React.useRef(handler);
+    React.useLayoutEffect(() => {
+        handlerRef.current = handler;
+    }, [handler]);
+
+    return React.useCallback((path: string) => {
+        handlerRef.current(path);
+    }, []);
+}
+
+const EMPTY_FILE_SEARCH_RESULTS: FileItem[] = [];
+
+const RepositoryTreeMainContentHost = React.memo(function RepositoryTreeMainContentHost({
+    content,
+}: Readonly<{ content: React.ReactNode }>) {
+    return <>{content}</>;
+});
+
+export const SessionRepositoryTreeBrowserView = React.memo((props: SessionRepositoryTreeBrowserViewProps) => {
+    const { theme } = useUnistyles();
+    const { machineRpcTargetAvailable } = useSessionMachineReachability(props.sessionId);
+
+    const expandedPaths = useSessionRepositoryTreeExpandedPaths(props.sessionId);
+    const scmSnapshot = useSessionProjectScmSnapshot(props.sessionId);
+    const didWarmScmRef = React.useRef<string | null>(null);
+
+    const [uncontrolledSearchQuery, setUncontrolledSearchQuery] = React.useState('');
+    const searchQuery = props.searchQuery ?? uncontrolledSearchQuery;
+    const setSearchQuery = props.onSearchQueryChange ?? setUncontrolledSearchQuery;
+    const [showChangedOnly, setShowChangedOnly] = React.useState(false);
+    const [visibilityMode, setVisibilityMode] = React.useState<'project' | 'all'>('project');
+    const [gitIgnoreStatus, setGitIgnoreStatus] = React.useState<Readonly<{ sessionId: string; available?: boolean }> | null>(null);
+    const gitIgnoreAvailable = gitIgnoreStatus?.sessionId === props.sessionId ? gitIgnoreStatus.available : undefined;
+    const setGitIgnoreAvailable = React.useCallback((available: boolean | undefined) => {
+        setGitIgnoreStatus(previous => previous?.sessionId === props.sessionId && previous.available === available
+            ? previous : { sessionId: props.sessionId, available });
+    }, [props.sessionId]);
+    const { paths: revealedPaths, revealPath, latestRequest } = useRepositoryTreeRevealedPaths(props.sessionId);
+    const effectiveVisibilityMode = gitIgnoreAvailable === true ? visibilityMode : 'all';
+    const visibilityTabs = React.useMemo(() => [
+        { id: 'project' as const, label: t('files.toolbar.projectFiles') },
+        { id: 'all' as const, label: t('files.toolbar.allFiles') },
+    ], []);
+    const [detailsMode, setDetailsMode] = React.useState(false);
+    const [treeReloadNonce, setTreeReloadNonce] = React.useState(0);
+    const [treeRootLoading, setTreeRootLoading] = React.useState(false);
+    const [uploadMenuOpen, setUploadMenuOpen] = React.useState(false);
+    const [uploadDestinationDir, setUploadDestinationDir] = React.useState('');
+    const [searchResultState, setSearchResultState] = React.useState<Readonly<{ sessionId: string; query: string; files: FileItem[] }> | null>(null);
+    const searchResults = searchResultState?.sessionId === props.sessionId ? searchResultState.files : EMPTY_FILE_SEARCH_RESULTS;
+    const [isSearching, setIsSearching] = React.useState(false);
+    const showSearchBar = props.showSearchBar !== false;
+    const allowCreateActions = machineRpcTargetAvailable;
+    const uploadActionsAvailable = useSessionFileUploadAvailability(props.sessionId);
+    const webDropState = useRepositoryTreeWebDropState({
+        sessionId: props.sessionId,
+        enabled: allowCreateActions && Platform.OS === 'web',
+        expandedPaths,
+    });
+    const webFileInputRef = React.useRef<HTMLInputElement | null>(null);
+    const webFolderInputRef = React.useRef<HTMLInputElement | null>(null);
+    const handleRepositoryFileOpen = useStablePathCallback((path) => {
+        revealPath(path);
+        props.onOpenFile(path);
+    });
+    const handleRepositoryFileOpenPinned = useStablePathCallback((path) => {
+        revealPath(path);
+        (props.onOpenFilePinned ?? props.onOpenFile)(path);
+    });
+    const setWebFolderInputRef = React.useCallback((node: HTMLInputElement | null) => {
+        webFolderInputRef.current = node;
+        applyWebDirectoryInputAttributes(node);
+    }, []);
+
+    const scrollFades = useScrollEdgeFades({
+        enabledEdges: { top: true, bottom: true },
+        overflowThreshold: 1,
+        edgeThreshold: 1,
+    });
+
+    React.useEffect(() => {
+        if (!machineRpcTargetAvailable) return;
+        const key = `${props.sessionId}:${treeReloadNonce}`;
+        if (didWarmScmRef.current === key) return;
+        didWarmScmRef.current = key;
+        // Warm SCM snapshot so the file tree can display change badges even if the user
+        // hasn't opened the Source control panel yet.
+        scmStatusSync.invalidateFromUser(props.sessionId);
+    }, [machineRpcTargetAvailable, props.sessionId, treeReloadNonce]);
+
+    React.useEffect(() => {
+        let cancelled = false;
+        const q = searchQuery.trim();
+        if (showChangedOnly) {
+            setSearchResultState(null);
+            setIsSearching(false);
+            return;
+        }
+        if (!q) {
+            setSearchResultState(null);
+            setIsSearching(false);
+            return;
+        }
+
+        setIsSearching(true);
+        const handle = setTimeout(() => {
+            void (async () => {
+                try {
+                    // Same addressing as the composer's `@` picker: the search is scoped by the
+                    // session's MACHINE and FOLDER, so both surfaces share one index for a
+                    // workspace instead of building one per session.
+                    const scope = resolveSessionFileSuggestionScope(props.sessionId);
+                    const results = scope ? await searchFiles(scope, q, { limit: 200 }) : [];
+                    if (cancelled) return;
+                    setSearchResultState({ sessionId: props.sessionId, query: q, files: results });
+                } finally {
+                    if (cancelled) return;
+                    setIsSearching(false);
+                }
+            })();
+        }, 120);
+
+        return () => {
+            cancelled = true;
+            clearTimeout(handle);
+        };
+    }, [props.sessionId, searchQuery, showChangedOnly, treeReloadNonce]);
+
+    const shouldShowSearchResults = !showChangedOnly && searchQuery.trim().length > 0;
+    const canClearSearch = searchQuery.length > 0;
+
+    React.useEffect(() => {
+        if (showChangedOnly || shouldShowSearchResults) {
+            setTreeRootLoading(false);
+        }
+    }, [shouldShowSearchResults, showChangedOnly]);
+
+    const refresh = React.useCallback(() => {
+        const scope = resolveSessionFileSuggestionScope(props.sessionId);
+        if (scope) fileSearchCache.clearCache(scope);
+        clearCachedRepositoryDirectoryEntries({ sessionId: props.sessionId });
+        scmStatusSync.invalidateFromUser(props.sessionId);
+        setTreeReloadNonce((n) => n + 1);
+    }, [props.sessionId]);
+
+    const transfers = useWorkspaceFileTransfers({
+        sessionId: props.sessionId,
+        onResolveUploadConflicts: showUploadConflictResolutionDialog,
+        onAfterUploadSuccess: refresh,
+    });
+
+    const handleFilesDropped = React.useCallback(async (event: any) => {
+        const dataTransfer = event?.dataTransfer;
+        if (!dataTransfer) return;
+        const dropped = await readWebDroppedEntries(dataTransfer as any);
+        const entries: WorkspaceUploadEntry[] = dropped.map((entry) => ({
+            kind: 'web',
+            file: entry.file,
+            relativePath: entry.relativePath,
+        }));
+        const res = await transfers.startUploads({ entries, destinationDir: webDropState.dropDestinationDir });
+        if (!res.ok) {
+            Modal.alert(t('common.error'), res.error);
+        }
+    }, [transfers.startUploads, webDropState.dropDestinationDir]);
+
+    const dropZoneHandlers = useWebFileDropZone({
+        enabled: allowCreateActions && Platform.OS === 'web',
+        onFileDragActiveChange: webDropState.onFileDragActiveChange,
+        onFilesDropped: handleFilesDropped,
+    });
+
+    const dropZoneHandlersWithRoot = React.useMemo(() => ({
+        ...dropZoneHandlers,
+        onDragEnter: (event: any) => {
+            if (shouldUseRepositoryRootDropTarget(event)) {
+                webDropState.setRootDropTarget();
+            }
+            dropZoneHandlers.onDragEnter(event);
+        },
+        onDragOver: (event: any) => {
+            if (shouldUseRepositoryRootDropTarget(event)) {
+                webDropState.setRootDropTarget();
+            }
+            dropZoneHandlers.onDragOver(event);
+        },
+    }), [dropZoneHandlers, webDropState.setRootDropTarget]);
+
+    const handleRevealPath = React.useCallback((path: string, isDirectory = false) => {
+        if (!isSafeWorkspaceRelativePath(path)) return;
+        setSearchQuery('');
+        setShowChangedOnly(false);
+        revealPath(path, { focus: true });
+        const expandedPaths = computeExpandedPathsForReveal({
+            expandedPaths: storage.getState().getSessionRepositoryTreeExpandedPaths(props.sessionId),
+            fullPath: path,
+        });
+        storage.getState().setSessionRepositoryTreeExpandedPaths(props.sessionId,
+            isDirectory && !expandedPaths.includes(path) ? [...expandedPaths, path] : expandedPaths);
+    }, [props.sessionId, setSearchQuery, revealPath]);
+
+    React.useEffect(() => {
+        if (props.revealRequest) handleRevealPath(props.revealRequest.path);
+    }, [props.revealRequest, handleRevealPath]);
+
+    const handleSearchFolderPress = React.useCallback((folder: FileItem) => {
+        handleRevealPath(folder.fullPath.replace(/\/+$/, ''), true);
+    }, [handleRevealPath]);
+
+    const collapseAll = React.useCallback(() => {
+        storage.getState().setSessionRepositoryTreeExpandedPaths(props.sessionId, []);
+    }, [props.sessionId]);
+
+    const createFile = React.useCallback(() => {
+        void (async () => {
+            const raw = await Modal.prompt(
+                t('files.createFilePromptTitle'),
+                t('files.createFilePromptBody'),
+                { placeholder: 'src/new-file.ts' },
+            );
+            if (typeof raw !== 'string') return;
+            const path = raw.trim();
+            if (!path) return;
+            if (!isSafeWorkspaceRelativePath(path) || path.endsWith('/')) {
+                Modal.alert(t('common.error'), t('files.createFileInvalidPath'));
+                return;
+            }
+
+            const res = await sessionWriteFile(props.sessionId, path, '', null);
+            if (!res.success) {
+                Modal.alert(t('common.error'), res.error || t('files.createFileFailed'));
+                return;
+            }
+
+            const nextExpanded = computeExpandedPathsForReveal({
+                expandedPaths,
+                fullPath: path,
+            });
+            storage.getState().setSessionRepositoryTreeExpandedPaths(props.sessionId, nextExpanded);
+            refresh();
+
+            handleRepositoryFileOpenPinned(path);
+        })();
+    }, [expandedPaths, handleRepositoryFileOpenPinned, props.sessionId, refresh]);
+
+    const createFolder = React.useCallback(() => {
+        void (async () => {
+            const raw = await Modal.prompt(
+                t('files.createFolderPromptTitle'),
+                t('files.createFolderPromptBody'),
+                { placeholder: 'src/new-folder' },
+            );
+            if (typeof raw !== 'string') return;
+            const directoryPath = raw.trim().replace(/\/+$/, '');
+            if (!directoryPath) return;
+            if (!isSafeWorkspaceRelativePath(directoryPath)) {
+                Modal.alert(t('common.error'), t('files.createFolderInvalidPath'));
+                return;
+            }
+
+            const res = await sessionCreateDirectory(props.sessionId, directoryPath);
+            if (!res.success) {
+                Modal.alert(t('common.error'), res.error || t('files.createFolderFailed'));
+                return;
+            }
+
+            const nextExpanded = computeExpandedPathsForReveal({
+                expandedPaths,
+                // Expand the newly-created directory itself by using a synthetic child path.
+                fullPath: `${directoryPath}/.placeholder`,
+            });
+            revealPath(directoryPath);
+            const withDir = nextExpanded.includes(directoryPath) ? nextExpanded : [...nextExpanded, directoryPath];
+            storage.getState().setSessionRepositoryTreeExpandedPaths(props.sessionId, withDir);
+            refresh();
+        })();
+    }, [expandedPaths, props.sessionId, refresh, revealPath]);
+
+    const startWebUploads = React.useCallback(async (files: readonly File[], destinationDir: string) => {
+        const entries: WorkspaceUploadEntry[] = files.map((file) => ({
+            kind: 'web',
+            file,
+            relativePath: (file as any).webkitRelativePath || file.name,
+        }));
+        const res = await transfers.startUploads({ entries, destinationDir });
+        if (!res.ok) {
+            Modal.alert(t('common.error'), res.error);
+        }
+    }, [transfers.startUploads]);
+
+    const startNativeUploads = React.useCallback(async () => {
+        const picked = await nativePickFiles({ multiple: true });
+        const nativePicked = picked.filter((p): p is Extract<NativePickedFile, { kind: 'native' }> => p.kind === 'native');
+        if (nativePicked.length === 0) return;
+        const entries: WorkspaceUploadEntry[] = nativePicked.map((p) => ({
+            kind: 'native',
+            uri: p.uri,
+            name: p.name,
+            sizeBytes: p.sizeBytes,
+            mimeType: p.mimeType,
+            relativePath: p.name,
+        }));
+        const res = await transfers.startUploads({ entries, destinationDir: uploadDestinationDir });
+        if (!res.ok) {
+            Modal.alert(t('common.error'), res.error);
+        }
+    }, [transfers.startUploads, uploadDestinationDir]);
+
+    const selectUploadDestination = React.useCallback(async () => {
+        const nextDestination = await promptRepositoryUploadDestination(uploadDestinationDir);
+        if (nextDestination === null) return;
+        setUploadDestinationDir(nextDestination);
+    }, [uploadDestinationDir]);
+
+    const uploadMenuConfig = React.useMemo(() => createRepositoryTreeUploadMenuConfig({
+        uploadActionsAvailable,
+        isWeb: Platform.OS === 'web',
+    }), [uploadActionsAvailable]);
+
+    const uploadMenuItems = React.useMemo(() => [
+        {
+            id: 'repository-tree-upload-destination-select',
+            title: t('settingsAttachments.workspaceDirectory.uploadsDirectory.title'),
+            subtitle: uploadDestinationDir || t('files.projectRoot'),
+            category: t('common.path'),
+            icon: <Icon name="folder-open" size={16} color={theme.colors.text.secondary} />,
+            disabled: !uploadActionsAvailable,
+        },
+        ...uploadMenuConfig.items.map((item) => ({
+            id: item.id,
+            title: t(item.titleKey),
+            subtitle: uploadDestinationDir || t('files.projectRoot'),
+            category: t('files.toolbar.upload'),
+            icon: <Icon name={item.iconName} size={16} color={theme.colors.text.secondary} />,
+            disabled: item.disabled,
+        })),
+    ], [theme.colors.text.secondary, uploadActionsAvailable, uploadDestinationDir, uploadMenuConfig.items]);
+
+    const onSelectUploadMenuItem = React.useCallback((itemId: string) => {
+        setUploadMenuOpen(false);
+        if (!uploadActionsAvailable) return;
+        if (itemId === 'repository-tree-upload-destination-select') {
+            void selectUploadDestination();
+            return;
+        }
+        if (itemId === 'repository-tree-upload-files') {
+            if (Platform.OS === 'web') {
+                webFileInputRef.current?.click();
+                return;
+            }
+            void startNativeUploads();
+        }
+        if (itemId === 'repository-tree-upload-folder') {
+            if (Platform.OS !== 'web') return;
+            webFolderInputRef.current?.click();
+        }
+    }, [selectUploadDestination, startNativeUploads, uploadActionsAvailable]);
+
+    const toolbarActions = React.useMemo<ToolbarActionConfig[]>(() => {
+        const actions: ToolbarActionConfig[] = [
+            {
+                id: 'repository-tree-filter-changed',
+                priority: 1,
+                order: 0,
+                icon: <Icon name="funnel-simple" size={16} color={showChangedOnly ? theme.colors.text.link : theme.colors.text.secondary} />,
+                menuIcon: 'funnel-simple',
+                accessibilityLabel: t('files.toolbar.changedFiles'),
+                selected: showChangedOnly,
+                onPress: () => setShowChangedOnly((prev) => !prev),
+            },
+            {
+                id: 'repository-tree-toggle-details',
+                priority: 2,
+                order: 1,
+                icon: <Icon name="list" size={16} color={detailsMode ? theme.colors.text.link : theme.colors.text.secondary} />,
+                menuIcon: 'list',
+                accessibilityLabel: t('common.details'),
+                selected: detailsMode,
+                onPress: () => setDetailsMode((prev) => !prev),
+            },
+            {
+                id: 'repository-tree-upload',
+                priority: 3,
+                order: 2,
+                icon: <Icon name="cloud-arrow-up" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'cloud-arrow-up',
+                accessibilityLabel: t('files.toolbar.upload'),
+                disabled: !uploadActionsAvailable,
+                selected: uploadDestinationDir.length > 0,
+                onPress: () => setUploadMenuOpen(true),
+            },
+            {
+                id: 'repository-tree-create-file',
+                priority: 5,
+                order: 3,
+                icon: <Icon name="file-text" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'file-text',
+                accessibilityLabel: t('files.createFileA11y'),
+                disabled: !allowCreateActions,
+                onPress: createFile,
+            },
+            {
+                id: 'repository-tree-create-folder',
+                priority: 6,
+                order: 4,
+                icon: <Icon name="folder" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'folder',
+                accessibilityLabel: t('files.createFolderA11y'),
+                disabled: !allowCreateActions,
+                onPress: createFolder,
+            },
+            {
+                id: 'repository-tree-clear-search',
+                priority: 4,
+                order: 5,
+                icon: <Icon name="x" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'x',
+                accessibilityLabel: t('files.clearSearchA11y'),
+                onPress: () => setSearchQuery(''),
+            },
+            {
+                id: 'repository-tree-refresh',
+                priority: 10,
+                order: 6,
+                icon: treeRootLoading
+                    ? <ActivitySpinner testID="repository-tree-refresh-loading" size="small" color={theme.colors.text.secondary} />
+                    : <Icon name="arrows-clockwise" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'arrow-clockwise',
+                accessibilityLabel: t('common.refresh'),
+                onPress: refresh,
+            },
+        ];
+
+        if (expandedPaths.length > 0) {
+            actions.push({
+                id: 'repository-tree-collapse-all',
+                priority: 0,
+                order: 7,
+                icon: <Icon name="arrows-in" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'arrows-in',
+                accessibilityLabel: t('files.repositoryCollapseAll'),
+                onPress: collapseAll,
+            });
+        }
+
+        if (props.onRequestClose) {
+            actions.push({
+                id: 'repository-tree-close',
+                priority: 8,
+                order: 8,
+                icon: <Icon name="x" size={16} color={theme.colors.text.secondary} />,
+                menuIcon: 'x',
+                accessibilityLabel: t('common.close'),
+                onPress: props.onRequestClose,
+            });
+        }
+
+        if (canClearSearch !== true) {
+            return actions.filter((action) => action.id !== 'repository-tree-clear-search');
+        }
+
+        return actions;
+    }, [
+        allowCreateActions,
+        uploadActionsAvailable,
+        canClearSearch,
+        collapseAll,
+        createFile,
+        createFolder,
+        detailsMode,
+        expandedPaths.length,
+        refresh,
+        setSearchQuery,
+        showChangedOnly,
+        uploadDestinationDir.length,
+        props.onRequestClose,
+        theme.colors.text.link,
+        theme.colors.text.secondary,
+        treeRootLoading,
+    ]);
+
+    const buildOverflowItems = React.useCallback((hiddenActions: readonly ToolbarActionConfig[]) => {
+        const hiddenItems = hiddenActions
+            .filter((action) => action.id !== 'repository-tree-upload')
+            .map((action) => ({
+                id: action.id,
+                title: action.accessibilityLabel,
+                icon: action.menuIcon,
+                disabled: action.disabled,
+                onPress: action.onPress,
+            }));
+        if (!hiddenActions.some((action) => action.id === 'repository-tree-upload')) {
+            return hiddenItems;
+        }
+
+        const uploadOverflowItems: ItemAction[] = [
+            {
+                id: 'repository-tree-upload-destination-select',
+                title: t('settingsAttachments.workspaceDirectory.uploadsDirectory.title'),
+                icon: 'folder-open',
+                disabled: !uploadActionsAvailable,
+                onPress: () => onSelectUploadMenuItem('repository-tree-upload-destination-select'),
+            },
+            ...uploadMenuConfig.items.map((item) => ({
+                id: item.id,
+                title: t(item.titleKey),
+                icon: item.iconName,
+                disabled: item.disabled,
+                onPress: () => onSelectUploadMenuItem(item.id),
+            })),
+        ];
+
+        return [...uploadOverflowItems, ...hiddenItems];
+    }, [onSelectUploadMenuItem, uploadActionsAvailable, uploadMenuConfig.items]);
+
+    const renderToolbarIconButton = React.useCallback((action: ToolbarActionConfig) => {
+        if (action.id === 'repository-tree-upload') {
+            return (
+                <DropdownMenu
+                    key={action.id}
+                    open={uploadMenuOpen}
+                    onOpenChange={setUploadMenuOpen}
+                    items={uploadMenuItems}
+                    onSelect={onSelectUploadMenuItem}
+                    matchTriggerWidth={uploadMenuConfig.matchTriggerWidth}
+                    trigger={({ toggle }) => (
+                        <FileBrowserToolbarIconButton
+                            testID="repository-tree-upload"
+                            accessibilityLabel={action.accessibilityLabel}
+                            onPress={toggle}
+                            selected={action.selected}
+                            disabled={action.disabled}
+                        >
+                            {action.icon}
+                        </FileBrowserToolbarIconButton>
+                    )}
+                />
+            );
+        }
+
+        return (
+            <FileBrowserToolbarIconButton
+                key={action.id}
+                testID={action.id}
+                accessibilityLabel={action.accessibilityLabel}
+                onPress={action.onPress}
+                selected={action.selected}
+                disabled={action.disabled}
+            >
+                {action.icon}
+            </FileBrowserToolbarIconButton>
+        );
+    }, [onSelectUploadMenuItem, uploadMenuConfig.matchTriggerWidth, uploadMenuItems, uploadMenuOpen]);
+
+    const handleRequestDownload = React.useCallback((params: Parameters<typeof transfers.startDownload>[0]) => (
+        transfers.startDownload(params)
+    ), [transfers.startDownload]);
+
+    const handleExpandedPathsChange = React.useCallback((paths: string[]) => {
+        storage.getState().setSessionRepositoryTreeExpandedPaths(props.sessionId, paths);
+    }, [props.sessionId]);
+
+    const repositoryTreeTheme = React.useMemo(() => theme, [
+        theme.colors.state.danger.foreground,
+        theme.colors.state.neutral.foreground,
+        theme.colors.state.success.foreground,
+        theme.colors.surface.pressed,
+        theme.colors.text.link,
+        theme.colors.text.secondary,
+    ]);
+
+    const searchResultsTheme = React.useMemo(() => theme, [
+        theme.colors.border.default,
+        theme.colors.surface.inset,
+        theme.colors.text.link,
+        theme.colors.text.primary,
+        theme.colors.text.secondary,
+    ]);
+    const activeSearchResultsTheme = shouldShowSearchResults ? searchResultsTheme : null;
+    const handleSearchResultFilePress = useStableFileOpenCallback((file: FileItem) => {
+        props.onOpenFile(file.fullPath);
+    });
+    const handleSearchResultFilePressPinned = useStableFileOpenCallback((file: FileItem) => {
+        (props.onOpenFilePinned ?? props.onOpenFile)(file.fullPath);
+    });
+
+    const repositoryTreeMainContent = React.useMemo(() => (
+        <View style={repositoryTreeBrowserStyles.content}>
+            {showChangedOnly ? (
+                <RepositoryTreeChangedFilesPane
+                    sessionId={props.sessionId}
+                    scmSnapshot={scmSnapshot}
+                    searchQuery={searchQuery}
+                        onSearchQueryChange={setSearchQuery}
+                        onShowAllRepositoryFiles={() => setShowChangedOnly(false)}
+                        onOpenFile={handleRepositoryFileOpen}
+                        onOpenFilePinned={handleRepositoryFileOpenPinned}
+                />
+            ) : shouldShowSearchResults ? (
+                <SearchResultsList
+                    theme={activeSearchResultsTheme}
+                    isSearching={isSearching}
+                    searchQuery={searchQuery}
+                    searchResults={searchResults}
+                    searchResultsQuery={searchResultState?.query}
+                    onFolderPress={handleSearchFolderPress}
+                    onFilePress={handleSearchResultFilePress}
+                    onFilePressPinned={handleSearchResultFilePressPinned}
+                    onLayout={scrollFades.onViewportLayout}
+                    onContentSizeChange={scrollFades.onContentSizeChange}
+                    onScroll={scrollFades.onScroll}
+                    scrollEventThrottle={16}
+                />
+            ) : (
+                <RepositoryTreeList
+                    theme={repositoryTreeTheme}
+                    sessionId={props.sessionId}
+                    reloadToken={treeReloadNonce}
+                    detailsMode={detailsMode}
+                    visibilityMode={visibilityMode}
+                    revealedPaths={revealedPaths}
+                    revealRequest={latestRequest}
+                    onGitIgnoreAvailableChange={setGitIgnoreAvailable}
+                    writeActionsEnabled={allowCreateActions}
+                    onRequestRefresh={refresh}
+                    onRequestDownload={handleRequestDownload}
+                    onWebDropTargetChange={webDropState.onDropTargetChange}
+                    webDropHoverPath={webDropState.dropHoverPath}
+                    expandedPaths={expandedPaths}
+                    onExpandedPathsChange={handleExpandedPathsChange}
+                    onOpenFile={handleRepositoryFileOpen}
+                    onOpenFilePinned={handleRepositoryFileOpenPinned}
+                    scmSnapshot={scmSnapshot}
+                    onLayout={scrollFades.onViewportLayout}
+                    onContentSizeChange={scrollFades.onContentSizeChange}
+                    onScroll={scrollFades.onScroll}
+                    scrollEventThrottle={16}
+                    showInlineLoadingHeader={false}
+                    onRootLoadingChange={setTreeRootLoading}
+                />
+            )}
+            <RepositoryTreeDropOverlay
+                visible={webDropState.fileDragActive}
+                destinationLabel={webDropState.dropDestinationDir || t('files.projectRoot')}
+            />
+        </View>
+    ), [
+        activeSearchResultsTheme,
+        visibilityMode,
+        revealedPaths,
+        latestRequest,
+        setGitIgnoreAvailable,
+        allowCreateActions,
+        detailsMode,
+        expandedPaths,
+        handleExpandedPathsChange,
+        handleRequestDownload,
+        handleRepositoryFileOpen,
+        handleRepositoryFileOpenPinned,
+        handleSearchFolderPress,
+        handleSearchResultFilePress,
+        handleSearchResultFilePressPinned,
+        isSearching,
+        props.sessionId,
+        refresh,
+        repositoryTreeTheme,
+        scmSnapshot,
+        scrollFades.onContentSizeChange,
+        scrollFades.onScroll,
+        scrollFades.onViewportLayout,
+        searchQuery,
+        searchResults,
+        searchResultState?.query,
+        setSearchQuery,
+        shouldShowSearchResults,
+        showChangedOnly,
+        theme.colors.surface.base,
+        theme.colors.text.secondary,
+        transfers.cancelDownload,
+        transfers.cancelUploads,
+        transfers.downloadState,
+        transfers.uploadState,
+        treeReloadNonce,
+        webDropState.dropDestinationDir,
+        webDropState.dropHoverPath,
+        webDropState.fileDragActive,
+        webDropState.onDropTargetChange,
+    ]);
+
+    return (
+        <View style={repositoryTreeBrowserStyles.root}>
+            {showSearchBar ? (
+                <FilesystemBrowserToolbarChrome
+                    testID="repository-tree-toolbar"
+                    searchTestID="repository-tree-search"
+                    searchPlaceholder={t('files.searchPlaceholder')}
+                    searchValue={searchQuery}
+                    onSearchValueChange={setSearchQuery}
+                    actions={toolbarActions}
+                    buildOverflowItems={buildOverflowItems}
+                    overflowTriggerTestID="repository-tree-toolbar-overflow"
+                    renderActionNode={renderToolbarIconButton}
+                />
+            ) : null}
+            {!showChangedOnly && !shouldShowSearchResults ? (
+                <View style={{ paddingHorizontal: 12, paddingBottom: 8, gap: 6 }}>
+                    <SegmentedTabBar
+                        tabs={visibilityTabs}
+                        activeTabId={effectiveVisibilityMode}
+                        onSelectTab={setVisibilityMode}
+                        testIDPrefix="repository-tree-visibility"
+                    />
+                    {gitIgnoreAvailable === false ? (
+                        <Text testID="repository-tree-project-unavailable" style={{ color: theme.colors.text.secondary }}>
+                            {t('files.toolbar.projectFilesUnavailable')}
+                        </Text>
+                    ) : null}
+                </View>
+            ) : null}
+            {Platform.OS === 'web' ? (
+                <>
+                    <input
+                        data-testid="repository-tree-upload-input-files"
+                        ref={webFileInputRef}
+                        type="file"
+                        style={{ display: 'none' }}
+                        multiple
+                        onChange={(e) => {
+                            const files = Array.from(e.target.files ?? []);
+                            if (files.length > 0) {
+                                void startWebUploads(files, uploadDestinationDir);
+                            }
+                            e.target.value = '';
+                        }}
+                    />
+                    {React.createElement('input', {
+                        'data-testid': 'repository-tree-upload-input-folder',
+                        ref: setWebFolderInputRef,
+                        type: 'file',
+                        style: { display: 'none' },
+                        multiple: true,
+                        onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
+                            const files = Array.from(e.target.files ?? []);
+                            if (files.length > 0) {
+                                void startWebUploads(files, uploadDestinationDir);
+                            }
+                            e.target.value = '';
+                        },
+                    })}
+                </>
+            ) : null}
+            <WebDropTargetView testID="repository-tree-drop-zone" style={repositoryTreeBrowserStyles.dropZone} {...dropZoneHandlersWithRoot}>
+                <RepositoryTreeMainContentHost content={repositoryTreeMainContent} />
+                <ScrollEdgeFades
+                    color={theme.colors.surface.base}
+                    size={18}
+                    edges={scrollFades.visibility}
+                />
+                <ScrollEdgeIndicators
+                    edges={scrollFades.visibility}
+                    color={theme.colors.text.secondary}
+                    size={14}
+                    opacity={0.35}
+                />
+                <RepositoryTreeTransferStatusBar
+                    uploadState={transfers.uploadState}
+                    downloadState={transfers.downloadState}
+                    onCancelUploads={transfers.cancelUploads}
+                    onCancelDownload={transfers.cancelDownload}
+                />
+            </WebDropTargetView>
+        </View>
+    );
+});

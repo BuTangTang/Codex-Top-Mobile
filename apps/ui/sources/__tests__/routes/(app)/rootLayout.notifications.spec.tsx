@@ -1,0 +1,994 @@
+import React from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act } from 'react-test-renderer';
+
+import {
+    createRootLayoutFeaturesResponse,
+    createDeferred,
+    createStorageStoreMock,
+    flushHookEffects,
+    renderScreen,
+} from '@/dev/testkit';
+import type { LocalSettings } from '@/sync/domains/settings/localSettings';
+import { PUSH_NOTIFICATION_ACTION_IDS } from '@happier-dev/protocol';
+import { createServerFetchWithReachabilityProbe } from '@/dev/testkit/mocks/serverFetch';
+import { installRootLayoutRouteCommonModuleMocks } from './rootLayoutRouteTestHelpers';
+
+type ReactActEnvironmentGlobal = typeof globalThis & {
+    IS_REACT_ACT_ENVIRONMENT?: boolean;
+};
+(globalThis as ReactActEnvironmentGlobal).IS_REACT_ACT_ENVIRONMENT = true;
+
+const mockState = await vi.hoisted(async () => {
+    const { localSettingsDefaults } = await import('@/sync/domains/settings/localSettings');
+    const { settingsDefaults } = await import('@/sync/domains/settings/settings');
+    return {
+        activeServerUrl: 'https://api.happier.dev',
+        activeServerAccountScope: null as { serverId: string; accountId: string } | null,
+        activeServerAccountScopeListeners: new Set<() => void>(),
+        applySettingsSpy: vi.fn(),
+        clearPendingNotificationActionSpy: vi.fn(),
+        clearPendingNotificationNavSpy: vi.fn(),
+        setPendingNotificationNavSpy: vi.fn(),
+        clearPendingTerminalConnectSpy: vi.fn(),
+        lastUnmount: null as null | (() => Promise<void>),
+        mockSettings: {
+            ...settingsDefaults,
+            voice: {
+                ...settingsDefaults.voice,
+                providerId: 'off' as const,
+            },
+        },
+        mockLocalSettings: {
+            ...localSettingsDefaults,
+            activityBadgesEnabled: false,
+        } satisfies LocalSettings,
+        pendingNotificationActionValue: null as { serverUrl: string; sessionId: string; requestId: string; action: 'allow' | 'deny' } | null,
+        pendingNotificationNavValue: null as { serverUrl: string; route: string } | null,
+        pendingTerminalConnectValue: null as { publicKeyB64Url: string; serverUrl: string } | null,
+        pendingTerminalConnectRequiresScope: false,
+        pushSpy: vi.fn(),
+        navigateSpy: vi.fn(),
+        serverProfilesValue: [] as { id: string; serverUrl: string }[],
+        tabActiveServerId: null as string | null,
+        sessionAllowSpy: vi.fn((..._args: unknown[]) => Promise.resolve()),
+        sessionDenySpy: vi.fn((..._args: unknown[]) => Promise.resolve()),
+        setActiveServerAndSwitchSpy: vi.fn(async (_params: { serverId: string; scope: string; refreshAuth: unknown }) => true),
+        upsertActivateAndSwitchServerSpy: vi.fn(async (_params: { serverUrl: string; source: string; scope: string; refreshAuth: unknown }) => true),
+    };
+});
+
+const expoNotificationsMock = vi.hoisted(() => ({
+    DEFAULT_ACTION_IDENTIFIER: 'expo.modules.notifications.actions.DEFAULT',
+    getLastNotificationResponseAsync: vi.fn(),
+    clearLastNotificationResponseAsync: vi.fn(async () => {}),
+    addNotificationResponseReceivedListener: vi.fn((_listener: (response: unknown) => void) => ({ remove: () => {} })),
+    setBadgeCountAsync: vi.fn(async () => {}),
+}));
+
+vi.mock('expo-notifications', () => expoNotificationsMock);
+
+vi.mock('@/utils/platform/loadExpoNotifications', () => ({
+    loadExpoNotifications: () => Promise.resolve(expoNotificationsMock),
+}));
+
+vi.mock('@expo/vector-icons', () => ({
+    Ionicons: 'Ionicons',
+}));
+
+installRootLayoutRouteCommonModuleMocks({
+    router: async () => {
+        const { createExpoRouterMock } = await import('@/dev/testkit/mocks/router');
+        return createExpoRouterMock({
+            pathname: '/',
+            segments: ['(app)'],
+            router: {
+                push: mockState.pushSpy,
+                navigate: mockState.navigateSpy,
+                replace: vi.fn(),
+                back: vi.fn(),
+                setParams: vi.fn(),
+            },
+        }).module;
+    },
+    storage: async (importOriginal) => {
+        const { createStorageModuleMock } = await import('@/dev/testkit/mocks/storage');
+        return createStorageModuleMock({
+            importOriginal,
+            overrides: {
+                storage: createStorageStoreMock({
+                    settings: mockState.mockSettings as any,
+                    localSettings: mockState.mockLocalSettings,
+                }),
+                // This route only reads a small subset of the profile/local settings storage contract.
+                useProfile: () => ({ linkedProviders: [], username: 'u' } as any),
+                useAllSessions: () => [],
+                useFriendRequests: () => [],
+                useLocalSettings: () => mockState.mockLocalSettings,
+                useLocalSetting: (<K extends keyof LocalSettings>(key: K): LocalSettings[K] =>
+                    mockState.mockLocalSettings[key]) as typeof import('@/sync/domains/state/storage')['useLocalSetting'],
+                useSettings: () => mockState.mockSettings as any,
+                useSetting: ((key: keyof typeof mockState.mockSettings) => mockState.mockSettings[key]) as any,
+                useActiveServerAccountScope: () => React.useSyncExternalStore(
+                    (listener) => {
+                        mockState.activeServerAccountScopeListeners.add(listener);
+                        return () => mockState.activeServerAccountScopeListeners.delete(listener);
+                    },
+                    () => mockState.activeServerAccountScope,
+                    () => mockState.activeServerAccountScope,
+                ),
+            },
+        });
+    },
+});
+
+vi.mock('@/auth/context/AuthContext', () => ({
+    useAuth: () => ({ isAuthenticated: true, refreshFromActiveServer: vi.fn(async () => {}) }),
+}));
+
+vi.mock('@/auth/routing/authRouting', () => ({
+    isPublicRouteForUnauthenticated: () => true,
+}));
+
+vi.mock('@/utils/platform/platform', () => ({
+    isRunningOnMac: () => false,
+}));
+
+vi.mock('@/components/navigation/Header', () => ({
+    createHeader: () => null,
+}));
+
+vi.mock('@/desktop/tray/DesktopTrayRuntime', () => ({
+    DesktopTrayRuntime: () => null,
+}));
+
+vi.mock('@/hooks/server/useFriendsAllowUsernameSupport', () => ({
+    useFriendsAllowUsernameSupport: () => false,
+}));
+
+vi.mock('@/sync/domains/state/storageStore', () => {
+    const storage = createStorageStoreMock({
+        profile: { linkedProviders: [], username: 'u' } as any,
+        localSettings: mockState.mockLocalSettings,
+    });
+    return { storage, getStorage: () => storage };
+});
+
+vi.mock('@/sync/sync', () => ({
+    sync: {
+        applySettings: (...args: unknown[]) => mockState.applySettingsSpy(...args),
+    },
+}));
+
+vi.mock('@/sync/domains/server/serverProfiles', () => ({
+    getActiveServerUrl: () => mockState.activeServerUrl,
+    getServerProfileById: (id: string) => mockState.serverProfilesValue.find((profile) => profile.id === id) ?? null,
+    getTabActiveServerId: () => mockState.tabActiveServerId,
+    listServerProfiles: () => mockState.serverProfilesValue.map((p) => ({ ...p, name: p.id, createdAt: 0, updatedAt: 0, lastUsedAt: 0 })),
+    getActiveServerSnapshot: () => ({
+        serverId: 'server-1',
+        serverUrl: mockState.activeServerUrl,
+        kind: 'custom',
+        generation: 1,
+    }),
+    resolveServerProfileScopeId: (profile: { id?: string; serverIdentityId?: string | null }) => profile.serverIdentityId || profile.id || '',
+    resolveServerProfileScopeIdForIdentifier: (id: string | null | undefined) => String(id ?? '').trim(),
+    areServerProfileIdentifiersEquivalent: (left: string | null | undefined, right: string | null | undefined) => (
+        String(left ?? '').trim() !== ''
+        && String(left ?? '').trim() === String(right ?? '').trim()
+    ),
+    subscribeActiveServer: () => () => {},
+    subscribeServerProfiles: () => () => {},
+    setServerProfileIdentityForUrl: vi.fn(),
+}));
+
+vi.mock('@/sync/domains/server/activeServerSwitch', () => ({
+    normalizeServerUrl: (value: string) => String(value ?? '').trim().replace(/\/+$/, ''),
+    upsertActivateAndSwitchServer: mockState.upsertActivateAndSwitchServerSpy,
+    setActiveServerAndSwitch: mockState.setActiveServerAndSwitchSpy,
+}));
+
+vi.mock('@/sync/domains/pending/pendingTerminalConnect', () => ({
+    getPendingTerminalConnect: () => (
+        mockState.pendingTerminalConnectRequiresScope && !mockState.activeServerAccountScope
+            ? null
+            : mockState.pendingTerminalConnectValue
+    ),
+    clearPendingTerminalConnect: () => mockState.clearPendingTerminalConnectSpy(),
+    setPendingTerminalConnect: vi.fn(),
+}));
+
+vi.mock('@/sync/domains/pending/pendingNotificationNav', () => ({
+    getPendingNotificationNav: () => mockState.pendingNotificationNavValue,
+    setPendingNotificationNav: (next: { serverUrl: string; route: string }) => {
+        mockState.setPendingNotificationNavSpy(next);
+        mockState.pendingNotificationNavValue = next;
+    },
+    clearPendingNotificationNav: () => {
+        mockState.clearPendingNotificationNavSpy();
+        mockState.pendingNotificationNavValue = null;
+    },
+}));
+
+vi.mock('@/sync/domains/pending/pendingNotificationAction', () => ({
+    getPendingNotificationAction: () => mockState.pendingNotificationActionValue,
+    setPendingNotificationAction: (next: { serverUrl: string; sessionId: string; requestId: string; action: 'allow' | 'deny' }) => {
+        mockState.pendingNotificationActionValue = next;
+    },
+    clearPendingNotificationAction: () => {
+        mockState.clearPendingNotificationActionSpy();
+        mockState.pendingNotificationActionValue = null;
+    },
+}));
+
+vi.mock('@/sync/ops', () => ({
+    sessionAllow: (...args: unknown[]) => mockState.sessionAllowSpy(...args),
+    sessionDeny: (...args: unknown[]) => mockState.sessionDenySpy(...args),
+}));
+
+vi.mock('@/sync/api/capabilities/getReadyServerFeatures', () => ({
+    getReadyServerFeatures: async () =>
+        createRootLayoutFeaturesResponse({
+            features: { voice: { enabled: false, happierVoice: { enabled: false } } },
+            capabilities: { voice: { configured: false, provider: null, requested: false, disabledByBuildPolicy: false } },
+        }),
+}));
+
+// 保留能力解析与选择逻辑，只隔离 HTTP 边界，避免后台功能探测访问网络。
+beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn(createServerFetchWithReachabilityProbe(async () =>
+        new Response(JSON.stringify(createRootLayoutFeaturesResponse()), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+        }),
+    )));
+});
+
+afterEach(async () => {
+    mockState.activeServerUrl = 'https://api.happier.dev';
+    mockState.activeServerAccountScope = null;
+    mockState.serverProfilesValue = [];
+    mockState.tabActiveServerId = null;
+    mockState.pendingTerminalConnectValue = null;
+    mockState.pendingTerminalConnectRequiresScope = false;
+    mockState.pendingNotificationNavValue = null;
+    mockState.pendingNotificationActionValue = null;
+    await mockState.lastUnmount?.();
+    mockState.lastUnmount = null;
+    mockState.pushSpy.mockClear();
+    mockState.navigateSpy.mockClear();
+    mockState.setPendingNotificationNavSpy.mockClear();
+    mockState.upsertActivateAndSwitchServerSpy.mockReset();
+    mockState.setActiveServerAndSwitchSpy.mockReset();
+    mockState.clearPendingTerminalConnectSpy.mockClear();
+    mockState.clearPendingNotificationNavSpy.mockClear();
+    mockState.clearPendingNotificationActionSpy.mockClear();
+    mockState.sessionAllowSpy.mockClear();
+    mockState.sessionDenySpy.mockClear();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+});
+
+async function renderRootLayout() {
+    const RootLayout = (await import('@/app/(app)/_layout')).default;
+    await mockState.lastUnmount?.();
+    mockState.lastUnmount = (await renderScreen(React.createElement(RootLayout))).unmount;
+    await flushHookEffects();
+}
+
+describe('App RootLayout notifications', () => {
+    it('opens distinct notification events for one session through the scoped singular owner', async () => {
+        // 不 mock 导航 owner：不同系统事件必须复用真实 scoped/singular 导航。
+        mockState.serverProfilesValue = [{ id: 'server-1', serverUrl: 'https://api.happier.dev' }];
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue(null);
+        let listener: ((response: unknown) => void) | undefined;
+        expoNotificationsMock.addNotificationResponseReceivedListener.mockImplementation((callback) => {
+            listener = callback; return { remove: () => {} };
+        });
+        await renderRootLayout();
+        await act(async () => {
+            for (const identifier of ['event-one', 'event-two']) {
+                listener?.({ notification: { request: { identifier, content: { data: {
+                    interaction: 'open_only', sessionId: 'same-session', serverUrl: 'https://api.happier.dev',
+                } } } } });
+            }
+        });
+        expect(mockState.pushSpy).not.toHaveBeenCalled();
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(2);
+        for (const call of mockState.navigateSpy.mock.calls) {
+            expect(call[0]).toBe('/session/same-session?serverId=server-1');
+            expect(call[1]?.dangerouslySingular?.()).toBe('session');
+        }
+    });
+
+    it('keeps listening after restoring pending navigation without repeating the cold response', async () => {
+        mockState.pendingNotificationNavValue = { serverUrl: 'https://api.happier.dev', route: '/session/restored' };
+        const response = { notification: { request: { identifier: 'restored-event', content: { data: {
+            interaction: 'open_only', sessionId: 'restored', serverUrl: 'https://api.happier.dev',
+        } } } } };
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue(response);
+        let listener: ((response: unknown) => void) | undefined;
+        expoNotificationsMock.addNotificationResponseReceivedListener.mockImplementation((callback) => {
+            listener = callback; return { remove: () => {} };
+        });
+        await renderRootLayout();
+        expect(mockState.pushSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/restored');
+        expect(listener).toBeTypeOf('function');
+        // 同一条冷启动响应的前台重放仍被去重，新的通知仍能正常打开。
+        await act(async () => {
+            listener?.(response);
+            listener?.({ notification: { request: { identifier: 'second-event', content: { data: {
+                interaction: 'open_only', sessionId: 'second', serverUrl: 'https://api.happier.dev',
+            } } } } });
+        });
+        expect(mockState.pushSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.navigateSpy).toHaveBeenLastCalledWith('/session/second?serverId=server-1', expect.any(Object));
+    });
+
+    it('does not replay a delayed cold notification after a newer foreground click', async () => {
+        const coldResponse = createDeferred<any>();
+        expoNotificationsMock.getLastNotificationResponseAsync.mockReturnValue(coldResponse.promise);
+        let listener: ((response: unknown) => void) | undefined;
+        expoNotificationsMock.addNotificationResponseReceivedListener.mockImplementation((callback) => {
+            listener = callback; return { remove: () => {} };
+        });
+        await renderRootLayout();
+        await act(async () => {
+            listener?.({ notification: { request: { identifier: 'foreground-new', content: { data: {
+                interaction: 'open_only', sessionId: 'new-linked', serverUrl: 'https://api.happier.dev',
+            } } } } });
+        });
+        await act(async () => {
+            coldResponse.resolve({ notification: { request: { identifier: 'cold-old', content: { data: {
+                interaction: 'open_only', sessionId: 'old-linked', serverUrl: 'https://api.happier.dev',
+            } } } } });
+            await coldResponse.promise;
+        });
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.navigateSpy).toHaveBeenLastCalledWith('/session/new-linked?serverId=server-1', expect.any(Object));
+    });
+
+    // 多台电脑的会话共用同一服务器，服务器相同并不代表旧通知仍拥有导航权。
+    it.each(['already_active', 'switch_pending'] as const)('keeps the newer linked session on the same server when %s', async (secondState) => {
+        const oldSwitch = createDeferred<boolean>();
+        const newSwitch = createDeferred<boolean>();
+        mockState.serverProfilesValue = [{ id: 'owner', serverUrl: 'https://owner.example.test' }];
+        mockState.setActiveServerAndSwitchSpy.mockImplementationOnce(async () => {
+            mockState.activeServerUrl = 'https://owner.example.test';
+            return oldSwitch.promise;
+        }).mockImplementationOnce(async () => {
+            mockState.activeServerUrl = 'https://owner.example.test';
+            return newSwitch.promise;
+        });
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue({
+            notification: { request: { identifier: 'same-server-a', content: { data: {
+                interaction: 'open_only', sessionId: 'session-a', serverUrl: 'https://owner.example.test',
+            } } } },
+        });
+        let listener: ((response: unknown) => void) | undefined;
+        expoNotificationsMock.addNotificationResponseReceivedListener.mockImplementation((callback) => {
+            listener = callback; return { remove: () => {} };
+        });
+        await renderRootLayout();
+        await act(async () => {
+            if (secondState === 'switch_pending') mockState.activeServerUrl = 'https://api.happier.dev';
+            listener?.({ notification: { request: { identifier: 'same-server-b', content: { data: {
+                interaction: 'open_only', sessionId: 'session-b', serverUrl: 'https://owner.example.test',
+            } } } } });
+        });
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(2);
+        expect(mockState.navigateSpy).toHaveBeenNthCalledWith(1, '/session/session-a?serverId=owner', expect.any(Object));
+        expect(mockState.navigateSpy).toHaveBeenLastCalledWith('/session/session-b?serverId=owner', expect.any(Object));
+        expect(mockState.setPendingNotificationNavSpy).not.toHaveBeenCalled();
+        await act(async () => {
+            oldSwitch.resolve(true); newSwitch.resolve(true);
+            await Promise.all([oldSwitch.promise, newSwitch.promise]);
+        });
+        // 连接完成只能更新连接，不得重放旧通知的导航。
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(2);
+        expect(mockState.navigateSpy).toHaveBeenLastCalledWith('/session/session-b?serverId=owner', expect.any(Object));
+        expect(mockState.pendingNotificationNavValue).toBeNull();
+    });
+
+    it.each(['notification', 'manual'] as const)('does not reopen an old target after a newer %s server choice', async (choice) => {
+        const oldSwitch = createDeferred<boolean>();
+        const newSwitch = createDeferred<boolean>();
+        mockState.serverProfilesValue = [{ id: 'owner', serverUrl: 'https://owner.example.test' },
+            { id: 'new-owner', serverUrl: 'https://new.example.test' }];
+        mockState.setActiveServerAndSwitchSpy.mockImplementationOnce(async () => {
+            mockState.activeServerUrl = 'https://owner.example.test';
+            return oldSwitch.promise;
+        }).mockImplementationOnce(async () => {
+            mockState.activeServerUrl = 'https://new.example.test';
+            return newSwitch.promise;
+        });
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue({
+            notification: { request: { identifier: 'old-target', content: { data: {
+                interaction: 'open_only', sessionId: 'same-id', serverUrl: 'https://owner.example.test',
+            } } } },
+        });
+        let listener: ((response: unknown) => void) | undefined;
+        expoNotificationsMock.addNotificationResponseReceivedListener.mockImplementation((callback) => {
+            listener = callback; return { remove: () => {} };
+        });
+        await renderRootLayout();
+        await act(async () => {
+            if (choice === 'manual') mockState.activeServerUrl = 'https://new.example.test';
+            else listener?.({ notification: { request: { identifier: 'new-target', content: { data: {
+                interaction: 'open_only', sessionId: 'same-id', serverUrl: 'https://new.example.test',
+            } } } } });
+        });
+        const expectedCount = choice === 'notification' ? 2 : 1;
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(expectedCount);
+        expect(mockState.navigateSpy).toHaveBeenNthCalledWith(1, '/session/same-id?serverId=owner', expect.any(Object));
+        if (choice === 'notification') {
+            expect(mockState.navigateSpy).toHaveBeenLastCalledWith('/session/same-id?serverId=new-owner', expect.any(Object));
+        }
+        expect(mockState.setPendingNotificationNavSpy).not.toHaveBeenCalled();
+        await act(async () => {
+            oldSwitch.resolve(true); newSwitch.resolve(true);
+            await Promise.all([oldSwitch.promise, newSwitch.promise]);
+        });
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(expectedCount);
+        if (choice === 'notification') {
+            expect(mockState.navigateSpy).toHaveBeenLastCalledWith('/session/same-id?serverId=new-owner', expect.any(Object));
+        }
+    });
+
+    // 冷启和前台通知共享入口；跨服务器失败不能误入当前服务器的同名会话。
+    it.each(['cold', 'foreground'] as const)('routes open-only %s taps without approval or URL override', async (entry) => {
+        const response = { actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            notification: { request: { identifier: 'desktop-event', content: { data: {
+                interaction: 'open_only', sessionId: 'linked', requestId: 'desktop-request',
+                machineId: 'owner-machine', serverUrl: 'https://api.happier.dev', url: '/session/wrong',
+            } } } } };
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue(entry === 'cold' ? response : null);
+        let listener: ((response: unknown) => void) | undefined;
+        expoNotificationsMock.addNotificationResponseReceivedListener.mockImplementation((callback: any) => {
+            listener = callback; return { remove: () => {} };
+        });
+        await renderRootLayout();
+        if (entry === 'foreground') await act(async () => { listener?.(response); });
+        await flushHookEffects();
+        expect(mockState.navigateSpy).toHaveBeenCalledWith('/session/linked?serverId=server-1', expect.any(Object));
+        expect(mockState.sessionAllowSpy).not.toHaveBeenCalled();
+        expect(mockState.sessionDenySpy).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('opens a linked desktop session with its saved scope regardless of switch result %s', async (switched) => {
+        mockState.serverProfilesValue = [{ id: 'owner', serverUrl: 'https://owner.example.test' }];
+        mockState.setActiveServerAndSwitchSpy.mockImplementationOnce(async () => {
+            mockState.activeServerUrl = 'https://owner.example.test';
+            return switched;
+        });
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue({
+            notification: { request: { identifier: 'desktop-switch', content: { data: {
+                interaction: 'open_only', sessionId: 'linked', serverUrl: 'https://owner.example.test',
+            } } } },
+        });
+        await renderRootLayout();
+        expect(mockState.setActiveServerAndSwitchSpy).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'owner' }));
+        expect(mockState.navigateSpy).toHaveBeenCalledWith('/session/linked?serverId=owner', expect.any(Object));
+        expect(mockState.pendingNotificationNavValue).toBeNull();
+        expect(mockState.sessionAllowSpy).not.toHaveBeenCalled();
+    });
+
+    it('opens server settings for an unsafe mismatched open-only target', async () => {
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue({
+            notification: { request: { identifier: 'desktop-unsafe', content: { data: {
+                interaction: 'open_only', sessionId: 'same-id', serverUrl: 'http://127.0.0.1:3005',
+            } } } },
+        });
+        await renderRootLayout();
+        expect(mockState.pushSpy).not.toHaveBeenCalledWith('/session/same-id');
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/settings/server?url=http%3A%2F%2F127.0.0.1%3A3005&source=notification');
+    });
+
+    it.each(['pending', 'rejected'] as const)('opens a scoped saved target immediately when connection is %s', async (outcome) => {
+        // 真实 canonical 导航拥有连接副作用；失败不丢失 route 的目标 serverId。
+        const connection = createDeferred<boolean>();
+        mockState.serverProfilesValue = [{ id: 'owner', serverUrl: 'https://owner.example.test' }];
+        mockState.setActiveServerAndSwitchSpy.mockImplementationOnce(() => connection.promise);
+        expoNotificationsMock.getLastNotificationResponseAsync.mockResolvedValue({
+            notification: { request: { identifier: 'desktop-failed-switch', content: { data: {
+                interaction: 'open_only', sessionId: 'same-id', serverUrl: 'https://owner.example.test',
+            } } } },
+        });
+        await renderRootLayout();
+        expect(mockState.navigateSpy).toHaveBeenCalledWith('/session/same-id?serverId=owner', expect.any(Object));
+        expect(mockState.navigateSpy.mock.calls[0]?.[1]?.dangerouslySingular?.()).toBe('session');
+        expect(mockState.setPendingNotificationNavSpy).not.toHaveBeenCalled();
+        expect(mockState.setActiveServerAndSwitchSpy).toHaveBeenCalledTimes(1);
+        await act(async () => {
+            if (outcome === 'rejected') connection.reject(new Error('Synthetic connection failure'));
+            else connection.resolve(true);
+            await connection.promise.catch(() => {});
+        });
+        expect(mockState.navigateSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.pendingNotificationNavValue).toBeNull();
+    });
+
+    it('routes to pending terminal connect after authentication', async () => {
+        mockState.pendingTerminalConnectValue = {
+            publicKeyB64Url: 'abc123',
+            serverUrl: 'https://api.happier.dev',
+        };
+
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue(null);
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/terminal/connect#key=abc123&server=https%3A%2F%2Fapi.happier.dev');
+        expect(mockState.upsertActivateAndSwitchServerSpy).not.toHaveBeenCalled();
+    });
+
+    it('resumes terminal connect exactly once when account scope hydrates after authentication', async () => {
+        mockState.pendingTerminalConnectValue = {
+            publicKeyB64Url: 'hydrated-key',
+            serverUrl: 'https://api.happier.dev',
+        };
+        mockState.pendingTerminalConnectRequiresScope = true;
+
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue(null);
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+        expect(mockState.pushSpy).not.toHaveBeenCalled();
+
+        await act(async () => {
+            mockState.activeServerAccountScope = { serverId: 'server-1', accountId: 'account-a' };
+            for (const listener of mockState.activeServerAccountScopeListeners) listener();
+        });
+        await flushHookEffects();
+        await act(async () => {
+            for (const listener of mockState.activeServerAccountScopeListeners) listener();
+        });
+        await flushHookEffects();
+
+        expect(mockState.pushSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/terminal/connect#key=hydrated-key&server=https%3A%2F%2Fapi.happier.dev');
+    });
+
+    it('promotes pending terminal connect server when a tab override masks the device default', async () => {
+        mockState.pendingTerminalConnectValue = {
+            publicKeyB64Url: 'abc123',
+            serverUrl: 'https://api.happier.dev',
+        };
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        mockState.tabActiveServerId = 'api-server';
+
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue(null);
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.upsertActivateAndSwitchServerSpy).toHaveBeenCalledWith({
+            serverUrl: 'https://api.happier.dev',
+            source: 'url',
+            scope: 'device',
+            refreshAuth: expect.any(Function),
+        });
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/terminal/connect#key=abc123&server=https%3A%2F%2Fapi.happier.dev');
+    });
+
+    it('switches server and continues without reloading when pending terminal connect targets another server', async () => {
+        mockState.pendingTerminalConnectValue = {
+            publicKeyB64Url: 'abc123',
+            serverUrl: 'https://company.example.test',
+        };
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue(null);
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.upsertActivateAndSwitchServerSpy).toHaveBeenCalledWith({
+            serverUrl: 'https://company.example.test',
+            source: 'url',
+            scope: 'device',
+            refreshAuth: expect.any(Function),
+        });
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/terminal/connect#key=abc123&server=https%3A%2F%2Fcompany.example.test');
+    });
+
+    it('navigates to the session when a notification contains sessionId', async () => {
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: Notifications.DEFAULT_ACTION_IDENTIFIER,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n1',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_123' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/s_123');
+    });
+
+    it('dedupes notification responses across cold start and response listener', async () => {
+        const Notifications = await import('expo-notifications');
+        const response = {
+            actionIdentifier: Notifications.DEFAULT_ACTION_IDENTIFIER,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n1',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_123' },
+                    },
+                },
+            },
+        };
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue(response as any);
+        vi.spyOn(Notifications, 'clearLastNotificationResponseAsync').mockResolvedValue(undefined as any);
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation((listener: any) => {
+            listener(response);
+            return { remove: () => {} };
+        });
+
+        await renderRootLayout();
+
+        expect(mockState.pushSpy).toHaveBeenCalledTimes(1);
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/s_123');
+        expect(Notifications.clearLastNotificationResponseAsync).toHaveBeenCalledTimes(1);
+    });
+
+    it('switches server and navigates when a notification includes serverUrl', async () => {
+        mockState.serverProfilesValue = [
+            { id: 'server-1', serverUrl: 'https://api.happier.dev' },
+            { id: 'server-2', serverUrl: 'https://company.example.test' },
+        ];
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: Notifications.DEFAULT_ACTION_IDENTIFIER,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n2',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_456', serverUrl: 'https://company.example.test' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.setActiveServerAndSwitchSpy).toHaveBeenCalledWith({
+            serverId: 'server-2',
+            scope: 'device',
+            refreshAuth: expect.any(Function),
+        });
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/s_456');
+    });
+
+    it('does not auto-switch to loopback serverUrl from notifications', async () => {
+        mockState.serverProfilesValue = [
+            { id: 'server-1', serverUrl: 'https://api.happier.dev' },
+        ];
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: Notifications.DEFAULT_ACTION_IDENTIFIER,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n3',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_789', serverUrl: 'http://localhost:3005' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.setActiveServerAndSwitchSpy).not.toHaveBeenCalled();
+        expect(mockState.upsertActivateAndSwitchServerSpy).not.toHaveBeenCalled();
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/s_789');
+    });
+
+    it('sends a permission allow response and navigates when notification action is pressed', async () => {
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n4',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_allow', requestId: 'p_allow', serverUrl: 'https://api.happier.dev' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.sessionAllowSpy).toHaveBeenCalledWith('s_allow', 'p_allow', undefined, undefined, 'approved');
+        expect(mockState.navigateSpy).toHaveBeenCalledWith('/session/s_allow', expect.any(Object));
+        expect(mockState.navigateSpy.mock.calls[0]?.[1]?.dangerouslySingular?.()).toBe('session');
+    });
+
+    it('switches to a saved inactive server and performs permission allow when notification action is pressed', async () => {
+        mockState.serverProfilesValue = [
+            { id: 'server-1', serverUrl: 'https://api.happier.dev' },
+            { id: 'server-2', serverUrl: 'https://company.example.test' },
+        ];
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n4b',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_allow_2', requestId: 'p_allow_2', serverUrl: 'https://company.example.test' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.setActiveServerAndSwitchSpy).toHaveBeenCalledWith({
+            serverId: 'server-2',
+            scope: 'device',
+            refreshAuth: expect.any(Function),
+        });
+        expect(mockState.sessionAllowSpy).toHaveBeenCalledWith('s_allow_2', 'p_allow_2', undefined, undefined, 'approved');
+        expect(mockState.navigateSpy).toHaveBeenCalledWith('/session/s_allow_2', expect.any(Object));
+        expect(mockState.navigateSpy.mock.calls[0]?.[1]?.dangerouslySingular?.()).toBe('session');
+    });
+
+    it('does not perform permission allow when notification action is pressed without serverUrl', async () => {
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n4c',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_allow_3', requestId: 'p_allow_3' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.sessionAllowSpy).not.toHaveBeenCalled();
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/s_allow_3');
+    });
+
+    it('does not perform permission allow when notification action targets an unsaved server', async () => {
+        mockState.serverProfilesValue = [
+            { id: 'server-1', serverUrl: 'https://api.happier.dev' },
+        ];
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n4d',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_allow_4', requestId: 'p_allow_4', serverUrl: 'https://unknown.example.test' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.sessionAllowSpy).not.toHaveBeenCalled();
+        expect(mockState.setActiveServerAndSwitchSpy).not.toHaveBeenCalled();
+        expect(mockState.upsertActivateAndSwitchServerSpy).not.toHaveBeenCalled();
+        expect(mockState.pendingNotificationNavValue).toEqual({ serverUrl: 'https://unknown.example.test', route: '/session/s_allow_4' });
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/settings/server?url=https%3A%2F%2Funknown.example.test&source=notification');
+    });
+
+    it('ignores unknown notification action identifiers (does not auto-add or navigate)', async () => {
+        mockState.serverProfilesValue = [
+            { id: 'server-1', serverUrl: 'https://api.happier.dev' },
+        ];
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: 'UNKNOWN_ACTION',
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n_unknown',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_unknown', serverUrl: 'https://unknown.example.test' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.setActiveServerAndSwitchSpy).not.toHaveBeenCalled();
+        expect(mockState.upsertActivateAndSwitchServerSpy).not.toHaveBeenCalled();
+        expect(mockState.pendingNotificationNavValue).toBe(null);
+        expect(mockState.pushSpy).not.toHaveBeenCalled();
+    });
+
+    it('auto-adds and switches server when zero servers exist and a permission action targets an unsaved server (but does not perform the action)', async () => {
+        mockState.serverProfilesValue = [];
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionAllowV1,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n4e',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_allow_5', requestId: 'p_allow_5', serverUrl: 'https://new.example.test' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.sessionAllowSpy).not.toHaveBeenCalled();
+        expect(mockState.upsertActivateAndSwitchServerSpy).toHaveBeenCalledWith({
+            serverUrl: 'https://new.example.test',
+            source: 'notification',
+            scope: 'device',
+            refreshAuth: expect.any(Function),
+        });
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/session/s_allow_5');
+    });
+
+    it('routes to server settings with a prefilled url when a notification targets an unsaved server and servers already exist', async () => {
+        mockState.serverProfilesValue = [
+            { id: 'server-1', serverUrl: 'https://api.happier.dev' },
+        ];
+        mockState.activeServerUrl = 'https://api.happier.dev';
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: Notifications.DEFAULT_ACTION_IDENTIFIER,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n6',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_999', serverUrl: 'https://unknown2.example.test' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.pendingNotificationNavValue).toEqual({ serverUrl: 'https://unknown2.example.test', route: '/session/s_999' });
+        expect(mockState.pushSpy).toHaveBeenCalledWith('/settings/server?url=https%3A%2F%2Funknown2.example.test&source=notification');
+        expect(mockState.setActiveServerAndSwitchSpy).not.toHaveBeenCalled();
+        expect(mockState.upsertActivateAndSwitchServerSpy).not.toHaveBeenCalled();
+    });
+
+    it('sends a permission deny response and navigates when notification action is pressed', async () => {
+        const Notifications = await import('expo-notifications');
+        vi.spyOn(Notifications, 'getLastNotificationResponseAsync').mockResolvedValue({
+            actionIdentifier: PUSH_NOTIFICATION_ACTION_IDS.permissionDenyV1,
+            notification: {
+                date: Date.parse('2026-02-09T00:00:00.000Z'),
+                request: {
+                    identifier: 'n5',
+                    trigger: null,
+                    content: {
+                        title: null,
+                        subtitle: null,
+                        body: null,
+                        categoryIdentifier: null,
+                        sound: null,
+                        data: { sessionId: 's_deny', requestId: 'p_deny', serverUrl: 'https://api.happier.dev' },
+                    },
+                },
+            },
+        });
+        vi.spyOn(Notifications, 'addNotificationResponseReceivedListener').mockImplementation(() => ({ remove: () => {} }));
+
+        await renderRootLayout();
+
+        expect(mockState.sessionDenySpy).toHaveBeenCalledWith('s_deny', 'p_deny', undefined, undefined, 'denied', 'Denied from notification');
+        expect(mockState.navigateSpy).toHaveBeenCalledWith('/session/s_deny', expect.any(Object));
+        expect(mockState.navigateSpy.mock.calls[0]?.[1]?.dangerouslySingular?.()).toBe('session');
+    });
+});

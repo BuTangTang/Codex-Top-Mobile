@@ -1,0 +1,294 @@
+import * as React from 'react';
+import { useUnistyles } from 'react-native-unistyles';
+
+import { Item } from '@/components/ui/lists/Item';
+import { ItemGroup } from '@/components/ui/lists/ItemGroup';
+import { ItemList } from '@/components/ui/lists/ItemList';
+import { Switch } from '@/components/ui/forms/Switch';
+import { Modal } from '@/modal';
+import { t } from '@/text';
+import { useSettingMutable } from '@/sync/domains/state/storage';
+import { Icon } from '@/components/ui/icons/Icon';
+
+type TranscriptMotionPreset = 'off' | 'subtle' | 'full';
+
+function clampInt(value: number, bounds: Readonly<{ min: number; max: number }>): number {
+    if (!Number.isFinite(value)) return bounds.min;
+    return Math.min(bounds.max, Math.max(bounds.min, Math.trunc(value)));
+}
+
+export const TranscriptRenderingAdvancedSettingsView = React.memo(function TranscriptRenderingAdvancedSettingsView() {
+    const { theme } = useUnistyles();
+    const popoverBoundaryRef = React.useRef<any>(null);
+
+    const [transcriptStreamingCoalesceEnabled, setTranscriptStreamingCoalesceEnabled] = useSettingMutable('transcriptStreamingCoalesceEnabled');
+    const [transcriptStreamingCoalesceWindowMs, setTranscriptStreamingCoalesceWindowMs] = useSettingMutable('transcriptStreamingCoalesceWindowMs');
+    const [transcriptStreamingCoalesceMaxBatchSize, setTranscriptStreamingCoalesceMaxBatchSize] = useSettingMutable('transcriptStreamingCoalesceMaxBatchSize');
+    const [transcriptStreamingPartialOutputEnabled, setTranscriptStreamingPartialOutputEnabled] = useSettingMutable('transcriptStreamingPartialOutputEnabled');
+    const [transcriptThinkingPulseStaleMs, setTranscriptThinkingPulseStaleMs] = useSettingMutable('transcriptThinkingPulseStaleMs');
+
+    const [transcriptMotionPreset] = useSettingMutable('transcriptMotionPreset');
+    const normalizedMotionPreset: TranscriptMotionPreset =
+        transcriptMotionPreset === 'off' || transcriptMotionPreset === 'full' ? transcriptMotionPreset : 'subtle';
+
+    const [transcriptMotionFreshnessMs, setTranscriptMotionFreshnessMs] = useSettingMutable('transcriptMotionFreshnessMs');
+    const [transcriptAnimateNewItemsEnabled, setTranscriptAnimateNewItemsEnabled] = useSettingMutable('transcriptAnimateNewItemsEnabled');
+    const [transcriptAnimateToolExpandCollapseEnabled, setTranscriptAnimateToolExpandCollapseEnabled] = useSettingMutable('transcriptAnimateToolExpandCollapseEnabled');
+    const [transcriptAnimateToolExpandCollapseFreshOnly, setTranscriptAnimateToolExpandCollapseFreshOnly] = useSettingMutable('transcriptAnimateToolExpandCollapseFreshOnly');
+    const [transcriptAnimateThinkingEnabled, setTranscriptAnimateThinkingEnabled] = useSettingMutable('transcriptAnimateThinkingEnabled');
+
+    const [transcriptScrollPinOffsetThresholdPx, setTranscriptScrollPinOffsetThresholdPx] = useSettingMutable('transcriptScrollPinOffsetThresholdPx');
+    const [transcriptScrollAutoFollowWhenPinned, setTranscriptScrollAutoFollowWhenPinned] = useSettingMutable('transcriptScrollAutoFollowWhenPinned');
+    const [transcriptScrollJumpToBottomMinNewCount, setTranscriptScrollJumpToBottomMinNewCount] = useSettingMutable('transcriptScrollJumpToBottomMinNewCount');
+    const [transcriptScrollJumpToBottomAnimateScroll, setTranscriptScrollJumpToBottomAnimateScroll] = useSettingMutable('transcriptScrollJumpToBottomAnimateScroll');
+
+    const canAdjustMotion = normalizedMotionPreset !== 'off';
+
+    return (
+        <ItemList ref={popoverBoundaryRef} style={{ paddingTop: 0 }}>
+            <ItemGroup
+                title={t('settingsSession.transcript.advanced.performanceTitle')}
+                footer={t('settingsSession.transcript.advanced.performanceFooter')}
+            >
+                <Item
+                    title={t('settingsSession.transcript.advanced.coalesceEnabledTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.coalesceEnabledSubtitle')}
+                    icon={<Icon name="stack-simple" size={29} color={theme.colors.accent.indigo} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptStreamingCoalesceEnabled === true}
+                            onValueChange={(v) => setTranscriptStreamingCoalesceEnabled(Boolean(v) as any)}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => setTranscriptStreamingCoalesceEnabled((transcriptStreamingCoalesceEnabled !== true) as any)}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.coalesceWindowTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.coalesceWindowSubtitle', { value: String(transcriptStreamingCoalesceWindowMs ?? 0) })}
+                    icon={<Icon name="timer" size={29} color={theme.colors.text.secondary} />}
+                    onPress={async () => {
+                        const raw = await Modal.prompt(
+                            t('settingsSession.transcript.advanced.coalesceWindowPromptTitle'),
+                            t('settingsSession.transcript.advanced.coalesceWindowPromptBody'),
+                        );
+                        if (raw == null) return;
+                        const parsed = Number(String(raw).replace(/[^0-9]/g, ''));
+                        if (!Number.isFinite(parsed)) return;
+                        setTranscriptStreamingCoalesceWindowMs(clampInt(parsed, { min: 0, max: 200 }) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.coalesceMaxBatchTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.coalesceMaxBatchSubtitle', { value: String(transcriptStreamingCoalesceMaxBatchSize ?? 0) })}
+                    icon={<Icon name="funnel-simple" size={29} color={theme.colors.text.secondary} />}
+                    onPress={async () => {
+                        const raw = await Modal.prompt(
+                            t('settingsSession.transcript.advanced.coalesceMaxBatchPromptTitle'),
+                            t('settingsSession.transcript.advanced.coalesceMaxBatchPromptBody'),
+                        );
+                        if (raw == null) return;
+                        const parsed = Number(String(raw).replace(/[^0-9]/g, ''));
+                        if (!Number.isFinite(parsed)) return;
+                        setTranscriptStreamingCoalesceMaxBatchSize(clampInt(parsed, { min: 1, max: 2000 }) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.streamingPartialOutputTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.streamingPartialOutputSubtitle')}
+                    icon={<Icon name="pulse" size={29} color={theme.colors.text.secondary} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptStreamingPartialOutputEnabled !== false}
+                            onValueChange={(v) => setTranscriptStreamingPartialOutputEnabled(Boolean(v) as any)}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => setTranscriptStreamingPartialOutputEnabled((transcriptStreamingPartialOutputEnabled === false) as any)}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.thinkingPulseStaleTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.thinkingPulseStaleSubtitle', { value: String(transcriptThinkingPulseStaleMs ?? 0) })}
+                    icon={<Icon name="hourglass" size={29} color={theme.colors.text.secondary} />}
+                    onPress={async () => {
+                        const raw = await Modal.prompt(
+                            t('settingsSession.transcript.advanced.thinkingPulseStalePromptTitle'),
+                            t('settingsSession.transcript.advanced.thinkingPulseStalePromptBody'),
+                        );
+                        if (raw == null) return;
+                        const parsed = Number(String(raw).replace(/[^0-9]/g, ''));
+                        if (!Number.isFinite(parsed)) return;
+                        setTranscriptThinkingPulseStaleMs(clampInt(parsed, { min: 5000, max: 600_000 }) as any);
+                    }}
+                />
+
+            </ItemGroup>
+
+            <ItemGroup
+                title={t('settingsSession.transcript.advanced.motionTitle')}
+                footer={t('settingsSession.transcript.advanced.motionFooter')}
+            >
+                <Item
+                    title={t('settingsSession.transcript.advanced.freshnessTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.freshnessSubtitle', { value: String(transcriptMotionFreshnessMs ?? 0) })}
+                    icon={<Icon name="timer" size={29} color={theme.colors.text.secondary} />}
+                    onPress={async () => {
+                        if (!canAdjustMotion) return;
+                        const raw = await Modal.prompt(
+                            t('settingsSession.transcript.advanced.freshnessPromptTitle'),
+                            t('settingsSession.transcript.advanced.freshnessPromptBody'),
+                        );
+                        if (raw == null) return;
+                        const parsed = Number(String(raw).replace(/[^0-9]/g, ''));
+                        if (!Number.isFinite(parsed)) return;
+                        setTranscriptMotionFreshnessMs(clampInt(parsed, { min: 0, max: 600_000 }) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.animateNewItemsTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.animateNewItemsSubtitle')}
+                    icon={<Icon name="sparkle" size={29} color={theme.colors.accent.orange} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptAnimateNewItemsEnabled === true}
+                            onValueChange={(v) => setTranscriptAnimateNewItemsEnabled(Boolean(v) as any)}
+                            disabled={!canAdjustMotion}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => {
+                        if (!canAdjustMotion) return;
+                        setTranscriptAnimateNewItemsEnabled((transcriptAnimateNewItemsEnabled !== true) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.animateToolExpandCollapseTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.animateToolExpandCollapseSubtitle')}
+                    icon={<Icon name="arrows-down-up" size={29} color={theme.colors.text.secondary} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptAnimateToolExpandCollapseEnabled === true}
+                            onValueChange={(v) => setTranscriptAnimateToolExpandCollapseEnabled(Boolean(v) as any)}
+                            disabled={!canAdjustMotion}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => {
+                        if (!canAdjustMotion) return;
+                        setTranscriptAnimateToolExpandCollapseEnabled((transcriptAnimateToolExpandCollapseEnabled !== true) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.animateToolExpandCollapseFreshOnlyTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.animateToolExpandCollapseFreshOnlySubtitle')}
+                    icon={<Icon name="leaf" size={29} color={theme.colors.text.secondary} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptAnimateToolExpandCollapseFreshOnly === true}
+                            onValueChange={(v) => setTranscriptAnimateToolExpandCollapseFreshOnly(Boolean(v) as any)}
+                            disabled={!canAdjustMotion || transcriptAnimateToolExpandCollapseEnabled !== true}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => {
+                        if (!canAdjustMotion) return;
+                        if (transcriptAnimateToolExpandCollapseEnabled !== true) return;
+                        setTranscriptAnimateToolExpandCollapseFreshOnly((transcriptAnimateToolExpandCollapseFreshOnly !== true) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.animateThinkingTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.animateThinkingSubtitle')}
+                    icon={<Icon name="lightbulb" size={29} color={theme.colors.text.secondary} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptAnimateThinkingEnabled === true}
+                            onValueChange={(v) => setTranscriptAnimateThinkingEnabled(Boolean(v) as any)}
+                            disabled={!canAdjustMotion}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => {
+                        if (!canAdjustMotion) return;
+                        setTranscriptAnimateThinkingEnabled((transcriptAnimateThinkingEnabled !== true) as any);
+                    }}
+                />
+            </ItemGroup>
+
+            <ItemGroup
+                title={t('settingsSession.transcript.advanced.scrollTitle')}
+                footer={t('settingsSession.transcript.advanced.scrollFooter')}
+            >
+                <Item
+                    title={t('settingsSession.transcript.advanced.pinOffsetTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.pinOffsetSubtitle', { value: String(transcriptScrollPinOffsetThresholdPx ?? 0) })}
+                    icon={<Icon name="navigation-arrow" size={29} color={theme.colors.text.secondary} />}
+                    onPress={async () => {
+                        const raw = await Modal.prompt(
+                            t('settingsSession.transcript.advanced.pinOffsetPromptTitle'),
+                            t('settingsSession.transcript.advanced.pinOffsetPromptBody'),
+                        );
+                        if (raw == null) return;
+                        const parsed = Number(String(raw).replace(/[^0-9]/g, ''));
+                        if (!Number.isFinite(parsed)) return;
+                        setTranscriptScrollPinOffsetThresholdPx(clampInt(parsed, { min: 0, max: 400 }) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.autoFollowTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.autoFollowSubtitle')}
+                    icon={<Icon name="arrow-circle-down" size={29} color={theme.colors.text.secondary} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptScrollAutoFollowWhenPinned === true}
+                            onValueChange={(v) => setTranscriptScrollAutoFollowWhenPinned(Boolean(v) as any)}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => setTranscriptScrollAutoFollowWhenPinned((transcriptScrollAutoFollowWhenPinned !== true) as any)}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.jumpMinNewCountTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.jumpMinNewCountSubtitle', { value: String(transcriptScrollJumpToBottomMinNewCount ?? 0) })}
+                    icon={<Icon name="caret-down" size={29} color={theme.colors.text.secondary} />}
+                    onPress={async () => {
+                        const raw = await Modal.prompt(
+                            t('settingsSession.transcript.advanced.jumpMinNewCountPromptTitle'),
+                            t('settingsSession.transcript.advanced.jumpMinNewCountPromptBody'),
+                        );
+                        if (raw == null) return;
+                        const parsed = Number(String(raw).replace(/[^0-9]/g, ''));
+                        if (!Number.isFinite(parsed)) return;
+                        setTranscriptScrollJumpToBottomMinNewCount(clampInt(parsed, { min: 1, max: 999 }) as any);
+                    }}
+                />
+
+                <Item
+                    title={t('settingsSession.transcript.advanced.jumpAnimateScrollTitle')}
+                    subtitle={t('settingsSession.transcript.advanced.jumpAnimateScrollSubtitle')}
+                    icon={<Icon name="arrows-down-up" size={29} color={theme.colors.text.secondary} />}
+                    rightElement={
+                        <Switch
+                            value={transcriptScrollJumpToBottomAnimateScroll === true}
+                            onValueChange={(v) => setTranscriptScrollJumpToBottomAnimateScroll(Boolean(v) as any)}
+                        />
+                    }
+                    showChevron={false}
+                    onPress={() => setTranscriptScrollJumpToBottomAnimateScroll((transcriptScrollJumpToBottomAnimateScroll !== true) as any)}
+                />
+            </ItemGroup>
+        </ItemList>
+    );
+});
+
+export default TranscriptRenderingAdvancedSettingsView;

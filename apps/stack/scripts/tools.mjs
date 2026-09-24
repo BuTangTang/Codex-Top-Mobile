@@ -1,0 +1,89 @@
+import './utils/env/env.mjs';
+import { join } from 'node:path';
+
+import { parseArgs } from './utils/cli/args.mjs';
+import { printResult, wantsHelp, wantsJson } from './utils/cli/cli.mjs';
+import { getRootDir } from './utils/paths/paths.mjs';
+import { run } from './utils/proc/proc.mjs';
+
+const TOOL_SCRIPTS = {
+  'setup-pr': 'scripts/setup_pr.mjs',
+  setuppr: 'scripts/setup_pr.mjs',
+  setupPR: 'scripts/setup_pr.mjs',
+
+  'review-pr': 'scripts/review_pr.mjs',
+  reviewpr: 'scripts/review_pr.mjs',
+  reviewPR: 'scripts/review_pr.mjs',
+
+  import: 'scripts/import.mjs',
+  review: 'scripts/review.mjs',
+  edison: 'scripts/edison.mjs',
+  'profile-processes': 'scripts/profile_processes.mjs',
+  profileprocesses: 'scripts/profile_processes.mjs',
+  profileProcesses: 'scripts/profile_processes.mjs',
+
+  'profile-mobile-scenario': 'scripts/profile_mobile_scenario.mjs',
+  profilemobilescenario: 'scripts/profile_mobile_scenario.mjs',
+  profileMobileScenario: 'scripts/profile_mobile_scenario.mjs',
+};
+
+async function main() {
+  const rootDir = getRootDir(import.meta.url);
+  const argv = process.argv.slice(2);
+  const { flags } = parseArgs(argv);
+  const json = wantsJson(argv, { flags });
+
+  const positionals = argv.filter((a) => !a.startsWith('--'));
+  const cmd = (positionals[0] ?? '').trim();
+
+  const scriptRel = TOOL_SCRIPTS[cmd];
+
+  // If the user asked for help for a specific tool, delegate to that tool's script.
+  if (wantsHelp(argv, { flags }) && scriptRel && cmd && cmd !== 'help') {
+    const idx = argv.indexOf(cmd);
+    const forwarded = idx === -1 ? argv.slice(1) : [...argv.slice(0, idx), ...argv.slice(idx + 1)];
+    await run(process.execPath, [join(rootDir, scriptRel), ...forwarded], { cwd: rootDir, env: process.env });
+    return;
+  }
+
+  if (wantsHelp(argv, { flags }) || !cmd || cmd === 'help') {
+    printResult({
+      json,
+      data: { commands: ['setup-pr', 'review-pr', 'import', 'review', 'edison', 'profile-processes', 'profile-mobile-scenario'] },
+      text: [
+        '[tools] usage:',
+        '  hstack tools setup-pr --repo=<pr-url|number> [--dev|--start] [--json] [-- ...]',
+        '  hstack tools review-pr --repo=<pr-url|number> [--dev|--start] [--json] [-- ...]',
+        '  hstack tools import [--json]',
+        '  hstack tools review [ui|cli|server|all] [--json]',
+        '  hstack tools edison [--stack=<name>] -- <edison args...>',
+        '  hstack tools profile-processes --pid=<pid>|--command-match=<unique substring> [--duration=30s] [--interval=1s] [--stack-sample=10s] [--memory-map] [--json]',
+        '  hstack tools profile-mobile-scenario --scenario=<name> --udid=<ios-udid> [--execute-flow] [--profile-process] [--json]',
+      ].join('\n'),
+    });
+    return;
+  }
+
+  if (!scriptRel) {
+    throw new Error(`[tools] unknown tool: ${cmd}`);
+  }
+
+  const idx = argv.indexOf(cmd);
+  const forwarded = idx === -1 ? argv.slice(1) : [...argv.slice(0, idx), ...argv.slice(idx + 1)];
+  if (scriptRel === 'scripts/profile_processes.mjs') {
+    const { runProfileProcessesCli } = await import('./profile_processes.mjs');
+    await runProfileProcessesCli(forwarded);
+    return;
+  }
+  if (scriptRel === 'scripts/profile_mobile_scenario.mjs') {
+    const { runProfileMobileScenarioCli } = await import('./profile_mobile_scenario.mjs');
+    await runProfileMobileScenarioCli(forwarded);
+    return;
+  }
+  await run(process.execPath, [join(rootDir, scriptRel), ...forwarded], { cwd: rootDir, env: process.env });
+}
+
+main().catch((err) => {
+  console.error('[tools] failed:', err);
+  process.exit(1);
+});

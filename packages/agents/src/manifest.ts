@@ -1,0 +1,633 @@
+import type { AgentCore, AgentId } from './types.js';
+import { getProviderCliRuntimeSpec } from './providers/providerCliRuntime.js';
+
+export const DEFAULT_AGENT_ID: AgentId = 'claude';
+
+const NO_NATIVE_IMAGE_GENERATION = 'unsupported' as const;
+const GENERIC_SESSION_MEDIA_OUTPUT = 'supported' as const;
+const EXPERIMENTAL_SESSION_MEDIA_OUTPUT = 'experimental' as const;
+
+function providerDetectKey(agentId: AgentId): string {
+    return getProviderCliRuntimeSpec(agentId).binaryName;
+}
+
+export const AGENTS_CORE = {
+    claude: {
+        id: 'claude',
+        cliSubcommand: 'claude',
+        detectKey: providerDetectKey('claude'),
+        flavorAliases: [],
+        cloudConnect: { vendorKey: 'anthropic', status: 'wired' },
+        connectedServices: {
+            supportedServiceIds: ['claude-subscription', 'anthropic'],
+            sessionAuthSwitch: {
+                continuityMode: 'restart_same_home',
+                supportedTransitions: ['same_connected_group'],
+                providerStateSharingRequired: {
+                    serviceIds: ['claude-subscription', 'anthropic'],
+                    supportedTransitions: ['native_to_connected', 'connected_to_native', 'connected_to_connected'],
+                },
+            },
+            providerStateSharing: {
+                config: {
+                    supported: true,
+                    modes: ['linked', 'copied', 'isolated'],
+                },
+                state: {
+                    supported: true,
+                    modes: ['isolated', 'shared'],
+                    sharedStatePrivacyRiskAcknowledgementRequired: true,
+                },
+            },
+            supportedKindsByServiceId: {
+                'claude-subscription': ['oauth', 'token'],
+                anthropic: ['token'],
+            },
+        },
+        resume: {
+            vendorResume: 'supported',
+            vendorResumeIdField: 'claudeSessionId',
+            // The Agent's own session-log POINTER for the handoff brief, not a
+            // resume gate (`AM-24`). The predecessor key name is retained
+            // deliberately — see `AgentResumeConfig`.
+            vendorResumeContinuityProofField: 'claudeTranscriptPath',
+        },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+            usageLimitRecovery: { checkNow: 'supported' },
+        },
+        handoff: { vendorStateTransfer: 'supported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        runtimeInput: {
+            inFlightSteerSupported: true,
+            terminalPromptInjectionSupported: true,
+        },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'supported',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    codex: {
+        id: 'codex',
+        cliSubcommand: 'codex',
+        detectKey: providerDetectKey('codex'),
+        flavorAliases: ['codex-acp', 'codex-mcp', 'openai', 'gpt'],
+        cloudConnect: { vendorKey: 'openai', status: 'wired' },
+        connectedServices: {
+            supportedServiceIds: ['openai-codex', 'openai'],
+            quotaResetServiceIds: ['openai-codex'],
+            sessionAuthSwitch: {
+                continuityMode: 'restart_shared_state_required',
+                supportedTransitions: ['same_connected_group'],
+                providerStateSharingRequired: {
+                    serviceIds: ['openai-codex'],
+                    supportedTransitions: ['native_to_connected', 'connected_to_native', 'connected_to_connected'],
+                },
+            },
+            providerStateSharing: {
+                config: {
+                    supported: true,
+                    modes: ['linked', 'copied', 'isolated'],
+                },
+                state: {
+                    supported: true,
+                    modes: ['isolated', 'shared'],
+                    sharedStatePrivacyRiskAcknowledgementRequired: true,
+                },
+            },
+            supportedKindsByServiceId: {
+                'openai-codex': ['oauth'],
+                openai: ['token'],
+            },
+        },
+        resume: { vendorResume: 'experimental', vendorResumeIdField: 'codexSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionFork: { conversation: 'supported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'supported' },
+            usageLimitRecovery: { checkNow: 'supported' },
+        },
+        runtimeKinds: {
+            defaultKind: 'appServer',
+            byKind: {
+                mcp: {
+                    kind: 'mcp',
+                    overrides: {
+                        resume: { vendorResume: 'unsupported' },
+                        sessionCapabilities: {
+                            sessionFork: { conversation: 'unsupported' },
+                            sessionRollback: { conversation: 'unsupported' },
+                            usageLimitRecovery: { checkNow: 'unsupported' },
+                        },
+                        handoff: { vendorStateTransfer: 'unsupported' },
+                        localControl: null,
+                        media: { nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION },
+                    },
+                },
+                acp: {
+                    kind: 'acp',
+                    overrides: {
+                        sessionCapabilities: {
+                            sessionFork: { conversation: 'unsupported' },
+                            sessionRollback: { conversation: 'unsupported' },
+                            usageLimitRecovery: { checkNow: 'unsupported' },
+                        },
+                        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+                        media: { nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION },
+                    },
+                },
+                appServer: {
+                    kind: 'appServer',
+                    overrides: {
+                        localControl: { supported: true, topology: 'shared', attachStrategy: 'provider_attach' },
+                    },
+                },
+            },
+        },
+        handoff: { vendorStateTransfer: 'experimental', requiresExplicitSessionId: true },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'supported',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: 'supported',
+        },
+    },
+    opencode: {
+        id: 'opencode',
+        cliSubcommand: 'opencode',
+        detectKey: providerDetectKey('opencode'),
+        flavorAliases: ['open-code'],
+        cloudConnect: null,
+        connectedServices: {
+            supportedServiceIds: ['openai-codex', 'openai', 'claude-subscription', 'anthropic'],
+            sessionAuthSwitch: {
+                continuityMode: 'restart_same_home',
+                supportedTransitions: ['native_to_connected', 'connected_to_native', 'connected_to_connected'],
+            },
+            supportedKindsByServiceId: {
+                'openai-codex': ['oauth'],
+                openai: ['token'],
+                // OpenCode brokers Claude subscription OAuth (browser login) + setup-token via the
+                // Happier daemon broker (Bearer + anthropic-beta), so both kinds are selectable.
+                // Anthropic stays token-only (Console API key, x-api-key).
+                'claude-subscription': ['oauth', 'token'],
+                anthropic: ['token'],
+            },
+        },
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'opencodeSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            // Server dialect is detected only after the runtime connects. This
+            // static declaration must therefore describe the least capable
+            // reachable server: pure V2 has no session-fork route.
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+            usageLimitRecovery: { checkNow: 'supported' },
+        },
+        runtimeKinds: {
+            defaultKind: 'server',
+            byKind: {
+                server: { kind: 'server' },
+                acp: {
+                    kind: 'acp',
+                    overrides: {
+                        sessionStorage: { direct: false },
+                        sessionCapabilities: {
+                            sessionFork: { conversation: 'supported', fromMessage: 'unsupported' },
+                            usageLimitRecovery: { checkNow: 'unsupported' },
+                        },
+                        localControl: null,
+                    },
+                },
+            },
+        },
+        handoff: { vendorStateTransfer: 'supported' },
+        localControl: { supported: true, topology: 'shared', attachStrategy: 'provider_attach' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    gemini: {
+        id: 'gemini',
+        cliSubcommand: 'gemini',
+        detectKey: providerDetectKey('gemini'),
+        flavorAliases: [],
+        cloudConnect: { vendorKey: 'gemini', status: 'wired' },
+        connectedServices: {
+            supportedServiceIds: ['gemini'],
+            sessionAuthSwitch: {
+                continuityMode: 'restart_same_home',
+                supportedTransitions: ['native_to_connected', 'connected_to_connected'],
+            },
+            supportedKindsByServiceId: {
+                gemini: ['oauth'],
+            },
+        },
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'geminiSessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+            usageLimitRecovery: { checkNow: 'supported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'supported',
+            emitsSessionMedia: 'unsupported',
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    auggie: {
+        id: 'auggie',
+        cliSubcommand: 'auggie',
+        detectKey: providerDetectKey('auggie'),
+        flavorAliases: [],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'auggieSessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: EXPERIMENTAL_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    qwen: {
+        id: 'qwen',
+        cliSubcommand: 'qwen',
+        detectKey: providerDetectKey('qwen'),
+        flavorAliases: ['qwen-code'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'qwenSessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    kimi: {
+        id: 'kimi',
+        cliSubcommand: 'kimi',
+        detectKey: providerDetectKey('kimi'),
+        flavorAliases: ['kimi-cli'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'kimiSessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'supported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        // Kimi Code's ACP initialize advertises `mcpCapabilities.http`/`.sse` (see the
+        // runtime fingerprint in the CLI's Kimi discovery owner), and the built-in ACP
+        // config passes Happier's MCP descriptors on session/new and session/load.
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    kilo: {
+        id: 'kilo',
+        cliSubcommand: 'kilo',
+        detectKey: providerDetectKey('kilo'),
+        flavorAliases: ['kilocode'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'kiloSessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    kiro: {
+        id: 'kiro',
+        cliSubcommand: 'kiro',
+        detectKey: providerDetectKey('kiro'),
+        flavorAliases: ['kiro-cli'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'experimental', vendorResumeIdField: 'kiroSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    devin: {
+        id: 'devin',
+        cliSubcommand: 'devin',
+        detectKey: providerDetectKey('devin'),
+        flavorAliases: ['devin-cli'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'devinSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        runtimeInput: {
+            inFlightSteerSupported: false,
+            terminalPromptInjectionSupported: false,
+        },
+        // Devin loads session MCP servers through its provider-owned process config adapter.
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    customAcp: {
+        id: 'customAcp',
+        cliSubcommand: 'customAcp',
+        detectKey: providerDetectKey('customAcp'),
+        flavorAliases: ['custom-acp'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'unsupported' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    pi: {
+        id: 'pi',
+        cliSubcommand: 'pi',
+        detectKey: providerDetectKey('pi'),
+        flavorAliases: ['pi-coding-agent'],
+        cloudConnect: null,
+        connectedServices: {
+            supportedServiceIds: ['openai-codex', 'openai', 'claude-subscription', 'anthropic'],
+            sessionAuthSwitch: {
+                continuityMode: 'restart_same_home',
+                supportedTransitions: ['connected_to_connected'],
+                providerStateSharingRequired: {
+                    supportedTransitions: ['native_to_connected', 'connected_to_native', 'connected_to_connected'],
+                },
+            },
+            providerStateSharing: {
+                config: {
+                    supported: false,
+                    modes: ['isolated'],
+                    unavailableReason: 'not_implemented',
+                },
+                state: {
+                    supported: true,
+                    modes: ['isolated', 'shared'],
+                    sharedStatePrivacyRiskAcknowledgementRequired: true,
+                },
+            },
+            supportedKindsByServiceId: {
+                'openai-codex': ['oauth'],
+                openai: ['token'],
+                'claude-subscription': ['oauth', 'token'],
+                anthropic: ['token'],
+            },
+        },
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'piSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+            usageLimitRecovery: { checkNow: 'supported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        runtimeInput: {
+            inFlightSteerSupported: true,
+            terminalPromptInjectionSupported: false,
+        },
+        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: EXPERIMENTAL_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    copilot: {
+        id: 'copilot',
+        cliSubcommand: 'copilot',
+        detectKey: providerDetectKey('copilot'),
+        flavorAliases: ['github-copilot', 'copilot-cli'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'copilotSessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    cursor: {
+        id: 'cursor',
+        cliSubcommand: 'cursor',
+        detectKey: providerDetectKey('cursor'),
+        flavorAliases: ['cursor-agent'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: {
+            vendorResume: 'experimental',
+            vendorResumeIdField: 'cursorSessionId',
+            experimentalResumePolicy: 'runtime_checked',
+        },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'unsupported',
+            emitsSessionMedia: 'supported',
+            nativeImageGeneration: 'supported',
+        },
+    },
+    grok: {
+        id: 'grok',
+        cliSubcommand: 'grok',
+        detectKey: providerDetectKey('grok'),
+        flavorAliases: ['grok-build', 'grok-cli'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: {
+            vendorResume: 'experimental',
+            vendorResumeIdField: 'grokSessionId',
+            experimentalResumePolicy: 'runtime_checked',
+        },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'unsupported' },
+        runtimeInput: {
+            inFlightSteerSupported: true,
+            terminalPromptInjectionSupported: false,
+        },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'unsupported',
+            emitsSessionMedia: 'unsupported',
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    agy: {
+        id: 'agy',
+        cliSubcommand: 'agy',
+        detectKey: providerDetectKey('agy'),
+        flavorAliases: [],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'agySessionId' },
+        // The managed ACP server owns an opaque provider session id, but Happier does not
+        // read an Agy-native transcript store directly.
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        // Interactive `agy` stays the system-first terminal/local-control surface.
+        // The managed `agy_acp_server` ACP transport never shares session identity with it
+        // until a real create → list/load round trip proves equivalence.
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    fx: {
+        id: 'fx',
+        cliSubcommand: 'fx',
+        detectKey: providerDetectKey('fx'),
+        flavorAliases: [],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'fxSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'supported',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    droid: {
+        id: 'droid',
+        cliSubcommand: 'droid',
+        detectKey: providerDetectKey('droid'),
+        flavorAliases: ['factory-droid'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'droidSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+} as const satisfies Record<AgentId, AgentCore>;

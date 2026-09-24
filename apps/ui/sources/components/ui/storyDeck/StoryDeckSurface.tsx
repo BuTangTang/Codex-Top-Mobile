@@ -1,0 +1,350 @@
+import * as React from 'react';
+import {
+    ScrollView,
+    View,
+    useWindowDimensions,
+    type LayoutChangeEvent,
+    type NativeScrollEvent,
+    type NativeSyntheticEvent,
+} from 'react-native';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+
+import { Image as ExpoImage } from 'expo-image';
+import type { StoryDeckCard, StoryDeckMediaSurface } from '@/changelog/releaseNotes/types';
+import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
+import {
+    StoryDeckSlideTransition,
+    type StoryDeckSlideTransitionHandle,
+    type StoryDeckSlideTransitionRole,
+} from '@/components/ui/motion';
+
+import { StoryDeckA11yAnnouncements } from './StoryDeckA11yAnnouncements';
+import { StoryDeckFooterActions } from './StoryDeckFooterActions';
+import { StoryDeckFrame } from './StoryDeckFrame';
+import { StoryDeckImageCard } from './StoryDeckImageCard';
+import { StoryDeckListCard } from './StoryDeckListCard';
+import { StoryDeckVideoCard } from './StoryDeckVideoCard';
+import { StoryDeckKeyboardShortcuts } from './StoryDeckKeyboardShortcuts';
+import {
+    resolveStoryDeckImageSources,
+    resolveStoryDeckMediaSources,
+    resolveStoryDeckPosterImageSources,
+    type StoryDeckImageSource,
+} from './StoryDeckMediaSources';
+import { resolveStoryDeckPresentation, type StoryDeckCardLayout } from './storyDeckPresentation';
+
+export type StoryDeckSlideAnimation = 'pager' | 'softBlur';
+
+export type StoryDeckSurfaceProps = Readonly<{
+    cards: ReadonlyArray<StoryDeckCard>;
+    onComplete: () => void;
+    onDismiss?: () => void;
+    onSecondaryAction?: () => void;
+    secondaryActionLabel?: string;
+    slideAnimation?: StoryDeckSlideAnimation;
+    alternateWideMediaPlacement?: boolean;
+    testID?: string;
+}>;
+
+function prefetchRemoteStoryDeckImageSources(sources: readonly StoryDeckImageSource[]): void {
+    for (const source of sources) {
+        if (source.kind === 'remote') {
+            void ExpoImage.prefetch(source.uri);
+        }
+    }
+}
+
+const stylesheet = StyleSheet.create({
+    container: {
+        flex: 1,
+        minHeight: 0,
+    },
+    pager: {
+        flex: 1,
+        overflow: 'hidden',
+    },
+    page: {
+        flex: 1,
+        overflow: 'hidden',
+    },
+});
+
+function getCardTitleKey(card: StoryDeckCard): string {
+    return card.titleKey;
+}
+
+export function StoryDeckSurface(props: StoryDeckSurfaceProps) {
+    useUnistyles();
+    const styles = stylesheet;
+    const { width: viewportWidth } = useWindowDimensions();
+    const reducedMotion = useReducedMotionPreference();
+    const scrollRef = React.useRef<ScrollView | null>(null);
+    const softSlideRef = React.useRef<StoryDeckSlideTransitionHandle | null>(null);
+    const [currentIndex, setCurrentIndex] = React.useState(0);
+    const [measuredWidth, setMeasuredWidth] = React.useState<number | null>(null);
+    // F13.3 — footer-button debounce while a soft-blur transition is in
+    // flight. Set to true when we dispatch a commitNext/commitPrevious; the
+    // parent commit handlers below clear it once the spring callback fires
+    // and `setCurrentIndex` runs. Spammed presses while in flight are dropped
+    // so the deck never double-advances or skips content.
+    const [isSoftSlideTransitioning, setIsSoftSlideTransitioning] = React.useState(false);
+    const slideAnimation = props.slideAnimation ?? 'pager';
+    const usesPager = slideAnimation === 'pager';
+    const presentation = React.useMemo(
+        () => resolveStoryDeckPresentation(viewportWidth),
+        [viewportWidth],
+    );
+
+    const totalCount = props.cards.length;
+    const isLastSlide = currentIndex >= totalCount - 1;
+    const fallbackPageWidth = presentation.cardLayout === 'wide'
+        ? Math.min(viewportWidth - 32, presentation.frameMaxWidth)
+        : viewportWidth;
+    const pageWidth = measuredWidth && measuredWidth > 0 ? measuredWidth : fallbackPageWidth;
+
+    React.useEffect(() => {
+        // Prefetch the first card's image and the next card's image where applicable.
+        if (props.cards.length === 0) return;
+        for (let i = 0; i < Math.min(2, props.cards.length); i += 1) {
+            const card = props.cards[i];
+            if (!card) continue;
+            if (card.kind !== 'image' && card.kind !== 'video') continue;
+            if (card.kind === 'image') {
+                prefetchRemoteStoryDeckImageSources(resolveStoryDeckImageSources(card.media, {
+                    surface: presentation.mediaSurface,
+                }).sources);
+                continue;
+            }
+            for (const url of resolveStoryDeckMediaSources(card.media, { surface: presentation.mediaSurface }).urls) {
+                void ExpoImage.prefetch(url);
+            }
+            prefetchRemoteStoryDeckImageSources(resolveStoryDeckPosterImageSources(card.media, {
+                surface: presentation.mediaSurface,
+            }).sources);
+        }
+    }, [presentation.mediaSurface, props.cards]);
+
+    const setIndex = React.useCallback((nextIndex: number, animated: boolean) => {
+        const safeIndex = Math.max(0, Math.min(nextIndex, totalCount - 1));
+        setCurrentIndex(safeIndex);
+        if (usesPager) {
+            scrollRef.current?.scrollTo({ x: safeIndex * pageWidth, animated: animated && !reducedMotion });
+        }
+    }, [pageWidth, reducedMotion, totalCount, usesPager]);
+
+    const advanceToNext = React.useCallback(() => {
+        setCurrentIndex((current) => Math.min(current + 1, totalCount - 1));
+        // F13.3 — clear the in-flight debounce flag once the parent commit
+        // handler runs (the soft-blur spring has settled).
+        setIsSoftSlideTransitioning(false);
+    }, [totalCount]);
+
+    const advanceToPrevious = React.useCallback(() => {
+        setCurrentIndex((current) => Math.max(current - 1, 0));
+        setIsSoftSlideTransitioning(false);
+    }, []);
+
+    const handleLayout = React.useCallback((event: LayoutChangeEvent) => {
+        const nextWidth = event.nativeEvent.layout.width;
+        if (nextWidth <= 0) return;
+        setMeasuredWidth((current) => (current === nextWidth ? current : nextWidth));
+    }, []);
+
+    const handlePrimary = React.useCallback(() => {
+        if (isLastSlide) {
+            props.onComplete();
+            return;
+        }
+        if (!usesPager && softSlideRef.current) {
+            // F13.3 — drop spam presses while the previous commit spring is
+            // still in flight. Otherwise rapid taps could enqueue multiple
+            // advances. The primitive itself also single-flights commits, but
+            // gating at the surface gives us a place to wire visual feedback
+            // (disabled/dim button) in a follow-up without further plumbing.
+            if (isSoftSlideTransitioning) return;
+            setIsSoftSlideTransitioning(true);
+            // Drive the same spring as a swipe-release so Continue and swipe
+            // produce identical motion. Bounds are honored inside the handle.
+            softSlideRef.current.commitNext();
+            return;
+        }
+        setIndex(currentIndex + 1, true);
+    }, [isLastSlide, isSoftSlideTransitioning, currentIndex, setIndex, props, usesPager]);
+
+    const handleBack = React.useCallback(() => {
+        if (currentIndex <= 0) return;
+        if (!usesPager && softSlideRef.current) {
+            if (isSoftSlideTransitioning) return;
+            setIsSoftSlideTransitioning(true);
+            softSlideRef.current.commitPrevious();
+            return;
+        }
+        setIndex(currentIndex - 1, true);
+    }, [currentIndex, isSoftSlideTransitioning, setIndex, usesPager]);
+
+    const handleScrollEnd = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+        if (pageWidth <= 0) return;
+        const offsetX = event.nativeEvent.contentOffset.x;
+        const nextIndex = Math.round(offsetX / pageWidth);
+        if (nextIndex !== currentIndex) {
+            setCurrentIndex(Math.max(0, Math.min(nextIndex, totalCount - 1)));
+        }
+    }, [currentIndex, pageWidth, totalCount]);
+
+    const renderSoftSlideItem = React.useCallback(
+        (index: number, _role: StoryDeckSlideTransitionRole): React.ReactNode => {
+            const card = props.cards[index];
+            if (!card) return null;
+            return (
+                <View
+                    style={[styles.page, { width: pageWidth }]}
+                    testID={`${props.testID ?? 'story-deck'}-page-${index}`}
+                >
+                    {renderCard(
+                        card,
+                        index === currentIndex,
+                        `${props.testID ?? 'story-deck'}-card-${index}`,
+                        presentation.mediaSurface,
+                        presentation.cardLayout,
+                        index,
+                        pageWidth,
+                        props.alternateWideMediaPlacement === true,
+                    )}
+                </View>
+            );
+        },
+        [
+            props.cards,
+            props.testID,
+            props.alternateWideMediaPlacement,
+            currentIndex,
+            pageWidth,
+            presentation.mediaSurface,
+            presentation.cardLayout,
+            styles.page,
+        ],
+    );
+
+    const currentCard = props.cards[currentIndex];
+
+    return (
+        <View
+            style={styles.container}
+            testID={props.testID ?? 'story-deck-surface'}
+            onLayout={handleLayout}
+        >
+            <StoryDeckA11yAnnouncements
+                currentIndex={currentIndex}
+                totalCount={totalCount}
+                currentTitleKey={currentCard ? getCardTitleKey(currentCard) : ''}
+            />
+            <StoryDeckKeyboardShortcuts
+                onAdvance={handlePrimary}
+                onBack={currentIndex > 0 ? handleBack : undefined}
+                onDismiss={props.onDismiss}
+            />
+            <StoryDeckFrame
+                currentIndex={currentIndex}
+                totalCount={totalCount}
+                footer={(
+                    <StoryDeckFooterActions
+                        isLastSlide={isLastSlide}
+                        onPrimary={handlePrimary}
+                        onSecondary={props.onSecondaryAction}
+                        secondaryLabel={props.secondaryActionLabel}
+                        testID={`${props.testID ?? 'story-deck'}-footer`}
+                    />
+                )}
+            >
+                {usesPager ? (
+                    <ScrollView
+                        ref={scrollRef}
+                        style={styles.pager}
+                        horizontal
+                        pagingEnabled
+                        showsHorizontalScrollIndicator={false}
+                        onMomentumScrollEnd={handleScrollEnd}
+                        keyboardShouldPersistTaps="handled"
+                    >
+                        {props.cards.map((card, index) => (
+                            <View
+                                key={`${card.kind}-${index}`}
+                                style={[styles.page, { width: pageWidth }]}
+                                testID={`${props.testID ?? 'story-deck'}-page-${index}`}
+                            >
+                                {renderCard(
+                                    card,
+                                    index === currentIndex,
+                                    `${props.testID ?? 'story-deck'}-card-${index}`,
+                                    presentation.mediaSurface,
+                                    presentation.cardLayout,
+                                    index,
+                                    pageWidth,
+                                    props.alternateWideMediaPlacement === true,
+                                )}
+                            </View>
+                        ))}
+                    </ScrollView>
+                ) : (
+                    <StoryDeckSlideTransition
+                        ref={softSlideRef}
+                        activeIndex={currentIndex}
+                        itemCount={totalCount}
+                        renderItem={renderSoftSlideItem}
+                        onCommitNext={advanceToNext}
+                        onCommitPrevious={advanceToPrevious}
+                        blur
+                        preset="soft"
+                        reducedMotion={reducedMotion}
+                        style={styles.pager}
+                        testID={`${props.testID ?? 'story-deck'}-soft-slide`}
+                    />
+                )}
+            </StoryDeckFrame>
+        </View>
+    );
+}
+
+function renderCard(
+    card: StoryDeckCard,
+    isCurrent: boolean,
+    testID: string,
+    mediaSurface: StoryDeckMediaSurface,
+    layout: StoryDeckCardLayout,
+    index: number,
+    initialContainerWidth: number,
+    alternateWideMediaPlacement: boolean,
+): React.ReactNode {
+    const mediaPlacement = layout === 'wide' && alternateWideMediaPlacement && index % 2 === 1 ? 'end' : 'start';
+
+    switch (card.kind) {
+        case 'list':
+            return <StoryDeckListCard card={card} layout={layout} testID={testID} />;
+        case 'image':
+            return (
+                <StoryDeckImageCard
+                    card={card}
+                    isCurrent={isCurrent}
+                    mediaSurface={mediaSurface}
+                    layout={layout}
+                    mediaPlacement={mediaPlacement}
+                    initialContainerWidth={initialContainerWidth}
+                    testID={testID}
+                />
+            );
+        case 'video':
+            return (
+                <StoryDeckVideoCard
+                    card={card}
+                    isCurrent={isCurrent}
+                    mediaSurface={mediaSurface}
+                    layout={layout}
+                    mediaPlacement={mediaPlacement}
+                    initialContainerWidth={initialContainerWidth}
+                    testID={testID}
+                />
+            );
+        default:
+            return null;
+    }
+}

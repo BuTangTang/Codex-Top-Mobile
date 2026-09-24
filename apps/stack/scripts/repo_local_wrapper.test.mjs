@@ -1,0 +1,569 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { dirname, join } from 'node:path';
+import { createServer } from 'node:net';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+import { runNodeCapture as runNode } from './testkit/core/run_node_capture.mjs';
+import { resolveStablePortStart } from './utils/expo/metro_ports.mjs';
+
+async function listenOnPort(port) {
+  const srv = createServer((socket) => {
+    // Tests use this only as a port reservation primitive. If something external
+    // (e.g. a browser tab) connects, immediately close the socket so server.close()
+    // cannot hang waiting for long-lived connections to drain.
+    try {
+      socket.destroy();
+    } catch {
+      // ignore
+    }
+  });
+  await new Promise((resolve, reject) => {
+    srv.once('error', reject);
+    srv.listen({ host: '127.0.0.1', port }, () => resolve());
+  });
+  return srv;
+}
+
+async function reserveStableStartPort({ stackName, baseCandidates, range }) {
+  for (const base of baseCandidates) {
+    const startPort = resolveStablePortStart({
+      env: {
+        HAPPIER_STACK_SERVER_PORT_BASE: String(base),
+        HAPPIER_STACK_SERVER_PORT_RANGE: String(range),
+      },
+      stackName,
+      baseKey: 'HAPPIER_STACK_SERVER_PORT_BASE',
+      rangeKey: 'HAPPIER_STACK_SERVER_PORT_RANGE',
+      defaultBase: base,
+      defaultRange: range,
+    });
+    try {
+      const server = await listenOnPort(startPort);
+      return { base, range, startPort, server };
+    } catch {
+      // Port in use; try another base.
+    }
+  }
+  throw new Error(`failed to reserve a stable start port (bases=${baseCandidates.join(', ')}, range=${range})`);
+}
+
+test('repo-local wrapper dry-run prints hstack invocation with repo-local env', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'dev', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: { ...process.env, HAPPIER_STACK_CLI_ROOT_DIR: '/some/other/install' },
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.cwd, repoRoot);
+  assert.equal(data.cmd, process.execPath);
+  assert.ok(Array.isArray(data.args), 'expected args array');
+  assert.equal(
+    data.args[0],
+    join(repoRoot, 'apps', 'stack', 'bin', 'hstack.mjs'),
+    'expected wrapper to invoke repo-local hstack bin'
+  );
+  assert.equal(data.args[1], 'dev');
+
+  assert.equal(data.env.HAPPIER_STACK_CLI_ROOT_DISABLE, '1');
+  assert.equal(data.env.HAPPIER_STACK_REPO_DIR, repoRoot);
+  assert.ok(String(data.env.HAPPIER_STACK_STACK ?? '').trim() !== '', 'expected stackless wrapper to scope to a non-main stack name');
+  assert.ok(String(data.env.HAPPIER_STACK_ENV_FILE ?? '').trim() !== '', 'expected wrapper to set a stack env file path for stack-scoped commands');
+  assert.ok(String(data.env.HAPPIER_STACK_CLI_HOME_DIR ?? '').trim() !== '', 'expected wrapper to set a stack-scoped CLI home dir');
+  assert.ok(String(data.env.HAPPIER_ACTIVE_SERVER_ID ?? '').trim() !== '', 'expected wrapper to set a stack-scoped active server id');
+  assert.ok(String(data.env.HAPPIER_STACK_LOG_TEE_DIR ?? '').trim() !== '', 'expected wrapper to set a stack-scoped log tee dir');
+  assert.ok(String(data.env.HAPPIER_STACK_INVOKED_CWD ?? '').trim() !== '');
+});
+
+test('repo-local wrapper defaults `tui` to mobile-capable `tui dev` when no forwarded args are provided', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'tui', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'tui');
+  assert.equal(data.args[2], 'dev');
+  assert.equal(data.args[3], '--mobile');
+});
+
+test('repo-local execution-host adapter receives the exact original argv before wrapper normalization', { skip: process.platform !== 'darwin' }, async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir);
+  const repoRoot = dirname(dirname(packageRoot));
+  const root = mkdtempSync(join(tmpdir(), 'happier-repo-local-controller-'));
+  const controller = join(root, 'controller.mjs');
+  const stackHome = join(root, 'stack-home');
+  mkdirSync(stackHome, { recursive: true });
+  writeFileSync(controller, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n');
+  writeFileSync(join(stackHome, 'execution-host.json'), JSON.stringify({
+    version: 2,
+    controllerEntrypoint: controller,
+  }));
+  try {
+    const result = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'tui', '--dry-run'],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, HAPPIER_STACK_HOME_DIR: stackHome },
+      },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), [
+      '--workspace-id=0.2',
+      `--local-entrypoint=${join(packageRoot, 'scripts', 'repo_local.mjs')}`,
+      '--',
+      'tui',
+      '--dry-run',
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('repo-local wrapper preserves explicit `tui` forwarded args', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'tui', 'stack', 'dev', 'exp1', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'tui');
+  assert.equal(data.args[2], 'stack');
+  assert.equal(data.args[3], 'dev');
+  assert.equal(data.args[4], 'exp1');
+});
+
+test('repo-local wrapper preserves flag-only tui args', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'tui', '--json', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'tui');
+  assert.equal(data.args[2], '--json');
+});
+
+test('repo-local wrapper preserves explicit tui tauri flags', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'tui', '--tauri', '--mobile', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'tui');
+  assert.equal(data.args[2], '--tauri');
+  assert.equal(data.args[3], '--mobile');
+  assert.equal(data.env.HAPPIER_STACK_CLI_BUILD_MODE, 'always');
+});
+
+test('repo-local wrapper forwards --help when a subcommand is provided', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'auth', '--help', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'auth');
+  assert.equal(data.args[2], '--help');
+});
+
+test('repo-local wrapper maps `stop` to stack stop for the repo-local stack', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'stop', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'stack');
+  assert.equal(data.args[2], 'stop');
+  assert.ok(String(data.args[3] ?? '').trim() !== '');
+});
+
+test('repo-local wrapper maps `mobile:install` to stack mobile:install for the repo-local stack', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'mobile:install', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.equal(data.ok, true);
+  assert.equal(data.args[1], 'stack');
+  assert.equal(data.args[2], 'mobile:install');
+  assert.ok(String(data.args[3] ?? '').trim().startsWith('repo-'), `expected repo-local stack name, got: ${data.args[3]}`);
+
+  // Convenience: default name should be user-friendly (the repo-local stack name can be noisy).
+  assert.ok(
+    data.args.some((a) => String(a).startsWith('--name=')),
+    `expected wrapper to set a default --name=... for mobile:install:\n${JSON.stringify(data.args, null, 2)}`
+  );
+});
+
+test('repo-local wrapper uses a development-friendly default name for `mobile:install --app-env=development`', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir);
+  const repoRoot = dirname(dirname(packageRoot));
+
+  const res = await runNode(
+    [join(packageRoot, 'scripts', 'repo_local.mjs'), 'mobile:install', '--app-env=development', '--dry-run'],
+    {
+      cwd: repoRoot,
+      env: process.env,
+    }
+  );
+  assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+  const data = JSON.parse(res.stdout);
+  assert.ok(
+    data.args.includes('--name=Happier Dev (Local)'),
+    `expected development install to default to a development-friendly app name:\n${JSON.stringify(data.args, null, 2)}`
+  );
+});
+
+test('repo-local wrapper auto-installs deps when node_modules are missing', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const preflightRoot = mkdtempSync(join(tmpdir(), 'happier-repo-local-preflight-'));
+  try {
+    writeFileSync(join(preflightRoot, 'package.json'), JSON.stringify({ name: 'tmp', private: true }));
+
+    const binDir = join(preflightRoot, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const logPath = join(preflightRoot, 'yarn.log');
+    const yarnBin = join(binDir, 'yarn');
+    writeFileSync(
+      yarnBin,
+      [
+        '#!/usr/bin/env node',
+        "import { appendFileSync, mkdirSync } from 'node:fs';",
+        "import { dirname, join } from 'node:path';",
+        'const logPath = process.env.YARN_LOG;',
+        "appendFileSync(logPath, process.argv.slice(2).join(' ') + '\\n');",
+        "if (process.argv.includes('install')) {",
+        "  const nodeModules = join(process.cwd(), 'node_modules');",
+        "  mkdirSync(nodeModules, { recursive: true });",
+        '}',
+        'process.exit(0);',
+      ].join('\n') + '\n',
+    );
+    chmodSync(yarnBin, 0o755);
+
+    const res = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'dev'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH ?? ''}`,
+          YARN_LOG: logPath,
+          HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ROOT: preflightRoot,
+          HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ONLY: '1',
+        },
+      }
+    );
+
+    assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+    const log = readFileSync(logPath, 'utf-8');
+    assert.match(log, /\binstall\b/);
+  } finally {
+    rmSync(preflightRoot, { recursive: true, force: true });
+  }
+});
+
+test('repo-local wrapper leaves existing dependency freshness admission to the stack owner', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir);
+  const repoRoot = dirname(dirname(packageRoot));
+  const preflightRoot = mkdtempSync(join(tmpdir(), 'happier-repo-local-existing-deps-'));
+  try {
+    writeFileSync(join(preflightRoot, 'package.json'), JSON.stringify({ name: 'tmp', private: true }));
+    mkdirSync(join(preflightRoot, 'node_modules'), { recursive: true });
+    const binDir = join(preflightRoot, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const logPath = join(preflightRoot, 'yarn.log');
+    writeFileSync(logPath, '');
+    const yarnBin = join(binDir, 'yarn');
+    writeFileSync(
+      yarnBin,
+      '#!/usr/bin/env node\n' +
+        "import { appendFileSync } from 'node:fs';\n" +
+        "appendFileSync(process.env.YARN_LOG, process.argv.slice(2).join(' ') + '\\n');\n",
+    );
+    chmodSync(yarnBin, 0o755);
+
+    const res = await runNode([join(packageRoot, 'scripts', 'repo_local.mjs'), 'dev'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        YARN_LOG: logPath,
+        HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ROOT: preflightRoot,
+        HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ONLY: '1',
+      },
+    });
+
+    assert.equal(res.code, 0, res.stderr || res.stdout);
+    assert.equal(readFileSync(logPath, 'utf-8'), '');
+  } finally {
+    rmSync(preflightRoot, { recursive: true, force: true });
+  }
+});
+
+test('repo-local wrapper preserves user-defined env keys while managing stack-owned keys', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const stacksRoot = mkdtempSync(join(tmpdir(), 'happier-repo-local-stacks-'));
+  try {
+    // First: compute the repo-local stack env file path without mutating the real repo checkout.
+    // (We use --dry-run so the wrapper doesn't create/update any local state.)
+    const dry = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'dev', '--dry-run'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HAPPIER_STACK_STORAGE_DIR: stacksRoot,
+        },
+      }
+    );
+    assert.equal(dry.code, 0, `expected exit 0, got ${dry.code}\nstdout:\n${dry.stdout}\nstderr:\n${dry.stderr}`);
+    const dryData = JSON.parse(dry.stdout);
+    const envPath = String(dryData?.env?.HAPPIER_STACK_ENV_FILE ?? '').trim();
+    assert.ok(envPath, 'expected dry-run to include HAPPIER_STACK_ENV_FILE');
+
+    // Seed env file with a user-defined key and pinned ports.
+    mkdirSync(dirname(envPath), { recursive: true });
+    writeFileSync(
+      envPath,
+      ['CUSTOM_KEY=1', 'HAPPIER_STACK_SERVER_PORT=9999', 'HAPPIER_STACK_EXPO_DEV_PORT=19999', ''].join('\n')
+    );
+
+    // Next: run a command that exercises the wrapper's env-file sync logic but does not spawn hstack.
+    const res = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'stop'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HAPPIER_STACK_STORAGE_DIR: stacksRoot,
+          HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ONLY: '1',
+        },
+      }
+    );
+    assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+    const updated = readFileSync(envPath, 'utf-8');
+    assert.match(updated, /\bCUSTOM_KEY=1\b/, `expected user key to be preserved:\n${updated}`);
+    assert.match(updated, /\bHAPPIER_STACK_SERVER_PORT=9999\b/, `expected pinned port to be preserved:\n${updated}`);
+    assert.match(updated, /\bHAPPIER_STACK_EXPO_DEV_PORT=19999\b/, `expected pinned expo port to be preserved:\n${updated}`);
+  } finally {
+    rmSync(stacksRoot, { recursive: true, force: true });
+  }
+});
+
+test('repo-local wrapper prunes pinned server port when it falls outside the configured stackless port range', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const stacksRoot = mkdtempSync(join(tmpdir(), 'happier-repo-local-stacks-'));
+  try {
+    const dry = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'dev', '--dry-run'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HAPPIER_STACK_STORAGE_DIR: stacksRoot,
+        },
+      }
+    );
+    assert.equal(dry.code, 0, `expected exit 0, got ${dry.code}\nstdout:\n${dry.stdout}\nstderr:\n${dry.stderr}`);
+    const dryData = JSON.parse(dry.stdout);
+    const envPath = String(dryData?.env?.HAPPIER_STACK_ENV_FILE ?? '').trim();
+    assert.ok(envPath, 'expected dry-run to include HAPPIER_STACK_ENV_FILE');
+
+    // Seed env with a stale pinned port in the legacy range. Stackless is expected to use the
+    // high stable range (default base/range managed by the wrapper).
+    mkdirSync(dirname(envPath), { recursive: true });
+    writeFileSync(
+      envPath,
+      [
+        'CUSTOM_KEY=1',
+        'HAPPIER_STACK_SERVER_PORT_BASE=52005',
+        'HAPPIER_STACK_SERVER_PORT_RANGE=2000',
+        'HAPPIER_STACK_SERVER_PORT=3009',
+        '',
+      ].join('\n')
+    );
+
+    const res = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'stop'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HAPPIER_STACK_STORAGE_DIR: stacksRoot,
+          HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ONLY: '1',
+        },
+      }
+    );
+    assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+
+    const updated = readFileSync(envPath, 'utf-8');
+    assert.match(updated, /\bCUSTOM_KEY=1\b/, `expected user key to be preserved:\n${updated}`);
+    assert.match(updated, /\bHAPPIER_STACK_SERVER_PORT_BASE=52005\b/, `expected base to be preserved:\n${updated}`);
+    assert.match(updated, /\bHAPPIER_STACK_SERVER_PORT_RANGE=2000\b/, `expected range to be preserved:\n${updated}`);
+    assert.doesNotMatch(updated, /\bHAPPIER_STACK_SERVER_PORT=3009\b/, `expected stale pinned port to be pruned:\n${updated}`);
+  } finally {
+    rmSync(stacksRoot, { recursive: true, force: true });
+  }
+});
+
+test('repo-local wrapper persists a stable pinned server port when none is present (service/tailscale pre-start)', async () => {
+  const scriptsDir = dirname(fileURLToPath(import.meta.url));
+  const packageRoot = dirname(scriptsDir); // apps/stack
+  const repoRoot = dirname(dirname(packageRoot)); // repo root
+
+  const stacksRoot = mkdtempSync(join(tmpdir(), 'happier-repo-local-stacks-'));
+  try {
+    const dry = await runNode(
+      [join(packageRoot, 'scripts', 'repo_local.mjs'), 'dev', '--dry-run'],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HAPPIER_STACK_STORAGE_DIR: stacksRoot,
+        },
+      }
+    );
+    assert.equal(dry.code, 0, `expected exit 0, got ${dry.code}\nstdout:\n${dry.stdout}\nstderr:\n${dry.stderr}`);
+    const dryData = JSON.parse(dry.stdout);
+    const envPath = String(dryData?.env?.HAPPIER_STACK_ENV_FILE ?? '').trim();
+    assert.ok(envPath, 'expected dry-run to include HAPPIER_STACK_ENV_FILE');
+    const stackName = String(dryData?.env?.HAPPIER_STACK_STACK ?? '').trim();
+    assert.ok(stackName, 'expected dry-run to include HAPPIER_STACK_STACK');
+
+    // Ensure env exists but does not contain a server port pin yet.
+    mkdirSync(dirname(envPath), { recursive: true });
+    writeFileSync(envPath, ['CUSTOM_KEY=1', ''].join('\n'));
+
+    // Reserve the first stable port to force the wrapper to pick the next free one and persist it.
+    const reserved = await reserveStableStartPort({
+      stackName,
+      baseCandidates: [52005, 54005, 56005, 58005],
+      range: 2000,
+    });
+    try {
+      const res = await runNode(
+        [join(packageRoot, 'scripts', 'repo_local.mjs'), 'service', 'status'],
+        {
+          cwd: repoRoot,
+          env: {
+            ...process.env,
+            HAPPIER_STACK_STORAGE_DIR: stacksRoot,
+            HAPPIER_STACK_SERVER_PORT_BASE: String(reserved.base),
+            HAPPIER_STACK_SERVER_PORT_RANGE: String(reserved.range),
+            HAPPIER_STACK_REPO_LOCAL_AUTO_INSTALL: '0',
+            HAPPIER_STACK_REPO_LOCAL_PREFLIGHT_ONLY: '1',
+          },
+        }
+      );
+      assert.equal(res.code, 0, `expected exit 0, got ${res.code}\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
+    } finally {
+      await new Promise((resolve) => reserved.server.close(() => resolve()));
+    }
+
+    const updated = readFileSync(envPath, 'utf-8');
+    assert.match(updated, /\bCUSTOM_KEY=1\b/, `expected user key to be preserved:\n${updated}`);
+    const m = updated.match(/^HAPPIER_STACK_SERVER_PORT=(\d+)$/m);
+    assert.ok(m, `expected wrapper to persist HAPPIER_STACK_SERVER_PORT:\n${updated}`);
+    const pinned = Number(m?.[1] ?? '');
+    assert.ok(Number.isFinite(pinned) && pinned > 0, `expected pinned port to be numeric, got: ${m?.[1]}`);
+    assert.ok(
+      pinned >= reserved.base && pinned < reserved.base + reserved.range,
+      `expected pinned port within range [${reserved.base}, ${reserved.base + reserved.range}): ${pinned}`
+    );
+    assert.notEqual(pinned, reserved.startPort, `expected wrapper to avoid occupied start port ${reserved.startPort}, got: ${pinned}`);
+  } finally {
+    rmSync(stacksRoot, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,433 @@
+import * as React from 'react';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { renderScreen } from '@/dev/testkit';
+import {
+    installTranscriptCommonModuleMocks,
+    resetTranscriptCommonModuleMockState,
+} from '../transcriptTestHelpers';
+import type {
+    TranscriptForkCommon,
+    TranscriptMessageDisplayCommon,
+    TranscriptToolChromeCommon,
+    TranscriptToolRouteCommon,
+} from '@/components/sessions/transcript/transcriptSessionCommon';
+
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+let messageById: Record<string, any> = {};
+let renderedToolCallsGroupViewProps: any[] = [];
+let renderedToolCallsGroupViewWithCommonProps: any[] = [];
+
+installTranscriptCommonModuleMocks({
+    storage: async () => {
+        const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+        return createStorageModuleStub({
+            useMessagesByIds: (_sessionId: string, messageIds: readonly string[]) =>
+                messageIds.map((id) => messageById[id]).filter(Boolean),
+            useSessionForkSupportSource: () => null,
+            useSessionMessagesById: () => ({}),
+            useSessionMessagesReducerState: () => null,
+            useSessionWorkspacePath: () => null,
+            useSetting: () => null,
+        });
+    },
+});
+
+vi.mock('@/hooks/server/useFeatureEnabled', () => ({
+  useFeatureEnabled: () => false,
+}));
+
+vi.mock('@/components/sessions/transcript/motion/TranscriptEnterWrapper', () => ({
+  TranscriptEnterWrapper: (props: any) => React.createElement(React.Fragment, null, props.children),
+}));
+
+vi.mock('@/components/sessions/transcript/turns/toolCalls/ToolCallsGroupView', () => ({
+  ToolCallsGroupView: (props: any) => {
+    renderedToolCallsGroupViewProps.push(props);
+    return React.createElement('ToolCallsGroupView', props);
+  },
+  ToolCallsGroupViewWithSessionCommon: (props: any) => {
+    renderedToolCallsGroupViewWithCommonProps.push(props);
+    return React.createElement('ToolCallsGroupViewWithSessionCommon', props);
+  },
+}));
+
+function getRenderedToolCallsGroupViewProps() {
+    return [...renderedToolCallsGroupViewProps, ...renderedToolCallsGroupViewWithCommonProps];
+}
+
+describe('ToolCallsGroupRow', () => {
+  beforeEach(() => {
+    messageById = {};
+    renderedToolCallsGroupViewProps = [];
+    renderedToolCallsGroupViewWithCommonProps = [];
+  });
+
+  it('forwards parent-provided transcript session common while keeping row-local tool lookup', async () => {
+    const messageDisplayCommon = {
+      sessionThinkingDisplayMode: 'inline',
+      sessionThinkingInlineChrome: 'plain',
+      sessionThinkingInlinePresentation: 'summary',
+      transcriptMessageTimestampDisplayMode: 'never',
+      transcriptStreamingMarkdownRenderingEnabled: false,
+      transcriptStreamingPartialOutputEnabled: true,
+      transcriptStreamingSettleDelayMs: 0,
+      transcriptStreamingSmoothingEnabled: false,
+      transcriptMessageSelectionEnabled: true,
+      transcriptMessageSendToSessionEnabled: false,
+      debugInformationEnabled: false,
+      workspacePath: null,
+    } satisfies TranscriptMessageDisplayCommon;
+    const forkCommon = {
+      executionRunsEnabled: false,
+      agentSwitchingEnabled: false,
+      sessionForkSupportSource: null,
+      sessionReplayEnabled: false,
+      sessionReplayMaxSeedChars: 120_000,
+      sessionReplayStrategy: 'recent_messages',
+      sessionReplaySummaryRunnerV1: null,
+    } satisfies TranscriptForkCommon;
+    const toolChromeCommon = {
+      toolViewTimelineChromeMode: 'cards',
+      transcriptToolCallsCollapsedPreviewCount: 1,
+      transcriptToolCallsGroupShowBackground: false,
+    } satisfies TranscriptToolChromeCommon;
+    const toolRouteCommon = {
+      messagesById: {},
+      reducerState: null,
+    } satisfies TranscriptToolRouteCommon;
+    const toolMessage = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: null,
+      createdAt: 1,
+      tool: { id: 'bash-1', name: 'Bash', state: 'completed', input: { command: 'pwd' } },
+      children: [],
+    };
+
+    const { ToolCallsGroupRowWithSessionCommon } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRowWithSessionCommon as any, {
+      sessionId: 's1',
+      toolCallsGroupId: 'group-1',
+      toolMessageIds: ['tool-1'],
+      metadata: null,
+      expanded: false,
+      onSetExpanded: () => {},
+      interaction: { canSendMessages: true, canApprovePermissions: true },
+      getMessageById: (messageId: string) => (messageId === 'tool-1' ? toolMessage : null),
+      forkCommon,
+      messageDisplayCommon,
+      toolChromeCommon,
+      toolRouteCommon,
+    }));
+
+    expect(renderedToolCallsGroupViewProps).toHaveLength(0);
+    expect(renderedToolCallsGroupViewWithCommonProps).toEqual([
+      expect.objectContaining({
+        toolMessages: [expect.objectContaining({ id: 'tool-1' })],
+        forkCommon,
+        messageDisplayCommon,
+        toolChromeCommon,
+        toolRouteCommon,
+      }),
+    ]);
+  });
+
+  it('uses the provided local lookup for tool rows that are not yet present in the global store', async () => {
+    const toolMessageOne = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: null,
+      createdAt: 1,
+      tool: { id: 'bash-1', name: 'Bash', state: 'completed', input: { command: 'pwd' } },
+      children: [],
+    };
+    const toolMessageTwo = {
+      kind: 'tool-call',
+      id: 'tool-2',
+      localId: null,
+      createdAt: 2,
+      tool: { id: 'bash-2', name: 'Bash', state: 'running', input: { command: 'ls' } },
+      children: [],
+    };
+
+    const { ToolCallsGroupRow } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRow as any, {
+          sessionId: 's1',
+          toolCallsGroupId: 'group-1',
+          toolMessageIds: ['tool-1', 'tool-2'],
+          metadata: null,
+          expanded: false,
+          onSetExpanded: () => {},
+          interaction: { canSendMessages: true, canApprovePermissions: true },
+          getMessageById: (messageId: string) => {
+            if (messageId === 'tool-1') return toolMessageOne;
+            if (messageId === 'tool-2') return toolMessageTwo;
+            return null;
+          },
+        }));
+
+    expect(getRenderedToolCallsGroupViewProps()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolMessages: [
+            expect.objectContaining({ id: 'tool-1' }),
+            expect.objectContaining({ id: 'tool-2' }),
+          ],
+          status: 'running',
+        }),
+      ]),
+    );
+  });
+
+  it('projects a completed structured tool failure as a failed whole-row group', async () => {
+    const toolMessage = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: null,
+      createdAt: 1,
+      tool: {
+        id: 'bash-1',
+        name: 'Bash',
+        state: 'completed',
+        input: { command: 'happier tools call' },
+        result: {
+          content: [{
+            type: 'text',
+            text: '{"v":1,"ok":false,"kind":"tools_call","error":{"code":"invalid_parameters","message":"invalid_parameters"}}\n\n\nCommand exited with code 1',
+          }],
+          details: {},
+        },
+      },
+      children: [],
+    };
+
+    const { ToolCallsGroupRow } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRow as any, {
+      sessionId: 's1',
+      toolCallsGroupId: 'group-1',
+      toolMessageIds: ['tool-1'],
+      metadata: null,
+      expanded: false,
+      onSetExpanded: () => {},
+      interaction: { canSendMessages: true, canApprovePermissions: true },
+      getMessageById: (messageId: string) => (messageId === 'tool-1' ? toolMessage : null),
+    }));
+
+    expect(getRenderedToolCallsGroupViewProps()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: 'error' }),
+      ]),
+    );
+  });
+
+  it('projects an unavailable tool with a failed Happier envelope in stdout as a failed whole-row group', async () => {
+    const toolMessage = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: null,
+      createdAt: 1,
+      tool: {
+        id: 'delegate-1',
+        name: 'subagents.delegate.start',
+        state: 'unavailable',
+        input: {},
+        result: {
+          stdout: '{"v":1,"ok":false,"kind":"tools_call","error":{"code":"unknown_tool","message":"Unknown built-in Happier tool: subagents.delegate.start"}}\n',
+        },
+      },
+      children: [],
+    };
+
+    const { ToolCallsGroupRow } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRow as any, {
+      sessionId: 's1',
+      toolCallsGroupId: 'group-1',
+      toolMessageIds: ['tool-1'],
+      metadata: null,
+      expanded: false,
+      onSetExpanded: () => {},
+      interaction: { canSendMessages: true, canApprovePermissions: true },
+      getMessageById: (messageId: string) => (messageId === 'tool-1' ? toolMessage : null),
+    }));
+
+    expect(getRenderedToolCallsGroupViewProps()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: 'error' }),
+      ]),
+    );
+  });
+
+  it('forwards tool pin state and callbacks to the whole grouped-tool view', async () => {
+    const onToggleToolPin = vi.fn();
+    const messagePins = [{
+      version: 1,
+      sessionId: 's1',
+      seq: 9,
+      transcriptBlockIndex: 2,
+      routeMessageId: 'local:tool-1',
+      role: 'tool',
+      pinnedAtMs: 1_000,
+      label: null,
+    }];
+    const toolMessage = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: 'tool-1',
+      createdAt: 1,
+      seq: 9,
+      transcriptBlockIndex: 2,
+      tool: { id: 'bash-1', name: 'Bash', state: 'completed', input: { command: 'pwd' } },
+      children: [],
+    };
+
+    const { ToolCallsGroupRow } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRow as any, {
+      sessionId: 's1',
+      toolCallsGroupId: 'group-1',
+      toolMessageIds: ['tool-1'],
+      metadata: null,
+      expanded: false,
+      onSetExpanded: () => {},
+      interaction: { canSendMessages: true, canApprovePermissions: true },
+      getMessageById: (messageId: string) => (messageId === 'tool-1' ? toolMessage : null),
+      messagePins,
+      onToggleToolPin,
+    }));
+
+    expect(getRenderedToolCallsGroupViewProps()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          messagePins,
+          onToggleToolPin,
+        }),
+      ]),
+    );
+  });
+
+  it('keeps pending-permission tool calls visible when the session is inactive (coerced to failed)', async () => {
+    const toolMessageOne = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: null,
+      createdAt: 1,
+      tool: {
+        id: 'mcp-1',
+        name: 'mcp__playwright__browser_navigate',
+        state: 'running',
+        input: { url: 'https://example.com' },
+        permission: { id: 'perm-1', status: 'pending' },
+      },
+      children: [],
+    };
+
+    const { ToolCallsGroupRow } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRow as any, {
+          sessionId: 's1',
+          toolCallsGroupId: 'group-1',
+          toolMessageIds: ['tool-1'],
+          metadata: null,
+          expanded: false,
+          onSetExpanded: () => {},
+          interaction: { canSendMessages: true, canApprovePermissions: false, permissionDisabledReason: 'inactive' },
+          getMessageById: (messageId: string) => {
+            if (messageId === 'tool-1') return toolMessageOne;
+            return null;
+          },
+        }));
+
+    expect(getRenderedToolCallsGroupViewProps()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolMessages: [
+            expect.objectContaining({
+              id: 'tool-1',
+              tool: expect.objectContaining({
+                state: 'error',
+                permission: expect.objectContaining({ status: 'canceled' }),
+              }),
+            }),
+          ],
+        }),
+      ]),
+    );
+  });
+
+  it('keeps completed tool calls visible when the session is inactive (and coerces pending-permission tools to failed)', async () => {
+    const completedToolMessage = {
+      kind: 'tool-call',
+      id: 'tool-1',
+      localId: null,
+      createdAt: 1,
+      tool: {
+        id: 'bash-1',
+        name: 'Bash',
+        state: 'completed',
+        input: { command: 'pwd' },
+        permission: { id: 'perm-1', status: 'approved' },
+      },
+      children: [],
+    };
+    const pendingToolMessage = {
+      kind: 'tool-call',
+      id: 'tool-2',
+      localId: null,
+      createdAt: 2,
+      tool: {
+        id: 'mcp-1',
+        name: 'mcp__playwright__browser_navigate',
+        state: 'running',
+        input: { url: 'https://example.com' },
+        permission: { id: 'perm-2', status: 'pending' },
+      },
+      children: [],
+    };
+
+    const { ToolCallsGroupRow } = await import('./ToolCallsGroupRow');
+
+    await renderScreen(React.createElement(ToolCallsGroupRow as any, {
+          sessionId: 's1',
+          toolCallsGroupId: 'group-1',
+          toolMessageIds: ['tool-1', 'tool-2'],
+          metadata: null,
+          expanded: false,
+          onSetExpanded: () => {},
+          interaction: { canSendMessages: true, canApprovePermissions: false, permissionDisabledReason: 'inactive' },
+          getMessageById: (messageId: string) => {
+            if (messageId === 'tool-1') return completedToolMessage;
+            if (messageId === 'tool-2') return pendingToolMessage;
+            return null;
+          },
+        }));
+
+    expect(getRenderedToolCallsGroupViewProps()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolMessages: [
+            expect.objectContaining({ id: 'tool-1' }),
+            expect.objectContaining({
+              id: 'tool-2',
+              tool: expect.objectContaining({
+                state: 'error',
+                permission: expect.objectContaining({ status: 'canceled' }),
+              }),
+            }),
+          ],
+          status: 'completed',
+        }),
+      ]),
+    );
+  });
+});
+
+afterEach(() => {
+    resetTranscriptCommonModuleMockState();
+});

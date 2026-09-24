@@ -1,0 +1,26 @@
+import { AGENTS_CORE } from '@happier-dev/agents';
+
+import { createAcpSessionListCatalogHook } from '@/agent/acp/catalog/createAcpSessionListCatalogHook';
+
+import { checklists } from './cli/checklists';
+import type { AgentCatalogEntry } from '../types';
+
+export const agent = {
+  id: AGENTS_CORE.kilo.id,
+  cliSubcommand: AGENTS_CORE.kilo.cliSubcommand,
+  getCliCommandHandler: async () => (await import('@/backends/kilo/cli/command')).handleKiloCliCommand,
+  getCliCapabilityOverride: async () => (await import('@/backends/kilo/cli/capability')).cliCapability,
+  getCliDetect: async () => (await import('@/backends/kilo/cli/detect')).cliDetect,
+  getCliAuthSpec: async () => (await import('@/backends/kilo/cli/auth/kiloCliAuthSpec')).kiloCliAuthSpec,
+  vendorResumeSupport: AGENTS_CORE.kilo.resume.vendorResume,
+  ...createAcpSessionListCatalogHook('kilo'),
+  getAcpBackendFactory: async () => {
+    const { createKiloBackend } = await import('@/backends/kilo/acp/backend');
+    return (opts) => ({ backend: createKiloBackend(opts as any) });
+  },
+  getPreflightSessionControlsProbeAdapter: async () => ({
+    failureCacheStrategy: 'cooldown',
+    cliModelsCommandArgs: ['models'],
+  }),
+  checklists,
+} satisfies AgentCatalogEntry;

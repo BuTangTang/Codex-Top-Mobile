@@ -1,0 +1,159 @@
+/* Theme-aware scrollbar styles using Unistyles CSS variables */
+
+::view-transition-image-pair(root) {
+    isolation: auto;
+}
+
+:root {
+    --happier-route-modal-box-shadow: 0 14px 40px rgba(0, 0, 0, 0.16), 0 6px 18px rgba(0, 0, 0, 0.12);
+}
+
+/*
+ * Font rendering. React-Native-Web does not set any smoothing hint, so on macOS the
+ * whole product renders with subpixel antialiasing, which reads noticeably heavier
+ * and blurrier than every native surface next to it. Set once at the root and let it
+ * inherit — no component should ever restate this.
+ */
+html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+@keyframes happierStatusDotPulse {
+    from {
+        opacity: 1;
+    }
+    to {
+        opacity: 0.3;
+    }
+}
+
+@keyframes happierActivitySpinnerSpin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+    animation: none;
+    mix-blend-mode: normal;
+    display: block;
+}
+
+/* Webkit Scrollbars (Chrome, Safari, Edge) */
+::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--colors-surface-inset);
+    border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--colors-border-default);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--colors-text-secondary);
+    background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--colors-surface-inset);
+}
+
+/* Firefox */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--colors-border-default) var(--colors-surface-inset);
+}
+
+/* Expo Router (web) modal sizing
+   - Expo Router uses a Vaul/Radix drawer for `presentation: 'modal'` on web.
+   - Default sizing is a bit short on large screens; override via attribute selectors
+     so we don't rely on hashed classnames. */
+@media (min-width: 700px) {
+    [data-vaul-drawer][data-vaul-drawer-direction="bottom"] [data-presentation="modal"] {
+        /*
+        Desktop web "modal" drawers should size to content by default (no giant empty
+        panel), but still be extensible up to a safe viewport cap.
+        */
+        height: auto !important;
+        min-height: 0 !important;
+        max-height: min(820px, calc(100vh - 96px)) !important;
+        filter: none !important;
+        box-shadow: var(--happier-route-modal-box-shadow) !important;
+        will-change: auto !important;
+    }
+}
+
+/* New session should behave like a full-height bottom sheet on mobile web. */
+@media (max-width: 767px) {
+    html[data-happy-route="new"] [data-vaul-drawer][data-vaul-drawer-direction="bottom"] [data-presentation="modal"] {
+        height: calc(100vh - 0px) !important;
+        max-height: calc(100vh - 0px) !important;
+        min-height: calc(100vh - 0px) !important;
+    }
+}
+
+/* Expo Router / Vaul route modal backdrop.
+   Expo Router owns this element outside BaseModal, but it exposes a CSS variable
+   for the overlay color and stable Vaul data attributes for the backdrop node. */
+[data-vaul-overlay] {
+    --expo-router-modal-overlay-background: var(--colors-overlay-scrim-wizard, rgba(255, 255, 255, 0.52));
+    -webkit-backdrop-filter: blur(2px);
+    backdrop-filter: blur(2px);
+}
+
+html[data-happy-backdrop-blur="off"] [data-vaul-overlay] {
+    --expo-router-modal-overlay-background: var(--colors-overlay-scrim-strong, rgba(0, 0, 0, 0.58));
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+}
+
+/* Ensure scrollbars are visible on hover for macOS */
+::-webkit-scrollbar:horizontal {
+    height: 12px;
+}
+
+::-webkit-scrollbar:vertical {
+    width: 12px;
+}
+
+/* Pierre diffs (web/desktop)
+   - Adjust typography + spacing via Pierre CSS variables.
+   - Prevent browser scroll anchoring jumps while diffs mount/virtualize/syntax-highlight. */
+.happier-pierre-diff-wrapper {
+    --diffs-font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    --diffs-font-size: 12px;
+    --diffs-line-height: 22px;
+    --diffs-tab-size: 2;
+    --diffs-header-font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --diffs-min-number-column-width: 4ch;
+    --diffs-gap-inline: 0;
+    --diffs-gap-block: 0;
+    overflow-anchor: none;
+}
+
+[data-happier-diff-virtual-root] {
+    overflow-anchor: none;
+}
+
+/* SCM review (FlashList) mounts/unmounts large diff blocks; prevent browser scroll anchoring jumps on web. */
+[data-testid="scm-review-list"],
+[data-testid="scm-review-list"] * {
+    overflow-anchor: none;
+}
+
+.happier-pierre-diff-wrapper diffs-container {
+    display: block;
+}

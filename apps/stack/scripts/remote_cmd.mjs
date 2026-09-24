@@ -1,0 +1,329 @@
+import './utils/env/env.mjs';
+
+import { pathToFileURL } from 'node:url';
+import { getReleaseRingCatalogEntry, normalizePublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings';
+import { run } from './utils/proc/proc.mjs';
+import { printResult, wantsHelp, wantsJson } from './utils/cli/cli.mjs';
+
+function takeFlagValue(args, name) {
+  const rest = [];
+  let value = null;
+
+  for (let i = 0; i < args.length; i += 1) {
+    const a = String(args[i] ?? '');
+    if (a === name) {
+      const next = String(args[i + 1] ?? '');
+      if (!next || next.startsWith('--')) {
+        throw new Error(`Missing value for ${name}`);
+      }
+      value = next;
+      i += 1;
+      continue;
+    }
+    if (a.startsWith(`${name}=`)) {
+      const v = a.slice(`${name}=`.length);
+      if (!v) throw new Error(`Missing value for ${name}`);
+      value = v;
+      continue;
+    }
+    rest.push(a);
+  }
+
+  return { value, rest };
+}
+
+function takeFlag(args, name) {
+  const rest = [];
+  let present = false;
+  for (const a of args) {
+    if (!present && a === name) {
+      present = true;
+      continue;
+    }
+    rest.push(a);
+  }
+  return { present, rest };
+}
+
+function safeBashSingleQuote(s) {
+  const raw = String(s ?? '');
+  if (raw === '') return "''";
+  // Wrap in single quotes and escape embedded single quotes safely.
+  // bash: 'foo'\''bar'
+  return `'${raw.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function displayChannel(channel) {
+  const normalized = normalizePublicReleaseRingId(channel);
+  if (!normalized) return String(channel ?? '').trim() || 'stable';
+  return getReleaseRingCatalogEntry(normalized).publicLabel;
+}
+
+function assertPublicChannel(channel, source = '--channel') {
+  const normalized = normalizePublicReleaseRingId(channel);
+  if (!normalized) {
+    throw new Error(`[remote] invalid ${source} value: ${channel} (expected stable|preview|dev)`);
+  }
+  return normalized;
+}
+
+export async function runRemoteDaemonSetupWithDeps(argvRaw, deps = {}) {
+  const resolvedDeps = {
+    runLocalMachineBootstrap: async ({ args }) => {
+      await run('happier', args, { env: process.env });
+    },
+    ...deps,
+  };
+
+  const argv0 = argvRaw.slice();
+  const json = wantsJson(argv0);
+
+  let args = argv0.slice();
+  const ssh = takeFlagValue(args, '--ssh');
+  args = ssh.rest;
+  if (!ssh.value) {
+    process.stderr.write('Missing required flag: --ssh <user@host>\n');
+    process.exit(2);
+  }
+
+  const sshConfigFile = takeFlagValue(args, '--ssh-config-file');
+  args = sshConfigFile.rest;
+  const knownHostsPath = takeFlagValue(args, '--known-hosts-path');
+  args = knownHostsPath.rest;
+  if (knownHostsPath.value) {
+    throw new Error('[remote] --known-hosts-path is not supported for daemon setup; use remote server setup');
+  }
+  const yesFlag = takeFlag(args, '--yes');
+  args = yesFlag.rest;
+
+  const channel = assertPublicChannel(resolveChannel(argv0));
+
+  const service = resolveService(argv0);
+  if (service !== 'user' && service !== 'none') {
+    throw new Error(`[remote] invalid --service value: ${service} (expected user or none)`);
+  }
+
+  const serverUrlFlag = takeFlagValue(args, '--server-url');
+  args = serverUrlFlag.rest;
+  const webappUrlFlag = takeFlagValue(args, '--webapp-url');
+  args = webappUrlFlag.rest;
+  const publicServerUrlFlag = takeFlagValue(args, '--public-server-url');
+  args = publicServerUrlFlag.rest;
+
+  await resolvedDeps.runLocalMachineBootstrap({
+    args: [
+      'machine',
+      'setup',
+      '--ssh',
+      ssh.value,
+      ...(channel === 'stable' ? [] : [`--channel=${channel}`]),
+      `--service-mode=${service}`,
+      ...(sshConfigFile.value ? [`--ssh-config-file=${sshConfigFile.value}`] : []),
+      ...(serverUrlFlag.value ? [`--server-url=${serverUrlFlag.value}`] : []),
+      ...(webappUrlFlag.value ? [`--webapp-url=${webappUrlFlag.value}`] : []),
+      ...(publicServerUrlFlag.value ? [`--public-server-url=${publicServerUrlFlag.value}`] : []),
+      ...(yesFlag.present ? ['--yes'] : []),
+      ...(json ? ['--json'] : []),
+    ],
+  });
+}
+
+function usageText() {
+  return [
+    '[remote] usage:',
+    '  hstack remote daemon setup --ssh <user@host> [--preview|--dev|--stable] [--channel <stable|preview|dev>]',
+    '    [--service <user|none>] [--ssh-config-file <path>]',
+    '    [--server-url=<url>] [--webapp-url=<url>] [--public-server-url=<url>]',
+    '    [--json]',
+    '',
+    '  hstack remote server setup --ssh <user@host> [--preview|--dev|--stable] [--channel <stable|preview|dev>]',
+    '    [--mode <user|system>] [--ssh-config-file <path>] [--known-hosts-path <path>]',
+    '    [--server-binary <path>]',
+    '    [--env KEY=VALUE]...',
+    '    [--json]',
+    '',
+    '  hstack remote relay setup --ssh <user@host> [--preview|--dev|--stable] [--channel <stable|preview|dev>]',
+    '    [--mode <user|system>] [--ssh-config-file <path>] [--known-hosts-path <path>]',
+    '    [--server-binary <path>]',
+    '    [--env KEY=VALUE]...',
+    '    [--json]',
+    '',
+    'notes:',
+    '  - This command runs remote operations over ssh.',
+    '  - It installs the Happier CLI on the remote host, pairs credentials, and optionally installs/starts the daemon service.',
+    '  - Default service mode is user; set --service none to skip daemon service setup.',
+    '  - Remote server setup installs the self-host runtime as a service (default: user mode).',
+  ].join('\n');
+}
+
+function resolveChannel(argv) {
+  if (argv.includes('--preview')) return 'preview';
+  if (argv.includes('--dev')) return 'publicdev';
+  if (argv.includes('--stable')) return 'stable';
+  const picked = argv.find((a) => a === '--channel' || a.startsWith('--channel='));
+  if (!picked) return 'stable';
+  if (picked === '--channel') {
+    const idx = argv.indexOf('--channel');
+    const v = String(argv[idx + 1] ?? '').trim();
+    return normalizePublicReleaseRingId(v) || v || 'stable';
+  }
+  const v = String(picked.slice('--channel='.length)).trim();
+  return normalizePublicReleaseRingId(v) || v || 'stable';
+}
+
+function resolveService(argv) {
+  const picked = argv.find((a) => a === '--service' || a.startsWith('--service='));
+  if (!picked) return 'user';
+  if (picked === '--service') {
+    const idx = argv.indexOf('--service');
+    const v = String(argv[idx + 1] ?? '').trim().toLowerCase();
+    return v || 'user';
+  }
+  const v = String(picked.slice('--service='.length)).trim().toLowerCase();
+  return v || 'user';
+}
+
+function resolveMode(argv) {
+  if (argv.includes('--system')) return 'system';
+  if (argv.includes('--user')) return 'user';
+  const picked = argv.find((a) => a === '--mode' || a.startsWith('--mode='));
+  if (!picked) return 'user';
+  if (picked === '--mode') {
+    const idx = argv.indexOf('--mode');
+    const v = String(argv[idx + 1] ?? '').trim().toLowerCase();
+    return v || 'user';
+  }
+  const v = String(picked.slice('--mode='.length)).trim().toLowerCase();
+  return v || 'user';
+}
+
+function collectEnvValues(argv) {
+  const args = Array.isArray(argv) ? argv.map(String) : [];
+  const values = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] ?? '';
+    if (a === '--env') {
+      const next = args[i + 1] ?? '';
+      if (!next || next.startsWith('--')) {
+        throw new Error('[remote] missing value for --env (expected KEY=VALUE)');
+      }
+      values.push(String(next));
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--env=')) {
+      const raw = a.slice('--env='.length);
+      if (!raw) throw new Error('[remote] missing value for --env (expected KEY=VALUE)');
+      values.push(String(raw));
+    }
+  }
+  return values;
+}
+
+async function runRemoteDaemonSetup(argvRaw) {
+  await runRemoteDaemonSetupWithDeps(argvRaw);
+}
+
+export async function runRemoteServerSetupWithDeps(argvRaw, deps = {}) {
+  const resolvedDeps = {
+    runRelayHostInstall: async ({ args }) => {
+      await run('happier', args, { env: process.env });
+    },
+    ...deps,
+  };
+
+  const argv0 = argvRaw.slice();
+  const json = wantsJson(argv0);
+
+  let args = argv0.slice();
+  const ssh = takeFlagValue(args, '--ssh');
+  args = ssh.rest;
+  if (!ssh.value) {
+    process.stderr.write('Missing required flag: --ssh <user@host>\n');
+    process.exit(2);
+  }
+
+  const sshConfigFile = takeFlagValue(args, '--ssh-config-file');
+  args = sshConfigFile.rest;
+  const knownHostsPath = takeFlagValue(args, '--known-hosts-path');
+  args = knownHostsPath.rest;
+
+  const channel = assertPublicChannel(resolveChannel(argv0));
+
+  const mode = resolveMode(argv0);
+  if (mode !== 'user' && mode !== 'system') {
+    throw new Error(`[remote] invalid --mode value: ${mode} (expected user or system)`);
+  }
+
+  const serverBinaryFlag = takeFlagValue(args, '--server-binary');
+  args = serverBinaryFlag.rest;
+  const legacyServerBinaryFlag = takeFlagValue(args, '--self-host-server-binary');
+  args = legacyServerBinaryFlag.rest;
+  if (serverBinaryFlag.value && legacyServerBinaryFlag.value) {
+    throw new Error('Do not combine --server-binary with --self-host-server-binary.');
+  }
+  const normalizedServerBinary = serverBinaryFlag.value || legacyServerBinaryFlag.value;
+
+  const envValues = collectEnvValues(argv0);
+
+  await resolvedDeps.runRelayHostInstall({
+    args: [
+      'relay',
+      'host',
+      'install',
+      '--ssh',
+      ssh.value,
+      `--channel=${channel === 'publicdev' ? 'dev' : channel}`,
+      `--mode=${mode}`,
+      ...(sshConfigFile.value ? [`--ssh-config-file=${sshConfigFile.value}`] : []),
+      ...(knownHostsPath.value ? [`--known-hosts-path=${knownHostsPath.value}`] : []),
+      ...(normalizedServerBinary ? ['--server-binary', normalizedServerBinary] : []),
+      ...envValues.flatMap((value) => ['--env', value]),
+      ...(json ? ['--json'] : []),
+    ],
+  });
+}
+
+async function runRemoteServerSetup(argvRaw) {
+  await runRemoteServerSetupWithDeps(argvRaw);
+}
+
+async function main() {
+  const argvRaw = process.argv.slice(2);
+  if (argvRaw.length === 0 || wantsHelp(argvRaw)) {
+    printResult({ json: wantsJson(argvRaw), data: { usage: usageText() }, text: usageText() });
+    return;
+  }
+
+  const positionals = argvRaw.filter((a) => a && a !== '--' && !a.startsWith('-'));
+  const top = String(positionals[0] ?? '').trim();
+  const sub = String(positionals[1] ?? '').trim();
+
+  if (top === 'daemon' && sub === 'setup') {
+    await runRemoteDaemonSetup(argvRaw);
+    return;
+  }
+  if (top === 'server' && sub === 'setup') {
+    await runRemoteServerSetup(argvRaw);
+    return;
+  }
+  if (top === 'relay' && sub === 'setup') {
+    await runRemoteServerSetup(argvRaw);
+    return;
+  }
+
+  printResult({
+    json: wantsJson(argvRaw),
+    data: { usage: usageText() },
+    text: usageText(),
+  });
+  process.exit(2);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  main().catch((error) => {
+    const msg = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${msg}\n`);
+    process.exit(1);
+  });
+}

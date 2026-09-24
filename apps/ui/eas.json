@@ -1,0 +1,299 @@
+{
+  "cli": {
+    "version": ">= 14.2.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "base": {
+      "node": "22.14.0",
+      "env": {
+        "HAPPIER_EAS_ENSURE_UI_WORKSPACES_BUILT": "1",
+        "HAPPIER_INSTALL_SCOPE": "ui,protocol,agents,cli-common,release-runtime,transfers,connection-supervisor,audio-stream-native,sherpa-native",
+        "HAPPIER_ANDROID_GRADLE_JVMARGS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8",
+        "YARN_PRODUCTION": "false",
+        "npm_config_production": "false",
+        "EXPO_PUBLIC_HAPPY_SERVER_URL": "https://api.happier.dev",
+        "HAPPIER_UI_VENDOR_WEB_ASSETS": "0",
+        "EXPO_UNSTABLE_WEB_MODAL": "1"
+      },
+      "android": {
+        "gradleCommand": ":app:bundleRelease -x lintVitalRelease -x lintVitalAnalyzeRelease"
+      }
+    },
+    "internaldev": {
+      "extends": "base",
+      "environment": "development",
+      "autoIncrement": true,
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "internaldev",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleDebug"
+      },
+      "env": {
+        "APP_ENV": "internaldev",
+        "EXPO_UPDATES_CHANNEL": "internaldev",
+        "EXPO_APP_NAME": "Happier (internal dev)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.dev.internal",
+        "EXPO_ANDROID_PACKAGE": "dev.happier.app.internaldev",
+        "HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE": "most-recent",
+        "HAPPIER_EXPO_DEVCLIENT_SILENT_LAUNCH": "true",
+        "HAPPIER_EXPO_USE_NATIVE_DEBUG": "true",
+        "EX_UPDATES_NATIVE_DEBUG": "1"
+      }
+    },
+    "internaldev-dev-client": {
+      "extends": "internaldev",
+      "env": {
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.dev.internal.devclient",
+        "EXPO_ANDROID_PACKAGE": "dev.happier.app.internaldev.devclient",
+        "EXPO_APP_SCHEME": "happier-internaldev-devclient"
+      }
+    },
+    "internaldev-store": {
+      "extends": "base",
+      "environment": "development",
+      "autoIncrement": true,
+      "developmentClient": true,
+      "distribution": "store",
+      "channel": "internaldev",
+      "env": {
+        "APP_ENV": "internaldev",
+        "EXPO_UPDATES_CHANNEL": "internaldev",
+        "EXPO_APP_NAME": "Happier (internal dev)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.dev.internal",
+        "EXPO_ANDROID_PACKAGE": "dev.happier.app.internaldev"
+      }
+    },
+    "internalpreview": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "distribution": "internal",
+      "channel": "internalpreview",
+      "env": {
+        "APP_ENV": "internalpreview",
+        "EXPO_UPDATES_CHANNEL": "internalpreview",
+        "EXPO_APP_NAME": "Happier (internal preview)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.internalpreview"
+      }
+    },
+    "internalpreview-apk": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "distribution": "internal",
+      "channel": "internalpreview",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -x lintVitalRelease -x lintVitalAnalyzeRelease"
+      },
+      "env": {
+        "APP_ENV": "internalpreview",
+        "EXPO_UPDATES_CHANNEL": "internalpreview",
+        "EXPO_APP_NAME": "Happier (internal preview)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.internalpreview"
+      }
+    },
+    "publicdev": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "distribution": "store",
+      "channel": "dev",
+      "env": {
+        "APP_ENV": "publicdev",
+        "EXPO_UPDATES_CHANNEL": "dev",
+        "EXPO_APP_NAME": "Happier (dev)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.publicdev"
+      }
+    },
+    "publicdev-apk": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "distribution": "internal",
+      "channel": "dev",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -x lintVitalRelease -x lintVitalAnalyzeRelease"
+      },
+      "env": {
+        "APP_ENV": "publicdev",
+        "EXPO_UPDATES_CHANNEL": "dev",
+        "EXPO_APP_NAME": "Happier (dev)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.publicdev",
+        "HAPPIER_ANDROID_BUILD_ARCHS": "arm64-v8a",
+        "HAPPIER_ANDROID_ENABLE_MINIFY": "1",
+        "HAPPIER_ANDROID_ENABLE_SHRINK_RESOURCES": "1",
+        "HAPPIER_ANDROID_GRADLE_JVMARGS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+      }
+    },
+    "publicdev-dev-client": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "dev",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleDebug"
+      },
+      "env": {
+        "APP_ENV": "publicdev",
+        "EXPO_UPDATES_CHANNEL": "dev",
+        "EXPO_APP_NAME": "Happier (dev)",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app.publicdev.devclient",
+        "EXPO_ANDROID_PACKAGE": "dev.happier.app.publicdev.devclient",
+        "EXPO_APP_SCHEME": "happier-dev-devclient",
+        "HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE": "most-recent",
+        "HAPPIER_EXPO_DEVCLIENT_SILENT_LAUNCH": "true"
+      }
+    },
+    "preview": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "distribution": "store",
+      "channel": "preview",
+      "env": {
+        "APP_ENV": "preview"
+      }
+    },
+    "preview-apk": {
+      "extends": "base",
+      "environment": "preview",
+      "autoIncrement": true,
+      "distribution": "internal",
+      "channel": "preview",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -x lintVitalRelease -x lintVitalAnalyzeRelease"
+      },
+      "env": {
+        "APP_ENV": "preview"
+      }
+    },
+    "production": {
+      "extends": "base",
+      "environment": "production",
+      "autoIncrement": true,
+      "channel": "production",
+      "android": {
+        "resourceClass": "large"
+      },
+      "env": {
+        "APP_ENV": "production"
+      }
+    },
+    "production-preview": {
+      "extends": "base",
+      "environment": "production",
+      "autoIncrement": true,
+      "distribution": "store",
+      "channel": "preview",
+      "env": {
+        "APP_ENV": "production",
+        "HAPPIER_APP_VARIANT_OVERRIDE": "preview",
+        "EXPO_UPDATES_CHANNEL": "preview",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app"
+      }
+    },
+    "production-apk": {
+      "extends": "base",
+      "environment": "production",
+      "autoIncrement": true,
+      "distribution": "internal",
+      "channel": "production",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -x lintVitalRelease -x lintVitalAnalyzeRelease"
+      },
+      "env": {
+        "APP_ENV": "production",
+        "HAPPIER_ANDROID_BUILD_ARCHS": "arm64-v8a",
+        "HAPPIER_ANDROID_ENABLE_MINIFY": "1",
+        "HAPPIER_ANDROID_ENABLE_SHRINK_RESOURCES": "1",
+        "HAPPIER_ANDROID_GRADLE_JVMARGS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+      }
+    },
+    "production-preview-apk": {
+      "extends": "base",
+      "environment": "production",
+      "autoIncrement": true,
+      "distribution": "internal",
+      "channel": "preview",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -x lintVitalRelease -x lintVitalAnalyzeRelease"
+      },
+      "env": {
+        "APP_ENV": "production",
+        "HAPPIER_APP_VARIANT_OVERRIDE": "preview",
+        "EXPO_UPDATES_CHANNEL": "preview",
+        "EXPO_APP_BUNDLE_ID": "dev.happier.app",
+        "HAPPIER_ANDROID_BUILD_ARCHS": "arm64-v8a",
+        "HAPPIER_ANDROID_ENABLE_MINIFY": "1",
+        "HAPPIER_ANDROID_ENABLE_SHRINK_RESOURCES": "1",
+        "HAPPIER_ANDROID_GRADLE_JVMARGS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+      }
+    },
+    "development": {
+      "extends": "internaldev"
+    },
+    "development-store": {
+      "extends": "internaldev-store"
+    },
+    "canary": {
+      "extends": "internalpreview"
+    },
+    "canary-apk": {
+      "extends": "internalpreview-apk"
+    }
+  },
+  "submit": {
+    "publicdev": {
+      "ios": {
+        "appleId": "leeroy.brun@gmail.com",
+        "ascAppId": "6761304097",
+        "appleTeamId": "L86V3EF623",
+        "ascApiKeyId": "58Q493BG53",
+        "ascApiKeyIssuerId": "69a6de85-8d20-47e3-e053-5b8c7c11a4d1",
+        "ascApiKeyPath": "./.eas/keys/AuthKey_58Q493BG53.p8"
+      },
+      "android": {
+        "track": "internal",
+        "releaseStatus": "draft"
+      }
+    },
+    "preview": {
+      "ios": {
+        "appleId": "leeroy.brun@gmail.com",
+        "ascAppId": "6759219841",
+        "appleTeamId": "L86V3EF623",
+        "ascApiKeyId": "58Q493BG53",
+        "ascApiKeyIssuerId": "69a6de85-8d20-47e3-e053-5b8c7c11a4d1",
+        "ascApiKeyPath": "./.eas/keys/AuthKey_58Q493BG53.p8"
+      },
+      "android": {
+        "track": "internal"
+      }
+    },
+    "production": {
+      "ios": {
+        "appleId": "leeroy.brun@gmail.com",
+        "ascAppId": "6758554297",
+        "appleTeamId": "L86V3EF623",
+        "ascApiKeyId": "58Q493BG53",
+        "ascApiKeyIssuerId": "69a6de85-8d20-47e3-e053-5b8c7c11a4d1",
+        "ascApiKeyPath": "./.eas/keys/AuthKey_58Q493BG53.p8"
+      },
+      "android": {
+        "track": "production",
+        "releaseStatus": "draft"
+      }
+    }
+  }
+}

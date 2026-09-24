@@ -1,0 +1,235 @@
+import * as React from 'react';
+import { Pressable, View } from 'react-native';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+
+import { Switch } from '@/components/ui/forms/Switch';
+import { Text } from '@/components/ui/text/Text';
+import type { SessionConfigOptionControl, SessionConfigOptionValueId } from '@/sync/domains/sessionControl/configOptionsControl';
+import {
+    isBooleanConfigOptionType,
+    resolveBooleanConfigOptionNextValue,
+    resolveBooleanConfigOptionValue,
+} from '@/sync/domains/sessionControl/configOptionsControl';
+import { t } from '@/text';
+
+type AgentInputSessionConfigOptionsSectionProps = Readonly<{
+    controls: ReadonlyArray<SessionConfigOptionControl>;
+    onSelectValue?: (configId: string, valueId: SessionConfigOptionValueId) => void;
+}>;
+
+function formatValue(valueId: SessionConfigOptionValueId): string {
+    return valueId;
+}
+
+export function AgentInputSessionConfigOptionsSection(props: AgentInputSessionConfigOptionsSectionProps) {
+    const { theme } = useUnistyles();
+    const transientStyles = React.useMemo(() => ({
+        choicePillSelected: {
+            borderColor: theme.colors.radio.active,
+        },
+        optionRowPressed: {
+            opacity: 0.85,
+        },
+    }), [theme.colors.radio.active]);
+
+    if (props.controls.length === 0) {
+        return null;
+    }
+
+    return (
+        <View style={styles.section}>
+            {props.controls.map((control) => {
+                const option = control.option;
+                const effectiveValue = control.effectiveValue;
+                const isBool = isBooleanConfigOptionType(option.type);
+
+                if (isBool) {
+                    const boolValue = resolveBooleanConfigOptionValue(option, effectiveValue);
+                    return (
+                        <Pressable
+                            key={option.id}
+                            onPress={() => props.onSelectValue?.(
+                                option.id,
+                                resolveBooleanConfigOptionNextValue(option, !boolValue),
+                            )}
+                            style={({ pressed }) => [
+                                styles.optionRow,
+                                pressed ? transientStyles.optionRowPressed : null,
+                            ]}
+                        >
+                            <View style={styles.booleanContent}>
+                                <View style={styles.optionContent}>
+                                    <Text style={styles.optionLabel}>
+                                        {option.name}
+                                    </Text>
+                                    <Text style={styles.optionDescription}>
+                                        {control.isPending
+                                            ? t('agentInput.acp.pendingValue', {
+                                                current: formatValue(option.currentValue),
+                                                requested: formatValue(control.requestedValue!),
+                                            })
+                                            : t('agentInput.acp.currentValue', { value: formatValue(option.currentValue) })}
+                                    </Text>
+                                    {option.description ? (
+                                        <Text style={styles.optionDescription}>
+                                            {option.description}
+                                        </Text>
+                                    ) : null}
+                                </View>
+                                <View style={styles.switchWrap}>
+                                    <Switch
+                                        value={boolValue}
+                                        onValueChange={(next) => props.onSelectValue?.(
+                                            option.id,
+                                            resolveBooleanConfigOptionNextValue(option, next),
+                                        )}
+                                    />
+                                </View>
+                            </View>
+                        </Pressable>
+                    );
+                }
+
+                const currentLabel =
+                    option.options?.find((entry) => entry.value === option.currentValue)?.name ??
+                    formatValue(option.currentValue);
+                const requestedLabel =
+                    control.requestedValue !== undefined
+                        ? option.options?.find((entry) => entry.value === control.requestedValue)?.name ??
+                            formatValue(control.requestedValue)
+                        : null;
+
+                const isSelect = option.type === 'select' && (option.options?.length ?? 0) > 0;
+                const isDisabled = control.disabled === true;
+
+                return (
+                    <View key={option.id} testID={`agent-input-config-option:${option.id}`} style={styles.configCard}>
+                        <Text style={styles.optionLabel}>
+                            {option.name}
+                        </Text>
+                        <Text
+                            testID={`agent-input-config-option-summary:${option.id}`}
+                            style={styles.optionDescription}
+                        >
+                            {isDisabled
+                                ? t('agentInput.acp.optionOverriddenBy', { name: control.disabledByOptionName ?? '' })
+                                : control.isPending && requestedLabel
+                                    ? t('agentInput.acp.pendingValue', { current: currentLabel, requested: requestedLabel })
+                                    : t('agentInput.acp.currentValue', { value: currentLabel })}
+                        </Text>
+                        {option.description ? (
+                            <Text style={styles.optionDescription}>
+                                {option.description}
+                            </Text>
+                        ) : null}
+
+                        {isSelect ? (
+                            <View style={[styles.choiceRow, isDisabled ? styles.choiceRowDisabled : null]} pointerEvents={isDisabled ? 'none' : 'auto'}>
+                                {option.options?.map((choice) => {
+                                    const isSelected = choice.value === effectiveValue;
+                                    return (
+                                        <Pressable
+                                            testID={`agent-input-config-option-option:${option.id}:${String(choice.value)}`}
+                                            key={`${option.id}:${String(choice.value)}`}
+                                            onPress={() => {
+                                                if (isDisabled) return;
+                                                props.onSelectValue?.(option.id, choice.value);
+                                            }}
+                                            style={({ pressed }) => [
+                                                styles.choicePill,
+                                                isSelected ? transientStyles.choicePillSelected : null,
+                                                pressed ? transientStyles.optionRowPressed : null,
+                                            ]}
+                                        >
+                                            <Text
+                                                style={[
+                                                    styles.choiceLabel,
+                                                    isSelected ? styles.choiceLabelSelected : null,
+                                                ]}
+                                            >
+                                                {choice.name}
+                                            </Text>
+                                        </Pressable>
+                                    );
+                                })}
+                            </View>
+                        ) : null}
+                    </View>
+                );
+            })}
+        </View>
+    );
+}
+
+const styles = StyleSheet.create((theme) => ({
+    section: {
+        gap: 8,
+    },
+    optionRow: {
+        borderRadius: 12,
+        paddingHorizontal: 10,
+        paddingVertical: 10,
+        backgroundColor: theme.colors.surface.base,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: theme.colors.border.default,
+    },
+    booleanContent: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 12,
+    },
+    optionContent: {
+        flex: 1,
+        flexShrink: 1,
+        gap: 3,
+    },
+    optionLabel: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: theme.colors.text.primary,
+    },
+    optionDescription: {
+        fontSize: 12,
+        lineHeight: 16,
+        color: theme.colors.text.secondary,
+    },
+    switchWrap: {
+        paddingLeft: 8,
+    },
+    configCard: {
+        gap: 5,
+        borderRadius: 12,
+        paddingHorizontal: 10,
+        paddingVertical: 10,
+        backgroundColor: theme.colors.surface.base,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: theme.colors.border.default,
+    },
+    choiceRow: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        gap: 6,
+        paddingTop: 2,
+    },
+    choiceRowDisabled: {
+        opacity: 0.4,
+    },
+    choicePill: {
+        minHeight: 30,
+        paddingHorizontal: 10,
+        paddingVertical: 6,
+        borderRadius: 999,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: theme.colors.border.default,
+        backgroundColor: theme.colors.surface.base,
+        justifyContent: 'center',
+    },
+    choiceLabel: {
+        fontSize: 12,
+        fontWeight: '500',
+        color: theme.colors.text.secondary,
+    },
+    choiceLabelSelected: {
+        color: theme.colors.text.primary,
+    },
+}));

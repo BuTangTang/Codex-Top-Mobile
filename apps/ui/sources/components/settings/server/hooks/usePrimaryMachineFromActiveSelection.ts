@@ -1,0 +1,81 @@
+import * as React from 'react';
+
+import { useActiveServerSnapshot } from '@/hooks/server/useActiveServerSnapshot';
+import { listServerProfiles } from '@/sync/domains/server/serverProfiles';
+import { getEffectiveServerSelectionFromRawSettings } from '@/sync/domains/server/selection/serverSelectionResolution';
+import {
+    listServerProfileScopeIds,
+    normalizeServerSelectionSettingsForProfileScopeIds,
+} from '@/sync/domains/server/selection/serverSelectionProfileScopeIds';
+import { useAllMachines, useMachineListByServerId, useSetting } from '@/sync/domains/state/storage';
+
+/**
+ * Returns the ID of the primary machine from the active server selection.
+ * 
+ * This hook respects the user's active server selection (single server or multi-server group)
+ * and returns the first non-revoked machine from the first visible server.
+ * 
+ * Use this instead of `useAllMachines()[0]` in settings screens to ensure machine-backed
+ * operations target the correct machine relative to the user's active server selection.
+ * 
+ * @returns The machine ID of the primary machine, or null if no machines are available
+ */
+export function usePrimaryMachineFromActiveSelection(): string | null {
+    const allMachines = useAllMachines();
+    const machineListByServerId = useMachineListByServerId();
+    const settingsServerSelectionGroups = useSetting('serverSelectionGroups');
+    const settingsServerSelectionActiveTargetKind = useSetting('serverSelectionActiveTargetKind');
+    const settingsServerSelectionActiveTargetId = useSetting('serverSelectionActiveTargetId');
+
+    const activeServerSnapshot = useActiveServerSnapshot();
+
+    const serverProfiles = React.useMemo(() => {
+        try {
+            return listServerProfiles().slice();
+        } catch {
+            return [];
+        }
+    }, [activeServerSnapshot.generation]);
+
+    return React.useMemo(() => {
+        // Determine which servers are visible based on active selection
+        const settings = normalizeServerSelectionSettingsForProfileScopeIds({
+            serverSelectionGroups: settingsServerSelectionGroups,
+            serverSelectionActiveTargetKind: settingsServerSelectionActiveTargetKind,
+            serverSelectionActiveTargetId: settingsServerSelectionActiveTargetId,
+        }, serverProfiles);
+        const selection = getEffectiveServerSelectionFromRawSettings({
+            activeServerId: activeServerSnapshot.serverId,
+            availableServerIds: listServerProfileScopeIds(serverProfiles),
+            settings,
+        });
+
+        const visibleServerIds = selection.serverIds.length > 0
+            ? selection.serverIds
+            : (activeServerSnapshot.serverId ? [activeServerSnapshot.serverId] : []);
+
+        // Get machines from the first visible server
+        for (const serverId of visibleServerIds) {
+            const machines =
+                machineListByServerId[serverId]
+                ?? (serverId === activeServerSnapshot.serverId ? allMachines : null)
+                ?? [];
+
+            // Find the first non-revoked machine
+            const visibleMachines = machines.filter((machine) => !machine.revokedAt);
+            if (visibleMachines.length > 0) {
+                return visibleMachines[0].id;
+            }
+        }
+
+        return null;
+    }, [
+        activeServerSnapshot.serverId,
+        allMachines,
+        machineListByServerId,
+        serverProfiles,
+        settingsServerSelectionActiveTargetId,
+        settingsServerSelectionActiveTargetKind,
+        settingsServerSelectionGroups,
+    ]);
+}

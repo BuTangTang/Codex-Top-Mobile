@@ -1,0 +1,256 @@
+import * as React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import { renderScreen } from '@/dev/testkit';
+
+import { InteractionManager, Platform } from 'react-native';
+import type { ActionListItem } from '@/components/ui/lists/ActionListSection';
+
+vi.mock('@/text', async () => {
+    const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+    return createTextModuleMock({ translate: (key) => key });
+});
+
+vi.mock('@expo/vector-icons', () => ({
+    Ionicons: (props: Record<string, unknown>) => React.createElement('Ionicons', props),
+}));
+
+function assertSingleCollapsedAction(
+    action: ActionListItem | readonly ActionListItem[] | undefined,
+): asserts action is ActionListItem {
+    expect(Array.isArray(action)).toBe(false);
+    if (!action || Array.isArray(action)) {
+        throw new Error('expected a single collapsed action');
+    }
+}
+
+describe('createAttachmentActionChip', () => {
+    it('on iOS it opens a chooser popover (image vs file) instead of launching a picker immediately', async () => {
+        const { createAttachmentActionChip } = await import('./createAttachmentActionChip');
+        const originalOs = Platform.OS;
+        (Platform as any).OS = 'ios';
+        const queuedInteractionCallbacks: Array<() => void> = [];
+        const queuedTimeoutCallbacks: Array<{ handler: () => void; timeout: number }> = [];
+        const runQueuedTimeout = (delay: number) => {
+            const index = queuedTimeoutCallbacks.findIndex((entry) => entry.timeout === delay);
+            expect(index).toBeGreaterThanOrEqual(0);
+            const [entry] = queuedTimeoutCallbacks.splice(index, 1);
+            entry!.handler();
+        };
+        type RunAfterInteractionsTask = Parameters<typeof InteractionManager.runAfterInteractions>[0];
+        const createRunAfterInteractionsResult = (): ReturnType<typeof InteractionManager.runAfterInteractions> => ({
+            then: (onfulfilled, onrejected) => Promise.resolve().then(() => onfulfilled?.(), onrejected),
+            done: () => undefined,
+            cancel: () => undefined,
+        });
+        const runAfterInteractionsSpy = vi
+            .spyOn(InteractionManager, 'runAfterInteractions')
+            .mockImplementation((task?: RunAfterInteractionsTask) => {
+                if (typeof task === 'function') {
+                    queuedInteractionCallbacks.push(task);
+                }
+                return createRunAfterInteractionsResult();
+            });
+        const setTimeoutSpy = vi
+            .spyOn(globalThis, 'setTimeout')
+            .mockImplementation((handler: TimerHandler, timeout?: number) => {
+                if (typeof handler === 'function') {
+                    queuedTimeoutCallbacks.push({ handler: handler as () => void, timeout: timeout ?? 0 });
+                }
+                return 0 as unknown as ReturnType<typeof setTimeout>;
+            });
+
+        try {
+            const onPickFile = vi.fn();
+            const onPickImage = vi.fn();
+            const onPasteImage = vi.fn();
+
+            const chip = createAttachmentActionChip({
+                onPickFile,
+                onPickImage,
+                onPasteImage,
+            } as any);
+
+            expect(chip.collapsedContentPopover).toBeTruthy();
+
+            const toggleCollapsedPopover = vi.fn();
+            const screen = await renderScreen(
+                <React.Fragment>
+                    {chip.render({
+                        chipStyle: () => ({}),
+                        showLabel: true,
+                        iconColor: '#000',
+                        textStyle: {},
+                        countTextStyle: {},
+                        chipAnchorRef: { current: null },
+                        popoverAnchorRef: { current: null },
+                        toggleCollapsedPopover,
+                    })}
+                </React.Fragment>,
+            );
+
+            expect(screen.tree.toJSON()).not.toBeNull();
+            await screen.pressByTestIdAsync('agent-input-attachments-chip');
+            expect(toggleCollapsedPopover).toHaveBeenCalledWith('attachments-add');
+
+            const requestClose = vi.fn();
+            const renderContent = chip.collapsedContentPopover!.renderContent;
+            if (typeof renderContent !== 'function') {
+                throw new Error('Expected collapsedContentPopover.renderContent to be a function');
+            }
+            const contentScreen = await renderScreen(
+                <React.Fragment>
+                    {renderContent({ requestClose, maxHeight: 420 }) as React.ReactNode}
+                </React.Fragment>,
+            );
+
+            await contentScreen.pressByTestIdAsync('attachments-action-add-image');
+            expect(requestClose).toHaveBeenCalled();
+            expect(onPickImage).not.toHaveBeenCalled();
+            expect(runAfterInteractionsSpy).toHaveBeenCalledTimes(1);
+            queuedInteractionCallbacks.shift()?.();
+            expect(onPickImage).not.toHaveBeenCalled();
+            expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 250);
+            runQueuedTimeout(250);
+            expect(onPickImage).toHaveBeenCalledTimes(1);
+
+            requestClose.mockClear();
+            await contentScreen.pressByTestIdAsync('attachments-action-add-file');
+            expect(requestClose).toHaveBeenCalled();
+            expect(onPickFile).not.toHaveBeenCalled();
+            expect(runAfterInteractionsSpy).toHaveBeenCalledTimes(2);
+            queuedInteractionCallbacks.shift()?.();
+            expect(onPickFile).not.toHaveBeenCalled();
+            expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 250);
+            runQueuedTimeout(250);
+            expect(onPickFile).toHaveBeenCalledTimes(1);
+
+            requestClose.mockClear();
+            await contentScreen.pressByTestIdAsync('attachments-action-paste-image');
+            expect(requestClose).toHaveBeenCalled();
+            expect(onPasteImage).not.toHaveBeenCalled();
+            expect(runAfterInteractionsSpy).toHaveBeenCalledTimes(3);
+            queuedInteractionCallbacks.shift()?.();
+            expect(onPasteImage).not.toHaveBeenCalled();
+            expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 250);
+            runQueuedTimeout(250);
+            expect(onPasteImage).toHaveBeenCalledTimes(1);
+        } finally {
+            setTimeoutSpy.mockRestore();
+            runAfterInteractionsSpy.mockRestore();
+            (Platform as any).OS = originalOs;
+        }
+    });
+
+    // NOTE: a "JS-thread starvation fallback" case used to live here. It mocked
+    // `InteractionManager.runAfterInteractions` to never invoke its task, which RN 0.81's
+    // `InteractionManagerStub` cannot do (it always resolves on a microtask), and it asserted a
+    // timeout fallback that could therefore never fire. Both the fallback and the test were removed;
+    // the iOS case above covers the real contract (interaction task -> 250ms popover-dismiss delay).
+
+    it('on web it keeps the attach chip as a direct action (no chooser popover)', async () => {
+        const { createAttachmentActionChip } = await import('./createAttachmentActionChip');
+        const originalOs = Platform.OS;
+        (Platform as any).OS = 'web';
+
+        try {
+            const callOrder: string[] = [];
+            const onPickFile = vi.fn(() => {
+                callOrder.push('pickFile');
+            });
+            const onPickImage = vi.fn();
+            const chip = createAttachmentActionChip({
+                onPickFile,
+                onPickImage,
+            } as any);
+
+            expect(chip.collapsedContentPopover).toBeFalsy();
+            expect(typeof chip.collapsedAction).toBe('function');
+
+            const dismiss = vi.fn(() => {
+                callOrder.push('dismiss');
+            });
+            const blurInput = vi.fn(() => {
+                callOrder.push('blur');
+            });
+            const collapsed = chip.collapsedAction?.({
+                tint: '#000',
+                dismiss,
+                blurInput,
+            });
+            assertSingleCollapsedAction(collapsed);
+            if (typeof collapsed.onPress !== 'function') {
+                throw new Error('Expected web attach chip to expose a single collapsedAction with onPress');
+            }
+
+            collapsed.onPress();
+            expect(callOrder).toEqual(['blur', 'pickFile', 'dismiss']);
+
+            const screen = await renderScreen(
+                <React.Fragment>
+                    {chip.render({
+                        chipStyle: () => ({}),
+                        showLabel: true,
+                        iconColor: '#000',
+                        textStyle: {},
+                        countTextStyle: {},
+                        chipAnchorRef: { current: null },
+                        popoverAnchorRef: { current: null },
+                        toggleCollapsedPopover: vi.fn(),
+                    })}
+                </React.Fragment>,
+            );
+            expect(screen.tree.toJSON()).not.toBeNull();
+            await screen.pressByTestIdAsync('agent-input-attachments-chip');
+            expect(onPickFile).toHaveBeenCalled();
+        } finally {
+            (Platform as any).OS = originalOs;
+        }
+    });
+
+    it('on web it ignores duplicate press events fired shortly after opening (prevents double-open)', async () => {
+        const { createAttachmentActionChip } = await import('./createAttachmentActionChip');
+        const originalOs = Platform.OS;
+        const originalNow = Date.now;
+        (Platform as any).OS = 'web';
+
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-03-25T12:00:00.000Z'));
+
+        try {
+            const onPickFile = vi.fn();
+            const onPickImage = vi.fn();
+            const chip = createAttachmentActionChip({
+                onPickFile,
+                onPickImage,
+            } as any);
+
+            const screen = await renderScreen(
+                <React.Fragment>
+                    {chip.render({
+                        chipStyle: () => ({}),
+                        showLabel: true,
+                        iconColor: '#000',
+                        textStyle: {},
+                        countTextStyle: {},
+                        chipAnchorRef: { current: null },
+                        popoverAnchorRef: { current: null },
+                        toggleCollapsedPopover: vi.fn(),
+                    })}
+                </React.Fragment>,
+            );
+
+            await screen.pressByTestIdAsync('agent-input-attachments-chip');
+            await screen.pressByTestIdAsync('agent-input-attachments-chip');
+            expect(onPickFile).toHaveBeenCalledTimes(1);
+
+            vi.advanceTimersByTime(500);
+            await screen.pressByTestIdAsync('agent-input-attachments-chip');
+            expect(onPickFile).toHaveBeenCalledTimes(2);
+        } finally {
+            (Platform as any).OS = originalOs;
+            vi.useRealTimers();
+            (Date as any).now = originalNow;
+        }
+    });
+
+});

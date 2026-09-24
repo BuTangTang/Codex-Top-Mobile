@@ -1,0 +1,391 @@
+import React, { useEffect, useState } from 'react';
+import { View, Linking } from 'react-native';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+
+import { useNavigateToSession } from '@/hooks/session/useNavigateToSession';
+import { Text } from '@/components/ui/text/Text';
+import { useAuth } from '@/auth/context/AuthContext';
+import { getUserProfile, sendFriendRequest, removeFriend } from '@/sync/api/social/apiFriends';
+import { UserProfile, getDisplayName } from '@/sync/domains/social/friendTypes';
+import { Avatar } from '@/components/ui/avatar/Avatar';
+import { ItemList } from '@/components/ui/lists/ItemList';
+import { ItemGroup } from '@/components/ui/lists/ItemGroup';
+import { Item } from '@/components/ui/lists/Item';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+import { layout } from '@/components/ui/layout/layout';
+import { useHappyAction } from '@/hooks/ui/useHappyAction';
+import { Modal } from '@/modal';
+import { t } from '@/text';
+import { trackFriendsConnect } from '@/track';
+import { useAllSessions } from '@/sync/domains/state/storage';
+import { useSessionSharingSupport } from '@/hooks/session/useSessionSharingSupport';
+import { HappyError } from '@/utils/errors/errors';
+import { getAuthProvider } from '@/auth/providers/registry';
+import { isSafeBadgeUrl } from '@/utils/url/urlSafety';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import { Icon } from '@/components/ui/icons/Icon';
+
+const USERNAME_PREFIX = '@';
+
+export default function UserProfileScreen() {
+    const { id } = useLocalSearchParams<{ id: string }>();
+    const { credentials } = useAuth();
+    const router = useRouter();
+    const navigateToSession = useNavigateToSession();
+    const { theme } = useUnistyles();
+    const sessions = useAllSessions();
+    const sharingSupported = useSessionSharingSupport();
+    const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+
+    // Load user profile on mount
+    useEffect(() => {
+        if (!credentials || !id) return;
+
+        const loadUserProfile = async () => {
+            setIsLoading(true);
+            try {
+                const profile = await getUserProfile(credentials, id);
+                setUserProfile(profile);
+            } catch (error) {
+                console.error('Failed to load user profile:', error);
+                await Modal.alert(t('errors.failedToLoadProfile'), '', [
+                    {
+                        text: t('common.ok'),
+                        onPress: () => router.back()
+                    }
+                ]);
+            } finally {
+                setIsLoading(false);
+            }
+        };
+
+        loadUserProfile();
+    }, [credentials, id]);
+
+    // Add friend / Accept request action
+    const [addingFriend, addFriend] = useHappyAction(async () => {
+        if (!credentials || !userProfile) return;
+
+        try {
+            const updatedProfile = await sendFriendRequest(credentials, userProfile.id);
+            if (updatedProfile) {
+                trackFriendsConnect();
+                setUserProfile(updatedProfile);
+            } else {
+                await Modal.alert(t('friends.userNotFound'));
+            }
+        } catch (e) {
+            if (e instanceof HappyError && e.message === 'provider-required') {
+                await Modal.alert(t('friends.bothMustHaveGithub'));
+                return;
+            }
+            if (e instanceof HappyError && e.message === 'username-required') {
+                await Modal.alert(t('friends.username.required'));
+                return;
+            }
+            if (e instanceof HappyError && e.message === 'friends-disabled') {
+                await Modal.alert(t('friends.disabled'));
+                return;
+            }
+            throw e;
+        }
+    });
+
+    // Remove friend / Cancel request / Reject request action  
+    const [removingFriend, handleRemoveFriend] = useHappyAction(async () => {
+        if (!credentials || !userProfile) return;
+
+        if (userProfile.status === 'friend') {
+            // Removing a friend
+            const confirmed = await Modal.confirm(
+                t('friends.removeFriend'),
+                t('friends.removeFriendConfirm', { name: getDisplayName(userProfile) }),
+                { confirmText: t('friends.remove'), destructive: true }
+            );
+
+            if (!confirmed) return;
+        } else if (userProfile.status === 'requested') {
+            // Canceling a sent request
+            const confirmed = await Modal.confirm(
+                t('friends.cancelRequest'),
+                t('friends.cancelRequestConfirm', { name: getDisplayName(userProfile) }),
+                { confirmText: t('common.yes'), destructive: false }
+            );
+
+            if (!confirmed) return;
+        }
+
+        const updatedProfile = await removeFriend(credentials, userProfile.id);
+        if (updatedProfile) {
+            setUserProfile(updatedProfile);
+        }
+    });
+
+    if (isLoading) {
+        return (
+            <View style={styles.loadingContainer}>
+                <ActivitySpinner size="large" color={theme.colors.accent.blue} />
+            </View>
+        );
+    }
+
+    if (!userProfile) {
+        return (
+            <View style={styles.errorContainer}>
+                <Text style={styles.errorText}>{t('errors.userNotFound')}</Text>
+            </View>
+        );
+    }
+
+    const displayName = getDisplayName(userProfile);
+    const avatarUrl = userProfile.avatar?.url;
+
+    // Determine friend actions based on status
+    const getFriendActions = () => {
+        switch (userProfile.status) {
+            case 'friend':
+                return [{
+                    title: t('friends.removeFriend'),
+                    icon: <Icon name="user-minus" size={29} color={theme.colors.state.danger.foreground} />,
+                    onPress: handleRemoveFriend,
+                    loading: removingFriend,
+                }];
+            case 'pending':
+                // User has received a friend request
+                return [
+                    {
+                        title: t('friends.acceptRequest'),
+                        icon: <Icon name="check-circle" size={29} color={theme.colors.state.success.foreground} />,
+                        onPress: addFriend,
+                        loading: addingFriend,
+                    },
+                    {
+                        title: t('friends.denyRequest'),
+                        icon: <Icon name="x-circle" size={29} color={theme.colors.state.danger.foreground} />,
+                        onPress: handleRemoveFriend,
+                        loading: removingFriend,
+                    }
+                ];
+            case 'requested':
+                // User has sent a friend request
+                return [{
+                    title: t('friends.cancelRequest'),
+                    icon: <Icon name="x" size={29} color={theme.colors.accent.orange} />,
+                    onPress: handleRemoveFriend,
+                    loading: removingFriend,
+                }];
+            case 'rejected':
+            case 'none':
+            default:
+                return [{
+                    title: t('friends.requestFriendship'),
+                    icon: <Icon name="user-plus" size={29} color={theme.colors.accent.blue} />,
+                    onPress: addFriend,
+                    loading: addingFriend,
+                }];
+        }
+    };
+
+    const friendActions = getFriendActions();
+    const sharedSessions = userProfile.status === 'friend' && sharingSupported
+        ? sessions.filter(session => session.owner === userProfile.id)
+        : [];
+
+    return (
+        <ItemList style={{ paddingTop: 0 }}>
+            {/* User Info Header */}
+            <View style={styles.headerContainer}>
+                <View style={styles.profileCard}>
+                    <View style={{ marginBottom: 16 }}>
+                        <Avatar
+                            id={userProfile.id}
+                            size={90}
+                            imageUrl={avatarUrl}
+                            thumbhash={userProfile.avatar?.thumbhash}
+                        />
+                    </View>
+
+                    <Text style={styles.displayName}>{displayName}</Text>
+
+                        <Text style={styles.username}>{USERNAME_PREFIX}{userProfile.username}</Text>
+
+                    {/* Bio */}
+                    {userProfile.bio && (
+                        <Text style={styles.bio}>{userProfile.bio}</Text>
+                    )}
+
+                    {/* Friend Status Badge */}
+                    {userProfile.status === 'friend' && (
+                        <View style={styles.statusBadge}>
+                            <Icon name="check-circle" size={16} color={theme.colors.state.success.foreground} />
+                            <Text style={styles.statusText}>{t('friends.alreadyFriends')}</Text>
+                        </View>
+                    )}
+                </View>
+            </View>
+
+            {/* Actions */}
+            <ItemGroup>
+                {friendActions.map((action, index) => (
+                    <Item
+                        key={index}
+                        title={action.title}
+                        icon={action.icon}
+                        onPress={action.onPress}
+                        loading={action.loading}
+                        showChevron={false}
+                    />
+                ))}
+            </ItemGroup>
+
+            {/* Sessions shared by this friend */}
+            {userProfile.status === 'friend' && sharingSupported && (
+                <ItemGroup title={t('friends.sharedSessions')}>
+                    {sharedSessions.length > 0 ? (
+                        sharedSessions.map((session) => (
+                            <Item
+                                key={session.id}
+                                title={session.metadata?.name || session.metadata?.path || t('sessionHistory.title')}
+                                subtitle={t('session.sharing.viewOnly')}
+                                icon={<Icon name="chat-circle-dots" size={29} color={theme.colors.accent.blue} />}
+                                onPress={() => { void navigateToSession(session.id); }}
+                            />
+                        ))
+                    ) : (
+                        <Item
+                            title={t('friends.noSharedSessions')}
+                            icon={<Icon name="chat-circle" size={29} color={theme.colors.text.secondary} />}
+                            showChevron={false}
+                        />
+                    )}
+                </ItemGroup>
+            )}
+
+            {userProfile.badges?.length ? (
+                <ItemGroup>
+                    {userProfile.badges.map((badge) => {
+                        const provider = getAuthProvider(badge.id);
+                        const iconName = provider?.badgeIconName ?? 'link-outline';
+                        const title = provider?.displayName ?? badge.id;
+                        return (
+                            <Item
+                                key={`${badge.id}:${badge.url}`}
+                                title={title}
+                                detail={badge.label}
+                                icon={<Icon name={iconName as any} size={29} color={theme.colors.text.primary} />}
+                                onPress={async () => {
+                                    try {
+                                        if (!isSafeBadgeUrl(badge.url)) {
+                                            await Modal.alert(t('common.error'), t('errors.invalidShareLink'));
+                                            return;
+                                        }
+                                        const supported = await Linking.canOpenURL(badge.url);
+                                        if (!supported) {
+                                            await Modal.alert(t('common.error'), t('errors.invalidShareLink'));
+                                            return;
+                                        }
+                                        await Linking.openURL(badge.url);
+                                    } catch {
+                                        await Modal.alert(t('common.error'), t('errors.invalidShareLink'));
+                                    }
+                                }}
+                            />
+                        );
+                    })}
+                </ItemGroup>
+            ) : null}
+
+            {/* Profile Details */}
+            {/* <ItemGroup>
+                <Item
+                    title={t('profile.firstName')}
+                    detail={userProfile.firstName || '-'}
+                    showChevron={false}
+                />
+                <Item
+                    title={t('profile.lastName')}
+                    detail={userProfile.lastName || '-'}
+                    showChevron={false}
+                />
+                <Item
+                    title={t('profile.username')}
+                    detail={`@${userProfile.username}`}
+                    showChevron={false}
+                />
+                <Item
+                    title={t('profile.status')}
+                    detail={t(`friends.status.${userProfile.status}`)}
+                    showChevron={false}
+                />
+            </ItemGroup> */}
+        </ItemList>
+    );
+}
+
+const styles = StyleSheet.create((theme) => ({
+    loadingContainer: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        backgroundColor: theme.colors.background.canvas,
+    },
+    errorContainer: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        backgroundColor: theme.colors.background.canvas,
+        padding: 32,
+    },
+    errorText: {
+        fontSize: 16,
+        color: theme.colors.text.secondary,
+        textAlign: 'center',
+    },
+    headerContainer: {
+        maxWidth: layout.maxWidth,
+        alignSelf: 'center',
+        width: '100%',
+    },
+    profileCard: {
+        alignItems: 'center',
+        paddingVertical: 32,
+        backgroundColor: theme.colors.surface.base,
+        marginTop: 16,
+        borderRadius: 12,
+        marginHorizontal: 16,
+    },
+    displayName: {
+        fontSize: 24,
+        fontWeight: '600',
+        color: theme.colors.text.primary,
+        marginBottom: 4,
+    },
+    username: {
+        fontSize: 16,
+        color: theme.colors.text.secondary,
+        marginBottom: 12,
+    },
+    bio: {
+        fontSize: 14,
+        color: theme.colors.text.secondary,
+        textAlign: 'center',
+        paddingHorizontal: 32,
+        marginBottom: 16,
+    },
+    statusBadge: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: 'rgba(52, 199, 89, 0.1)',
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 16,
+        marginTop: 8,
+    },
+    statusText: {
+        fontSize: 13,
+        color: theme.colors.state.success.foreground,
+        marginLeft: 4,
+        fontWeight: '500',
+    },
+}));

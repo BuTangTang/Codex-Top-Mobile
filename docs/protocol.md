@@ -1,0 +1,239 @@
+# Protocol
+
+This document describes the Happier wire protocol as implemented in `apps/server`. The protocol is intentionally small: JSON over HTTP for reads/actions and Socket.IO for real-time sync. Most payloads are end-to-end encrypted client-side; see `encryption.md` for the encryption boundaries and encoding details. For the full HTTP surface and auth flows, see `api.md`.
+
+## Transport and versioning
+- HTTP API: JSON requests/responses on `/v1` and `/v2` routes.
+- WebSocket: Socket.IO server at path `/v1/updates` (transports: websocket, polling).
+- CORS: `*` (server-side).
+
+## Protocol design motivations
+The protocol is designed to stay minimal, explicit, and resilient under intermittent connectivity. A few guiding principles shape naming, payloads, and versioning:
+
+- **Small surface area over completeness.** Routes and events exist only when they provide a clear sync primitive (e.g., sessions, artifacts, KV). If a capability can be expressed as data within an existing primitive, it should be.
+- **Explicit event types and short keys.** Update payloads use `t` for the event type and concise field names (`sid`, `id`, `seq`) to keep message size down without hiding meaning. These names are stable because they are used across clients.
+- **Separation of persistent vs. ephemeral.** Anything that must be recoverable after reconnect is an `update` event with a sequence number. Presence and usage are `ephemeral` to avoid state confusion and minimize storage.
+- **Monotonic ordering at the user level.** `UpdatePayload.seq` is a single per-user counter. This makes client reconciliation simple: apply updates in order and you are consistent for that user.
+- **Optimistic concurrency by default.** Versioned fields (metadata, agent state, artifact parts, access keys, KV) require `expectedVersion`. This prevents silent overwrites and keeps conflict resolution client-driven.
+- **Client-side encryption boundaries.** The server never needs to understand plaintext. The protocol therefore treats most payloads as opaque strings or base64 blobs, which keeps server logic simple and privacy guarantees strong.
+- **Released compatibility over breaking changes.** Evolve released routes/events additively or through explicit negotiation and seam-owned translation; do not mutate existing wire semantics in place or create competing domain owners. Baselines, mixed-version directions, predecessor rules, and removal conditions are defined in `compatibility.md`.
+- **Avoid full REST verbs.** Reads are primarily `GET`, while writes/actions are primarily `POST`, with `DELETE` used when the intent is unambiguous. We avoid the full REST palette because many mutations are not cleanly tied to a single entity or involve more than CRUD logic. Keeping to `GET` + `POST` (plus occasional `DELETE`) makes the client simpler and the protocol clearer.
+
+If a new protocol field or event is proposed, it should answer: does this create a durable sync primitive, or can it be encoded inside existing encrypted payloads without expanding the API surface?
+
+## Authentication
+Most endpoints require `Authorization: Bearer <token>`. The same token is also used in the Socket.IO handshake. Full auth flows and endpoints are documented in `api.md`.
+
+## WebSocket connection
+### Handshake
+Connect with Socket.IO using:
+
+```
+path: "/v1/updates"
+auth: {
+  token: "<bearer token>",
+  clientType: "user-scoped" | "session-scoped" | "machine-scoped",
+  sessionId?: "<session id>",
+  machineId?: "<machine id>"
+}
+```
+
+Rules enforced server-side:
+- `token` is required.
+- `session-scoped` requires `sessionId`.
+- `machine-scoped` requires `machineId`.
+
+### Connection types
+- `user-scoped`: receives account-wide updates.
+- `session-scoped`: receives updates for a specific session only.
+- `machine-scoped`: used by daemons; receives machine updates and emits machine state.
+
+### Server -> client events
+The server emits two event types:
+
+#### `update`
+Persistent sync events. Payload shape:
+```
+{
+  id: string,
+  seq: number,
+  body: { t: string, ... },
+  createdAt: number
+}
+```
+
+#### `ephemeral`
+Transient presence/usage events. Payload shape:
+```
+{
+  type: string,
+  ...
+}
+```
+
+### Update event types
+Field names below match on-wire payloads.
+
+- `new-session`
+  - `body`: `{ t: "new-session", id, seq, metadata, metadataVersion, agentState, agentStateVersion, dataEncryptionKey, active, activeAt, createdAt, updatedAt }`
+
+- `update-session`
+  - `body`: `{ t: "update-session", id, metadata?, agentState? }`
+  - `metadata`: `{ value, version }` or null
+  - `agentState`: `{ value, version }` or null
+
+- `delete-session`
+  - `body`: `{ t: "delete-session", sid }`
+
+- `new-message`
+  - `body`: `{ t: "new-message", sid, message: { id, seq, content, localId, createdAt, updatedAt } }`
+
+- `update-account`
+  - `body`: `{ t: "update-account", id, settings?, github? }`
+
+- `new-machine`
+  - `body`: `{ t: "new-machine", machineId, seq, metadata, metadataVersion, daemonState, daemonStateVersion, dataEncryptionKey, active, activeAt, createdAt, updatedAt }`
+
+- `update-machine`
+  - `body`: `{ t: "update-machine", machineId, metadata?, daemonState?, activeAt? }`
+
+- `new-artifact`
+  - `body`: `{ t: "new-artifact", artifactId, seq, header, headerVersion, body, bodyVersion, dataEncryptionKey, createdAt, updatedAt }`
+
+- `update-artifact`
+  - `body`: `{ t: "update-artifact", artifactId, header?, body? }`
+
+- `delete-artifact`
+  - `body`: `{ t: "delete-artifact", artifactId }`
+
+- `relationship-updated`
+  - `body`: `{ t: "relationship-updated", uid, status, timestamp }`
+
+- `new-feed-post`
+  - `body`: `{ t: "new-feed-post", id, body, cursor, createdAt }`
+
+- `kv-batch-update`
+  - `body`: `{ t: "kv-batch-update", changes: [{ key, value, version }] }`
+
+### Ephemeral event types
+- `activity`: `{ type: "activity", id: sessionId, active, activeAt, thinking? }`
+- `machine-activity`: `{ type: "machine-activity", id: machineId, active, activeAt }`
+- `usage`: `{ type: "usage", id: sessionId, key, tokens, cost, timestamp }`
+- `machine-status`: `{ type: "machine-status", machineId, online, timestamp }`
+
+### Client -> server WebSocket events
+- `ping` -> callback `{}`
+
+- `update-metadata`
+  - `{ sid, metadata, expectedVersion }`
+  - Response: `{ result: "success", version, metadata }` or `{ result: "version-mismatch", version, metadata }`
+
+- `update-state`
+  - `{ sid, agentState, expectedVersion }`
+  - Response: `{ result: "success", version, agentState }` or `{ result: "version-mismatch", version, agentState }`
+
+- `message`
+  - `{ sid, message, localId? }`
+  - Creates a new session message (encrypted payload) and emits `new-message` update to other connections.
+
+- `session-alive`
+  - `{ sid, time, thinking? }`
+  - In the current development server, the released event refreshes the exact machine-bound publisher's reachability. The server uses its receipt time, retains observations while coalescing writes, and does not derive runtime activity from the legacy `thinking` flag. See [presence ownership](backend-architecture.md#presence-and-activity).
+  - Committed reachability is published through `publishSessionPublisherLifecycleUpdate` as session updates to interested participants.
+
+- `session-end`
+  - `{ sid, time }`
+  - Closes the authorized publisher and publishes its inactive state through the same lifecycle-update owner.
+
+- `usage-report`
+  - `{ key, sessionId?, tokens, cost }`
+  - Stores usage report and optionally emits `ephemeral` usage for the session.
+
+- `machine-alive`
+  - `{ machineId, time }`
+  - Emits `ephemeral` machine-activity.
+
+- `machine-update-metadata`
+  - `{ machineId, metadata, expectedVersion }`
+  - Response: `{ result: "success", version, metadata }` or `{ result: "version-mismatch", version, metadata }`
+
+- `machine-update-state`
+  - `{ machineId, daemonState, expectedVersion }`
+  - Response: `{ result: "success", version, daemonState }` or `{ result: "version-mismatch", version, daemonState }`
+
+- `artifact-read`
+  - `{ artifactId }`
+  - Response: `{ result: "success", artifact }` or `{ result: "error", message }`
+
+- `artifact-create`
+  - `{ id, header, body, dataEncryptionKey }`
+  - Response: `{ result: "success", artifact }` or `{ result: "error", message }`
+
+- `artifact-update`
+  - `{ artifactId, header?, body? }` where `header` and `body` include `data` + `expectedVersion`
+  - Response: `{ result: "success", header?, body? }` or `{ result: "version-mismatch", header?, body? }`
+
+- `artifact-delete`
+  - `{ artifactId }`
+  - Response: `{ result: "success" }` or `{ result: "error", message }`
+
+- `access-key-get`
+  - `{ sessionId, machineId }`
+  - Response: `{ ok: true, accessKey? }` or `{ ok: false, error }`
+
+- `rpc-register`
+  - `{ method }` -> server emits `rpc-registered`
+
+- `rpc-unregister`
+  - `{ method }` -> server emits `rpc-unregistered`
+
+- `rpc-call`
+  - `{ method, params }` -> callback `{ ok, result? | error? }`
+  - Server forwards to the registered socket via `rpc-request` (ack-based).
+
+## HTTP endpoints by area
+See `api.md` for the full HTTP endpoint catalog and auth flows.
+
+## Sequencing and concurrency
+- `UpdatePayload.seq` is the per-user update sequence (monotonic) used for sync ordering.
+- Sessions, machines, and artifacts have their own `seq` fields used by clients for ordering.
+- Versioned fields (metadata, agentState, daemonState, artifact header/body, access keys, KV) use optimistic concurrency with `expectedVersion` and return a version-mismatch response containing the current version/data.
+
+### Transcript catch-up and reading position
+
+The following describes the current development implementation, not a new server protocol or a released client guarantee.
+
+Account-change cursors, session sequence hints, and transcript paging cursors serve different purposes. A session hint announces newer durable content; it does not prove that this device has loaded the intervening rows. Likewise, acknowledging an account change need not download the entire transcript: the UI can retain the outstanding forward load in its existing deferred-transcript state. Failed shell loads, message loads, and revision repairs still block the affected checkpoint.
+
+`decideMessageCatchUpPolicy` owns hosted transcript catch-up decisions. The existing defaults allow three incremental pages, with a separate large-gap threshold of 500 sequence positions and a long-offline threshold of 30 minutes. Those positions are not necessarily main-transcript rows. Large backlogs go directly to the latest page when following the live tail; history readers defer forward loading. An explicit reopen can probe one page even when the session hint appears current. Known deferred backlog remains authoritative when that hint is stale; a failed catch-up read retains that demand for retry.
+
+Latest-page catch-up merges rows into the retained cache and records omitted history through the existing tail-discontinuity owner. It does not clear cached history. The current viewport intent is checked again after asynchronous work: a reader who has scrolled away or entered a target window must not acquire a new live-tail display floor from the outstanding response. Forward-edge paging, target-window paging, and jump-to-bottom keep their existing distinct navigation responsibilities; visibility alone is not an instruction to jump to the bottom.
+
+The shared message-page pipeline publishes coverage and received revisions only after decryption and application succeed. An unavailable encrypted row leaves the page retryable, rather than advancing past it. Realtime messages can arrive beyond a missing interval, so the deferred-transcript owner retains a gap floor independently of the highest observed message. A successful page acknowledges only the interval it covers; a successful latest snapshot transfers skipped history to the tail-discontinuity owner.
+
+Revision repair uses message identities and available sequence hints to fetch bounded affected ranges, rather than replaying every row between distant edits. Each group uses the configured page size and can refresh already-known neighbors without inserting unseen, unrequested rows. It suppresses historical lifecycle events and does not change the visible target window or forward paging cursor. Already-current revisions count as repaired; missing or unavailable rows remain outstanding. Account-change hints are coalesced per session and retain only the latest hint, not a complete journal of edited message identities. Consequently, bounded repair cannot certify the freshness of every historical row outside the fetched ranges.
+
+A repair captures the existing immutable stale-marker sequence map before reading. It can acknowledge those markers only while that exact snapshot remains current. Every new stale mark replaces the snapshot, including another edit to the same row at the same sequence position, so an older response cannot clear newer repair demand after a clear or reset.
+
+### Direct transcript continuation
+
+The development direct-session RPC response retains each agent's existing `truncated` boolean and adds optional `truncationReason: "page_limit" | "source_discontinuity"`. Old readers continue to see the original boolean; new readers use the explicit reason when present to distinguish an ordinary bounded page from invalidated source history. In particular, Claude can report `page_limit` while retaining its legacy `truncated: false`. A legacy response without a reason remains conservative.
+
+Ordinary forward paging extends the accepted transcript without replacing a detached reader's anchor. A source discontinuity requires a successful latest read before replacement, and the direct cursor owner retains that recovery requirement until replacement succeeds. Network failure or a reader leaving the live tail during the request preserves the accepted transcript. This is separate from CLI session-message replay, whose continuation cursor must be compared with the cursor sent for that page, not the maximum row just applied.
+
+A hosted/direct handoff or direct-link rebind can preserve the Session ID while changing transcript authority. The new source's initial window is staged before replacing the accepted rows, pagination and gap state; a failed read leaves that accepted state intact. In-flight reads capture their source identity, so a superseded response cannot publish rows, completion or paging state for the replacement source. Source identity follows transcript routing, not activity or backend-mode metadata.
+
+After a bounded direct read or push reports a page-limited backlog, the next live-tail refresh or push stages the latest page instead of repeatedly replaying adjacent pages. A further capped push consumes that existing demand through the same catch-up owner; it does not append another backlog page first. This ordinary catch-up merges cached history rather than discarding it. Detached readers still load one adjacent page on explicit forward-edge demand. This uses the source's existing page budget, not a second UI page ceiling; ordinary no-work tail probes do not raise the catching-up indicator.
+
+The existing tail-discontinuity owner represents both hosted sequence gaps and direct opaque-cursor gaps. Direct continuity is established by original source-row overlap, never timestamps or displayed tool identities. The same transcript projection keeps the connected suffix visible with the existing “Earlier messages” separator, while retaining disconnected older rows in the cache. Normal older-edge loading walks from the latest island into the hole; after overlap it resumes the preserved pre-gap older cursor. Stacked jumps retain the deepest prefix, and terminal exhaustion stops network requests without pretending that an unbridged gap became contiguous.
+
+Within the main transcript, initial-fill and jump reads report exhaustion to the existing older-pagination machine rather than retaining a separate component flag. A later fillable tail gap can reset an exhausted pager; that reset alone does not fetch a page or move the viewport. If bounded initial fill leaves the main transcript too short to scroll, “Earlier messages” lets the reader request one page through that same pager and prepend path. It does not restart automatic fill or use the main cursor inside a target window. Sidechain and public transcript lists retain their dataset-scoped pagination lifecycles.
+
+An older-page response is admitted only while the accepted transcript window that requested it still exists. Ordinary tail growth preserves that window identity; source reset or replacement retires it, so a held response cannot reinsert rows from the replaced source even when cursor strings are reused. Forward reads and staged snapshots also check their request-start cursor so they cannot overwrite a newer accepted tail.
+
+Claude's file cursor records the consumed JSONL boundary, not an arbitrary file size: a partially written terminal record remains readable when the writer completes it. The existing bounded file pager supplies that boundary for snapshots, tail initialization, and source-reset recovery. If the existing read budget cannot establish the boundary, the read fails rather than publishing an unsafe cursor. A page budget and an incomplete terminal line are distinct outcomes.
+
+## Implementation references
+- API routes: `apps/server/sources/app/api/routes`
+- Socket handlers: `apps/server/sources/app/api/socket`
+- Event routing: `apps/server/sources/app/events/eventRouter.ts`

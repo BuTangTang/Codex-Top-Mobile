@@ -1,0 +1,198 @@
+import React from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+    renderScreen,
+    standardCleanup,
+} from '@/dev/testkit';
+import {
+    createNavigationMock,
+    createRouterMock,
+    createStackOptionsCapture,
+    enableReactActEnvironment,
+    installPickerCommonModuleMocks,
+    PICKER_NAV_STATE,
+    PICKER_THEME_COLORS,
+} from './testHarness';
+
+enableReactActEnvironment();
+
+type KeyboardAvoidingViewProps = Readonly<{
+    children?: React.ReactNode;
+} & Record<string, unknown>>;
+type KeyboardControllerMockProps = React.PropsWithChildren<Record<string, unknown>>;
+
+const keyboardOffsetState = vi.hoisted(() => ({
+    headerHeight: 0,
+    platformOS: 'ios' as 'ios' | 'android',
+    statusBarHeight: 0,
+}));
+
+vi.mock('@expo/vector-icons', async () => (await import('@/dev/testkit/mocks/icons')).createExpoVectorIconsMock());
+
+vi.mock('expo-constants', () => ({
+    default: {
+        get statusBarHeight() {
+            return keyboardOffsetState.statusBarHeight;
+        },
+    },
+}));
+
+vi.mock('@react-navigation/elements', () => ({
+    useHeaderHeight: () => keyboardOffsetState.headerHeight,
+}));
+
+vi.mock('react-native-keyboard-controller', () => ({
+    KeyboardAwareScrollView: ({ children, ...props }: KeyboardControllerMockProps) =>
+        React.createElement('KeyboardAwareScrollView', props, children),
+    KeyboardAvoidingView: ({ children, ...props }: KeyboardControllerMockProps) =>
+        React.createElement('KeyboardAvoidingView', props, children),
+    KeyboardStickyView: ({ children, ...props }: KeyboardControllerMockProps) =>
+        React.createElement('KeyboardStickyView', props, children),
+}));
+
+const routerMock = createRouterMock();
+const navigationMock = createNavigationMock() as ReturnType<typeof createNavigationMock> & {
+    setOptions: ReturnType<typeof vi.fn>;
+    addListener: ReturnType<typeof vi.fn>;
+};
+navigationMock.setOptions = vi.fn();
+navigationMock.addListener = vi.fn(() => ({ remove: vi.fn() }));
+const stackOptionsCapture = createStackOptionsCapture();
+
+installPickerCommonModuleMocks({
+    reactNative: async () =>
+        (await import('@/dev/testkit/mocks/reactNative')).createReactNativeWebMock({
+            KeyboardAvoidingView: (props: KeyboardAvoidingViewProps) =>
+                React.createElement('KeyboardAvoidingView', props, props.children),
+            Platform: {
+                get OS() {
+                    return keyboardOffsetState.platformOS;
+                },
+            },
+            useWindowDimensions: () => ({ width: 390, height: 844 }),
+        }),
+    expoRouter: async () =>
+        (await import('@/dev/testkit/mocks/router')).createExpoRouterMock({
+            navigation: navigationMock,
+            params: {
+                profileData: JSON.stringify({
+                    id: 'p1',
+                    name: 'Test profile',
+                    isBuiltIn: false,
+                    compatibility: { claude: true, codex: true, gemini: true },
+                }),
+            },
+            router: {
+                push: routerMock.push,
+                back: routerMock.back,
+                replace: routerMock.replace,
+                setParams: routerMock.setParams,
+            },
+            stackOptionsCapture,
+        }).module,
+    unistyles: async () =>
+        (await import('@/dev/testkit/mocks/unistyles')).createUnistylesMock({
+            theme: { colors: { header: PICKER_THEME_COLORS.header, groupped: PICKER_THEME_COLORS.groupped } },
+            runtime: { insets: { bottom: 0 } },
+        }),
+    text: async () => (await import('@/dev/testkit/mocks/text')).createTextModuleMock(),
+    storage: async (importOriginal) =>
+        (await import('@/dev/testkit/mocks/storage')).createStorageModuleMock({
+            importOriginal,
+            overrides: {
+                useSettingMutable: () => [[], vi.fn()],
+            },
+        }),
+    modal: async () =>
+        (await import('@/dev/testkit/mocks/modal')).createModalModuleMock({
+            spies: {
+                alert: vi.fn(),
+                show: vi.fn(),
+            },
+        }).module,
+});
+
+vi.mock('@/components/profiles/edit', () => ({
+    ProfileEditForm: () => React.createElement('ProfileEditForm'),
+}));
+
+vi.mock('@/components/ui/layout/layout', () => ({
+    layout: { maxWidth: 1024 },
+}));
+
+vi.mock('@/sync/domains/profiles/profileUtils', () => ({
+    DEFAULT_PROFILES: [],
+    getBuiltInProfile: () => null,
+    getBuiltInProfileNameKey: () => null,
+    resolveProfileById: () => null,
+}));
+
+vi.mock('@/sync/domains/profiles/profileMutations', () => ({
+    convertBuiltInProfileToCustom: <T,>(profile: T) => profile,
+    createEmptyCustomProfile: () => ({ id: 'new', name: '', isBuiltIn: false, compatibility: { claude: true, codex: true, gemini: true } }),
+    duplicateProfileForEdit: <T,>(profile: T) => profile,
+}));
+
+vi.mock('@/utils/ui/promptUnsavedChangesAlert', () => ({
+    promptUnsavedChangesAlert: vi.fn(async () => 'keep'),
+}));
+
+describe('ProfileEditScreen (header buttons)', () => {
+    afterEach(() => {
+        standardCleanup();
+    });
+
+    beforeEach(() => {
+        keyboardOffsetState.headerHeight = 0;
+        keyboardOffsetState.platformOS = 'ios';
+        keyboardOffsetState.statusBarHeight = 0;
+        stackOptionsCapture.reset();
+        navigationMock.getState = vi.fn(() => ({
+            index: PICKER_NAV_STATE.index,
+            routes: PICKER_NAV_STATE.routes.map((route) => ({ key: route.key })),
+        }));
+    });
+
+    it('renders a header close button even when the form is pristine', async () => {
+        const ProfileEditScreen = (await import('@/app/(app)/new/pick/profile-edit')).default;
+        await renderScreen(React.createElement(ProfileEditScreen));
+
+        const options = stackOptionsCapture.getResolved();
+        expect(typeof options?.headerLeft).toBe('function');
+    });
+
+    it('renders a disabled header save button when the form is pristine', async () => {
+        const ProfileEditScreen = (await import('@/app/(app)/new/pick/profile-edit')).default;
+        await renderScreen(React.createElement(ProfileEditScreen));
+
+        const options = stackOptionsCapture.getResolved();
+        expect(typeof options?.headerRight).toBe('function');
+
+        const headerRight = options?.headerRight;
+        const saveButton = headerRight?.();
+        expect(saveButton?.props?.disabled).toBe(true);
+    });
+
+    it('keeps the profile edit form inside the standard keyboard-aware screen frame', async () => {
+        const ProfileEditScreen = (await import('@/app/(app)/new/pick/profile-edit')).default;
+        const { KeyboardAwareScreen } = await import('@/components/ui/keyboardAvoidance');
+        const screen = await renderScreen(React.createElement(ProfileEditScreen));
+
+        const keyboardFrame = screen.findByType(KeyboardAwareScreen);
+        expect(keyboardFrame.props.mode).toBe('form');
+        expect(keyboardFrame.props.keyboardVerticalOffset).toBe(0);
+    });
+
+    it('does not apply the native header offset to Android keyboard avoidance', async () => {
+        keyboardOffsetState.platformOS = 'android';
+        keyboardOffsetState.statusBarHeight = 24;
+        keyboardOffsetState.headerHeight = 56;
+
+        const ProfileEditScreen = (await import('@/app/(app)/new/pick/profile-edit')).default;
+        const { KeyboardAwareScreen } = await import('@/components/ui/keyboardAvoidance');
+        const screen = await renderScreen(React.createElement(ProfileEditScreen));
+
+        const keyboardFrame = screen.findByType(KeyboardAwareScreen);
+        expect(keyboardFrame.props.keyboardVerticalOffset).toBe(0);
+    });
+});

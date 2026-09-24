@@ -1,0 +1,121 @@
+import type { CodeLinesExternalScrollView } from '@/components/ui/code/view/CodeLinesViewCore';
+import * as React from 'react';
+import { Platform, View, useWindowDimensions } from 'react-native';
+
+import { DiffViewer } from '@/components/ui/code/diff/DiffViewer';
+import { buildCodeLinesFromUnifiedDiff } from '@/components/ui/code/model/buildCodeLinesFromUnifiedDiff';
+import { useCodeLinesReviewComments } from '@/components/sessions/reviews/comments/useCodeLinesReviewComments';
+import type { ReviewCommentDraft } from '@/sync/domains/input/reviewComments/reviewCommentTypes';
+import { filterReviewCommentDraftsForFile } from '@/sync/domains/input/reviewComments/filterReviewCommentDrafts';
+import { resolveInlineDiffVirtualization } from '@/components/ui/code/diff/resolveInlineDiffVirtualization';
+import { useInlineDiffVirtualizationThresholds } from '@/components/ui/code/diff/useInlineDiffVirtualizationThresholds';
+import { resolveInlineDiffVirtualizedMaxHeight } from '@/components/ui/code/diff/resolveInlineDiffVirtualizedMaxHeight';
+import { resolveInlineDiffVirtualizedViewportStyle } from '@/components/ui/code/diff/resolveInlineDiffVirtualizedViewportStyle';
+import { useIntraLineWordDiffConfig } from '@/components/ui/code/diff/useIntraLineWordDiffConfig';
+import { useSetting } from '@/sync/domains/state/storage';
+
+const DISABLED_INTRA_LINE_WORD_DIFF = { enabled: false, maxLines: 0, maxLineLength: 0, maxPairs: 0 };
+
+export type DiffReviewCommentsViewerProps = Readonly<{
+    filePath: string;
+    unifiedDiff: string;
+    scrollToLineId?: string;
+    highlightLineId?: string;
+    onScrollToLine?: (windowY: number) => void;
+    externalScrollView?: CodeLinesExternalScrollView;
+    reviewCommentsEnabled: boolean;
+    reviewCommentDrafts: readonly ReviewCommentDraft[];
+    onUpsertReviewCommentDraft?: (draft: ReviewCommentDraft) => void;
+    onDeleteReviewCommentDraft?: (commentId: string) => void;
+    onReviewCommentError?: (message: string) => void;
+    wrapLines?: boolean;
+    showLineNumbers?: boolean;
+    showPrefix?: boolean;
+}>;
+
+function DiffReviewCommentsViewerInner(props: DiffReviewCommentsViewerProps) {
+    const wrapLinesSetting = useSetting('wrapLinesInDiffs');
+    const showLineNumbersSetting = useSetting('showLineNumbers');
+    const effectiveWrapLines = props.wrapLines ?? (wrapLinesSetting !== false);
+    const effectiveShowLineNumbers = props.showLineNumbers ?? (showLineNumbersSetting !== false);
+    const effectiveShowPrefix = props.showPrefix ?? effectiveShowLineNumbers;
+
+    const intraLineDiff = useIntraLineWordDiffConfig();
+    const { height: windowHeight } = useWindowDimensions();
+    const { lineThreshold, reviewCommentsLineThreshold = lineThreshold, byteThreshold } = useInlineDiffVirtualizationThresholds();
+
+    const effectiveReviewCommentsLineThreshold = lineThreshold > 0
+        ? Math.min(lineThreshold, reviewCommentsLineThreshold)
+        : lineThreshold;
+    const virtualized = props.reviewCommentsEnabled === true
+        ? resolveInlineDiffVirtualization({
+            unifiedDiff: props.unifiedDiff,
+            oldText: null,
+            newText: null,
+            lineThreshold: effectiveReviewCommentsLineThreshold,
+            byteThreshold,
+        })
+        : true;
+    const lineModelIntraLineDiff = virtualized
+        ? DISABLED_INTRA_LINE_WORD_DIFF
+        : intraLineDiff;
+
+    const lines = React.useMemo(() => buildCodeLinesFromUnifiedDiff({
+        unifiedDiff: props.unifiedDiff,
+        hideFilePrelude: true,
+        intraLineDiff: lineModelIntraLineDiff,
+    }), [lineModelIntraLineDiff, props.unifiedDiff]);
+
+    const draftsForFile = React.useMemo(() => {
+        return filterReviewCommentDraftsForFile({
+            enabled: props.reviewCommentsEnabled === true,
+            filePath: props.filePath,
+            source: 'diff',
+            drafts: props.reviewCommentDrafts,
+        });
+    }, [props.filePath, props.reviewCommentDrafts, props.reviewCommentsEnabled]);
+
+    const controls = useCodeLinesReviewComments({
+        enabled: props.reviewCommentsEnabled,
+        filePath: props.filePath,
+        source: 'diff',
+        lines,
+        drafts: draftsForFile,
+        onUpsertDraft: props.onUpsertReviewCommentDraft,
+        onDeleteDraft: props.onDeleteReviewCommentDraft,
+        onError: props.onReviewCommentError,
+    });
+
+    const virtualizedContainerStyle = virtualized
+        ? resolveInlineDiffVirtualizedViewportStyle(resolveInlineDiffVirtualizedMaxHeight(windowHeight))
+        : undefined;
+    const showInactiveCommentAffordance = Platform.OS === 'web';
+
+    return (
+        <View style={virtualizedContainerStyle}>
+            <DiffViewer
+                scrollToLineId={props.scrollToLineId}
+                highlightLineId={props.highlightLineId}
+                onScrollToLine={props.onScrollToLine}
+                externalScrollView={props.externalScrollView}
+                mode="unified"
+                filePath={props.filePath}
+                unifiedDiff={props.unifiedDiff}
+                precomputedLines={lines}
+                onPressLine={controls?.onPressAddComment}
+                onPressLineRange={controls?.onPressAddCommentRange}
+                pressLineWhenNotSelectable={Boolean(controls?.onPressAddComment)}
+                onPressAddComment={controls?.onPressAddComment}
+                isCommentActive={controls?.isCommentActive}
+                renderAfterLine={controls?.renderAfterLine}
+                showInactiveCommentAffordance={showInactiveCommentAffordance}
+                virtualized={virtualized}
+                wrapLines={effectiveWrapLines}
+                showLineNumbers={effectiveShowLineNumbers}
+                showPrefix={effectiveShowPrefix}
+            />
+        </View>
+    );
+}
+
+export const DiffReviewCommentsViewer = React.memo(DiffReviewCommentsViewerInner);

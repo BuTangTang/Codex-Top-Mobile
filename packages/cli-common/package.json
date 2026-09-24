@@ -1,0 +1,146 @@
+{
+  "name": "@happier-dev/cli-common",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./jsonOwnerBuildLockState": {
+      "import": "./jsonOwnerBuildLockState.cjs",
+      "require": "./jsonOwnerBuildLockState.cjs",
+      "default": "./jsonOwnerBuildLockState.cjs"
+    },
+    "./cliDistBuildManifest": {
+      "types": "./cliDistBuildManifest.d.cts",
+      "import": "./cliDistBuildManifest.cjs",
+      "require": "./cliDistBuildManifest.cjs",
+      "default": "./cliDistBuildManifest.cjs"
+    },
+    "./numericPlanetFrame": {
+      "types": "./numericPlanetFrame.d.mts",
+      "import": "./numericPlanetFrame.mjs",
+      "default": "./numericPlanetFrame.mjs"
+    },
+    "./workspaceLockLease": {
+      "types": "./workspaceLockLease.d.mts",
+      "import": "./workspaceLockLease.mjs",
+      "default": "./workspaceLockLease.mjs"
+    },
+    "./workspaceBundleLock": {
+      "types": "./workspaceBundleLock.d.mts",
+      "import": "./workspaceBundleLock.mjs",
+      "default": "./workspaceBundleLock.mjs"
+    },
+    "./processInstance": {
+      "types": "./processInstance.d.mts",
+      "import": "./processInstance.mjs",
+      "default": "./processInstance.mjs"
+    },
+    "./runtimeImportProbePolicy": {
+      "types": "./runtimeImportProbePolicy.d.mts",
+      "import": "./runtimeImportProbePolicy.mjs",
+      "default": "./runtimeImportProbePolicy.mjs"
+    },
+    "./links": {
+      "types": "./dist/links.d.ts",
+      "default": "./dist/links.js"
+    },
+    "./update": {
+      "types": "./dist/update/index.d.ts",
+      "default": "./dist/update/index.js"
+    },
+    "./workspaces": {
+      "types": "./dist/workspaces/index.d.ts",
+      "default": "./dist/workspaces/index.js"
+    },
+    "./service": {
+      "types": "./dist/service/index.d.ts",
+      "default": "./dist/service/index.js"
+    },
+    "./providers": {
+      "types": "./dist/providers/index.d.ts",
+      "default": "./dist/providers/index.js"
+    },
+    "./expandHomeDirPath": {
+      "types": "./expandHomeDirPath.d.cts",
+      "import": "./expandHomeDirPath.cjs",
+      "require": "./expandHomeDirPath.cjs",
+      "default": "./expandHomeDirPath.cjs"
+    },
+    "./providers/managedJavaScriptRuntime": {
+      "types": "./dist/providers/managedJavaScriptRuntime.d.ts",
+      "default": "./dist/providers/managedJavaScriptRuntime.js"
+    },
+    "./tailscale": {
+      "types": "./dist/tailscale/index.d.ts",
+      "default": "./dist/tailscale/index.js"
+    },
+    "./tailscale/taskContract": {
+      "types": "./dist/tailscale/taskContract.d.ts",
+      "default": "./dist/tailscale/taskContract.js"
+    },
+    "./process": {
+      "types": "./dist/process/index.d.ts",
+      "default": "./dist/process/index.js"
+    },
+    "./fs/windowsProtectedAcl": {
+      "types": "./dist/fs/windowsProtectedAcl.d.ts",
+      "default": "./dist/fs/windowsProtectedAcl.js"
+    },
+    "./componentArtifacts": {
+      "types": "./dist/componentArtifacts/index.d.ts",
+      "default": "./dist/componentArtifacts/index.js"
+    },
+    "./output": {
+      "types": "./dist/output/index.d.ts",
+      "default": "./dist/output/index.js"
+    },
+    "./firstPartyRuntime": {
+      "types": "./dist/firstPartyRuntime/index.d.ts",
+      "default": "./dist/firstPartyRuntime/index.js"
+    },
+    "./firstPartyRuntime/relayRuntime": {
+      "types": "./dist/firstPartyRuntime/relayRuntime.d.ts",
+      "default": "./dist/firstPartyRuntime/relayRuntime.js"
+    },
+    "./firstPartyRuntime/selfHostServerEnv": {
+      "types": "./dist/firstPartyRuntime/selfHostServerEnv.d.ts",
+      "default": "./dist/firstPartyRuntime/selfHostServerEnv.js"
+    },
+    "./firstPartyRuntime/serverRuntimeArtifactLayout": {
+      "types": "./dist/firstPartyRuntime/serverRuntimeArtifactLayout.d.ts",
+      "default": "./dist/firstPartyRuntime/serverRuntimeArtifactLayout.js"
+    },
+    "./relayHost": {
+      "types": "./dist/relayHost/index.d.ts",
+      "default": "./dist/relayHost/index.js"
+    },
+    "./systemTasks": {
+      "types": "./dist/systemTasks/index.d.ts",
+      "default": "./dist/systemTasks/index.js"
+    }
+  },
+  "scripts": {
+    "tsc": "node ../../scripts/workspaces/runTypeScriptCli.mjs",
+    "build": "node scripts/build.mjs",
+    "postinstall:real": "yarn -s build",
+    "postinstall": "node -e \"const fs=require('fs');const cp=require('child_process');if(/(^|[\\\\\\\\/])node_modules([\\\\\\\\/]|$)/i.test(process.cwd()))process.exit(0);try{const gate=require('../../scripts/postinstall/shouldRunPostinstall.cjs');if(!gate.shouldRunPostinstall({workspace:'cli-common',scope:process.env.HAPPIER_INSTALL_SCOPE||''}))process.exit(0);}catch{}if(!fs.existsSync('tsconfig.json'))process.exit(0);const run=(cmd,args)=>cp.spawnSync(cmd,args,{stdio:'inherit'});const npmExec=process.env.npm_execpath;let r;if(npmExec){r=run(process.execPath,[npmExec,'run','-s','postinstall:real']);}else{r=run(process.platform==='win32'?'yarn.cmd':'yarn',['-s','postinstall:real']);if(r.error&&process.platform==='win32'){r=run('yarn',['-s','postinstall:real']);}}if(r.error){console.error(r.error.message);process.exit(1);}process.exit(r.status??1);\"",
+    "typecheck": "node ../../scripts/workspaces/runTypeScriptCli.mjs --noEmit -p tsconfig.json",
+    "test": "yarn -s build && node ../../node_modules/vitest/vitest.mjs run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@happier-dev/agents": "0.0.0",
+    "@happier-dev/protocol": "0.0.0",
+    "@happier-dev/release-runtime": "0.0.0",
+    "chalk": "^5.6.2"
+  },
+  "devDependencies": {
+    "@typescript/native": "npm:typescript@7.0.2",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,9 @@
+Claude Code v2.1.170
+
+ Tips for getting started:
+  Run /init to create a CLAUDE.md file
+
+What would you like to work on?
+
+>
+  ? for shortcuts

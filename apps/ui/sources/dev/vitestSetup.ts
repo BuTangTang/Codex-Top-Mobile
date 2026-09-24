@@ -1,0 +1,771 @@
+import * as React from 'react';
+import { IDBFactory } from 'fake-indexeddb';
+import { afterAll, afterEach, beforeEach, vi } from 'vitest';
+
+import { installVitestRnShim } from './vitestRnShim';
+import { resetRuntimeFetch } from '@/utils/system/runtimeFetch';
+import { SHADOW_LEVELS } from '@/shadowElevation';
+import { buildLightStateColors, LIGHT_STATE_INFO_FOREGROUND } from '@/theme/tokens/stateColors';
+import { lightSurfaceColors, lightTextColors } from '@/theme/tokens/surfaceAndTextColors';
+import { standardCleanup } from './testkit/cleanup/standardCleanup';
+import { disposeUndiciDispatcherForTestTeardown } from './testkit/cleanup/undiciDispatcherCleanup';
+import { createReanimatedModuleMock } from './testkit/mocks/reanimated';
+import { resetReactNativeMmkvStub } from './reactNativeMmkvStub';
+
+// UI tests should not inherit embedded build-policy gating (set in CI).
+// Clear it by default so feature tests can opt-in explicitly per case.
+process.env.HAPPIER_FEATURE_POLICY_ENV = '';
+
+// Some browser-oriented libraries (e.g. xterm add-ons) ship UMD bundles that expect a `self` global.
+// Define it up-front so Vitest can import those modules in Node without crashing during module eval.
+const g = globalThis as any;
+g.IS_REACT_ACT_ENVIRONMENT = true;
+if (!Object.prototype.hasOwnProperty.call(g, '__DEV__')) {
+    g.__DEV__ = true;
+}
+
+if (!Object.prototype.hasOwnProperty.call(g, 'self') || g.self == null) {
+    try {
+        Object.defineProperty(g, 'self', {
+            value: g,
+            enumerable: true,
+            configurable: true,
+            writable: true,
+        });
+    } catch {
+        g.self = g;
+    }
+}
+
+const ORIGINAL_WINDOW = (globalThis as any).window;
+const ORIGINAL_DOCUMENT = (globalThis as any).document;
+const ORIGINAL_NAVIGATOR = (globalThis as any).navigator;
+const ORIGINAL_SELF = (globalThis as any).self;
+const ORIGINAL_WINDOW_DESCRIPTOR = Object.getOwnPropertyDescriptor(globalThis as any, 'window');
+const ORIGINAL_DOCUMENT_DESCRIPTOR = Object.getOwnPropertyDescriptor(globalThis as any, 'document');
+const ORIGINAL_NAVIGATOR_DESCRIPTOR = Object.getOwnPropertyDescriptor(globalThis as any, 'navigator');
+const ORIGINAL_SELF_DESCRIPTOR = Object.getOwnPropertyDescriptor(globalThis as any, 'self');
+const HAD_WINDOW = Object.prototype.hasOwnProperty.call(globalThis as any, 'window');
+const HAD_DOCUMENT = Object.prototype.hasOwnProperty.call(globalThis as any, 'document');
+const HAD_NAVIGATOR = Object.prototype.hasOwnProperty.call(globalThis as any, 'navigator');
+const HAD_SELF = Object.prototype.hasOwnProperty.call(globalThis as any, 'self');
+
+function restoreDomGlobalsToOriginal(): void {
+    const g = globalThis as any;
+
+    const restore = (key: 'window' | 'document' | 'navigator' | 'self', had: boolean, value: unknown) => {
+        if (had) {
+            try {
+                g[key] = value;
+            } catch {
+                const originalDescriptor =
+                    key === 'window'
+                        ? ORIGINAL_WINDOW_DESCRIPTOR
+                        : key === 'document'
+                            ? ORIGINAL_DOCUMENT_DESCRIPTOR
+                            : key === 'navigator'
+                                ? ORIGINAL_NAVIGATOR_DESCRIPTOR
+                                : ORIGINAL_SELF_DESCRIPTOR;
+                if (originalDescriptor?.configurable) {
+                    // Node can expose DOM-like globals (e.g. navigator) as accessor-only properties.
+                    // Re-define them as data properties for test determinism.
+                    Object.defineProperty(g, key, {
+                        value,
+                        enumerable: true,
+                        configurable: true,
+                        writable: true,
+                    });
+                }
+            }
+            return;
+        }
+        try {
+            delete g[key];
+        } catch {
+            g[key] = undefined;
+        }
+    };
+
+    restore('window', HAD_WINDOW, ORIGINAL_WINDOW);
+    restore('document', HAD_DOCUMENT, ORIGINAL_DOCUMENT);
+    restore('navigator', HAD_NAVIGATOR, ORIGINAL_NAVIGATOR);
+    restore('self', HAD_SELF, ORIGINAL_SELF);
+}
+
+type StorageLike = Readonly<{
+    getItem: (key: string) => string | null;
+    setItem: (key: string, value: string) => void;
+    removeItem: (key: string) => void;
+    clear: () => void;
+    key: (index: number) => string | null;
+    readonly length: number;
+}>;
+
+function createMemoryStorage(backing: Map<string, string>): StorageLike {
+    return {
+        getItem: (key) => backing.get(String(key)) ?? null,
+        setItem: (key, value) => {
+            backing.set(String(key), String(value));
+        },
+        removeItem: (key) => {
+            backing.delete(String(key));
+        },
+        clear: () => {
+            backing.clear();
+        },
+        key: (index) => {
+            const keys = Array.from(backing.keys());
+            return typeof keys[index] === 'string' ? keys[index] : null;
+        },
+        get length() {
+            return backing.size;
+        },
+    };
+}
+
+const originalConsoleError = console.error;
+console.error = (...args: unknown[]) => {
+    if (typeof args[0] === 'string' && args[0].includes('react-test-renderer is deprecated')) {
+        return;
+    }
+    originalConsoleError(...args);
+};
+
+function maybeLogActiveHandles(tag: string): void {
+    if (process.env.HAPPIER_VITEST_DEBUG_ACTIVE_HANDLES !== '1') return;
+    dumpActiveHandlesAlways(tag, process.env.HAPPIER_VITEST_DEBUG_ACTIVE_HANDLES_VERBOSE === '1');
+}
+
+function dumpActiveHandlesAlways(tag: string, verbose: boolean): void {
+    const anyProcess = process as any;
+    if (typeof anyProcess._getActiveHandles !== 'function') return;
+    const handles: unknown[] = anyProcess._getActiveHandles();
+    const counts = new Map<string, number>();
+    for (const handle of handles) {
+        const name =
+            typeof handle === 'object' && handle && (handle as any).constructor && typeof (handle as any).constructor.name === 'string'
+                ? (handle as any).constructor.name
+                : typeof handle;
+        counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const summary = Array.from(counts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, count]) => `${name}:${count}`)
+        .join(', ');
+    const stdinPaused = typeof (process.stdin as any)?.isPaused === 'function' ? (process.stdin as any).isPaused() : null;
+    const stdinDataListeners = typeof (process.stdin as any)?.listenerCount === 'function'
+        ? (process.stdin as any).listenerCount('data')
+        : null;
+    originalConsoleError(
+        `[vitest] active handles (${tag}): ${summary || '<none>'}` +
+        `${stdinPaused == null ? '' : `, stdinPaused=${stdinPaused}`}` +
+        `${stdinDataListeners == null ? '' : `, stdinDataListeners=${stdinDataListeners}`}`,
+    );
+
+    if (!verbose) return;
+
+    const allowlisted = new Set(['Pipe', 'Socket']);
+    const suspicious = handles
+        .map((handle) => {
+            const name =
+                typeof handle === 'object' && handle && (handle as any).constructor && typeof (handle as any).constructor.name === 'string'
+                    ? (handle as any).constructor.name
+                    : typeof handle;
+            return { name, handle };
+        })
+        .filter(({ name }) => !allowlisted.has(name));
+
+    if (suspicious.length === 0) return;
+
+    const details = suspicious.slice(0, 5).map(({ name, handle }) => {
+        if (name === 'TLSSocket' || name === 'Socket') {
+            const anyHandle = handle as any;
+            const remote = typeof anyHandle.remoteAddress === 'string'
+                ? `${anyHandle.remoteAddress}${typeof anyHandle.remotePort === 'number' ? `:${anyHandle.remotePort}` : ''}`
+                : null;
+            const servername = typeof anyHandle.servername === 'string' ? anyHandle.servername : null;
+            return `${name}(${[remote ? `remote=${remote}` : null, servername ? `servername=${servername}` : null].filter(Boolean).join(',') || 'n/a'})`;
+        }
+        return name;
+    }).join(', ');
+
+    originalConsoleError(`[vitest] active handles details (${tag}): ${details}${suspicious.length > 5 ? ` (+${suspicious.length - 5} more)` : ''}`);
+}
+
+function pauseStdinForTests(): void {
+    try {
+        const stdin = process.stdin as any;
+        if (stdin && typeof stdin.pause === 'function') {
+            stdin.pause();
+        }
+        if (stdin && typeof stdin.removeAllListeners === 'function') {
+            stdin.removeAllListeners('data');
+            stdin.removeAllListeners('readable');
+        }
+        if (stdin && typeof stdin.unref === 'function') {
+            stdin.unref();
+        }
+    } catch {
+        // ignore
+    }
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    try {
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => {
+                reject(new Error(`[vitest] timed out after ${ms}ms: ${label}`));
+            }, ms);
+        });
+        return await Promise.race([promise, timeoutPromise]);
+    } finally {
+        if (timeoutId != null) {
+            clearTimeout(timeoutId);
+        }
+    }
+}
+
+async function dumpWhyIsNodeRunning(tag: string): Promise<void> {
+    if (process.env.HAPPIER_VITEST_DEBUG_WHY_NODE_RUNNING !== '1') return;
+    try {
+        const mod = await import('why-is-node-running');
+        const whyIsNodeRunning = (mod as unknown as { default?: unknown }).default ?? mod;
+        if (typeof whyIsNodeRunning !== 'function') return;
+        originalConsoleError(`[vitest] why-is-node-running dump (${tag})`);
+        whyIsNodeRunning();
+    } catch {
+        // ignore
+    }
+}
+
+async function closeUndiciGlobalDispatcherForTests(): Promise<void> {
+    try {
+        const undici = await import('undici');
+        const getGlobalDispatcher = (undici as unknown as { getGlobalDispatcher?: () => unknown }).getGlobalDispatcher;
+        if (typeof getGlobalDispatcher !== 'function') return;
+        const dispatcher = getGlobalDispatcher() as unknown as {
+            close?: () => Promise<void> | void;
+            destroy?: () => Promise<void> | void;
+        } | null;
+        await disposeUndiciDispatcherForTestTeardown(dispatcher);
+    } catch {
+        // ignore (undici may not be available in some runtimes)
+    }
+}
+
+if (process.env.HAPPIER_VITEST_ENABLE_SIGNAL_DUMP === '1') {
+    // NOTE: Node uses SIGUSR1 to toggle the inspector, so use SIGUSR2 for our own dumps.
+    process.on('SIGUSR2', () => {
+        dumpActiveHandlesAlways('SIGUSR2', true);
+        void dumpWhyIsNodeRunning('SIGUSR2');
+    });
+}
+
+installVitestRnShim({ traceFile: process.env.VITEST_TRACE_LOAD ?? null });
+
+// `react-native` includes Flow syntax. Even with Vite aliases, some dependencies still
+// resolve it via Node's CJS loader, so we mock it explicitly here as well.
+vi.mock('react-native', async () => await import('./reactNativeStub'));
+
+// Vitest runs in Node; `react-native-mmkv` depends on React Native internals and can fail to parse.
+// Provide a minimal in-memory implementation for tests.
+const localStorageBacking = new Map<string, string>();
+const sessionStorageBacking = new Map<string, string>();
+const indexedDbForTests = new IDBFactory();
+
+vi.mock('expo-notifications', async () => await import('./expoNotificationsStub'));
+
+beforeEach(() => {
+    // Some test files enable fake timers and forget to restore them. Force real timers at the start
+    // of every test to avoid cross-test leakage (Vitest workers may execute multiple test files).
+    vi.useRealTimers();
+
+    // Many UI tests intentionally fake DOM globals by assigning directly to `globalThis.window` /
+    // `globalThis.document` without using `vi.stubGlobal`. Reset them to the original node runtime
+    // shape before each test so server seeding/runtime heuristics stay deterministic.
+    restoreDomGlobalsToOriginal();
+
+    resetReactNativeMmkvStub();
+    localStorageBacking.clear();
+    sessionStorageBacking.clear();
+
+    // Node 25 exposes an incomplete `localStorage` global behind an experimental flag and warns about
+    // missing persistence paths. Our UI runtime expects the browser `Storage` shape, so provide a
+    // stable in-memory implementation for tests.
+    vi.stubGlobal('localStorage', createMemoryStorage(localStorageBacking) as unknown as Storage);
+    vi.stubGlobal('sessionStorage', createMemoryStorage(sessionStorageBacking) as unknown as Storage);
+    // The web runtime persists large records in IndexedDB. Install the genuine browser storage
+    // boundary once for every test rather than forcing each consumer suite to duplicate it.
+    // The factory remains stable for the worker because repository storage owns an in-memory
+    // compare-and-swap baseline; owner tests clear the records they materialize.
+    vi.stubGlobal('indexedDB', indexedDbForTests);
+
+    if (process.env.HAPPIER_VITEST_FORBID_FETCH === '1') {
+        vi.stubGlobal('fetch', (async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url =
+                typeof input === 'string'
+                    ? input
+                    : input instanceof URL
+                        ? input.toString()
+                        : input && typeof (input as Request).url === 'string'
+                            ? (input as Request).url
+                            : String(input);
+            const method = String(init?.method ?? 'GET').toUpperCase();
+            throw new Error(`[vitest] unexpected fetch: ${method} ${url}`);
+        }) as unknown as typeof fetch);
+    }
+});
+
+afterEach(() => {
+    // Ensure fake timers never leak across tests (even when a test fails mid-flight).
+    vi.useRealTimers();
+
+    // Ensure mounted React test renderers never leak across tests. This is important for fork-based
+    // Vitest runs: a single test file leaking an interval/subscription can prevent the fork from
+    // exiting and hang the suite.
+    standardCleanup();
+
+    // Tests may override `runtimeFetch` via `setRuntimeFetch(...)`. Reset it after each test to
+    // prevent cross-test pollution (module state can persist across files in the same Vitest fork).
+    resetRuntimeFetch();
+
+    // Many tests use `vi.stubGlobal('fetch', ...)` and other globals. Ensure they don't leak across
+    // test files (Vitest workers may reuse the same global between sequential test files).
+    vi.unstubAllGlobals();
+
+    pauseStdinForTests();
+
+    restoreDomGlobalsToOriginal();
+});
+
+afterAll(async () => {
+    maybeLogActiveHandles('before afterAll cleanup');
+
+    const cleanupTimeoutMsRaw = Number.parseInt(process.env.HAPPIER_VITEST_AFTERALL_CLEANUP_TIMEOUT_MS ?? '', 10);
+    const cleanupTimeoutMs = Number.isFinite(cleanupTimeoutMsRaw) && cleanupTimeoutMsRaw > 0 ? cleanupTimeoutMsRaw : 30_000;
+    const debugCleanup = process.env.HAPPIER_VITEST_DEBUG_AFTERALL_CLEANUP === '1';
+
+    // Endpoint supervisors can start background timers and keep the Vitest fork alive even after all tests finish.
+    // Stop them before resetting reachability supervisors so the process can exit cleanly.
+    const endpointSupervisorMod = await import('@/sync/runtime/connectivity/endpointSupervisorPool');
+    if (debugCleanup) originalConsoleError('[vitest] afterAll cleanup: resetEndpointSupervisorPoolForTests (start)');
+    try {
+        await withTimeout(
+            endpointSupervisorMod.resetEndpointSupervisorPoolForTests(),
+            cleanupTimeoutMs,
+            'resetEndpointSupervisorPoolForTests',
+        );
+    } finally {
+        if (debugCleanup) originalConsoleError('[vitest] afterAll cleanup: resetEndpointSupervisorPoolForTests (end)');
+    }
+
+    maybeLogActiveHandles('after resetEndpointSupervisorPoolForTests');
+
+    // `serverFetch(...)` can start background server reachability supervisors. Ensure they are
+    // fully stopped at the end of the test run so the Vitest fork can exit cleanly.
+    //
+    // IMPORTANT: this must be awaited. Background retry timers inside the connection supervisor keep the
+    // fork process alive, which can otherwise hang the suite after the last test file completes.
+    const mod = await import('@/sync/runtime/connectivity/serverReachabilitySupervisorPool');
+    if (debugCleanup) originalConsoleError('[vitest] afterAll cleanup: resetServerReachabilitySupervisors (start)');
+    try {
+        await withTimeout(mod.resetServerReachabilitySupervisors(), cleanupTimeoutMs, 'resetServerReachabilitySupervisors');
+    } finally {
+        if (debugCleanup) originalConsoleError('[vitest] afterAll cleanup: resetServerReachabilitySupervisors (end)');
+    }
+
+    maybeLogActiveHandles('after resetServerReachabilitySupervisors');
+
+    if (debugCleanup) originalConsoleError('[vitest] afterAll cleanup: closeUndiciGlobalDispatcherForTests (start)');
+    try {
+        await withTimeout(closeUndiciGlobalDispatcherForTests(), cleanupTimeoutMs, 'closeUndiciGlobalDispatcherForTests');
+    } finally {
+        if (debugCleanup) originalConsoleError('[vitest] afterAll cleanup: closeUndiciGlobalDispatcherForTests (end)');
+    }
+
+    maybeLogActiveHandles('after closeUndiciGlobalDispatcherForTests');
+
+    pauseStdinForTests();
+
+    maybeLogActiveHandles('after pauseStdinForTests');
+
+    await dumpWhyIsNodeRunning('afterAll');
+});
+
+vi.mock('react-native-mmkv', async () => await import('./reactNativeMmkvStub'));
+
+// Many UI components depend on `@expo/vector-icons`, but the package's internal entrypoints
+// are not reliably resolvable in Vitest's node environment. Provide a minimal stub for tests.
+vi.mock('@expo/vector-icons', () => ({
+    Ionicons: 'Ionicons',
+    Octicons: 'Octicons',
+    AntDesign: 'AntDesign',
+    MaterialIcons: 'MaterialIcons',
+}));
+
+// The icon seam renders as an inspectable host element in tests, exactly as `Ionicons` did before
+// it — so assertions stay `findTestInstanceByTypeWithProps(screen, 'Icon', { name: 'terminal' })`
+// and need not know which Phosphor component a name resolves to. The seam's own behaviour (the
+// per-glyph optical scale, weight defaults) is covered by its dedicated test, which unmocks this.
+// Static, not `importOriginal` — pulling the real module back in here re-enters a module that is
+// mid-require and trips vitest's ERR_INTERNAL_ASSERTION. `ICON_SIZE` is a plain value object, so
+// restating it costs nothing; `IconName` is a type and erases.
+vi.mock('@/components/ui/icons/Icon', () => ({
+    Icon: 'Icon',
+    ICON_SIZE: { xs: 14, sm: 16, md: 20, lg: 24, xl: 29 },
+}));
+
+// Phosphor draws with `react-native-svg`, whose native primitives do not exist in the node test
+// runtime — without this, every component rendering a real icon fails to construct. Host-element
+// stand-ins keep the icon component in the tree while the leaf drawing primitives become
+// inspectable placeholders. A test needing different behaviour can still mock it locally.
+vi.mock('react-native-svg', () => {
+    const host = (name: string) => name;
+    return {
+        default: host('Svg'), Svg: host('Svg'), SvgXml: host('SvgXml'),
+        Path: host('Path'), G: host('G'), Circle: host('Circle'), Ellipse: host('Ellipse'),
+        Rect: host('Rect'), Line: host('Line'), Polyline: host('Polyline'), Polygon: host('Polygon'),
+        Text: host('SvgText'), TSpan: host('TSpan'), Defs: host('Defs'), Use: host('Use'),
+        Mask: host('Mask'), ClipPath: host('ClipPath'), Pattern: host('Pattern'),
+        Image: host('SvgImage'), LinearGradient: host('LinearGradient'),
+        RadialGradient: host('RadialGradient'), Stop: host('Stop'), Symbol: host('SvgSymbol'),
+        Marker: host('Marker'), ForeignObject: host('ForeignObject'),
+    };
+});
+
+// `@shopify/react-native-skia` requires native bindings; stub it for node/Vitest.
+vi.mock('@shopify/react-native-skia', () => ({
+    Canvas: 'Canvas',
+    Circle: 'Circle',
+    Image: 'SkiaImage',
+    Rect: 'Rect',
+    Group: 'Group',
+    LinearGradient: 'LinearGradient',
+    RadialGradient: 'RadialGradient',
+    Path: 'Path',
+    RoundedRect: 'RoundedRect',
+    DiffRect: 'DiffRect',
+    Skia: {
+        Path: {
+            Make: () => ({
+                addRect: () => undefined,
+                addRRect: () => undefined,
+            }),
+        },
+        XYWHRect: () => ({}),
+        RRectXY: () => ({}),
+    },
+    FilterMode: {
+        Nearest: 'nearest',
+        Linear: 'linear',
+    },
+    MipmapMode: {
+        None: 'none',
+        Nearest: 'nearest',
+        Linear: 'linear',
+    },
+    rect: () => ({}),
+    rrect: () => ({}),
+    useImage: (source: unknown) => source == null ? null : `skia-image:${String(source)}`,
+    vec: (x: number, y: number) => ({ x, y }),
+}));
+
+// `react-native-reanimated` requires native bindings; provide a lightweight mock for node/Vitest.
+vi.mock('react-native-reanimated', () => createReanimatedModuleMock());
+const createReanimatedSubpathMock = vi.hoisted(() => () => createReanimatedModuleMock());
+vi.mock('react-native-reanimated/lib/module', createReanimatedSubpathMock);
+vi.mock('react-native-reanimated/lib/module/index', createReanimatedSubpathMock);
+vi.mock('react-native-reanimated/lib/module/index.js', createReanimatedSubpathMock);
+vi.mock('react-native-reanimated/lib/module/publicGlobals', createReanimatedSubpathMock);
+vi.mock('react-native-reanimated/lib/module/publicGlobals.js', createReanimatedSubpathMock);
+
+// `react-native-typography` relies on React Native's platform resolution (e.g. systemWeights.web.js),
+// which Node/Vitest cannot resolve via CJS `require("../helpers/systemWeights")`. Provide a minimal
+// stub so components can render without pulling in platform-specific internals.
+vi.mock('react-native-typography', () => ({
+    iOSUIKit: {
+        title3: {},
+        title3Object: {},
+    },
+    human: {},
+    humanDense: {},
+    humanTall: {},
+    material: {},
+    materialDense: {},
+    materialTall: {},
+}));
+
+// `expo-constants` reads React Native `NativeModules` and isn't safe to import in Vitest.
+vi.mock('expo-constants', () => ({
+    default: {
+        statusBarHeight: 0,
+        expoConfig: { extra: {} },
+        manifest: null,
+        manifest2: null,
+    },
+}));
+
+// `expo-modules-core` is the shared native bridge used by Expo packages and can resolve into TS
+// source entrypoints that Vitest cannot transform safely under Node.
+vi.mock('expo-modules-core', async () => await import('./expoModulesCoreStub'));
+
+// `expo-updates` is native-oriented and pulls in platform-specific modules that Node/Vitest can't parse.
+vi.mock('expo-updates', () => ({
+    useUpdates: () => ({
+        currentlyRunning: {},
+        isChecking: false,
+        isDownloading: false,
+        isRestarting: false,
+        isStartupProcedureRunning: false,
+        isUpdateAvailable: false,
+        isUpdatePending: false,
+        restartCount: 0,
+    }),
+    checkForUpdateAsync: async () => ({ isAvailable: false }),
+    fetchUpdateAsync: async () => {},
+    reloadAsync: async () => {},
+}));
+
+// `expo-image` uses native view managers; stub it for Vitest.
+vi.mock('expo-image', () => ({
+    Image: 'Image',
+}));
+
+// `expo-video` ships native/web entrypoints that Vitest cannot parse under Node.
+// Product tests assert story-deck video behavior through focused local mocks.
+vi.mock('expo-video', async () => await import('./expoVideoStub'));
+
+// FlashList v2 depends on React Native new architecture internals that do not exist in node/Vitest.
+// Most unit tests only need a stable host component shape.
+vi.mock('@shopify/flash-list', () => ({
+    FlashList: 'FlashList',
+}));
+vi.mock('@/components/ui/lists/flashListCompat/FlashListCompat', async () => {
+    const flashListModule = await import('@shopify/flash-list');
+    const useLayoutState = <T,>(initialState: T | (() => T)) => React.useState<T>(() => (
+        typeof initialState === 'function'
+            ? (initialState as () => T)()
+            : initialState
+    ));
+    return {
+        FlashList: flashListModule.FlashList,
+        flashListRuntime: {
+            Component: flashListModule.FlashList,
+            usingFallback: false,
+            reason: null,
+        },
+        useLayoutState,
+        useRecyclingState: <T,>(initialState: T | (() => T)) => useLayoutState(initialState),
+        useMappingHelper: () => React.useMemo(() => ({
+            getMappingKey: (itemKey: string | number | bigint) => itemKey,
+        }), []),
+        LayoutCommitObserver: ({ children, onCommitLayoutEffect }: {
+            children: React.ReactNode;
+            onCommitLayoutEffect?: () => void;
+        }) => {
+            React.useLayoutEffect(() => {
+                onCommitLayoutEffect?.();
+            });
+            return React.createElement(React.Fragment, null, children);
+        },
+    };
+});
+
+// `expo-secure-store` is native; stub its async API for token storage tests.
+vi.mock('expo-secure-store', () => ({
+    getItemAsync: async () => null,
+    setItemAsync: async () => {},
+    deleteItemAsync: async () => {},
+}));
+
+// `react-native-unistyles` requires a Babel plugin at runtime which isn't present in Vitest.
+// Provide a lightweight mock so view/components can render in tests.
+vi.mock('react-native-unistyles', () => {
+    // Keep this theme self-contained: many unit tests mock `react-native` and may omit Platform,
+    // so importing the real theme (which depends on Platform.select) would make those tests flaky.
+    const flattenStyle = (style: any): any => {
+        if (style == null) return style;
+        if (Array.isArray(style)) {
+            return style.reduce((acc: Record<string, unknown>, entry: unknown) => ({
+                ...acc,
+                ...(flattenStyle(entry) ?? {}),
+            }), {});
+        }
+        if (typeof style === 'number') return {};
+        if (typeof style === 'object') return style;
+        return {};
+    };
+    const theme = {
+        dark: false,
+        colors: {
+            //
+            // Main colors
+            //
+            // Not restated, for the reason spelled out on `state` below: hand-copying this block
+            // had it serving `#000000`/`#666666`/`#999999` where the app paints
+            // `#222222`/`#6c6c70`/`#99999d`, so every suite without its own theme was certifying
+            // colours the app never renders. `theme/tokens/surfaceAndTextColors.ts` imports nothing.
+            text: lightTextColors,
+            accent: {
+                blue: '#007AFF',
+                green: '#34C759',
+                orange: '#FF9500',
+                yellow: '#FFCC00',
+                red: '#FF3B30',
+                indigo: '#5856D6',
+                purple: '#AF52DE',
+            },
+            // The one block that is NOT restated: components read `state.*` heavily and this
+            // program keeps adding roles to it, so a hand-copied value silently renders a colour
+            // the app never paints — or `undefined`, which looks like "no colour" and passes.
+            // `theme/tokens/stateColors.ts` imports nothing, so it is safe here where the real
+            // theme is not. `reactNativeStub`'s `Platform.select` resolves `default` first, so the
+            // test theme takes the same info hue the real theme resolves under Vitest;
+            // `vitestSetupThemeParity.test.ts` fails the moment those two disagree.
+            state: buildLightStateColors(LIGHT_STATE_INFO_FOREGROUND.default),
+            background: { canvas: '#F5F5F5' },
+            // See `text` above — same owner, four more drifts closed (`pressed`, `pressedOverlay`,
+            // `selected`, `sectionTint`).
+            surface: lightSurfaceColors,
+            border: {
+                default: '#eaeaea',
+                surface: 'transparent',
+                strong: '#d6d6d6',
+                modal: 'rgba(0, 0, 0, 0.1)',
+            },
+            focus: { ring: '#0059B3' },
+            glass: {
+                border: 'rgba(255, 255, 255, 0.92)',
+                innerShadow: 'inset 0px 8px 14px -10px rgba(0, 0, 0, 0.036)',
+                castShadow: '0px 4px 28px rgba(0, 0, 0, 0.07)',
+                composerSurface: '#ffffff',
+            },
+            effect: { surfaceHighlight: 'transparent' },
+            chrome: {
+                header: { background: '#ffffff', foreground: '#18171C' },
+            },
+            shadow: { color: '#000000', opacity: 0.1 },
+            // Keyed off the real scale rather than a hand-counted length: as a 0-indexed array of
+            // length 6 this silently had no entry for the highest level, and every consumer of it
+            // crashed on `undefined` the moment the scale grew.
+            shadowLevels: Object.fromEntries(SHADOW_LEVELS.map((level) => [level, {
+                boxShadow: '0 0 0 rgba(0, 0, 0, 0)',
+                shadowColor: '#000000',
+                shadowOffset: { width: 0, height: level },
+                shadowOpacity: 0.1,
+                shadowRadius: level,
+                elevation: level,
+            }])),
+            shadowPopoverArrowBoxShadow: '0 0 0 rgba(0, 0, 0, 0)',
+            overlay: {
+                scrim: 'rgba(0, 0, 0, 0.45)',
+                scrimSoft: 'rgba(0, 0, 0, 0.18)',
+                scrimStrong: 'rgba(255, 255, 255, 0.68)',
+                scrimWizard: 'rgba(255, 255, 255, 0.52)',
+                foreground: '#FFFFFF',
+                secondaryForeground: 'rgba(255, 255, 255, 0.9)',
+            },
+            desktopPetOverlay: {
+                bubble: {
+                    background: '#FFFFFF',
+                    backgroundPressed: '#F7F7F7',
+                    text: '#1C1C1E',
+                    textSecondary: '#5F6368',
+                    controlBackground: 'rgba(255, 255, 255, 0.96)',
+                    controlBackgroundPressed: '#F2F2F7',
+                },
+            },
+
+            //
+            // System components
+            //
+            switch: { track: { inactive: '#dddddd', active: '#34C759' }, thumb: { active: '#FFFFFF', inactive: '#767577' } },
+            radio: { active: '#007AFF', inactive: '#C0C0C0', dot: '#007AFF' },
+            button: {
+                primary: { background: '#000000', tint: '#FFFFFF', disabled: '#C0C0C0' },
+                secondary: { background: 'transparent', tint: '#666666', surface: '#ffffff' },
+            },
+            input: { background: '#F5F5F5', text: '#000000', placeholder: '#999999' },
+            segmentedControl: {
+                trackBackground: '#f0f0f0',
+                trackGradient: undefined,
+                activeBackground: '#ffffff',
+                activeGradient: undefined,
+            },
+
+            //
+            // Status / boxes
+            //
+            status: { error: '#ff3b30', connected: '#34C759', connecting: '#FFCC00', disconnected: '#999999', default: '#999999' },
+            //
+            // Permission buttons
+            //
+            permissionButton: {
+                allow: { background: '#34C759', text: '#FFFFFF' },
+                deny: { background: '#FF3B30', text: '#FFFFFF' },
+                allowAll: { background: '#007AFF', text: '#FFFFFF' },
+                inactive: { background: '#dddddd', border: '#cccccc', text: '#8E8E93' },
+                selected: { background: '#f2f2f2', border: '#cccccc', text: '#3C3C43' },
+            },
+
+            //
+            // Diff view palette (used by tool renderers)
+            //
+            diff: {
+                added: { background: '#e6ffed', border: '#b7eb8f', foreground: '#135200' },
+                removed: { background: '#ffecec', border: '#ffa39e', foreground: '#a8071a' },
+                hunk: { background: '#f5f5f5', foreground: '#666' },
+                context: { background: '#fff', foreground: '#333' },
+                lineNumber: { background: '#fff', foreground: '#999' },
+                inlineAdded: { background: '#acfaa6', foreground: '#135200' },
+                inlineRemoved: { background: '#ffcaca', foreground: '#a8071a' },
+            },
+            message: {
+                user: { background: '#f0eee6', foreground: '#000000' },
+                agent: { foreground: '#000000' },
+                event: { foreground: '#666666' },
+            },
+            feed: {
+                card: { background: '#f8f8f8' },
+            },
+            syntax: {
+                keyword: '#1d4ed8',
+                string: '#059669',
+                comment: '#6b7280',
+                number: '#0891b2',
+                function: '#9333ea',
+                default: '#374151',
+            },
+            versionControl: {
+                added: { foreground: '#22c55e', background: 'rgba(34, 197, 94, 0.12)' },
+                removed: { foreground: '#ef4444', background: 'rgba(239, 68, 68, 0.12)' },
+            },
+        },
+        borderRadius: {
+            sm: 4,
+            md: 8,
+            lg: 10,
+            xl: 12,
+            xxl: 16,
+            modalCard: 14,
+        },
+        iconSize: { small: 12, medium: 16, large: 20, xlarge: 24 },
+    };
+
+    return {
+        StyleSheet: {
+            create: (styles: any) => (typeof styles === 'function' ? styles(theme) : styles),
+            flatten: flattenStyle,
+            configure: () => {},
+            absoluteFillObject: {},
+        },
+        useUnistyles: () => ({ theme }),
+        UnistylesRuntime: {
+            setRootViewBackgroundColor: () => {},
+            setAdaptiveThemes: () => {},
+            setTheme: () => {},
+            updateTheme: () => {},
+        },
+    };
+});

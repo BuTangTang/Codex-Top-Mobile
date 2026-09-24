@@ -1,0 +1,4 @@
+Claude Code v2.1.170
+
+>
+⏸ plan mode on (shift+tab to cycle)

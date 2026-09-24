@@ -1,0 +1,633 @@
+import * as React from 'react';
+import { View, TouchableOpacity, Platform } from 'react-native';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+import { getToolViewComponent } from '@/components/tools/renderers/core/_registry';
+import { Message, ToolCall } from '@/sync/domains/messages/messageTypes';
+import { useElapsedTime } from '@/hooks/ui/useElapsedTime';
+import { Metadata } from '@/sync/domains/state/storageTypes';
+import type { OpenApprovalArtifactForSession } from '@/sync/domains/artifacts/approvalArtifacts';
+import { useRouter } from 'expo-router';
+import { PermissionFooter } from '../permissions/PermissionFooter';
+import { ApprovalPromptCard } from '../approvals/ApprovalPromptCard';
+import { parseToolUseError } from '@/utils/errors/toolErrorParser';
+import { t } from '@/text';
+import { useSetting } from '@/sync/domains/state/storage';
+import { resolveToolViewDetailLevel, type ToolViewDetailLevel } from '@/components/tools/normalization/policy/resolveToolViewDetailLevel';
+import { Text } from '@/components/ui/text/Text';
+import { ToolInlineBody } from './ToolInlineBody';
+import { TranscriptCollapsible } from '@/components/sessions/transcript/motion/TranscriptCollapsible';
+import { buildToolHeaderModel } from '@/components/tools/shell/presentation/buildToolHeaderModel';
+import { resolveToolStatusIndicatorKind } from '@/components/tools/shell/presentation/resolveToolStatusIndicatorKind';
+import { resolveToolErrorSummary } from '@/components/tools/shell/presentation/resolveToolErrorSummary';
+import { ActivitySpinner, iconMatchedSpinnerSize } from '@/components/ui/feedback/ActivitySpinner';
+import {
+    resolveToolViewDetailLevelDefaultForChromeMode,
+    resolveToolViewExpandedDetailLevelDefaultForChromeMode,
+    type ToolViewDetailLevelSetting,
+    type ToolViewExpandedDetailLevelSetting,
+} from '@/components/tools/normalization/policy/resolveToolViewDetailDefaultsForChromeMode';
+import { deriveToolTimelineDensity } from '@/components/tools/normalization/policy/deriveToolTimelineDensity';
+import { resolvePermissionPromptSurface, shouldShowGenericPermissionPromptForRequest } from '@/utils/sessions/permissions/permissionPromptPolicy';
+import { useEnsureSidechainsLoaded } from '@/hooks/session/useEnsureSidechainsLoaded';
+import { resolveToolTranscriptSidechainId } from './resolveToolTranscriptSidechainId';
+import {
+    SidechainHydrationInlineStatus,
+    shouldShowSidechainHydrationInlineStatus,
+} from './SidechainHydrationInlineStatus';
+import { buildToolCallMessageRouteId } from '@/sync/domains/messages/messageRouteIds';
+import { Typography } from '@/constants/Typography';
+import { isGenericSubAgentToolName, isSubAgentTranscriptToolName } from '@happier-dev/protocol/tools/v2';
+import { resolveInactiveSessionToolCallFailure } from '../permissions/resolveInactiveSessionToolCallFailure';
+import { navigateWithBlurOnWeb } from '@/utils/platform/navigateWithBlurOnWeb';
+import { buildApprovalToolCallLocation, doesApprovalMatchToolCall } from './toolApprovalPromptMatching';
+import type { TranscriptInteraction } from '@/utils/sessions/deriveTranscriptInteraction';
+import { TranscriptJumpAttention } from '@/components/sessions/transcript/navigation/TranscriptJumpHighlightOverlay';
+import { RowActionRevealSlot } from '@/components/sessions/transcript/messageActions/RowActionRevealSlot';
+import { readCoarsePrimaryPointer, useRowActionHoverHost } from '@/components/sessions/transcript/messageActions/rowActionRevealHost';
+import { shouldShowTranscriptRowPinAction } from '@/components/sessions/transcript/messageCopyVisibility';
+import type { ToolRowPinAction } from '@/components/sessions/transcript/toolCalls/ToolCallPinAction';
+import { Icon } from '@/components/ui/icons/Icon';
+import {
+    TranscriptRowSeqProvider,
+    useHistoricalTranscriptAgentId,
+} from '@/components/sessions/transcript/attribution/SessionTranscriptAgentAttributionContext';
+
+const TOOL_VIEW_HIGHLIGHT_RADIUS = 12;
+
+/**
+ * Ink size of the card's status mark. The running spinner derives its diameter from this through
+ * `iconMatchedSpinnerSize`, so the mark cannot appear to change size as a tool settles.
+ */
+const TOOL_VIEW_STATUS_GLYPH_PX = 20;
+
+interface ToolViewProps {
+    metadata: Metadata | null;
+    tool: ToolCall;
+    messages?: Message[];
+    onPress?: () => void;
+    sessionId?: string;
+    messageId?: string;
+    /** Row seq, so a seq-targeted transcript jump can land its highlight here. */
+    jumpHighlightSeq?: number | null;
+    headerAction?: ToolRowPinAction | null;
+    approvalRequests?: readonly OpenApprovalArtifactForSession[];
+    forcePermissionPromptsInTranscript?: boolean;
+    /**
+     * True when the card is rendered inside a tool-calls group, where the group's
+     * unit card already supplies a continuous `surface.inset` background and the
+     * rows must stack flush. In that context the card drops its own outer vertical
+     * margin so no page background shows between consecutive grouped tools.
+     * Standalone tool cards (default) keep the intrinsic margin.
+     */
+    embedded?: boolean;
+    interaction?: TranscriptInteraction;
+}
+
+export const ToolView = React.memo<ToolViewProps>((props) => {
+    const { tool, onPress, sessionId, messageId } = props;
+    // The canonical transcript row sequence. It already reaches this component
+    // for jump targeting; historical Agent attribution is its second reader, and
+    // it is published to the whole tool subtree so the body, the permission
+    // footer and the full view resolve the same Agent without six layers of
+    // prop drilling.
+    const transcriptSeq = props.jumpHighlightSeq ?? null;
+    const historicalAgentId = useHistoricalTranscriptAgentId(transcriptSeq);
+
+    const headerActionHost = useRowActionHoverHost();
+    const router = useRouter();
+    const { theme } = useUnistyles();
+    const [isExpanded, setIsExpanded] = React.useState(false);
+    const toolViewDetailLevelDefault = useSetting('toolViewDetailLevelDefault');
+    const toolViewDetailLevelDefaultLocalControl = useSetting('toolViewDetailLevelDefaultLocalControl');
+    const toolViewDetailLevelByToolName = useSetting('toolViewDetailLevelByToolName');
+    const toolViewTapAction = useSetting('toolViewTapAction');
+    const toolViewExpandedDetailLevelDefault = useSetting('toolViewExpandedDetailLevelDefault');
+    const toolViewExpandedDetailLevelByToolName = useSetting('toolViewExpandedDetailLevelByToolName');
+    const permissionPromptSurface = useSetting('permissionPromptSurface');
+    const normalizedToolViewDetailLevelDefaultSetting: ToolViewDetailLevelSetting =
+        toolViewDetailLevelDefault === 'default' ||
+        toolViewDetailLevelDefault === 'title' ||
+        toolViewDetailLevelDefault === 'compact' ||
+        toolViewDetailLevelDefault === 'summary' ||
+        toolViewDetailLevelDefault === 'full'
+            ? toolViewDetailLevelDefault
+            : 'default';
+    const normalizedToolViewExpandedDetailLevelDefaultSetting: ToolViewExpandedDetailLevelSetting =
+        toolViewExpandedDetailLevelDefault === 'default' ||
+        toolViewExpandedDetailLevelDefault === 'summary' ||
+        toolViewExpandedDetailLevelDefault === 'full'
+            ? toolViewExpandedDetailLevelDefault
+            : 'default';
+    const resolvedDetailLevelDefault = resolveToolViewDetailLevelDefaultForChromeMode({
+        chromeMode: 'cards',
+        setting: normalizedToolViewDetailLevelDefaultSetting,
+    });
+    const resolvedExpandedDetailLevelDefault = resolveToolViewExpandedDetailLevelDefaultForChromeMode({
+        chromeMode: 'cards',
+        setting: normalizedToolViewExpandedDetailLevelDefaultSetting,
+    });
+
+    const toolForSession = React.useMemo(() => {
+        return resolveInactiveSessionToolCallFailure({
+            tool,
+            permissionDisabledReason: props.interaction?.permissionDisabledReason,
+        });
+    }, [props.interaction?.permissionDisabledReason, tool]);
+
+    const headerModel = React.useMemo(() => {
+        return buildToolHeaderModel({
+            tool: toolForSession,
+            metadata: props.metadata,
+            iconSize: 18,
+            iconColorPrimary: theme.colors.text.primary,
+            iconColorSecondary: theme.colors.text.secondary,
+            historicalAgentId,
+        });
+    }, [historicalAgentId, props.metadata, theme.colors.text.primary, theme.colors.text.secondary, toolForSession]);
+
+    const toolForRendering = headerModel.toolForRendering;
+    const isWaitingForPermission = headerModel.isWaitingForPermission;
+
+    const handleToggleExpanded = React.useCallback(() => {
+        setIsExpanded((v) => !v);
+    }, []);
+
+    const normalizedToolName = headerModel.normalizedToolName;
+    let knownTool = headerModel.knownTool;
+    const routeMessageId = React.useMemo(() => {
+        if (props.interaction?.disableToolNavigation === true) return null;
+        return buildToolCallMessageRouteId({
+            toolId: typeof toolForRendering.id === 'string' ? toolForRendering.id : null,
+            fallbackMessageId: messageId,
+        });
+    }, [messageId, props.interaction?.disableToolNavigation, toolForRendering.id]);
+
+    const handleOpen = React.useCallback(() => {
+        if (onPress) {
+            onPress();
+        } else if (sessionId && routeMessageId) {
+            navigateWithBlurOnWeb(() => {
+                router.push(`/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(routeMessageId)}`);
+            });
+        }
+    }, [onPress, routeMessageId, router, sessionId]);
+
+    const canOpen = !!(onPress || (sessionId && routeMessageId));
+
+    const description: string | null = headerModel.subtitle;
+    const status: string | null = headerModel.statusText;
+    let minimal = false;
+    let noStatus = false;
+    let hideDefaultError = false;
+    
+    // For some agents (e.g. Gemini): unknown tools should be rendered as minimal (hidden)
+    // to avoid showing raw INPUT/OUTPUT for internal tools we haven't explicitly supported yet.
+    if (headerModel.shouldHideBodyPermanently) {
+        minimal = true;
+    }
+
+    // Handle optional title and function type
+    const toolTitle = headerModel.title;
+    if (knownTool && knownTool.minimal !== undefined) {
+        if (typeof knownTool.minimal === 'function') {
+            minimal = knownTool.minimal({ tool: toolForRendering, metadata: props.metadata, messages: props.messages });
+        } else {
+            minimal = knownTool.minimal;
+        }
+    }
+
+    const collapsedDetailLevel = toolForRendering.name.startsWith('mcp__') || headerModel.shouldCollapseUnknownToolByDefault
+        ? 'title'
+        : resolveToolViewDetailLevel({
+              toolName: normalizedToolName,
+              toolInput: toolForRendering.input,
+              detailLevelDefault: resolvedDetailLevelDefault,
+              detailLevelDefaultLocalControl: toolViewDetailLevelDefaultLocalControl,
+              detailLevelByToolName: toolViewDetailLevelByToolName as Record<string, ToolViewDetailLevel> | null | undefined,
+          });
+
+    const expandedDetailLevel: 'summary' | 'full' =
+        (toolViewExpandedDetailLevelByToolName as Record<string, 'summary' | 'full'> | null | undefined)?.[normalizedToolName] ?? resolvedExpandedDetailLevelDefault;
+
+    const effectiveDetailLevel = isExpanded ? expandedDetailLevel : collapsedDetailLevel;
+
+    const transcriptSidechainId = React.useMemo(() => {
+        return resolveToolTranscriptSidechainId({ tool: toolForRendering, normalizedToolName });
+    }, [normalizedToolName, toolForRendering]);
+
+    const sidechainHydration = useEnsureSidechainsLoaded({
+        enabled:
+            isExpanded &&
+            props.interaction?.disableToolNavigation !== true &&
+            isSubAgentTranscriptToolName(normalizedToolName),
+        sessionId,
+        sidechainIds: [transcriptSidechainId],
+    });
+
+    const inlineDetailLevel =
+        isGenericSubAgentToolName(normalizedToolName) && effectiveDetailLevel === 'full'
+            ? 'summary'
+            : effectiveDetailLevel;
+    const sidechainHydrationStatus = transcriptSidechainId
+        ? sidechainHydration.bySidechainId[transcriptSidechainId]?.status ?? sidechainHydration.status
+        : sidechainHydration.status;
+    const showSidechainHydrationStatus = isExpanded
+        && isSubAgentTranscriptToolName(normalizedToolName)
+        && shouldShowSidechainHydrationInlineStatus({
+            messageCount: props.messages?.length ?? 0,
+            sidechainId: transcriptSidechainId,
+            status: sidechainHydrationStatus,
+        });
+
+    const { density: timelineDensity, iconSize } = deriveToolTimelineDensity(effectiveDetailLevel);
+    const icon = React.useMemo(() => {
+        if (iconSize === 18) return headerModel.icon;
+        return buildToolHeaderModel({
+            tool,
+            metadata: props.metadata,
+            iconSize,
+            iconColorPrimary: theme.colors.text.primary,
+            iconColorSecondary: theme.colors.text.secondary,
+            historicalAgentId,
+        }).icon;
+    }, [headerModel.icon, historicalAgentId, iconSize, props.metadata, theme.colors.text.primary, theme.colors.text.secondary, tool]);
+
+    // Apply the per-tool detail level preference for the timeline card.
+    // - title: hide the tool body
+    // - compact: hide the tool body, keep a short inline subtitle
+    // - summary: default current behavior
+    // - full: prefer full-view component when available
+    if (effectiveDetailLevel === 'title' || effectiveDetailLevel === 'compact') {
+        minimal = true;
+    }
+    
+    if (knownTool && typeof knownTool.noStatus === 'boolean') {
+        noStatus = knownTool.noStatus;
+    }
+    if (knownTool && typeof knownTool.hideDefaultError === 'boolean') {
+        hideDefaultError = knownTool.hideDefaultError;
+    }
+
+    let statusIcon = null;
+
+    let isToolUseError = false;
+    if (toolForRendering.state === 'error' && toolForRendering.result && parseToolUseError(toolForRendering.result).isToolUseError) {
+        isToolUseError = true;
+    }
+
+    const statusKind = resolveToolStatusIndicatorKind(toolForRendering);
+    if (statusKind === 'permission_blocked') {
+        statusIcon = <Icon name="minus-circle" size={TOOL_VIEW_STATUS_GLYPH_PX} color={theme.colors.text.secondary} />;
+    } else if (statusKind === 'permission_pending') {
+        statusIcon = <Icon name="lock" size={TOOL_VIEW_STATUS_GLYPH_PX} color={theme.colors.state.neutral.foreground} />;
+    } else if (isToolUseError) {
+        statusIcon = <Icon name="minus-circle" size={TOOL_VIEW_STATUS_GLYPH_PX} color={theme.colors.text.secondary} />;
+        hideDefaultError = true;
+        minimal = true;
+    } else {
+        switch (statusKind) {
+            case 'running':
+                if (!noStatus) {
+                    // Matched to the 20px glyphs this slot swaps to, through the one helper that
+                    // owns the ratio. The hand-rolled `size="small"` plus a 0.8 transform was the
+                    // same arithmetic done privately: it scaled the drawing but not the layout box,
+                    // so the mark still reserved 20px and the correction could drift from the
+                    // helper the moment either number changed.
+                    statusIcon = (
+                        <ActivitySpinner
+                            size={iconMatchedSpinnerSize(TOOL_VIEW_STATUS_GLYPH_PX)}
+                            color={theme.colors.text.secondary}
+                        />
+                    );
+                }
+                break;
+            case 'error':
+                statusIcon = <Icon name="warning-circle" size={TOOL_VIEW_STATUS_GLYPH_PX} color={theme.colors.state.danger.foreground} />;
+                break;
+            case 'completed':
+            case 'none':
+            default:
+                break;
+        }
+    }
+
+    const primaryTapAction: 'expand' | 'open' =
+        toolViewTapAction === 'open' && canOpen ? 'open' : 'expand';
+    const primaryOnPress = primaryTapAction === 'open' ? handleOpen : handleToggleExpanded;
+
+    const secondaryTapAction: 'expand' | 'open' | null =
+        primaryTapAction === 'open'
+            ? 'expand'
+            : canOpen
+                ? 'open'
+                : null;
+    const secondaryOnPress =
+        secondaryTapAction === 'open'
+            ? handleOpen
+            : secondaryTapAction === 'expand'
+                ? handleToggleExpanded
+                : null;
+
+    const [headerActions, setHeaderActions] = React.useState<React.ReactNode | null>(null);
+    const isBodyVisible = effectiveDetailLevel !== 'title' && effectiveDetailLevel !== 'compact';
+    const bodyDetailLevel: 'summary' | 'full' = inlineDetailLevel === 'full' ? 'full' : 'summary';
+    const lastVisibleBodyDetailLevelRef = React.useRef<'summary' | 'full'>(bodyDetailLevel);
+    if (isBodyVisible) {
+        lastVisibleBodyDetailLevelRef.current = bodyDetailLevel;
+    }
+    const renderBodyDetailLevel = isBodyVisible ? bodyDetailLevel : lastVisibleBodyDetailLevelRef.current;
+
+    const collapsibleId =
+        messageId ??
+        toolForRendering.id ??
+        `${sessionId ?? 'no-session'}:${normalizedToolName}:${toolForRendering.createdAt}`;
+
+    const resolvedPermissionPromptSurface = props.forcePermissionPromptsInTranscript
+        ? 'transcript'
+        : resolvePermissionPromptSurface(permissionPromptSurface);
+    const showPermissionPromptsInTranscript = resolvedPermissionPromptSurface === 'transcript';
+    const matchingApprovalRequests = React.useMemo(() => {
+        const requests = props.approvalRequests ?? [];
+        if (requests.length === 0) return [];
+        return requests.filter((request) => doesApprovalMatchToolCall({
+            request,
+            sessionId,
+            messageId,
+            tool: toolForRendering,
+            normalizedToolName,
+        }));
+    }, [messageId, normalizedToolName, props.approvalRequests, sessionId, toolForRendering]);
+    const approvalLocation = React.useMemo(
+        () => buildApprovalToolCallLocation({ messageId }),
+        [messageId],
+    );
+
+    const headerDescription = effectiveDetailLevel === 'title' ? null : description;
+    const headerStatusText = effectiveDetailLevel === 'title' ? null : status;
+    const showSubtitleInline = timelineDensity === 'compact' || effectiveDetailLevel === 'compact';
+    const errorSummary =
+        statusKind === 'error' ? (resolveToolErrorSummary(toolForRendering) ?? t('common.error')) : null;
+
+    return (
+        <TranscriptRowSeqProvider value={transcriptSeq}>
+        <TranscriptJumpAttention
+            sessionId={sessionId ?? ''}
+            routeMessageId={messageId ?? null}
+            seq={transcriptSeq}
+            radius={TOOL_VIEW_HIGHLIGHT_RADIUS}
+            viewProps={{ testID: 'tool-view-container', ...headerActionHost.hoverProps }}
+            style={[styles.container, props.embedded ? styles.containerEmbedded : null]}
+        >
+            <View style={[styles.header, timelineDensity === 'compact' ? styles.headerCompact : null]}>
+                <TouchableOpacity
+                    testID="tool-view-header-primary"
+                    style={styles.headerMain}
+                    onPress={primaryOnPress}
+                    activeOpacity={0.8}
+                >
+                    <View style={[styles.iconContainer, timelineDensity === 'compact' ? styles.iconContainerCompact : null]}>
+                        {icon}
+                    </View>
+                    <View style={styles.titleContainer}>
+                        <Text style={styles.toolName} numberOfLines={1}>
+                            {toolTitle}
+                            {headerStatusText ? <Text style={styles.status}>{` ${headerStatusText}`}</Text> : null}
+                            {showSubtitleInline && headerDescription ? (
+                                <Text style={styles.compactSubtitle} numberOfLines={1}>
+                                    {` · ${headerDescription}`}
+                                </Text>
+                            ) : null}
+                        </Text>
+                        {!showSubtitleInline && headerDescription ? (
+                            <Text testID="tool-card-subtitle" style={styles.toolDescription} numberOfLines={1}>
+                                {headerDescription}
+                            </Text>
+                        ) : null}
+                    </View>
+                    {tool.state === 'running' && !isWaitingForPermission && (
+                        <View style={styles.elapsedContainer}>
+                            <ElapsedView from={toolForRendering.startedAt ?? toolForRendering.createdAt} />
+                        </View>
+                    )}
+                    {statusIcon}
+                </TouchableOpacity>
+
+                <View style={styles.headerRight}>
+                    {errorSummary ? (
+                        <View style={styles.headerError}>
+                            <Icon name="warning-circle" size={16} color={theme.colors.state.danger.foreground} />
+                            <Text style={styles.headerErrorText} numberOfLines={1}>
+                                {errorSummary}
+                            </Text>
+                        </View>
+                    ) : null}
+                    {props.headerAction ? (
+                        <RowActionRevealSlot
+                            revealed={shouldShowTranscriptRowPinAction({
+                                platformOS: Platform.OS,
+                                isRowHovered: headerActionHost.isHovered,
+                                isActionHovered: false,
+                                coarsePrimaryPointer: readCoarsePrimaryPointer(),
+                                pinned: props.headerAction.pinned,
+                            })}
+                            style={styles.headerActionsContainer}
+                            testID="tool-view-header-reveal-slot"
+                        >
+                            {props.headerAction.node}
+                        </RowActionRevealSlot>
+                    ) : null}
+                    {headerActions ? (
+                        <View style={styles.headerActionsContainer}>
+                            {headerActions}
+                        </View>
+                    ) : null}
+
+                    {secondaryOnPress ? (
+                        <TouchableOpacity
+                            testID="tool-view-header-secondary"
+                            onPress={secondaryOnPress}
+                            activeOpacity={0.8}
+                            style={styles.secondaryAction}
+                            hitSlop={15}
+                            accessibilityRole="button"
+                            accessibilityLabel={secondaryTapAction === 'open' ? t('toolView.open') : t('toolView.expand')}
+                        >
+                            {secondaryTapAction === 'open' ? (
+                                <Icon name="arrow-square-out" size={16} color={theme.colors.text.secondary} />
+                            ) : (
+                                <Icon
+                                    name={isExpanded ? 'caret-up' : 'caret-down'}
+                                    size={16}
+                                    color={theme.colors.text.secondary}
+                                />
+                            )}
+                        </TouchableOpacity>
+                    ) : null}
+                </View>
+            </View>
+
+            {/* Content area - either custom children or tool-specific view */}
+            <TranscriptCollapsible id={collapsibleId} createdAt={toolForRendering.createdAt} expanded={isBodyVisible}>
+                <View style={styles.content}>
+                    {showSidechainHydrationStatus ? (
+                        <SidechainHydrationInlineStatus
+                            testID="tool-view-sidechain-hydration-status"
+                            status={sidechainHydrationStatus}
+                        />
+                    ) : null}
+                    <ToolInlineBody
+                        mode="card"
+                        tool={toolForRendering}
+                        normalizedToolName={normalizedToolName}
+                        metadata={props.metadata}
+                        messages={props.messages ?? []}
+                        sessionId={sessionId}
+                        messageId={messageId}
+                        interaction={props.interaction}
+                        detailLevel={renderBodyDetailLevel}
+                        setHeaderActions={setHeaderActions}
+                    />
+                </View>
+            </TranscriptCollapsible>
+
+            {/* Permission footer - rendered for most tools */}
+            {/* AskUserQuestion and ExitPlanMode have custom action UIs */}
+            {showPermissionPromptsInTranscript && isWaitingForPermission && toolForRendering.permission && sessionId && shouldShowGenericPermissionPromptForRequest({ toolName: toolForRendering.name, requestKind: toolForRendering.permission.kind }) && (
+                <PermissionFooter
+                    permission={toolForRendering.permission}
+                    sessionId={sessionId}
+                    toolName={normalizedToolName}
+                    toolInput={toolForRendering.input}
+                    metadata={props.metadata}
+                    canApprovePermissions={props.interaction?.canApprovePermissions ?? true}
+                    disabledReason={props.interaction?.permissionDisabledReason}
+                />
+            )}
+            {matchingApprovalRequests.map((request) => (
+                <ApprovalPromptCard
+                    key={request.artifact.id}
+                    chrome="inline"
+                    artifact={request.artifact}
+                    approval={request.approval}
+                    location={approvalLocation}
+                    sessionId={sessionId ?? request.approval.origin?.sessionId ?? ''}
+                    canApprove={props.interaction?.canApprovePermissions ?? true}
+                    disabledReason={props.interaction?.permissionDisabledReason}
+                />
+            ))}
+        </TranscriptJumpAttention>
+        </TranscriptRowSeqProvider>
+    );
+});
+
+function ElapsedView(props: { from: number }) {
+    const { from } = props;
+    const elapsed = useElapsedTime(from);
+    return <Text style={styles.elapsedText}>{t('tools.common.elapsedSeconds', { seconds: elapsed.toFixed(1) })}</Text>;
+}
+
+const styles = StyleSheet.create((theme) => ({
+    container: {
+        backgroundColor: theme.colors.surface.inset,
+        borderRadius: 8,
+        marginVertical: 4,
+        overflow: 'hidden'
+    },
+    containerEmbedded: {
+        // Inside a tool-calls group card the unit card already paints a continuous
+        // inset background; dropping the outer margin keeps grouped tools flush so no
+        // page background shows between them.
+        marginVertical: 0,
+    },
+    header: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: 12,
+        backgroundColor: theme.colors.surface.elevated,
+    },
+    headerCompact: {
+        paddingHorizontal: 10,
+        paddingVertical: 10,
+    },
+    headerMain: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+        flex: 1,
+    },
+    headerRight: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
+    headerError: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 6,
+        maxWidth: 240,
+    },
+    headerErrorText: {
+        fontSize: 13,
+        color: theme.colors.state.danger.foreground,
+        ...Typography.default('semiBold'),
+    },
+    headerActionsContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+    },
+    secondaryAction: {
+        width: 34,
+        height: 34,
+        alignItems: 'center',
+        justifyContent: 'center',
+        marginLeft: 0,
+    },
+    iconContainer: {
+        width: 24,
+        height: 24,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    iconContainerCompact: {
+        width: 18,
+        height: 18,
+    },
+    titleContainer: {
+        flex: 1,
+    },
+    elapsedContainer: {
+        marginLeft: 8,
+    },
+    elapsedText: {
+        fontSize: 13,
+        color: theme.colors.text.secondary,
+        fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    },
+    toolName: {
+        fontSize: 13,
+        ...Typography.default('semiBold'),
+        color: theme.colors.text.primary,
+    },
+    status: {
+        fontWeight: '400',
+        fontSize: 13,
+        color: theme.colors.text.secondary,
+    },
+    toolDescription: {
+        fontSize: 13,
+        fontWeight: '400',
+        color: theme.colors.text.secondary,
+        marginTop: 2,
+    },
+    compactSubtitle: {
+        fontSize: 13,
+        fontWeight: '400',
+        color: theme.colors.text.secondary,
+    },
+    content: {
+        paddingHorizontal: 12,
+        paddingTop: 8,
+        overflow: 'visible'
+    },
+}));

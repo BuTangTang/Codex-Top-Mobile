@@ -1,0 +1,6 @@
+Claude Code v2.1.170
+
+Resuming session abc123 from on-disk history…
+user: investigate the failing build
+assistant: I will start by reading the CI logs and the build script.
+(rendered 3,128 lines of prior transcript; input not yet ready)

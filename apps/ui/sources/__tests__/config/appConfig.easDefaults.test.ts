@@ -1,0 +1,601 @@
+import { getConfig } from '@expo/config';
+import { describe, expect, it } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const DEFAULT_EAS_PROJECT_ID = '2a550bd7-e4d2-4f59-ab47-dcb778775cee';
+const DEFAULT_UPDATES_URL = `https://u.expo.dev/${DEFAULT_EAS_PROJECT_ID}`;
+
+function getUiDir(): string {
+    return join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+}
+
+function readUiPackageJson(): any {
+    return JSON.parse(readFileSync(join(getUiDir(), 'package.json'), 'utf8'));
+}
+
+function listFirstPartyExpoNativeWorkspaceDeps(): string[] {
+    const pkg = readUiPackageJson();
+    return Object.keys(pkg?.dependencies ?? {})
+        .filter((name) => name.startsWith('@happier-dev/'))
+        .map((name) => name.split('/')[1])
+        .filter((workspace): workspace is string => typeof workspace === 'string' && workspace.length > 0)
+        .filter((workspace) =>
+            existsSync(join(getUiDir(), '..', '..', 'packages', workspace, 'expo-module.config.json'))
+        )
+        .sort();
+}
+
+function getPublicConfig() {
+    return getConfig(getUiDir(), { skipSDKVersionRequirement: true, isPublicConfig: true }).exp;
+}
+
+type ExpoConfigWithAutolinking = ReturnType<typeof getPublicConfig> & {
+    autolinking?: {
+        ios?: {
+            exclude?: readonly string[];
+        };
+    };
+};
+
+/**
+ * 在测试中设置或精确恢复 NODE_ENV；兼容依赖声明将该字段标成只读的情况。
+ */
+function setTestNodeEnv(value: string | undefined): void {
+    if (value === undefined) Reflect.deleteProperty(process.env, 'NODE_ENV');
+    else Reflect.set(process.env, 'NODE_ENV', value);
+}
+
+/** 读出 Expo Router 插件和 extra 里的根目录，确认两处来自同一次解析。 */
+function readExpoRouterRoots(exp: ReturnType<typeof getPublicConfig>): { pluginRoot: unknown; extraRoot: unknown } {
+    const plugin = getPluginOptions(exp, 'expo-router') as { root?: unknown } | undefined;
+    const extra = exp.extra as { router?: { root?: unknown } } | undefined;
+    return {
+        pluginRoot: plugin?.root,
+        extraRoot: extra?.router?.root,
+    };
+}
+
+function getPluginOptions(exp: ReturnType<typeof getPublicConfig>, pluginName: string) {
+    const pluginEntry = Array.isArray(exp.plugins)
+        ? exp.plugins.find((entry) => Array.isArray(entry) && entry[0] === pluginName)
+        : undefined;
+
+    return Array.isArray(pluginEntry) ? pluginEntry[1] : undefined;
+}
+
+/** 隔离环境和本机配置，防止开发者的 app.local.js 改写默认配置断言。 */
+function withCleanEnv<T>(fn: () => T): T {
+    const keys = [
+        'APP_ENV',
+        'HAPPIER_APP_VARIANT_OVERRIDE',
+        'EXPO_PUBLIC_EAS_PROJECT_ID',
+        'EAS_PROJECT_ID',
+        'EXPO_EAS_PROJECT_ID',
+        'EXPO_UPDATES_URL',
+        'EXPO_UPDATES_CHANNEL',
+        'EXPO_APP_VERSION',
+        'EXPO_APP_NAME',
+        'HAPPY_STACKS_IOS_APP_NAME',
+        'EXPO_APP_OWNER',
+        'EXPO_APP_SLUG',
+        'EXPO_APP_BUNDLE_ID',
+        'EXPO_ANDROID_PACKAGE',
+        'HAPPIER_EXPO_RUNTIME_VERSION',
+        'HAPPIER_EXPO_RUNTIME_VERSION_POLICY',
+        'EXPO_APP_LOCAL_CONFIG_PATH',
+        'EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV',
+        'EXPO_PUBLIC_IOS_BACKGROUND_AUDIO',
+        'EXPO_IOS_BACKGROUND_AUDIO',
+        'HAPPIER_ANDROID_USES_CLEARTEXT_TRAFFIC',
+        'HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE',
+        'HAPPIER_EXPO_DEVCLIENT_SILENT_LAUNCH',
+        'HAPPIER_IOS_MEMORY_PROFILING_RUNTIME',
+        'HAPPIER_EXPO_USE_NATIVE_DEBUG',
+        'EX_UPDATES_NATIVE_DEBUG',
+        'EXPO_PUBLIC_HAPPIER_SYNC_TUNING_JSON',
+        'HAPPIER_SYNC_TUNING_JSON',
+        'EXPO_PUBLIC_CODEX_TOP_PREVIEW',
+    ] as const;
+
+    const previous: Partial<Record<(typeof keys)[number], string | undefined>> = {};
+    for (const key of keys) {
+        previous[key] = process.env[key];
+        delete process.env[key];
+    }
+    try {
+        process.env.EXPO_APP_LOCAL_CONFIG_PATH = join(getUiDir(), 'sources', '__tests__', 'config', 'fixtures', 'emptyAppLocalConfig.cjs');
+        return fn();
+    } finally {
+        for (const key of keys) {
+            const value = previous[key];
+            if (value === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = value;
+            }
+        }
+    }
+}
+
+describe('app.config.js', () => {
+    it('allows tailnet HTTP only for explicitly configured development clients', () => {
+        const regular = withCleanEnv(() => {
+            process.env.APP_ENV = 'publicdev';
+            return getPublicConfig();
+        });
+        expect(regular.ios?.infoPlist?.NSAppTransportSecurity?.NSExceptionDomains).toBeUndefined();
+
+        const client = withCleanEnv(() => {
+            process.env.APP_ENV = 'publicdev';
+            process.env.HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE = 'most-recent';
+            return getPublicConfig();
+        });
+        expect(client.ios?.infoPlist?.NSAppTransportSecurity).toEqual({
+            NSAllowsLocalNetworking: true,
+            NSAllowsArbitraryLoads: false,
+            NSExceptionDomains: {
+                '100.64.0.0/10': { NSExceptionAllowsInsecureHTTPLoads: true },
+            },
+        });
+    });
+
+    it('includes a default EAS project id so EAS can link dynamic configs', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+
+        expect(exp.extra?.eas?.projectId).toBe(DEFAULT_EAS_PROJECT_ID);
+        expect(exp.updates?.url).toBe(DEFAULT_UPDATES_URL);
+        expect(exp.extra?.app?.variant).toBe('development');
+        expect(exp.extra?.app?.identityVariant).toBe('internaldev');
+        expect(exp.name).toBe('Codex Top');
+        expect(exp.owner).toBe('happier-dev');
+        expect(exp.slug).toBe('happier');
+        expect(exp.ios?.bundleIdentifier).toBe('dev.happier.app.dev.internal');
+        expect(exp.android?.package).toBe('dev.happier.app.internaldev');
+        expect(exp.scheme).toBe('happier-internaldev');
+    });
+
+    it('exposes variant under extra.app when APP_ENV is set', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'preview';
+            return getPublicConfig();
+        });
+
+        expect(exp.extra?.app?.variant).toBe('preview');
+        expect(exp.extra?.app?.identityVariant).toBe('preview');
+        expect(exp.name).toBe('Codex Top');
+    });
+
+    it('maps the publicdev environment to the public dev identity while keeping preview-like public behavior', () => {
+        const { exp, featurePolicyEnv } = withCleanEnv(() => {
+            process.env.APP_ENV = 'publicdev';
+            const exp = getPublicConfig();
+            return {
+                exp,
+                featurePolicyEnv: process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV,
+            };
+        });
+
+        expect(exp.extra?.app?.variant).toBe('preview');
+        expect(exp.extra?.app?.identityVariant).toBe('publicdev');
+        expect(exp.name).toBe('Codex Top');
+        expect(exp.ios?.bundleIdentifier).toBe('dev.happier.app.publicdev');
+        expect(exp.android?.package).toBe('dev.happier.app.publicdev');
+        expect(exp.scheme).toBe('happier-dev');
+        expect(featurePolicyEnv).toBe('preview');
+        expect(exp.updates?.requestHeaders?.['expo-channel-name']).toBe('dev');
+    });
+
+    it('does not use iOS bundle id overrides as Android package overrides', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_APP_BUNDLE_ID = 'com.happier.local.leeroy.dev';
+            return getPublicConfig();
+        });
+
+        expect(exp.ios?.bundleIdentifier).toBe('com.happier.local.leeroy.dev');
+        expect(exp.android?.package).toBe('dev.happier.app.internaldev');
+    });
+
+    it('uses explicit Android package overrides independently from iOS bundle id overrides', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_APP_BUNDLE_ID = 'com.happier.local.leeroy.dev';
+            process.env.EXPO_ANDROID_PACKAGE = 'dev.happier.app.internaldev.devclient';
+            return getPublicConfig();
+        });
+
+        expect(exp.ios?.bundleIdentifier).toBe('com.happier.local.leeroy.dev');
+        expect(exp.android?.package).toBe('dev.happier.app.internaldev.devclient');
+    });
+
+    it('enables Android cleartext traffic by default through expo-build-properties so native manifests allow LAN/local HTTP relays', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+        expect(getPluginOptions(exp, 'expo-build-properties')).toEqual(
+            expect.objectContaining({
+                android: expect.objectContaining({
+                    usesCleartextTraffic: true,
+                }),
+            })
+        );
+    });
+
+    it('enables enriched markdown native math dependencies', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+        expect(getPluginOptions(exp, 'react-native-enriched-markdown')).toEqual({
+            enableMath: true,
+        });
+    });
+
+    it('allows disabling Android cleartext traffic explicitly via env override', () => {
+        const exp = withCleanEnv(() => {
+            process.env.HAPPIER_ANDROID_USES_CLEARTEXT_TRAFFIC = 'false';
+            return getPublicConfig();
+        });
+        expect(getPluginOptions(exp, 'expo-build-properties')).toEqual(
+            expect.objectContaining({
+                android: expect.objectContaining({
+                    usesCleartextTraffic: false,
+                }),
+            })
+        );
+    });
+
+    it('maps the internalpreview environment to the internal preview identity', () => {
+        const { exp, featurePolicyEnv } = withCleanEnv(() => {
+            process.env.APP_ENV = 'internalpreview';
+            const exp = getPublicConfig();
+            return {
+                exp,
+                featurePolicyEnv: process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV,
+            };
+        });
+
+        expect(exp.extra?.app?.variant).toBe('preview');
+        expect(exp.extra?.app?.identityVariant).toBe('internalpreview');
+        expect(exp.name).toBe('Codex Top');
+        expect(exp.ios?.bundleIdentifier).toBe('dev.happier.app.internalpreview');
+        expect(exp.android?.package).toBe('dev.happier.app.internalpreview');
+        expect(exp.scheme).toBe('happier-internalpreview');
+        expect(featurePolicyEnv).toBe('preview');
+        expect(exp.updates?.requestHeaders?.['expo-channel-name']).toBe('internalpreview');
+    });
+
+    it('allows overriding extra.app.variant without changing production identity config', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            process.env.HAPPIER_APP_VARIANT_OVERRIDE = 'preview';
+            return getPublicConfig();
+        });
+
+        expect(exp.extra?.app?.variant).toBe('preview');
+        expect(exp.name).toBe('Codex Top');
+        // Production identity still enables universal links / app links.
+        expect(exp.ios?.associatedDomains).toEqual([
+            'applinks:cloud.happier.dev',
+            'applinks:app.happier.dev',
+        ]);
+        const data = exp.android?.intentFilters?.[0]?.data;
+        const dataItems = Array.isArray(data) ? data : data ? [data] : [];
+        expect(dataItems.map((item) => item?.host)).toEqual([
+            'cloud.happier.dev',
+            'app.happier.dev',
+        ]);
+    });
+
+    it('uses the ui package.json version for expo.version by default', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+        // Avoid pinning a literal version; keep config tied to the package version.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const pkg = require('../../../package.json');
+        expect(exp.version).toBe(pkg.version);
+    });
+
+    it('defaults EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV based on the app variant', () => {
+        const envValue = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            getPublicConfig();
+            return process.env.EXPO_PUBLIC_HAPPIER_FEATURE_POLICY_ENV;
+        });
+
+        expect(envValue).toBe('production');
+    });
+
+    it('uses the configured native runtime train for internaldev OTA updates', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+        // Avoid pinning a literal runtime version; keep config tied to the package runtime train.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const pkg = require('../../../package.json');
+        expect(exp.runtimeVersion).toBe(pkg.happierExpoRuntimeVersion);
+    });
+
+    it('uses Expo fingerprint runtime policy for the publicdev lane', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'publicdev';
+            return getPublicConfig();
+        });
+        expect(exp.runtimeVersion).toEqual({ policy: 'fingerprint' });
+    });
+
+    it('uses the configured native runtime train for preview lane OTA updates', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'preview';
+            return getPublicConfig();
+        });
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const pkg = require('../../../package.json');
+        expect(exp.runtimeVersion).toBe(pkg.happierExpoRuntimeVersion);
+    });
+
+    it('uses the configured native runtime train for production lane OTA updates', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            return getPublicConfig();
+        });
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const pkg = require('../../../package.json');
+        expect(exp.runtimeVersion).toBe(pkg.happierExpoRuntimeVersion);
+    });
+
+    it('bumps the non-publicdev runtime train when first-party Expo native modules are part of the shipped app surface', () => {
+        const pkg = readUiPackageJson();
+        const nativeWorkspaceDeps = listFirstPartyExpoNativeWorkspaceDeps();
+
+        expect(nativeWorkspaceDeps).toEqual(expect.arrayContaining(['audio-stream-native', 'sherpa-native']));
+        expect(pkg.happierExpoRuntimeVersion).not.toBe('0.2.6-native');
+    });
+
+    it('allows forcing an Expo runtime policy for development diagnostics', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            process.env.HAPPIER_EXPO_RUNTIME_VERSION_POLICY = 'appVersion';
+            return getPublicConfig();
+        });
+
+        expect(exp.runtimeVersion).toEqual({ policy: 'appVersion' });
+    });
+
+    it('allows forcing an explicit Expo runtime version for maintenance OTA trains', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'preview';
+            process.env.HAPPIER_EXPO_RUNTIME_VERSION = '18';
+            return getPublicConfig();
+        });
+
+        expect(exp.runtimeVersion).toBe('18');
+    });
+
+    it('uses EXPO_PUBLIC_EAS_PROJECT_ID with highest precedence for updates linkage', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_PUBLIC_EAS_PROJECT_ID = 'public-project-id';
+            process.env.EAS_PROJECT_ID = 'eas-project-id';
+            process.env.EXPO_EAS_PROJECT_ID = 'expo-project-id';
+            return getPublicConfig();
+        });
+
+        expect(exp.extra?.eas?.projectId).toBe('public-project-id');
+        expect(exp.updates?.url).toBe('https://u.expo.dev/public-project-id');
+    });
+
+    it('forwards sync tuning JSON into extra.app for native release builds', () => {
+        const tuningJson = JSON.stringify({
+            syncPerformanceTelemetryEnabled: true,
+            nativeCryptoWorkerMode: 'auto',
+        });
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_PUBLIC_HAPPIER_SYNC_TUNING_JSON = tuningJson;
+            return getPublicConfig();
+        });
+
+        expect(exp.extra?.app?.syncTuningJson).toBe(tuningJson);
+    });
+
+    it('uses EAS_PROJECT_ID when EXPO_PUBLIC_EAS_PROJECT_ID is unset', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EAS_PROJECT_ID = 'eas-project-id';
+            process.env.EXPO_EAS_PROJECT_ID = 'expo-project-id';
+            return getPublicConfig();
+        });
+
+        expect(exp.extra?.eas?.projectId).toBe('eas-project-id');
+        expect(exp.updates?.url).toBe('https://u.expo.dev/eas-project-id');
+    });
+
+    it('allows EXPO_UPDATES_URL override while keeping project id override intact', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_PUBLIC_EAS_PROJECT_ID = 'public-project-id';
+            process.env.EXPO_UPDATES_URL = 'https://updates.example.test/custom';
+            return getPublicConfig();
+        });
+
+        expect(exp.extra?.eas?.projectId).toBe('public-project-id');
+        expect(exp.updates?.url).toBe('https://updates.example.test/custom');
+    });
+
+    it('allows owner and slug overrides for local variants', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_APP_OWNER = 'example-owner';
+            process.env.EXPO_APP_SLUG = 'example-slug';
+            return getPublicConfig();
+        });
+
+        expect(exp.owner).toBe('example-owner');
+        expect(exp.slug).toBe('example-slug');
+        expect(exp.extra?.eas?.projectId).toBe(DEFAULT_EAS_PROJECT_ID);
+    });
+
+    it('enables iOS background audio by default in development', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'development';
+            return getPublicConfig();
+        });
+
+        const plugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'react-native-audio-api');
+        expect(plugin).toEqual(['react-native-audio-api', expect.objectContaining({ iosBackgroundMode: true })]);
+    });
+
+    it('enables iOS background audio by default in preview', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'preview';
+            return getPublicConfig();
+        });
+
+        const plugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'react-native-audio-api');
+        expect(plugin).toEqual(['react-native-audio-api', expect.objectContaining({ iosBackgroundMode: true })]);
+    });
+
+    it('allows overriding iOS background audio via env', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'preview';
+            process.env.EXPO_PUBLIC_IOS_BACKGROUND_AUDIO = 'false';
+            return getPublicConfig();
+        });
+
+        const plugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'react-native-audio-api');
+        expect(plugin).toEqual(['react-native-audio-api', expect.objectContaining({ iosBackgroundMode: false })]);
+    });
+
+    it('does not enable OTA-native debug development-client launch overrides by default', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'development';
+            return getPublicConfig();
+        });
+
+        const devClientPlugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'expo-dev-client');
+        expect(devClientPlugin).toBeUndefined();
+        expect(exp.developmentClient?.silentLaunch).toBeUndefined();
+        expect(exp.updates?.useNativeDebug).toBeUndefined();
+    });
+
+    it('enables OTA-native debug development-client behavior only when explicitly requested by env', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'development';
+            process.env.HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE = 'most-recent';
+            process.env.HAPPIER_EXPO_DEVCLIENT_SILENT_LAUNCH = 'true';
+            process.env.HAPPIER_EXPO_USE_NATIVE_DEBUG = 'true';
+            return getPublicConfig();
+        });
+
+        const devClientPlugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'expo-dev-client');
+        expect(devClientPlugin).toEqual(['expo-dev-client', expect.objectContaining({ launchMode: 'most-recent' })]);
+        expect(exp.developmentClient?.silentLaunch).toBe(true);
+        expect(exp.updates?.useNativeDebug).toBe(true);
+    });
+
+    it('suppresses dev-client config-only behavior for memory profiling runtimes', () => {
+        const regularExp: ExpoConfigWithAutolinking = withCleanEnv(() => {
+            process.env.APP_ENV = 'development';
+            return getPublicConfig();
+        });
+        expect(regularExp.autolinking?.ios?.exclude).toBeUndefined();
+
+        const memoryExp: ExpoConfigWithAutolinking = withCleanEnv(() => {
+            process.env.APP_ENV = 'development';
+            process.env.HAPPIER_IOS_MEMORY_PROFILING_RUNTIME = '1';
+            process.env.HAPPIER_EXPO_DEVCLIENT_LAUNCH_MODE = 'most-recent';
+            process.env.HAPPIER_EXPO_DEVCLIENT_SILENT_LAUNCH = 'true';
+            return getPublicConfig();
+        });
+
+        const pluginNames = (memoryExp.plugins ?? []).map((entry: any) => (Array.isArray(entry) ? entry[0] : entry));
+        expect(pluginNames).not.toContain('expo-dev-client');
+        expect(memoryExp.developmentClient?.silentLaunch).toBeUndefined();
+        expect(memoryExp.autolinking?.ios?.exclude).toBeUndefined();
+    });
+
+    it('does not include unused optional native plugins in the default config', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+        const pluginNames = (exp.plugins ?? []).map((entry: any) => (Array.isArray(entry) ? entry[0] : entry));
+
+        expect(pluginNames).not.toContain('expo-location');
+        expect(pluginNames).not.toContain('expo-calendar');
+    });
+
+    it('includes iOS privacy purpose strings required by App Store static analysis', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+
+        expect(exp.ios?.infoPlist?.NSPhotoLibraryUsageDescription).toBeTruthy();
+        expect(exp.ios?.infoPlist?.NSPhotoLibraryAddUsageDescription).toBeTruthy();
+        expect(exp.ios?.infoPlist?.NSLocationWhenInUseUsageDescription).toBeTruthy();
+    });
+
+    it('applies app.local overrides when a local config file is provided', () => {
+        const exp = withCleanEnv(() => {
+            process.env.EXPO_APP_LOCAL_CONFIG_PATH = join(
+                getUiDir(),
+                'sources',
+                '__tests__',
+                'config',
+                'fixtures',
+                'app.local.fixture.cjs',
+            );
+            return getPublicConfig();
+        });
+
+        expect(exp.name).toBe('Happier (local override)');
+        expect(exp.ios?.infoPlist?.NSPhotoLibraryUsageDescription).toBe(
+            'Local override: access photos for sharing.',
+        );
+    });
+
+    it('keeps both Expo Router roots on sources/app unless the Codex Top preview switch is enabled for development', () => {
+        const official = './sources/app';
+        const preview = './sources/dev/codexTopPreview/app';
+
+        expect(withCleanEnv(() => readExpoRouterRoots(getPublicConfig()))).toEqual({
+            pluginRoot: official,
+            extraRoot: official,
+        });
+
+        expect(withCleanEnv(() => {
+            process.env.EXPO_PUBLIC_CODEX_TOP_PREVIEW = '1';
+            process.env.APP_ENV = 'preview';
+            return readExpoRouterRoots(getPublicConfig());
+        })).toEqual({
+            pluginRoot: official,
+            extraRoot: official,
+        });
+
+        expect(withCleanEnv(() => {
+            process.env.EXPO_PUBLIC_CODEX_TOP_PREVIEW = '1';
+            process.env.APP_ENV = 'production';
+            return readExpoRouterRoots(getPublicConfig());
+        })).toEqual({
+            pluginRoot: official,
+            extraRoot: official,
+        });
+
+        expect(withCleanEnv(() => {
+            process.env.EXPO_PUBLIC_CODEX_TOP_PREVIEW = '1';
+            process.env.APP_ENV = 'publicdev';
+            return readExpoRouterRoots(getPublicConfig());
+        })).toEqual({
+            pluginRoot: official,
+            extraRoot: official,
+        });
+
+        const previousNodeEnv = process.env.NODE_ENV;
+        try {
+            expect(withCleanEnv(() => {
+                setTestNodeEnv('production');
+                process.env.EXPO_PUBLIC_CODEX_TOP_PREVIEW = '1';
+                process.env.APP_ENV = 'development';
+                return readExpoRouterRoots(getPublicConfig());
+            })).toEqual({
+                pluginRoot: official,
+                extraRoot: official,
+            });
+
+            expect(withCleanEnv(() => {
+                setTestNodeEnv('development');
+                process.env.EXPO_PUBLIC_CODEX_TOP_PREVIEW = '1';
+                process.env.APP_ENV = 'development';
+                return readExpoRouterRoots(getPublicConfig());
+            })).toEqual({
+                pluginRoot: preview,
+                extraRoot: preview,
+            });
+        } finally {
+            setTestNodeEnv(previousNodeEnv);
+        }
+    });
+});

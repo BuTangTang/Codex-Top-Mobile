@@ -1,0 +1,216 @@
+import type {
+  KeyedBackoffTracker,
+  KeyedLatestWorkCounters,
+  KeyedLatestWorkEnqueueResult,
+  KeyedLatestWorkScheduler,
+  KeyedLatestWorkStats,
+} from '../../../api/connection/scheduling';
+import { createKeyedLatestWorkScheduler } from '../../../api/connection/scheduling';
+
+export type ConnectedServiceQuotaPersistencePayload = Readonly<{
+  materialFingerprint: string;
+}>;
+
+export type ConnectedServiceQuotaPersistenceFlushResult = Readonly<{
+  timedOut: boolean;
+  drained: boolean;
+}>;
+
+export type ConnectedServiceQuotaPersistenceScheduler<TKey extends string, TPayload extends ConnectedServiceQuotaPersistencePayload> =
+  Omit<KeyedLatestWorkScheduler<TKey, TPayload>, 'flushAll'> & Readonly<{
+    flushAll: (timeoutMs: number) => Promise<ConnectedServiceQuotaPersistenceFlushResult>;
+  }>;
+
+type PausedQuotaPersistencePayload<TPayload extends ConnectedServiceQuotaPersistencePayload> = {
+  consecutiveFailures: number;
+  lastTouchedAtMs: number;
+  materialFingerprint: string;
+  payload: TPayload;
+  reason: 'retryable_failures' | 'nonretryable_failure';
+};
+
+class QuotaPersistenceRetryControlError extends Error {
+  public constructor(
+    public readonly retry: boolean,
+    public readonly originalError: unknown,
+  ) {
+    super('quota_persistence_retry_control');
+    this.name = 'QuotaPersistenceRetryControlError';
+  }
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.trunc(value));
+}
+
+export function createConnectedServiceQuotaPersistenceScheduler<
+  TKey extends string,
+  TPayload extends ConnectedServiceQuotaPersistencePayload,
+>(options: Readonly<{
+  run: (key: TKey, payload: TPayload) => Promise<void>;
+  maxConcurrent: number;
+  minKeyIntervalMs: number;
+  maxKeys: number;
+  maxKeyAgeMs: number;
+  maxPendingPayloadAgeMs: number;
+  maxConsecutiveFailures?: number;
+  now?: () => number;
+  isConnected?: () => boolean;
+  backoff?: KeyedBackoffTracker;
+  shouldRetry?: (error: unknown) => boolean;
+  shouldPauseAfterFailure?: (error: unknown) => boolean;
+  onEvent?: (event: Readonly<{ type: keyof KeyedLatestWorkCounters; key: TKey; reason?: string }>) => void;
+}>): ConnectedServiceQuotaPersistenceScheduler<TKey, TPayload> {
+  const maxConsecutiveFailures = normalizePositiveInteger(options.maxConsecutiveFailures, 5);
+  const maxPausedKeys = normalizePositiveInteger(options.maxKeys, 1);
+  const now = options.now ?? Date.now;
+  const pausedByKey = new Map<TKey, PausedQuotaPersistencePayload<TPayload>>();
+  const forceFlushKeys = new Set<TKey>();
+  let pausedSuppressedCount = 0;
+
+  function shouldRetry(error: unknown): boolean {
+    if (error instanceof QuotaPersistenceRetryControlError) return error.retry;
+    return options.shouldRetry?.(error) ?? true;
+  }
+
+  function emitSuppressed(key: TKey, reason: string): void {
+    pausedSuppressedCount += 1;
+    options.onEvent?.({ type: 'suppressed', key, reason });
+  }
+
+  function evictOldestPausedKeys(protectedKey: TKey): void {
+    while (pausedByKey.size > maxPausedKeys) {
+      let oldestKey: TKey | null = null;
+      let oldestTouchedAtMs = Number.POSITIVE_INFINITY;
+      for (const [key, paused] of pausedByKey) {
+        if (key === protectedKey) continue;
+        if (paused.lastTouchedAtMs < oldestTouchedAtMs) {
+          oldestTouchedAtMs = paused.lastTouchedAtMs;
+          oldestKey = key;
+        }
+      }
+      if (!oldestKey) return;
+      pausedByKey.delete(oldestKey);
+      forceFlushKeys.delete(oldestKey);
+    }
+  }
+
+  function rememberPausedPayload(
+    key: TKey,
+    payload: TPayload,
+    consecutiveFailures: number,
+    reason: PausedQuotaPersistencePayload<TPayload>['reason'],
+  ): void {
+    pausedByKey.set(key, {
+      consecutiveFailures,
+      lastTouchedAtMs: now(),
+      materialFingerprint: payload.materialFingerprint,
+      payload,
+      reason,
+    });
+    evictOldestPausedKeys(key);
+  }
+
+  const scheduler = createKeyedLatestWorkScheduler<TKey, TPayload>({
+    ...options,
+    run: async (key, payload) => {
+      const forced = forceFlushKeys.delete(key);
+      try {
+        await options.run(key, payload);
+        pausedByKey.delete(key);
+      } catch (error) {
+        if (options.shouldPauseAfterFailure?.(error) === false) {
+          pausedByKey.delete(key);
+          throw error;
+        }
+
+        if (!shouldRetry(error)) {
+          rememberPausedPayload(key, payload, maxConsecutiveFailures, 'nonretryable_failure');
+          throw new QuotaPersistenceRetryControlError(false, error);
+        }
+
+        const previous = pausedByKey.get(key);
+        const previousFailures =
+          !forced && previous?.materialFingerprint === payload.materialFingerprint
+            ? previous.consecutiveFailures
+            : 0;
+        const consecutiveFailures = forced ? maxConsecutiveFailures : previousFailures + 1;
+
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          rememberPausedPayload(key, payload, maxConsecutiveFailures, 'retryable_failures');
+          throw new QuotaPersistenceRetryControlError(false, error);
+        }
+
+        rememberPausedPayload(key, payload, consecutiveFailures, 'retryable_failures');
+        throw error;
+      }
+    },
+    shouldRetry,
+  });
+
+  function enqueuePausedPayloadForFlush(key: TKey, paused: PausedQuotaPersistencePayload<TPayload>): void {
+    if (paused.reason === 'nonretryable_failure') return;
+    forceFlushKeys.add(key);
+    scheduler.enqueue(key, paused.payload);
+  }
+
+  return {
+    enqueue: (key, payload, opts): KeyedLatestWorkEnqueueResult => {
+      const paused = pausedByKey.get(key);
+      if (paused && paused.materialFingerprint === payload.materialFingerprint) {
+        paused.payload = payload;
+        paused.lastTouchedAtMs = now();
+        const reason = paused.reason === 'nonretryable_failure'
+          ? 'paused_after_nonretryable_failure'
+          : 'paused_after_failures';
+        emitSuppressed(key, reason);
+        return { type: 'suppressed', reason };
+      }
+      if (paused && paused.materialFingerprint !== payload.materialFingerprint) {
+        pausedByKey.delete(key);
+        forceFlushKeys.delete(key);
+      }
+      return scheduler.enqueue(key, payload, opts);
+    },
+    flushKey: async (key, timeoutMs) => {
+      const paused = pausedByKey.get(key);
+      if (paused) enqueuePausedPayloadForFlush(key, paused);
+      return await scheduler.flushKey(key, timeoutMs);
+    },
+    flushAll: async (timeoutMs) => {
+      for (const [key, paused] of pausedByKey) {
+        enqueuePausedPayloadForFlush(key, paused);
+      }
+      await scheduler.flushAll(timeoutMs);
+      const stats = scheduler.getStats();
+      const hasFlushablePausedWork = Array.from(pausedByKey.values()).some(
+        (paused) => paused.reason !== 'nonretryable_failure',
+      );
+      const drained = stats.pendingKeyCount === 0 && stats.activeCount === 0 && !hasFlushablePausedWork;
+      return {
+        timedOut: !drained,
+        drained,
+      };
+    },
+    cancelKey: (key) => {
+      pausedByKey.delete(key);
+      forceFlushKeys.delete(key);
+      scheduler.cancelKey(key);
+    },
+    dispose: () => {
+      pausedByKey.clear();
+      forceFlushKeys.clear();
+      scheduler.dispose();
+    },
+    notifyConnectivityChanged: () => scheduler.notifyConnectivityChanged(),
+    getCounters: (): KeyedLatestWorkCounters => {
+      const counters = scheduler.getCounters();
+      return { ...counters, suppressed: counters.suppressed + pausedSuppressedCount };
+    },
+    getStats: (): KeyedLatestWorkStats => {
+      const stats = scheduler.getStats();
+      return { ...stats, retainedKeyCount: stats.retainedKeyCount + pausedByKey.size };
+    },
+  };
+}

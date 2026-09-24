@@ -1,0 +1,392 @@
+import { type Fastify } from "../../types";
+import { db } from "@/storage/db";
+import { z } from "zod";
+import { canManageSharing, canManagePermissionDelegation, areFriends } from "@/app/share/accessControl";
+import { ShareAccessLevel } from "@/storage/prisma";
+import { PROFILE_SELECT, toShareUserProfile } from "@/app/share/types";
+import { eventRouter, buildSessionSharedUpdate, buildSessionShareUpdatedUpdate, buildSessionShareRevokedUpdate } from "@/app/events/eventRouter";
+import { randomKeyNaked } from "@/utils/keys/randomKeyNaked";
+import { afterTx, inTx } from "@/storage/inTx";
+import { markAccountChanged } from "@/app/changes/markAccountChanged";
+import { resolveApiHotEndpointRateLimit } from "@/app/api/utils/apiRateLimitCatalog";
+import { invalidateSessionRelayAuthorizationForSession } from "@/app/api/socket/sessionRelayAuthCache";
+import { tombstoneSessionDraftForLifecycleInTx } from "@/app/account/sessionDrafts/sessionDraftService";
+
+type SessionShareRow = Awaited<ReturnType<typeof db.sessionShare.findFirst>>;
+
+function parseEncryptedDataKeyV0(encryptedDataKeyB64: string): Uint8Array<ArrayBuffer> {
+    let bytes: Uint8Array<ArrayBuffer>;
+    try {
+        const buf = Buffer.from(encryptedDataKeyB64, 'base64');
+        bytes = new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    } catch {
+        throw new Error('Invalid base64');
+    }
+    // version (1) + ephemeral pk (32) + nonce (24) + mac (16) = 73 minimum
+    if (bytes.length < 1 + 32 + 24 + 16) {
+        throw new Error('encryptedDataKey too short');
+    }
+    if (bytes[0] !== 0) {
+        throw new Error('Unsupported encryptedDataKey version');
+    }
+    return bytes;
+}
+
+/**
+ * Session sharing API routes
+ */
+export function shareRoutes(app: Fastify) {
+
+    /**
+     * Get all shares for a session (owner/admin only)
+     */
+    app.get('/v1/sessions/:sessionId/shares', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+
+        // Only owner or admin can view shares
+        if (!await canManageSharing(userId, sessionId)) {
+            return reply.code(403).send({ error: 'Forbidden' });
+        }
+
+        const shares = await db.sessionShare.findMany({
+            where: { sessionId },
+            include: {
+                sharedWithUser: {
+                    select: PROFILE_SELECT
+                }
+            },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        return reply.send({
+            shares: shares.map(share => ({
+                id: share.id,
+                sharedWithUser: toShareUserProfile(share.sharedWithUser),
+                accessLevel: share.accessLevel,
+                canApprovePermissions: share.canApprovePermissions,
+                createdAt: share.createdAt.getTime(),
+                updatedAt: share.updatedAt.getTime()
+            }))
+        });
+    });
+
+    /**
+     * Share session with a user
+     */
+    app.post('/v1/sessions/:sessionId/shares', {
+        preHandler: app.authenticate,
+        config: {
+            rateLimit: resolveApiHotEndpointRateLimit(process.env, "share.session.create"),
+        },
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            }),
+            body: z.object({
+                userId: z.string(),
+                accessLevel: z.enum(['view', 'edit', 'admin']),
+                canApprovePermissions: z.boolean().optional(),
+                encryptedDataKey: z.string().optional(),
+            })
+        }
+    }, async (request, reply) => {
+        const ownerId = request.userId;
+        const { sessionId } = request.params;
+        const { userId, accessLevel, canApprovePermissions, encryptedDataKey } = request.body;
+
+        const session = await db.session.findUnique({
+            where: { id: sessionId },
+            select: { id: true, encryptionMode: true }
+        });
+        if (!session) {
+            return reply.code(404).send({ error: 'Session not found' });
+        }
+        const sessionEncryptionMode: "e2ee" | "plain" = session.encryptionMode === "plain" ? "plain" : "e2ee";
+
+        // Only owner or admin can create shares
+        if (!await canManageSharing(ownerId, sessionId)) {
+            return reply.code(403).send({ error: 'Forbidden' });
+        }
+
+        if (canApprovePermissions === true) {
+            if (accessLevel === 'view') {
+                return reply.code(400).send({ error: 'Permission approvals require edit or admin access' });
+            }
+            if (!await canManagePermissionDelegation(ownerId, sessionId)) {
+                return reply.code(403).send({ error: 'Forbidden' });
+            }
+        }
+        const nextCanApprovePermissions = accessLevel === 'view' ? false : canApprovePermissions;
+
+        // Cannot share with yourself
+        if (userId === ownerId) {
+            return reply.code(400).send({ error: 'Cannot share with yourself' });
+        }
+
+        // Verify target user exists and get their public key
+        const targetUser = await db.account.findUnique({
+            where: { id: userId },
+            select: { id: true }
+        });
+
+        if (!targetUser) {
+            return reply.code(404).send({ error: 'User not found' });
+        }
+
+        // Check if users are friends
+        if (!await areFriends(ownerId, userId)) {
+            return reply.code(403).send({ error: 'Can only share with friends' });
+        }
+
+        let encryptedDataKeyBytes: Uint8Array<ArrayBuffer> | null = null;
+        if (sessionEncryptionMode === "e2ee") {
+            if (typeof encryptedDataKey !== "string" || encryptedDataKey.length === 0) {
+                return reply.code(400).send({ error: "encryptedDataKey required" });
+            }
+            try {
+                encryptedDataKeyBytes = parseEncryptedDataKeyV0(encryptedDataKey);
+            } catch {
+                return reply.code(400).send({ error: 'Invalid encryptedDataKey' });
+            }
+        }
+
+        const share = await inTx(async (tx) => {
+            const share = await tx.sessionShare.upsert({
+                where: {
+                    sessionId_sharedWithUserId: {
+                        sessionId,
+                        sharedWithUserId: userId
+                    }
+                },
+                create: {
+                    sessionId,
+                    sharedByUserId: ownerId,
+                    sharedWithUserId: userId,
+                    accessLevel: accessLevel as ShareAccessLevel,
+                    ...(nextCanApprovePermissions !== undefined ? { canApprovePermissions: nextCanApprovePermissions } : {}),
+                    encryptedDataKey: encryptedDataKeyBytes
+                },
+                update: {
+                    accessLevel: accessLevel as ShareAccessLevel,
+                    ...(nextCanApprovePermissions !== undefined ? { canApprovePermissions: nextCanApprovePermissions } : {}),
+                    encryptedDataKey: encryptedDataKeyBytes
+                },
+                include: {
+                    sharedWithUser: {
+                        select: PROFILE_SELECT
+                    },
+                    sharedByUser: {
+                        select: PROFILE_SELECT
+                    }
+                }
+            });
+
+            await markAccountChanged(tx, { accountId: ownerId, kind: 'share', entityId: sessionId });
+            const recipientShareCursor = await markAccountChanged(tx, { accountId: userId, kind: 'share', entityId: sessionId });
+            const recipientSessionCursor = await markAccountChanged(tx, { accountId: userId, kind: 'session', entityId: sessionId });
+            const recipientCursor = Math.max(recipientShareCursor, recipientSessionCursor);
+
+            afterTx(tx, () => {
+                // Participant list changed: cached relay fan-out targets for this session are stale.
+                invalidateSessionRelayAuthorizationForSession(sessionId);
+                const updatePayload = buildSessionSharedUpdate(share, recipientCursor, randomKeyNaked(12));
+                eventRouter.emitUpdate({
+                    userId: userId,
+                    payload: updatePayload,
+                    recipientFilter: { type: 'all-user-authenticated-connections' }
+                });
+            });
+
+            return share;
+        });
+
+        return reply.send({
+            share: {
+                id: share.id,
+                sharedWithUser: toShareUserProfile(share.sharedWithUser),
+                accessLevel: share.accessLevel,
+                canApprovePermissions: share.canApprovePermissions,
+                createdAt: share.createdAt.getTime(),
+                updatedAt: share.updatedAt.getTime()
+            }
+        });
+    });
+
+    /**
+     * Update share access level
+     */
+    app.patch('/v1/sessions/:sessionId/shares/:shareId', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                sessionId: z.string(),
+                shareId: z.string()
+            }),
+            body: z.object({
+                accessLevel: z.enum(['view', 'edit', 'admin']).optional(),
+                canApprovePermissions: z.boolean().optional(),
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId, shareId } = request.params;
+        const { accessLevel, canApprovePermissions } = request.body;
+
+        // Only owner or admin can update shares
+        if (!await canManageSharing(userId, sessionId)) {
+            return reply.code(403).send({ error: 'Forbidden' });
+        }
+
+        if (canApprovePermissions !== undefined) {
+            if (!await canManagePermissionDelegation(userId, sessionId)) {
+                return reply.code(403).send({ error: 'Forbidden' });
+            }
+        }
+
+        const existing = await db.sessionShare.findFirst({
+            where: { id: shareId, sessionId },
+            select: { accessLevel: true, canApprovePermissions: true },
+        });
+        if (!existing) {
+            return reply.code(404).send({ error: 'Share not found' });
+        }
+
+        const nextAccessLevel = accessLevel ?? existing.accessLevel;
+        if (canApprovePermissions === true && nextAccessLevel === 'view') {
+            return reply.code(400).send({ error: 'Permission approvals require edit or admin access' });
+        }
+        const nextCanApprovePermissions = nextAccessLevel === 'view'
+            ? false
+            : canApprovePermissions ?? existing.canApprovePermissions;
+        const shouldWriteCanApprovePermissions =
+            canApprovePermissions !== undefined || (accessLevel !== undefined && nextAccessLevel === 'view');
+
+        const share = await inTx(async (tx) => {
+            const share = await tx.sessionShare.update({
+                where: { id: shareId },
+                data: {
+                    ...(accessLevel !== undefined ? { accessLevel: accessLevel as ShareAccessLevel } : {}),
+                    ...(shouldWriteCanApprovePermissions ? { canApprovePermissions: nextCanApprovePermissions } : {}),
+                },
+                include: {
+                    sharedWithUser: {
+                        select: PROFILE_SELECT
+                    }
+                }
+            });
+
+            await markAccountChanged(tx, { accountId: userId, kind: 'share', entityId: sessionId });
+            const recipientShareCursor = await markAccountChanged(tx, { accountId: share.sharedWithUserId, kind: 'share', entityId: sessionId });
+            const recipientSessionCursor = await markAccountChanged(tx, { accountId: share.sharedWithUserId, kind: 'session', entityId: sessionId });
+            const recipientCursor = Math.max(recipientShareCursor, recipientSessionCursor);
+
+            afterTx(tx, () => {
+                invalidateSessionRelayAuthorizationForSession(sessionId);
+                const updatePayload = buildSessionShareUpdatedUpdate(
+                    share.id,
+                    share.sessionId,
+                    share.accessLevel,
+                    share.canApprovePermissions,
+                    share.updatedAt,
+                    recipientCursor,
+                    randomKeyNaked(12)
+                );
+                eventRouter.emitUpdate({
+                    userId: share.sharedWithUserId,
+                    payload: updatePayload,
+                    recipientFilter: { type: 'all-user-authenticated-connections' }
+                });
+            });
+
+            return share;
+        });
+
+        return reply.send({
+            share: {
+                id: share.id,
+                sharedWithUser: toShareUserProfile(share.sharedWithUser),
+                accessLevel: share.accessLevel,
+                canApprovePermissions: share.canApprovePermissions,
+                createdAt: share.createdAt.getTime(),
+                updatedAt: share.updatedAt.getTime()
+            }
+        });
+    });
+
+    /**
+     * Delete share (revoke access)
+     */
+    app.delete('/v1/sessions/:sessionId/shares/:shareId', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                sessionId: z.string(),
+                shareId: z.string()
+            })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId, shareId } = request.params;
+
+        // Only owner or admin can delete shares
+        if (!await canManageSharing(userId, sessionId)) {
+            return reply.code(403).send({ error: 'Forbidden' });
+        }
+
+        const result = await inTx(async (tx) => {
+            const share = await tx.sessionShare.findFirst({
+                where: { id: shareId, sessionId }
+            });
+
+            if (!share) {
+                return { share: null as SessionShareRow | null };
+            }
+
+            await tx.sessionShare.delete({
+                where: { id: shareId }
+            });
+
+            await tombstoneSessionDraftForLifecycleInTx(tx, {
+                accountId: share.sharedWithUserId,
+                sessionId,
+            });
+
+            await markAccountChanged(tx, { accountId: userId, kind: 'share', entityId: sessionId });
+            const recipientShareCursor = await markAccountChanged(tx, { accountId: share.sharedWithUserId, kind: 'share', entityId: sessionId });
+            const recipientSessionCursor = await markAccountChanged(tx, { accountId: share.sharedWithUserId, kind: 'session', entityId: sessionId });
+            const recipientCursor = Math.max(recipientShareCursor, recipientSessionCursor);
+
+            afterTx(tx, async () => {
+                // Participant list changed: cached relay fan-out targets for this session are stale.
+                invalidateSessionRelayAuthorizationForSession(sessionId);
+                const updatePayload = buildSessionShareRevokedUpdate(
+                    share.id,
+                    share.sessionId,
+                    recipientCursor,
+                    randomKeyNaked(12)
+                );
+                eventRouter.emitUpdate({
+                    userId: share.sharedWithUserId,
+                    payload: updatePayload,
+                    recipientFilter: { type: 'all-user-authenticated-connections' }
+                });
+            });
+
+            return { share };
+        });
+
+        if (!result.share) {
+            return reply.code(404).send({ error: 'Share not found' });
+        }
+
+        return reply.send({ success: true });
+    });
+}

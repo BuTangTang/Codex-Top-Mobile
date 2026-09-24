@@ -1,0 +1,66 @@
+import { describe, expect, it } from 'vitest';
+
+import { getInactiveSessionUiState } from '@/components/sessions/model/inactiveSessionUi';
+
+describe('getInactiveSessionUiState', () => {
+    it('shows input for active sessions', () => {
+        expect(getInactiveSessionUiState({
+            isSessionActive: true,
+            isResumable: false,
+            isMachineOnline: false,
+        })).toEqual({
+            shouldShowInput: true,
+            inactiveStatusTextKey: null,
+            noticeKind: 'none',
+        });
+    });
+
+    it('hides input and shows a not-resumable notice when vendor resume is not available', () => {
+        expect(getInactiveSessionUiState({
+            isSessionActive: false,
+            isResumable: false,
+            isMachineOnline: true,
+        })).toEqual({
+            shouldShowInput: false,
+            inactiveStatusTextKey: 'session.inactiveNotResumable',
+            noticeKind: 'not-resumable',
+        });
+    });
+
+    it('keeps input visible and shows a machine-offline notice for a resumable session', () => {
+        expect(getInactiveSessionUiState({
+            isSessionActive: false,
+            isResumable: true,
+            isMachineOnline: false,
+        })).toEqual({
+            shouldShowInput: true,
+            inactiveStatusTextKey: 'session.inactiveMachineOffline',
+            noticeKind: 'machine-offline',
+        });
+    });
+
+    it('shows input for inactive resumable sessions when machine is online', () => {
+        expect(getInactiveSessionUiState({
+            isSessionActive: false,
+            isResumable: true,
+            isMachineOnline: true,
+        })).toEqual({
+            shouldShowInput: true,
+            inactiveStatusTextKey: 'session.inactiveResumable',
+            noticeKind: 'none',
+        });
+    });
+
+    it('shows input for inactive voice conversation sessions even when normal resume is unavailable', () => {
+        expect(getInactiveSessionUiState({
+            isSessionActive: false,
+            isResumable: false,
+            isMachineOnline: false,
+            allowInputWhileInactive: true,
+        })).toEqual({
+            shouldShowInput: true,
+            inactiveStatusTextKey: null,
+            noticeKind: 'none',
+        });
+    });
+});

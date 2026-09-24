@@ -1,0 +1,133 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { createSpawnHappyCliEnvScope } from '@/testkit/process/spawnHappyCliHarness';
+
+const envScope = createSpawnHappyCliEnvScope();
+
+describe('buildHappyCliSubprocessInvocation (missing entrypoint)', () => {
+  beforeEach(() => {
+    envScope.patch({
+      HAPPIER_CLI_SUBPROCESS_RUNTIME: undefined,
+      HAPPIER_MANAGED_NODE_BIN: undefined,
+      HAPPIER_VARIANT: undefined,
+      HAPPIER_CLI_SUBPROCESS_ALLOW_TSX_FALLBACK: undefined,
+      HAPPIER_CLI_SUBPROCESS_PREFER_TSX: undefined,
+      HAPPIER_CLI_SUBPROCESS_ENTRYPOINT: undefined,
+      HAPPIER_CLI_SUBPROCESS_DIST_ENTRYPOINT: undefined,
+      HAPPIER_CLI_SUBPROCESS_DAEMON_DIST_CLOSURE_FINGERPRINT: undefined,
+      HAPPIER_CLI_SUBPROCESS_RUNTIME_BACKED: undefined,
+      HAPPIER_CLI_SUBPROCESS_STACK_RUNTIME_STATE_PATH: undefined,
+      HAPPIER_WINDOWS_SESSION_RUNNER_BINARY: undefined,
+      HAPPIER_STACK_REPO_DIR: undefined,
+      HAPPIER_STACK_CLI_ROOT_DIR: undefined,
+      HAPPIER_STACK_STACK: undefined,
+      TSX_TSCONFIG_PATH: undefined,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.doUnmock('node:fs');
+    vi.restoreAllMocks();
+    vi.resetModules();
+    envScope.restore();
+  });
+
+  it('throws a clear error when dist/index.mjs is missing, even under Vitest', async () => {
+    vi.resetModules();
+    vi.stubEnv('VITEST', '1');
+
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+      return {
+        ...actual,
+        existsSync: () => false,
+      };
+    });
+
+    const mod = (await import('./spawnHappyCLI')) as typeof import('./spawnHappyCLI');
+    expect(() => mod.buildHappyCliSubprocessInvocation(['--version'])).toThrow(
+      /Entrypoint .*dist[\\/]index\.mjs does not exist/,
+    );
+  });
+
+  it('falls back to tsx entrypoint in stack dev mode when dist/index.mjs is missing', async () => {
+    vi.resetModules();
+    vi.stubEnv('HAPPIER_STACK_STACK', 'dev2');
+    vi.stubEnv('HAPPIER_VARIANT', '');
+
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+      return {
+        ...actual,
+        existsSync: (path: string) => {
+          if (path.endsWith('dist/index.mjs')) return false;
+          if (path.endsWith('src/index.ts')) return true;
+          return actual.existsSync(path);
+        },
+      };
+    });
+
+    const mod = (await import('./spawnHappyCLI')) as typeof import('./spawnHappyCLI');
+    const invocation = mod.buildHappyCliSubprocessInvocation(['--version']);
+    expect(invocation.argv).toContain('--import');
+    expect(invocation.argv).toEqual(
+      expect.arrayContaining([expect.stringMatching(/node_modules\/tsx\/dist\/esm\/index\.mjs$/)]),
+    );
+    expect(invocation.argv.join(' ')).toContain('src/index.ts');
+    expect(invocation.env?.TSX_TSCONFIG_PATH).toEqual(expect.stringMatching(/[\\/]apps[\\/]cli[\\/]tsconfig\.json$/));
+    expect(process.env.TSX_TSCONFIG_PATH).toBeUndefined();
+  });
+
+  it('falls back to tsx entrypoint in a source checkout even when variant/stack env is missing', async () => {
+    vi.resetModules();
+
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+      return {
+        ...actual,
+        existsSync: (path: string) => {
+          if (path.endsWith('dist/index.mjs')) return false;
+          if (path.endsWith('src/index.ts')) return true;
+          return actual.existsSync(path);
+        },
+      };
+    });
+
+    const mod = (await import('./spawnHappyCLI')) as typeof import('./spawnHappyCLI');
+    const invocation = mod.buildHappyCliSubprocessInvocation(['--version']);
+    expect(invocation.argv).toContain('--import');
+    expect(invocation.argv).toEqual(
+      expect.arrayContaining([expect.stringMatching(/node_modules\/tsx\/dist\/esm\/index\.mjs$/)]),
+    );
+    expect(invocation.argv.join(' ')).toContain('src/index.ts');
+    expect(invocation.env?.TSX_TSCONFIG_PATH).toEqual(expect.stringMatching(/[\\/]apps[\\/]cli[\\/]tsconfig\.json$/));
+    expect(process.env.TSX_TSCONFIG_PATH).toBeUndefined();
+  });
+
+  it('uses argv-only fallback when dist entrypoint is missing in a self-contained bundled runtime without an explicit runtime override', async () => {
+    vi.resetModules();
+    vi.stubEnv('HAPPIER_CLI_SUBPROCESS_ENTRYPOINT', '/$bunfs/dist/index.mjs');
+
+    const originalArgv = [...process.argv];
+    const originalExecPath = process.execPath;
+    process.argv = ['/Applications/Happier.app/Contents/MacOS/happier', '/$bunfs/root/happier-darwin-arm64', 'daemon', 'start-sync'];
+
+    try {
+      Object.defineProperty(process, 'execPath', {
+        value: '/Applications/Happier.app/Contents/MacOS/happier',
+        configurable: true,
+      });
+      const mod = (await import('./spawnHappyCLI')) as typeof import('./spawnHappyCLI');
+      const invocation = mod.buildHappyCliSubprocessInvocation(['daemon', 'start-sync']);
+      expect(invocation.runtime).toBe('bun');
+      expect(invocation.argv).toEqual(['daemon', 'start-sync']);
+    } finally {
+      process.argv = originalArgv;
+      Object.defineProperty(process, 'execPath', {
+        value: originalExecPath,
+        configurable: true,
+      });
+    }
+  });
+});

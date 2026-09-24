@@ -1,0 +1,150 @@
+import { AppState, Platform } from 'react-native';
+import { isTauriDesktop } from '@/utils/platform/tauri';
+
+export function isRuntimeActive(): boolean {
+    if (isTauriDesktop()) {
+        return true;
+    }
+
+    try {
+        const appState = String(AppState.currentState ?? '').trim();
+        if (appState && appState !== 'active') {
+            return false;
+        }
+    } catch {
+        // ignore
+    }
+
+    try {
+        if (Platform.OS !== 'web') {
+            return true;
+        }
+    } catch {
+        // ignore
+    }
+
+    try {
+        const doc = (globalThis as unknown as { document?: Document }).document;
+        if (doc && typeof doc.visibilityState === 'string' && doc.visibilityState === 'hidden') {
+            return false;
+        }
+    } catch {
+        // ignore
+    }
+
+    return true;
+}
+
+function readDocument(): (Document & {
+    addEventListener?: Document['addEventListener'];
+    removeEventListener?: Document['removeEventListener'];
+}) | undefined {
+    try {
+        return (globalThis as unknown as { document?: Document }).document;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Notifies when the runtime's active/inactive state may have changed: the app
+ * moved between foreground and background, or (on web) the document was hidden
+ * or shown.
+ *
+ * This is the single owner of "what counts as a lifecycle transition" that
+ * `isRuntimeActive` reads. Every gated worker subscribes here instead of
+ * attaching its own `AppState` / `visibilitychange` listeners, so a new poller
+ * cannot silently ship without a lifecycle gate for want of somewhere to hang
+ * one. The listener is called on every transition signal, including ones that
+ * leave the state unchanged; a caller that needs edge semantics compares
+ * `isRuntimeActive()` itself.
+ */
+export function subscribeToRuntimeActiveChange(listener: () => void): () => void {
+    const detach: Array<() => void> = [];
+
+    const doc = readDocument();
+    if (typeof doc?.addEventListener === 'function' && typeof doc.removeEventListener === 'function') {
+        doc.addEventListener('visibilitychange', listener);
+        detach.push(() => {
+            doc.removeEventListener?.('visibilitychange', listener);
+        });
+    }
+
+    try {
+        const subscription = AppState.addEventListener?.('change', listener);
+        if (subscription && typeof subscription.remove === 'function') {
+            detach.push(() => subscription.remove());
+        }
+    } catch {
+        // ignore
+    }
+
+    return () => {
+        for (const stop of detach.splice(0)) {
+            stop();
+        }
+    };
+}
+
+/**
+ * Whether the host surface is on screen and actually being painted.
+ *
+ * Deliberately a different question from `isRuntimeActive()`. That one answers *may background
+ * WORK continue*, and returns `true` unconditionally on Tauri desktop so sync keeps running in a
+ * hidden window. Motion has the opposite need: an animation in a window nobody can see is pure
+ * cost, and `apps/ui/AGENTS.md` requires every animation loop to declare a stop condition. Same
+ * lifecycle signals and the same subscription (`subscribeToRuntimeActiveChange`) — one extra
+ * question, rather than a second set of listeners hung off `visibilitychange`.
+ *
+ * The document is authoritative wherever there is one, because it is the thing that does or does
+ * not paint. Native has no document, so the app-state answer above is the signal there.
+ */
+export function isHostVisible(): boolean {
+    try {
+        const doc = readDocument();
+        if (doc && typeof doc.visibilityState === 'string') {
+            return doc.visibilityState !== 'hidden';
+        }
+    } catch {
+        // ignore
+    }
+    return isRuntimeActive();
+}
+
+/**
+ * Runs an interval only while the runtime is active. If regular ticks were
+ * skipped while inactive, the callback runs once immediately when the runtime
+ * returns to active and the interval is overdue.
+ */
+export function startRuntimeActiveGatedInterval(
+    tick: () => void,
+    intervalMs: number,
+): () => void {
+    const delayMs = Math.max(1, Math.trunc(intervalMs));
+    let stopped = false;
+    let lastRunAt = Date.now();
+
+    const runNow = () => {
+        if (stopped || !isRuntimeActive()) return;
+        lastRunAt = Date.now();
+        tick();
+    };
+
+    const runIfOverdue = () => {
+        if (stopped || !isRuntimeActive()) return;
+        const now = Date.now();
+        if (now - lastRunAt < delayMs) return;
+        lastRunAt = now;
+        tick();
+    };
+
+    const interval = setInterval(runNow, delayMs);
+    const detachLifecycle = subscribeToRuntimeActiveChange(runIfOverdue);
+
+    return () => {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(interval);
+        detachLifecycle();
+    };
+}

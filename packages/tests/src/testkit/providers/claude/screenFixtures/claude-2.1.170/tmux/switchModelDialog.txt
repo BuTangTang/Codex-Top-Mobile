@@ -1,0 +1,9 @@
+Claude Code v2.1.170
+
+Reading cached conversation to re-evaluate context window…
+
+Switch model?
+  1. Yes, switch
+  2. No, go back
+
+>

@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+test('package export entrypoints load in Node ESM', async () => {
+  const links = await import('../dist/links.js');
+  assert.equal(typeof links.buildTerminalConnectLinks, 'function');
+  assert.equal(typeof links.buildConfigureServerLinks, 'function');
+
+  const tailscale = await import('../dist/tailscale/index.js');
+  assert.equal(typeof tailscale.resolveTailscaleBin, 'function');
+  assert.equal(typeof tailscale.tailscaleServeStatusMatchesInternalServerUrl, 'function');
+
+  const service = await import('../dist/service/index.js');
+  assert.equal(typeof service.resolveServiceBackend, 'function');
+
+  const providers = await import('../dist/providers/index.js');
+  assert.equal(typeof providers.planProviderCliInstall, 'function');
+
+  const homeDirPath = await import('../expandHomeDirPath.cjs');
+  assert.equal(typeof homeDirPath.expandHomeDirPath, 'function');
+  assert.equal(
+    homeDirPath.expandHomeDirPath('~/project\\mixed', { HOME: '/users/alice' }, 'linux'),
+    '/users/alice/project/mixed',
+  );
+
+  const root = await import('../dist/index.js');
+  assert.equal(typeof root.links.buildTerminalConnectLinks, 'function');
+  assert.equal(typeof root.tailscale.resolveTailscaleBin, 'function');
+  assert.equal(typeof root.service.resolveServiceBackend, 'function');
+  assert.equal(typeof root.providers.planProviderCliInstall, 'function');
+
+  const firstPartyRuntime = await import('../dist/firstPartyRuntime/index.js');
+  assert.equal(typeof firstPartyRuntime.getFirstPartyComponentCatalogEntry, 'function');
+  assert.equal(typeof root.firstPartyRuntime.getFirstPartyComponentCatalogEntry, 'function');
+});

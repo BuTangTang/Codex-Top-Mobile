@@ -1,0 +1,165 @@
+import { describe, expect, it } from 'vitest';
+
+import type { Metadata } from '@/sync/domains/state/storageTypes';
+
+import { describeEffectivePermissionMode } from './describeEffectivePermissionMode';
+
+function reasonCodes(res: ReturnType<typeof describeEffectivePermissionMode>): string[] {
+    return res.reasons.map((r) => r.code);
+}
+
+function buildMetadata(overrides: Partial<Metadata> = {}): Metadata {
+    return {
+        path: '/tmp',
+        host: 'h',
+        ...overrides,
+    };
+}
+
+describe('describeEffectivePermissionMode', () => {
+    it('fails closed to read-only for codex-like plan and emits reason codes', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'codex',
+            selectedMode: 'plan',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(res.effectiveMode).toBe('read-only');
+        expect(reasonCodes(res)).toContain('plan_not_supported_for_provider');
+    });
+
+    it('maps legacy plan to read-only for Claude and emits plan fallback reason', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'claude',
+            selectedMode: 'plan',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(res.effectiveMode).toBe('read-only');
+        expect(reasonCodes(res)).toContain('plan_not_supported_for_provider');
+    });
+
+    it('emits provider-native mapping reason when provider canonicalization changes the mode', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'claude',
+            selectedMode: 'safe-yolo',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(res.reasons).toContainEqual({
+            code: 'mode_mapped_for_provider',
+            params: { providerMode: 'auto' },
+        });
+    });
+
+    it('emits codex-like read-only enforcement reason', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'opencode',
+            selectedMode: 'read-only',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(res.effectiveMode).toBe('read-only');
+        expect(reasonCodes(res)).toContain('read_only_enforced_by_tool_gating');
+    });
+
+    it('emits next-prompt timing reason when apply timing is deferred', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'claude',
+            selectedMode: 'default',
+            metadata: buildMetadata(),
+            applyTiming: 'next_prompt',
+        });
+
+        expect(reasonCodes(res)).toContain('applies_on_next_message');
+    });
+
+    it('emits codex-like approval behavior reason for safe-yolo', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'codex',
+            selectedMode: 'safe-yolo',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(reasonCodes(res)).toContain('approval_setting_controls_auto_approval');
+    });
+
+    it('keeps default for pi (tool gating handled at spawn)', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'pi',
+            selectedMode: 'default',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(res.effectiveMode).toBe('default');
+        expect(reasonCodes(res)).not.toContain('read_only_enforced_by_tool_gating');
+    });
+
+    /** 保留尽力只读的权限含义，并使用中文说明该限制。 */
+    it('emits read_only_best_effort when provider maps read-only to a non-read-only native mode', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'claude',
+            selectedMode: 'read-only',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(reasonCodes(res)).toContain('read_only_best_effort');
+        expect(res.notes.some((note) => /尽力实现只读/.test(note))).toBe(true);
+    });
+
+    it('emits MCP spawn restriction reason when ACP policy providers have no ACP metadata', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'codex',
+            selectedMode: 'default',
+            metadata: buildMetadata(),
+            applyTiming: 'immediate',
+        });
+
+        expect(reasonCodes(res)).toContain('mcp_sandbox_restrictions_apply_on_spawn');
+    });
+
+    it('does not emit MCP spawn restriction reason when generic session-control metadata is present', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'codex',
+            selectedMode: 'default',
+            metadata: buildMetadata({
+                sessionModesV1: {
+                    v: 1,
+                    provider: 'unexpected-provider',
+                    updatedAt: 1,
+                    currentModeId: 'default',
+                    availableModes: [],
+                },
+            }),
+            applyTiming: 'immediate',
+        });
+
+        expect(reasonCodes(res)).not.toContain('mcp_sandbox_restrictions_apply_on_spawn');
+    });
+
+    it('falls back to legacy ACP metadata keys when generic session-control keys are absent', () => {
+        const res = describeEffectivePermissionMode({
+            agentType: 'codex',
+            selectedMode: 'default',
+            metadata: buildMetadata({
+                acpSessionModesV1: {
+                    v: 1,
+                    provider: 'unexpected-provider',
+                    updatedAt: 1,
+                    currentModeId: 'default',
+                    availableModes: [],
+                },
+            }),
+            applyTiming: 'immediate',
+        });
+
+        expect(reasonCodes(res)).not.toContain('mcp_sandbox_restrictions_apply_on_spawn');
+    });
+});

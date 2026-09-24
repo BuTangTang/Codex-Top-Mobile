@@ -1,0 +1,458 @@
+import { describe, expect, it, vi } from 'vitest';
+import tweetnacl from 'tweetnacl';
+
+import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+import { captureConsoleLogAndMuteStdout } from '@/testkit/logger/captureOutput';
+import { setStdioTtyForTest } from '@/testkit/process/stdio';
+
+const runTailscaleServeStatusMock = vi.fn<
+  (params: Readonly<{ timeoutMs: number; env: NodeJS.ProcessEnv; tailscaleBin: string }>) => Promise<string>
+>();
+
+const displayQRCodeMock = vi.fn<(url: string) => void>();
+
+vi.mock('@/integrations/tailscale/tailscaleCommand', () => ({
+  runTailscaleServeStatus: (params: Readonly<{ timeoutMs: number; env: NodeJS.ProcessEnv; tailscaleBin: string }>) =>
+    runTailscaleServeStatusMock(params),
+}));
+
+vi.mock('./qrcode', () => ({
+  displayQRCode: (url: string) => displayQRCodeMock(url),
+}));
+
+type AxiosRequestResponse = { state: 'requested' };
+type AxiosClaimResponse = { state: 'authorized'; token: string; response: string };
+type AxiosStatusResponse = { status: 'authorized' };
+type AxiosResponse<T> = { data: T };
+
+type AxiosLike = {
+  post: (url: string, body?: unknown) => Promise<AxiosResponse<AxiosRequestResponse | AxiosClaimResponse | unknown>>;
+  get: (url: string) => Promise<AxiosResponse<AxiosStatusResponse | unknown>>;
+};
+
+let capturedPublicKeyBase64: string | null = null;
+
+function encryptLegacyBundleForRecipientPublicKey(recipientPublicKeyBase64: string): string {
+  const recipientPublicKey = new Uint8Array(Buffer.from(recipientPublicKeyBase64, 'base64'));
+  const payload = new Uint8Array(32).fill(7);
+
+  const ephemeralKeyPair = tweetnacl.box.keyPair();
+  const nonce = new Uint8Array(24).fill(9);
+  const encrypted = tweetnacl.box(payload, nonce, recipientPublicKey, ephemeralKeyPair.secretKey);
+
+  const bundle = new Uint8Array(ephemeralKeyPair.publicKey.length + nonce.length + encrypted.length);
+  bundle.set(ephemeralKeyPair.publicKey, 0);
+  bundle.set(nonce, ephemeralKeyPair.publicKey.length);
+  bundle.set(encrypted, ephemeralKeyPair.publicKey.length + nonce.length);
+
+  return Buffer.from(bundle).toString('base64');
+}
+
+vi.mock('axios', async () => {
+  const axios: AxiosLike = {
+    post: vi.fn(async (url: string, body?: unknown) => {
+      if (url.endsWith('/v1/auth/request')) {
+        const publicKey = (body as { publicKey?: unknown } | undefined)?.publicKey;
+        capturedPublicKeyBase64 = typeof publicKey === 'string' ? publicKey : '';
+        return { data: { state: 'requested' } };
+      }
+      if (url.endsWith('/v1/auth/request/claim')) {
+        const claimBody = body as { publicKey?: unknown } | undefined;
+        const publicKey = typeof claimBody?.publicKey === 'string' ? claimBody.publicKey : capturedPublicKeyBase64 ?? '';
+        return {
+          data: {
+            state: 'authorized',
+            token: 'tok',
+            response: encryptLegacyBundleForRecipientPublicKey(publicKey),
+          },
+        };
+      }
+      throw new Error(`Unexpected axios.post URL: ${url}`);
+    }),
+    get: vi.fn(async (url: string) => {
+      if (url.endsWith('/v1/auth/request/status')) {
+        return { data: { status: 'authorized' } };
+      }
+      throw new Error(`Unexpected axios.get URL: ${url}`);
+    }),
+  };
+  return { default: axios };
+});
+
+describe.sequential('doAuth (non-interactive)', () => {
+  const envKeys = [
+    'HAPPIER_HOME_DIR',
+    'HAPPIER_SERVER_URL',
+    'HAPPIER_WEBAPP_URL',
+    'HAPPIER_PUBLIC_SERVER_URL',
+    'HAPPIER_NO_BROWSER_OPEN',
+    'HAPPIER_AUTH_POLL_INTERVAL_MS',
+    'HAPPIER_AUTH_METHOD',
+    'HAPPIER_TAILSCALE_AUTO_PUBLIC_URL',
+  ] as const;
+
+  it('prints both web + mobile instructions when method is not specified', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'https://server.example.test',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: undefined,
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+
+      const out = output.logs.join('\n');
+      expect(out).toContain('Relay URL: https://server.example.test');
+      expect(out).toContain('Web app URL: https://webapp.example.test');
+      expect(out).toContain('Mobile (recommended)');
+      expect(out).toContain('Web (fallback)');
+      expect(out).toContain('webapp.example.test/terminal/connect#key=');
+      expect(out).toContain('happier://terminal?');
+      expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('prefers Tailscale Serve https:// URL for QR/deep links when serverUrl is loopback and public url is unset', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-tailscale-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    runTailscaleServeStatusMock.mockResolvedValueOnce(
+      [
+        'https://my-machine.tailnet.ts.net',
+        '|-- / proxy http://127.0.0.1:53545',
+        '',
+      ].join('\n'),
+    );
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'http://127.0.0.1:53545',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_PUBLIC_SERVER_URL: undefined,
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: undefined,
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+
+      const out = output.logs.join('\n');
+      expect(out).toContain(encodeURIComponent('https://my-machine.tailnet.ts.net'));
+      expect(out).not.toContain(encodeURIComponent('http://127.0.0.1:53545'));
+      expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+      runTailscaleServeStatusMock.mockReset();
+    }
+  }, 15_000);
+
+  it('prints a LAN-only hint when canonical serverUrl is local HTTP', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-lan-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'http://192.168.1.10:3005',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: undefined,
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+
+      const out = output.logs.join('\n').toLowerCase();
+      expect(out).toContain('same lan');
+      expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('prints a hint when mobile links cannot embed localhost server URLs', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-loopback-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'http://127.0.0.1:53545',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_PUBLIC_SERVER_URL: undefined,
+        HAPPIER_TAILSCALE_AUTO_PUBLIC_URL: '0',
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: undefined,
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+
+      const out = output.logs.join('\n').toLowerCase();
+      expect(out).toContain('does not include a relay url');
+      expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('keeps localhost in web auth links and describes it as same-machine only', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-web-loopback-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'http://localhost:3010',
+        HAPPIER_WEBAPP_URL: 'http://happier-dev-auth.localhost:8082',
+        HAPPIER_PUBLIC_SERVER_URL: undefined,
+        HAPPIER_TAILSCALE_AUTO_PUBLIC_URL: '0',
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: 'web',
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+
+      const out = output.logs.join('\n').toLowerCase();
+      expect(out).toContain(encodeURIComponent('http://localhost:3010').toLowerCase());
+      expect(out).toContain('same machine');
+      expect(out).not.toContain('same lan');
+      expect(out).toContain('relay url is a localhost/loopback url');
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('uses apiServerUrl for auth API calls when HAPPIER_PUBLIC_SERVER_URL is set', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-apiServerUrl-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'http://127.0.0.1:53545',
+        HAPPIER_PUBLIC_SERVER_URL: 'https://my-stack.example.test',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: 'web',
+      });
+
+      vi.resetModules();
+      const axiosModule = await import('axios');
+      const axiosDefault = axiosModule.default as AxiosLike;
+      (axiosDefault.post as unknown as { mockClear: () => void }).mockClear();
+      (axiosDefault.get as unknown as { mockClear: () => void }).mockClear();
+
+      const { doAuth } = await import('./auth');
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+
+      const postMock = axiosDefault.post as unknown as { mock: { calls: unknown[][] } };
+      const getMock = axiosDefault.get as unknown as { mock: { calls: unknown[][] } };
+      const postUrls = postMock.mock.calls.map((c) => String(c[0]));
+      const getUrls = getMock.mock.calls.map((c) => String(c[0]));
+      expect(postUrls.join('\n')).toContain('http://127.0.0.1:53545/v1/auth/request');
+      expect(getUrls.join('\n')).toContain('http://127.0.0.1:53545/v1/auth/request/status');
+      expect(postUrls.join('\n')).not.toContain('https://my-stack.example.test');
+      expect(getUrls.join('\n')).not.toContain('https://my-stack.example.test');
+
+      const out = output.logs.join('\n');
+      expect(out).toContain(encodeURIComponent('https://my-stack.example.test'));
+      expect(out).not.toContain(encodeURIComponent('http://127.0.0.1:53545'));
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('fails fast with a clear message when claim response token/response are invalid', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-invalid-claim-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+
+    const axiosModule = await import('axios');
+    const axiosDefault = axiosModule.default as AxiosLike;
+    const originalPost = axiosDefault.post;
+
+    try {
+      axiosDefault.post = vi.fn(async (url: string, body?: unknown) => {
+        if (url.endsWith('/v1/auth/request')) {
+          const publicKey = (body as { publicKey?: unknown } | undefined)?.publicKey;
+          capturedPublicKeyBase64 = typeof publicKey === 'string' ? publicKey : '';
+          return { data: { state: 'requested' } };
+        }
+        if (url.endsWith('/v1/auth/request/claim')) {
+          return {
+            data: {
+              state: 'authorized',
+              token: 123,
+              response: null,
+            },
+          };
+        }
+        throw new Error(`Unexpected axios.post URL: ${url}`);
+      }) as AxiosLike['post'];
+
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'https://server.example.test',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: undefined,
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+      const creds = await doAuth();
+
+      expect(creds).toBeNull();
+      expect(output.logs.join('\n')).toContain('Unexpected response from the relay. Please try again.');
+    } finally {
+      axiosDefault.post = originalPost;
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('prints only the mobile link when mobile is explicitly selected', async () => {
+    const home = await createTempDir('happier-cli-auth-mobile-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'https://server.example.test',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: 'mobile',
+      });
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      expect((await doAuth())?.token).toBe('tok');
+      expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
+      const out = output.logs.join('\n');
+      expect(out).toContain('Connect this computer');
+      expect(out).toContain('happier://terminal?');
+      expect(out).not.toContain('webapp.example.test/terminal/connect#key=');
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('does not print a QR code when method is web', async () => {
+    const home = await createTempDir('happier-cli-auth-noninteractive-web-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'https://server.example.test',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_NO_BROWSER_OPEN: undefined,
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: 'web',
+      });
+
+      vi.resetModules();
+      const { doAuth } = await import('./auth');
+
+      const creds = await doAuth();
+      expect(creds?.token).toBe('tok');
+      expect(displayQRCodeMock).not.toHaveBeenCalled();
+
+      const out = output.logs.join('\n');
+      expect(out).toContain('Connect this computer');
+      expect(out).toContain('normal on a headless or remote computer');
+      expect(out).toContain('Copy this link into any browser');
+      expect(out).toContain('webapp.example.test/terminal/connect#key=');
+      expect(out).not.toContain('happier://terminal?');
+      expect(out.match(/Authentication successful/gu) ?? []).toHaveLength(0);
+    } finally {
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+});

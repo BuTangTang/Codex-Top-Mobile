@@ -1,0 +1,64 @@
+import chalk from 'chalk';
+
+import type { Credentials } from '@/persistence';
+import { readCommandPositionals } from '@/cli/commands/shared/argvFlags';
+import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
+import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
+import { normalizeActionExecuteResult } from './shared/normalizeActionExecuteResult';
+import { tryHandleApprovalRequestCreated } from './shared/tryHandleApprovalRequestCreated';
+
+export async function cmdSessionUnarchive(
+  argv: string[],
+  deps: Readonly<{ readCredentialsFn: () => Promise<Credentials | null> }>,
+): Promise<void> {
+  const json = wantsJson(argv);
+  const [idOrPrefix = ''] = readCommandPositionals(argv, { startIndex: 1 });
+  if (!idOrPrefix) {
+    throw new Error('Usage: happier session unarchive <session-id-or-prefix> [--json]');
+  }
+
+  const credentials = await deps.readCredentialsFn();
+  if (!credentials) {
+    if (json) {
+      await printJsonEnvelope({ ok: false, kind: 'session_unarchive', error: { code: 'not_authenticated' } });
+      return;
+    }
+    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    process.exit(1);
+  }
+
+  const executor = createCliActionExecutorFromCredentials({ credentials });
+  const actionRes = await executor.execute(
+    'session.unarchive',
+    { sessionId: idOrPrefix },
+    { surface: 'cli', defaultSessionId: null },
+  );
+  const normalized = normalizeActionExecuteResult(actionRes as any);
+  if (!normalized.ok) {
+    if (json) {
+      await printJsonEnvelope({
+        ok: false,
+        kind: 'session_unarchive',
+        error: {
+          code: normalized.errorCode,
+          ...(normalized.candidates ? { candidates: normalized.candidates } : {}),
+          ...(normalized.errorMessage ? { message: normalized.errorMessage } : {}),
+        },
+      });
+      return;
+    }
+    throw new Error(normalized.errorCode);
+  }
+
+  const result = normalized.data as any;
+  if (await tryHandleApprovalRequestCreated({ envelopeKind: 'session_unarchive', json, result })) {
+    return;
+  }
+
+  if (json) {
+    await printJsonEnvelope({ ok: true, kind: 'session_unarchive', data: { sessionId: result.sessionId, archivedAt: result.archivedAt } });
+    return;
+  }
+
+  console.log(chalk.green('✓'), `unarchived ${result.sessionId}`);
+}

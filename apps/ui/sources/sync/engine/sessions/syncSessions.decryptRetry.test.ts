@@ -1,0 +1,109 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { ApiMessage } from '@/sync/api/types/apiTypes';
+import { fetchAndApplyMessages } from './syncSessions';
+import { SessionMessagePageDecryptionError } from './sessionMessagesPagePipeline';
+
+function buildEncryptedApiMessage(id: string, seq: number): ApiMessage {
+    return {
+        id,
+        seq,
+        localId: null,
+        sidechainId: null,
+        content: {
+            t: 'encrypted',
+            c: `cipher-${id}`,
+        },
+        createdAt: 1_000 + seq,
+        updatedAt: 2_000 + seq,
+    };
+}
+
+describe('fetchAndApplyMessages (encrypted decrypt retry)', () => {
+    it('decrypts initial transcript pages in large default batches', async () => {
+        const messages = Array.from({ length: 150 }, (_, index) => buildEncryptedApiMessage(`m${index + 1}`, index + 1));
+        const request = vi.fn(async () => new Response(
+            JSON.stringify({ messages }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ));
+
+        const decryptMessages = vi.fn(async (apiMessages: ApiMessage[]) =>
+            apiMessages.map((m) => ({
+                id: m.id,
+                seq: m.seq,
+                localId: null,
+                createdAt: m.createdAt,
+                content: { role: 'user', content: { type: 'text', text: `hello-${m.id}` } },
+            })),
+        );
+
+        await fetchAndApplyMessages({
+            sessionId: 's1',
+            getSessionEncryption: () => ({ decryptMessages }),
+            request,
+            sessionReceivedMessages: new Map<string, Map<string, number>>(),
+            applyMessages: vi.fn(),
+            markMessagesLoaded: vi.fn(),
+            log: { log: () => {} },
+        });
+
+        expect(decryptMessages).toHaveBeenCalledTimes(3);
+        expect(decryptMessages.mock.calls[0]?.[0]).toHaveLength(64);
+        expect(decryptMessages.mock.calls[1]?.[0]).toHaveLength(64);
+        expect(decryptMessages.mock.calls[2]?.[0]).toHaveLength(22);
+    });
+
+    it('retries encrypted messages that previously failed to decrypt', async () => {
+        const request = vi.fn(async () => new Response(
+            JSON.stringify({
+                messages: [buildEncryptedApiMessage('m1', 1)],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ));
+
+        let canDecrypt = false;
+        const decryptMessages = vi.fn(async (messages: ApiMessage[]) => {
+            return messages.map((m) => ({
+                id: m.id,
+                seq: m.seq,
+                localId: null,
+                createdAt: m.createdAt,
+                content: canDecrypt
+                    ? { role: 'user', content: { type: 'text', text: 'hello' } }
+                    : null,
+            }));
+        });
+
+        const applyMessages = vi.fn();
+        const markMessagesLoaded = vi.fn();
+        const sessionReceivedMessages = new Map<string, Map<string, number>>();
+
+        await expect(fetchAndApplyMessages({
+            sessionId: 's1',
+            getSessionEncryption: () => ({ decryptMessages }),
+            request,
+            sessionReceivedMessages,
+            applyMessages,
+            markMessagesLoaded,
+            log: { log: () => {} },
+        })).rejects.toBeInstanceOf(SessionMessagePageDecryptionError);
+
+        expect(decryptMessages.mock.calls[0]?.[0]).toHaveLength(1);
+        expect(applyMessages).not.toHaveBeenCalled();
+        expect(markMessagesLoaded).not.toHaveBeenCalled();
+
+        canDecrypt = true;
+
+        await fetchAndApplyMessages({
+            sessionId: 's1',
+            getSessionEncryption: () => ({ decryptMessages }),
+            request,
+            sessionReceivedMessages,
+            applyMessages,
+            markMessagesLoaded,
+            log: { log: () => {} },
+        });
+
+        expect(decryptMessages.mock.calls[1]?.[0]).toHaveLength(1);
+        expect(applyMessages.mock.calls[0]?.[1]?.[0]?.id).toBe('m1');
+    });
+});

@@ -1,0 +1,320 @@
+import { z } from 'zod';
+
+import { VoiceAssistantActionSchema } from './voiceActions.js';
+import { BackendTargetRefSchema } from './backendTargets/backendTargetRef.js';
+import { PendingLocalIdSchema } from './sessionMessages/pendingLocalId.js';
+import {
+  ExecutionRunClassSchema,
+  type ExecutionRunClass,
+  ExecutionRunDisplaySchema,
+  type ExecutionRunDisplay,
+  ExecutionRunLaunchOriginSchema,
+  type ExecutionRunLaunchOrigin,
+  ExecutionRunIntentSchema,
+  type ExecutionRunIntent,
+  ExecutionRunIoModeSchema,
+  type ExecutionRunIoMode,
+  ExecutionRunReplaySeedRequestSchema,
+  type ExecutionRunReplaySeedRequest,
+  ExecutionRunResumeHandleSchema,
+  type ExecutionRunResumeHandle,
+  ExecutionRunResumeHandleVendorSessionV1Schema,
+  type ExecutionRunResumeHandleVendorSessionV1,
+  ExecutionRunResumeHandleVoiceAgentSessionsV1Schema,
+  type ExecutionRunResumeHandleVoiceAgentSessionsV1,
+  ExecutionRunRetentionPolicySchema,
+  type ExecutionRunRetentionPolicy,
+  ExecutionRunStartRequestSchema,
+  type ExecutionRunStartRequest,
+  ExecutionRunStartResponseSchema,
+  type ExecutionRunStartResponse,
+  normalizeLegacyExecutionRunBackendTargetInput,
+} from './executionRunStartRequest.js';
+import {
+  ExecutionRunListRequestSchema as ExecutionRunListRequestSchemaBase,
+  ExecutionRunStatusSchema as ExecutionRunStatusSchemaBase,
+} from './executionRunListRequest.js';
+export {
+  ExecutionRunRequestedConfigurationSchema,
+  projectExecutionRunRequestedConfiguration,
+  type ExecutionRunRequestedConfiguration,
+} from './executionRunRequestedConfiguration.js';
+import { ExecutionRunRequestedConfigurationSchema } from './executionRunRequestedConfiguration.js';
+
+/**
+ * Public contract for execution runs (sub-agents / reviews / planning / delegation / voice agent).
+ *
+ * Notes:
+ * - This schema is used by session-scoped RPC + MCP and must remain stable and bounded.
+ * - Rich/large UI payloads (e.g. full review findings) are carried via transcript message `meta.happier`.
+ */
+
+export {
+  ExecutionRunIntentSchema,
+  ExecutionRunRetentionPolicySchema,
+  ExecutionRunClassSchema,
+  ExecutionRunIoModeSchema,
+  normalizeLegacyExecutionRunBackendTargetInput,
+  ExecutionRunResumeHandleVendorSessionV1Schema,
+  ExecutionRunResumeHandleVoiceAgentSessionsV1Schema,
+  ExecutionRunResumeHandleSchema,
+  ExecutionRunDisplaySchema,
+  ExecutionRunLaunchOriginSchema,
+  ExecutionRunReplaySeedRequestSchema,
+  ExecutionRunStartRequestSchema,
+  ExecutionRunStartResponseSchema,
+};
+export type {
+  ExecutionRunIntent,
+  ExecutionRunRetentionPolicy,
+  ExecutionRunClass,
+  ExecutionRunIoMode,
+  ExecutionRunResumeHandleVendorSessionV1,
+  ExecutionRunResumeHandleVoiceAgentSessionsV1,
+  ExecutionRunResumeHandle,
+  ExecutionRunDisplay,
+  ExecutionRunLaunchOrigin,
+  ExecutionRunReplaySeedRequest,
+  ExecutionRunStartRequest,
+  ExecutionRunStartResponse,
+};
+
+// Canonical, stable error code vocabulary for RPC `errorCode` and MCP `error.code`.
+// Keep this pinned and deterministic; clients should branch on these strings.
+export const ExecutionRunTransportErrorCodeSchema = z.enum([
+  'execution_run_not_allowed',
+  'execution_run_not_found',
+  'execution_run_action_not_supported',
+  'execution_run_invalid_action_input',
+  'execution_run_stream_not_found',
+  'execution_run_busy',
+  'execution_run_failed',
+  'execution_run_send_outcome_unknown',
+  'execution_run_budget_exceeded',
+  'execution_run_protocol_unsupported',
+  'execution_run_target_unavailable',
+  'execution_run_start_ambiguous',
+  'execution_run_start_conflict',
+  'run_depth_exceeded',
+  'permission_denied',
+]);
+export type ExecutionRunTransportErrorCode = z.infer<typeof ExecutionRunTransportErrorCodeSchema>;
+export const ExecutionRunStatusSchema = ExecutionRunStatusSchemaBase;
+export type ExecutionRunStatus = z.infer<typeof ExecutionRunStatusSchema>;
+export const ExecutionRunListRequestSchema = ExecutionRunListRequestSchemaBase;
+export type ExecutionRunListRequest = z.infer<typeof ExecutionRunListRequestSchema>;
+
+export const ExecutionRunErrorSchema = z.object({
+  code: z.string().min(1),
+  message: z.string().optional(),
+}).passthrough();
+export type ExecutionRunError = z.infer<typeof ExecutionRunErrorSchema>;
+
+export const ExecutionRunTranscriptSchema = z.object({
+  persistenceMode: z.enum(['ephemeral', 'persistent']),
+  epoch: z.number().int().min(0),
+}).passthrough();
+export type ExecutionRunTranscript = z.infer<typeof ExecutionRunTranscriptSchema>;
+
+export const ExecutionRunPublicStateSchema = z.object({
+  runId: z.string().min(1),
+  callId: z.string().min(1),
+  sidechainId: z.string().min(1),
+  intent: ExecutionRunIntentSchema,
+  backendTarget: BackendTargetRefSchema,
+  display: ExecutionRunDisplaySchema.optional(),
+  launchOrigin: ExecutionRunLaunchOriginSchema.optional(),
+  requestedConfiguration: ExecutionRunRequestedConfigurationSchema.optional(),
+  // Policy/class fields are required for client surfaces (e.g. to decide if send/resume controls apply).
+  permissionMode: z.string().min(1),
+  retentionPolicy: ExecutionRunRetentionPolicySchema,
+  runClass: ExecutionRunClassSchema,
+  ioMode: ExecutionRunIoModeSchema,
+  status: ExecutionRunStatusSchema,
+  turnInFlight: z.boolean().optional(),
+  availableActionIds: z.array(z.string().min(1)).optional(),
+  resumeHandle: ExecutionRunResumeHandleSchema.optional(),
+  transcript: ExecutionRunTranscriptSchema.optional(),
+  startedAtMs: z.number().int().nonnegative(),
+  finishedAtMs: z.number().int().nonnegative().optional(),
+  error: ExecutionRunErrorSchema.optional(),
+}).passthrough();
+export type ExecutionRunPublicState = z.infer<typeof ExecutionRunPublicStateSchema>;
+
+export const ExecutionRunListResponseSchema = z.object({
+  runs: z.array(ExecutionRunPublicStateSchema),
+}).passthrough();
+export type ExecutionRunListResponse = z.infer<typeof ExecutionRunListResponseSchema>;
+
+export const ExecutionRunGetRequestSchema = z.object({
+  runId: z.string().min(1),
+  includeStructured: z.boolean().optional(),
+}).passthrough();
+export type ExecutionRunGetRequest = z.infer<typeof ExecutionRunGetRequestSchema>;
+
+export const ExecutionRunGetResponseSchema = z.object({
+  run: ExecutionRunPublicStateSchema,
+  latestToolResult: z.unknown().optional(),
+  structuredMeta: z.object({ kind: z.string(), payload: z.unknown() }).passthrough().optional(),
+  structuredMetaArtifactRef: z.object({ artifactId: z.string().min(1) }).passthrough().optional(),
+}).passthrough();
+export type ExecutionRunGetResponse = z.infer<typeof ExecutionRunGetResponseSchema>;
+
+export const ExecutionRunSendRequestSchema = z.object({
+  runId: z.string().min(1),
+  message: z.string().min(1),
+  resume: z.boolean().optional(),
+  delivery: z.enum(['prompt', 'steer_if_supported', 'interrupt']).optional(),
+}).passthrough();
+export type ExecutionRunSendRequest = z.infer<typeof ExecutionRunSendRequestSchema>;
+
+export const ExecutionRunSendResponseSchema = z.object({ ok: z.literal(true) }).passthrough();
+export type ExecutionRunSendResponse = z.infer<typeof ExecutionRunSendResponseSchema>;
+
+export const ExecutionRunStopRequestSchema = z.object({ runId: z.string().min(1) }).passthrough();
+export type ExecutionRunStopRequest = z.infer<typeof ExecutionRunStopRequestSchema>;
+
+export const ExecutionRunStopResponseSchema = z.object({ ok: z.literal(true) }).passthrough();
+export type ExecutionRunStopResponse = z.infer<typeof ExecutionRunStopResponseSchema>;
+
+export const ExecutionRunEnsureRequestSchema = z.object({
+  runId: z.string().min(1),
+  resume: z.boolean().optional(),
+}).passthrough();
+export type ExecutionRunEnsureRequest = z.infer<typeof ExecutionRunEnsureRequestSchema>;
+
+export const ExecutionRunEnsureResponseSchema = z.union([
+  z.object({ ok: z.literal(true) }).passthrough(),
+  z.object({ ok: z.literal(false), error: z.string().min(1), errorCode: z.string().min(1).optional() }).passthrough(),
+]);
+export type ExecutionRunEnsureResponse = z.infer<typeof ExecutionRunEnsureResponseSchema>;
+
+export const ExecutionRunEnsureOrStartRequestSchema = z.object({
+  runId: z.string().min(1).nullable().optional(),
+  start: ExecutionRunStartRequestSchema.optional(),
+  resume: z.boolean().optional(),
+}).passthrough().superRefine((value, ctx) => {
+  const runId = typeof value.runId === 'string' ? value.runId.trim() : '';
+  if (!runId) {
+    if (!value.start) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'start is required when runId is missing' });
+    }
+  }
+});
+export type ExecutionRunEnsureOrStartRequest = z.infer<typeof ExecutionRunEnsureOrStartRequestSchema>;
+
+export const ExecutionRunEnsureOrStartResponseSchema = z.union([
+  z.object({ ok: z.literal(true), runId: z.string().min(1), created: z.boolean() }).passthrough(),
+  z.object({ ok: z.literal(false), error: z.string().min(1), errorCode: z.string().min(1).optional() }).passthrough(),
+]);
+export type ExecutionRunEnsureOrStartResponse = z.infer<typeof ExecutionRunEnsureOrStartResponseSchema>;
+
+export const ExecutionRunActionRequestSchema = z.object({
+  runId: z.string().min(1),
+  actionId: z.string().min(1),
+  input: z.unknown().optional(),
+}).passthrough();
+export type ExecutionRunActionRequest = z.infer<typeof ExecutionRunActionRequestSchema>;
+
+export const ExecutionRunActionResponseSchema = z.object({
+  ok: z.boolean(),
+  updatedToolResult: z.unknown().optional(),
+}).passthrough();
+export type ExecutionRunActionResponse = z.infer<typeof ExecutionRunActionResponseSchema>;
+
+// Streaming turn IO (V1: used for intent='voice_agent').
+export const ExecutionRunTurnStreamStartRequestSchema = z.object({
+  runId: z.string().min(1),
+  message: z.string().min(1),
+  displayMessage: z.string().min(1).optional(),
+  resume: z.boolean().optional(),
+}).passthrough();
+export type ExecutionRunTurnStreamStartRequest = z.infer<typeof ExecutionRunTurnStreamStartRequestSchema>;
+
+export const ExecutionRunUserTranscriptDirectiveSchema = z.discriminatedUnion('mode', [
+  z.object({
+    mode: z.literal('persist'),
+    localId: PendingLocalIdSchema,
+  }).passthrough(),
+  z.object({
+    mode: z.literal('suppress'),
+  }).passthrough(),
+]);
+export type ExecutionRunUserTranscriptDirective = z.infer<typeof ExecutionRunUserTranscriptDirectiveSchema>;
+
+export const ExecutionRunTurnStreamStartV2RequestSchema = ExecutionRunTurnStreamStartRequestSchema.extend({
+  userTranscript: ExecutionRunUserTranscriptDirectiveSchema,
+});
+export type ExecutionRunTurnStreamStartV2Request = z.infer<typeof ExecutionRunTurnStreamStartV2RequestSchema>;
+
+export const ExecutionRunUserTranscriptCommitRequestSchema = z.object({
+  runId: z.string().min(1),
+  message: z.string().min(1),
+  displayMessage: z.string().min(1).optional(),
+  localId: PendingLocalIdSchema,
+}).passthrough();
+export type ExecutionRunUserTranscriptCommitRequest = z.infer<typeof ExecutionRunUserTranscriptCommitRequestSchema>;
+
+export const ExecutionRunUserTranscriptCommitResponseSchema = z.object({
+  ok: z.literal(true),
+}).passthrough();
+export type ExecutionRunUserTranscriptCommitResponse = z.infer<typeof ExecutionRunUserTranscriptCommitResponseSchema>;
+
+export const ExecutionRunTurnStreamStartResponseSchema = z.object({
+  streamId: z.string().min(1),
+}).passthrough();
+export type ExecutionRunTurnStreamStartResponse = z.infer<typeof ExecutionRunTurnStreamStartResponseSchema>;
+
+export const ExecutionRunTurnStreamReadRequestSchema = z.object({
+  runId: z.string().min(1),
+  streamId: z.string().min(1),
+  cursor: z.number().int().min(0),
+  maxEvents: z.number().int().min(1).max(256).optional(),
+}).passthrough();
+export type ExecutionRunTurnStreamReadRequest = z.infer<typeof ExecutionRunTurnStreamReadRequestSchema>;
+
+export const ExecutionRunTurnStreamEventDeltaSchema = z.object({
+  t: z.literal('delta'),
+  textDelta: z.string(),
+}).passthrough();
+export type ExecutionRunTurnStreamEventDelta = z.infer<typeof ExecutionRunTurnStreamEventDeltaSchema>;
+
+export const ExecutionRunTurnStreamEventDoneSchema = z.object({
+  t: z.literal('done'),
+  assistantText: z.string(),
+  actions: z.array(VoiceAssistantActionSchema).optional(),
+}).passthrough();
+export type ExecutionRunTurnStreamEventDone = z.infer<typeof ExecutionRunTurnStreamEventDoneSchema>;
+
+export const ExecutionRunTurnStreamEventErrorSchema = z.object({
+  t: z.literal('error'),
+  error: z.string(),
+  errorCode: z.string().optional(),
+}).passthrough();
+export type ExecutionRunTurnStreamEventError = z.infer<typeof ExecutionRunTurnStreamEventErrorSchema>;
+
+export const ExecutionRunTurnStreamEventSchema = z.discriminatedUnion('t', [
+  ExecutionRunTurnStreamEventDeltaSchema,
+  ExecutionRunTurnStreamEventDoneSchema,
+  ExecutionRunTurnStreamEventErrorSchema,
+]);
+export type ExecutionRunTurnStreamEvent = z.infer<typeof ExecutionRunTurnStreamEventSchema>;
+
+export const ExecutionRunTurnStreamReadResponseSchema = z.object({
+  streamId: z.string().min(1),
+  events: z.array(ExecutionRunTurnStreamEventSchema),
+  nextCursor: z.number().int().min(0),
+  done: z.boolean(),
+}).passthrough();
+export type ExecutionRunTurnStreamReadResponse = z.infer<typeof ExecutionRunTurnStreamReadResponseSchema>;
+
+export const ExecutionRunTurnStreamCancelRequestSchema = z.object({
+  runId: z.string().min(1),
+  streamId: z.string().min(1),
+}).passthrough();
+export type ExecutionRunTurnStreamCancelRequest = z.infer<typeof ExecutionRunTurnStreamCancelRequestSchema>;
+
+export const ExecutionRunTurnStreamCancelResponseSchema = z.object({
+  ok: z.literal(true),
+}).passthrough();
+export type ExecutionRunTurnStreamCancelResponse = z.infer<typeof ExecutionRunTurnStreamCancelResponseSchema>;

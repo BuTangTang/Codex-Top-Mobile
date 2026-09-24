@@ -1,0 +1,6 @@
+Claude Code v2.1.170
+
+Set model to Sonnet 4.6 and saved as your default for new sessions
+
+>
+What would you like to work on?

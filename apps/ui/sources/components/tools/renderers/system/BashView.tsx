@@ -1,0 +1,105 @@
+import * as React from 'react';
+import { StyleSheet } from 'react-native-unistyles';
+import { ToolCall } from '@/sync/domains/messages/messageTypes';
+import { ToolSectionView } from '../../shell/presentation/ToolSectionView';
+import { CommandView } from '@/components/sessions/transcript/CommandView';
+import { Metadata } from '@/sync/domains/state/storageTypes';
+import { extractShellCommand, stripShellCommandPreludeForDisplay } from '@happier-dev/protocol';
+import { readBashBackgroundTaskId } from '../../normalization/parse/backgroundTask';
+import { maybeParseJson } from '@happier-dev/protocol';
+import { extractStdStreams, tailTextWithEllipsis } from '../../normalization/parse/stdStreams';
+import { CodeView } from '@/components/ui/media/CodeView';
+import { Text } from '@/components/ui/text/Text';
+import { t } from '@/text';
+
+export const BashView = React.memo((props: { tool: ToolCall; metadata: Metadata | null; detailLevel?: 'title' | 'summary' | 'full' }) => {
+    const { input, result, state } = props.tool;
+    const rawCommand = extractShellCommand(input) ?? (typeof (input as any)?.command === 'string' ? (input as any).command : '');
+    const rawCommandTrimmed = typeof rawCommand === 'string' ? rawCommand.trim() : String(rawCommand ?? '');
+    const command = stripShellCommandPreludeForDisplay(rawCommandTrimmed);
+    const isFullView = props.detailLevel === 'full';
+    const didStripPrelude = rawCommandTrimmed.length > 0 && command !== rawCommandTrimmed;
+
+    // A detached command returns immediately with an empty stream pair, so without this the card
+    // reads as "ran and produced nothing". `backgroundTaskId` is the provider's attestation that it
+    // detached, and the same id is the join key to the background-task ledger and record.
+    const backgroundTaskId = readBashBackgroundTaskId(result);
+
+    const parsedStreams = extractStdStreams(result);
+    let unparsedOutput: string | null = null;
+    let error: string | null = null;
+    
+    if (result && state === 'completed') {
+        const parsedMaybe = maybeParseJson(result);
+        if (typeof parsedMaybe === 'string') {
+            unparsedOutput = parsedMaybe;
+        } else if (!parsedStreams) {
+            // When providers return a structured "bash result" envelope with empty stdout/stderr,
+            // don't dump the entire object into the transcript.
+            const obj = parsedMaybe && typeof parsedMaybe === 'object' && !Array.isArray(parsedMaybe) ? (parsedMaybe as Record<string, unknown>) : null;
+            const hasStdEnvelope =
+                !!obj &&
+                ('stdout' in obj || 'stderr' in obj || 'aggregated_output' in obj || 'formatted_output' in obj);
+            if (!hasStdEnvelope && isFullView) {
+                unparsedOutput = JSON.stringify(parsedMaybe);
+            }
+        }
+    } else if (state === 'error' && typeof result === 'string') {
+        error = result;
+    }
+
+    const maxStreamingChars = isFullView ? 8000 : 2000;
+    const maxCompletedChars = 6000;
+    const streamingStdout = parsedStreams?.stdout ? tailTextWithEllipsis(parsedStreams.stdout, maxStreamingChars) : null;
+    const streamingStderr = parsedStreams?.stderr ? tailTextWithEllipsis(parsedStreams.stderr, maxStreamingChars) : null;
+    const completedStdout =
+        parsedStreams?.stdout
+            ? (isFullView ? parsedStreams.stdout : tailTextWithEllipsis(parsedStreams.stdout, maxCompletedChars))
+            : unparsedOutput;
+    const completedStderr =
+        parsedStreams?.stderr
+            ? (isFullView ? parsedStreams.stderr : tailTextWithEllipsis(parsedStreams.stderr, maxCompletedChars))
+            : null;
+
+    return (
+        <>
+            <ToolSectionView>
+                <CommandView 
+                    command={command}
+                    stdout={state === 'running' ? streamingStdout : (state === 'completed' ? completedStdout : null)}
+                    stderr={state === 'running' ? streamingStderr : (state === 'completed' ? completedStderr : null)}
+                    error={error}
+                    hideEmptyOutput
+                    fullWidth={isFullView}
+                />
+                {backgroundTaskId ? (
+                    <Text style={styles.backgroundNotice} numberOfLines={2}>
+                        {t('tools.bashView.backgroundNotice')}
+                    </Text>
+                ) : null}
+            </ToolSectionView>
+            {isFullView && didStripPrelude ? (
+                <ToolSectionView title={t('tools.bashView.commandDiffTitle')} fullWidth>
+                    <Text style={styles.commandDiffHint} numberOfLines={3}>
+                        {t('tools.bashView.commandDiffHint')}
+                    </Text>
+                    <CodeView code={rawCommandTrimmed} />
+                </ToolSectionView>
+            ) : null}
+        </>
+    );
+});
+
+const styles = StyleSheet.create((theme) => ({
+    backgroundNotice: {
+        marginTop: 6,
+        marginHorizontal: 12,
+        fontSize: 13,
+        color: theme.colors.text.secondary,
+    },
+    commandDiffHint: {
+        marginHorizontal: 12,
+        marginBottom: 8,
+        color: theme.colors.text.secondary,
+    },
+}));

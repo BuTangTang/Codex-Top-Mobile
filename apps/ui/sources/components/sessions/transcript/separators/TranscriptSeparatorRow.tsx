@@ -1,0 +1,169 @@
+import * as React from 'react';
+import { Pressable, View, type ViewStyle } from 'react-native';
+import { StyleSheet, useUnistyles } from 'react-native-unistyles';
+
+import { Text } from '@/components/ui/text/Text';
+import { Icon, type IconName } from '@/components/ui/icons/Icon';
+
+export function TranscriptSeparatorRow(props: Readonly<{
+  testID?: string;
+  iconName: IconName;
+  title: string;
+  /**
+   * A caller-composed title run, rendered in the title's place.
+   *
+   * The default title is one string in one `Text`, which is right for every row
+   * whose label is only words. A label that has to interleave non-text runs —
+   * the Agent-transition divider sets each Agent's logo before its name — cannot
+   * be expressed that way, and duplicating this row to host one is worse than
+   * letting the caller own that slot. `title` stays the accessible name whatever
+   * is drawn, so a screen reader reads the sentence either way.
+   */
+  titleContent?: React.ReactNode;
+  titleTestID?: string;
+  subtitle?: string | null;
+  rightAccessory?: React.ReactNode;
+  onPress?: () => void;
+  chipTestID?: string;
+  accessibilityLabel?: string;
+  padding?: 'default' | 'none';
+  chipChrome?: 'default' | 'minimal';
+  containerStyle?: ViewStyle | null;
+}>): React.ReactElement {
+  const { theme } = useUnistyles();
+  const padding = props.padding === 'none' ? 'none' : 'default';
+  const chipChrome = props.chipChrome === 'minimal' ? 'minimal' : 'default';
+  const chipContent = (
+    <>
+      <Icon name={props.iconName} size={14} color={theme.colors.text.secondary} />
+      <View style={styles.textStack}>
+        {props.titleContent ?? (
+          <Text testID={props.titleTestID} style={[styles.title, { color: theme.colors.text.primary }]} numberOfLines={1}>
+            {props.title}
+          </Text>
+        )}
+        {props.subtitle ? (
+          <Text style={[styles.subtitle, { color: theme.colors.text.secondary }]} numberOfLines={1}>
+            {props.subtitle}
+          </Text>
+        ) : null}
+      </View>
+      {props.rightAccessory ? <View style={styles.rightAccessory}>{props.rightAccessory}</View> : null}
+    </>
+  );
+
+  return (
+    <View
+      testID={props.testID}
+      style={[
+        styles.container,
+        padding === 'none' ? styles.containerNoPadding : null,
+        props.containerStyle ?? null,
+      ]}
+    >
+      <View style={styles.row}>
+        <View style={[styles.line, { backgroundColor: theme.colors.border.default }]} />
+        {props.onPress ? (
+          <Pressable
+            testID={props.chipTestID}
+            onPress={props.onPress}
+            accessibilityRole="button"
+            accessibilityLabel={props.accessibilityLabel ?? props.title}
+            // The chip is ~30pt tall at its own padding, below a comfortable
+            // touch target, and it is the whole control when it is pressable.
+            // The minimal chrome has no padding of its own and needs more.
+            hitSlop={chipChrome === 'minimal' ? 10 : 6}
+            style={({ pressed }) => [
+              styles.chip,
+              chipChrome === 'minimal' ? styles.chipMinimal : null,
+              { backgroundColor: theme.colors.surface.base, borderColor: theme.colors.border.default, opacity: pressed ? 0.82 : 1 },
+            ]}
+          >
+            {chipContent}
+          </Pressable>
+        ) : (
+          <View
+            testID={props.chipTestID}
+            accessible={props.accessibilityLabel != null}
+            accessibilityLabel={props.accessibilityLabel}
+            accessibilityRole={props.accessibilityLabel != null ? 'text' : undefined}
+            style={[
+              styles.chip,
+              chipChrome === 'minimal' ? styles.chipMinimal : null,
+              { backgroundColor: theme.colors.surface.base, borderColor: theme.colors.border.default },
+            ]}
+          >
+            {chipContent}
+          </View>
+        )}
+        <View style={[styles.line, { backgroundColor: theme.colors.border.default }]} />
+      </View>
+    </View>
+  );
+}
+
+/**
+ * The separator title's type ramp, exported so a caller that composes its own
+ * title run sets it in the same face, size and weight as every other separator
+ * rather than restating the numbers.
+ */
+export const TRANSCRIPT_SEPARATOR_TITLE_TEXT_STYLE = {
+  fontSize: 12,
+  fontWeight: '600',
+} as const;
+
+const styles = StyleSheet.create((_theme) => ({
+  container: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  containerNoPadding: {
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+  },
+  row: {
+    maxWidth: 720,
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  line: {
+    flex: 1,
+    height: 1,
+    opacity: 0.8,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  chipMinimal: {
+    borderWidth: 0,
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+  },
+  textStack: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'column',
+    gap: 2,
+  },
+  title: {
+    ...TRANSCRIPT_SEPARATOR_TITLE_TEXT_STYLE,
+  },
+  subtitle: {
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  rightAccessory: {
+    marginLeft: 6,
+  },
+}));

@@ -1,0 +1,286 @@
+import { vi } from 'vitest';
+
+import {
+    CURRENT_PENDING_INPUT_PROTOCOL_VERSION,
+    SESSION_SYNC_PROTOCOL_VERSION_RUNTIME_ACTIVITY,
+    DEFAULT_PETS_CAPABILITIES,
+    DEFAULT_SESSION_CAPABILITIES,
+    type FeaturesResponse,
+} from '@happier-dev/protocol';
+
+type FixtureOverrides = {
+    friendsEnabled?: boolean;
+    friendsAllowUsername?: boolean;
+    friendsRequiredIdentityProviderId?: string | null;
+    voiceEnabled?: boolean;
+    happierVoiceEnabled?: boolean;
+    voiceConfigured?: boolean;
+    automationsEnabled?: boolean;
+    connectedServicesEnabled?: boolean;
+    connectedServicesQuotasEnabled?: boolean;
+    updatesOtaEnabled?: boolean;
+    sessionMediaGeneratedEnabled?: boolean;
+    petsCompanionEnabled?: boolean;
+    petsSyncEnabled?: boolean;
+    pairingDesktopQrMobileScanEnabled?: boolean;
+    oauthProviders?: Record<string, { enabled: boolean; configured: boolean }>;
+    authProviders?: Record<string, { enabled: boolean; configured: boolean }>;
+};
+
+export function buildServerFeaturesResponse(overrides: FixtureOverrides = {}): FeaturesResponse {
+    const oauthProviders = overrides.oauthProviders ?? { github: { enabled: true, configured: true } };
+    const authProviders = overrides.authProviders ?? {
+        github: {
+            enabled: true,
+            configured: true,
+        },
+    };
+
+    const voiceEnabled = overrides.voiceEnabled ?? false;
+    const happierVoiceEnabled = overrides.happierVoiceEnabled ?? voiceEnabled;
+    const voiceConfigured = overrides.voiceConfigured ?? happierVoiceEnabled;
+
+    const authProvidersWithDetails = Object.fromEntries(
+        Object.entries(authProviders).map(([id, state]) => [
+            id,
+            {
+                enabled: state.enabled,
+                configured: state.configured,
+                restrictions: { usersAllowlist: false, orgsAllowlist: false, orgMatch: 'any' as const },
+                offboarding: {
+                    enabled: false,
+                    intervalSeconds: 600,
+                    mode: 'per-request-cache' as const,
+                    source: 'oauth_user_token',
+                },
+            },
+        ]),
+    );
+
+    return {
+        features: {
+            bugReports: { enabled: true },
+            e2ee: {
+                keylessAccounts: { enabled: false },
+            },
+            encryption: {
+                plaintextStorage: { enabled: false },
+                accountOptOut: { enabled: false },
+            },
+            attachments: {
+                uploads: { enabled: true },
+            },
+            session: {
+                media: {
+                    generated: { enabled: overrides.sessionMediaGeneratedEnabled ?? false },
+                },
+            },
+            pets: {
+                companion: { enabled: overrides.petsCompanionEnabled ?? false },
+                sync: { enabled: overrides.petsSyncEnabled ?? false },
+            },
+            automations: {
+                enabled: overrides.automationsEnabled ?? true,
+            },
+            connectedServices: {
+                enabled: overrides.connectedServicesEnabled ?? true,
+                quotas: {
+                    enabled: overrides.connectedServicesQuotasEnabled ?? false,
+                },
+                subscription: { enabled: false },
+                accountGroups: {
+                    enabled: false,
+                },
+                accountFallback: {
+                    enabled: false,
+                },
+                autoQuotaReset: { enabled: false },
+                autoDisablePlanInvalid: { enabled: false },
+                poolQuotaLimitSelection: { enabled: false },
+            },
+            channelBridges: {
+                enabled: false,
+                telegram: {
+                    enabled: false,
+                },
+            },
+            updates: {
+                ota: {
+                    enabled: overrides.updatesOtaEnabled ?? true,
+                },
+            },
+            sharing: {
+                session: { enabled: true },
+                public: { enabled: true },
+                contentKeys: { enabled: true },
+                pendingQueueV2: { enabled: false },
+                pendingDeliveryState: { enabled: false },
+            },
+            sessions: {
+                enabled: false,
+                drafts: {
+                    enabled: false,
+                },
+                agentSwitching: {
+                    enabled: false,
+                },
+                folders: {
+                    enabled: false,
+                },
+                usageLimitRecovery: {
+                    enabled: false,
+                },
+                handoff: {
+                    enabled: false,
+                },
+            },
+            machines: {
+                enabled: false,
+                transfer: {
+                    enabled: false,
+                    directPeer: {
+                        enabled: false,
+                    },
+                    serverRouted: {
+                        enabled: false,
+                    },
+                },
+            },
+            terminal: {
+                embeddedPty: { enabled: false },
+            },
+            voice: {
+                enabled: voiceEnabled,
+                happierVoice: { enabled: happierVoiceEnabled },
+            },
+            social: {
+                friends: {
+                    enabled: overrides.friendsEnabled ?? true,
+                },
+            },
+            auth: {
+                recovery: {
+                    providerReset: { enabled: false },
+                },
+                mtls: { enabled: false },
+                login: {
+                    keyChallenge: { enabled: true },
+                },
+                pairing: {
+                    desktopQrMobileScan: { enabled: overrides.pairingDesktopQrMobileScanEnabled ?? true },
+                },
+                ui: {
+                    recoveryKeyReminder: { enabled: true },
+                },
+            },
+        },
+        capabilities: {
+            connectedServices: { credentialDelete: { revisionGuard: false } },
+            session: {
+                ...DEFAULT_SESSION_CAPABILITIES,
+                runtimeActivity: {
+                    protocolVersion: SESSION_SYNC_PROTOCOL_VERSION_RUNTIME_ACTIVITY,
+                },
+                pendingInput: {
+                    protocolVersion: CURRENT_PENDING_INPUT_PROTOCOL_VERSION,
+                },
+            },
+            bugReports: {
+                providerUrl: 'https://reports.happier.dev',
+                defaultIncludeDiagnostics: true,
+                maxArtifactBytes: 10 * 1024 * 1024,
+                acceptedArtifactKinds: ['ui-mobile', 'daemon', 'server', 'cli'],
+                uploadTimeoutMs: 20_000,
+                contextWindowMs: 30 * 60 * 1_000,
+            },
+            voice: {
+                configured: voiceConfigured,
+                provider: voiceConfigured ? 'elevenlabs' : null,
+                requested: voiceEnabled,
+                disabledByBuildPolicy: false,
+            },
+            pets: DEFAULT_PETS_CAPABILITIES,
+            sharing: {
+                pendingQueueV2: {
+                    deliveryState: false,
+                    deliveryBlockedReason: false,
+                },
+            },
+            encryption: {
+                storagePolicy: 'required_e2ee',
+                allowAccountOptOut: false,
+                defaultAccountMode: 'e2ee',
+                plainAccountSettingsAtRest: 'server_sealed',
+                plainAccountCredentialsAtRest: 'server_sealed',
+            },
+            machines: {
+                transfer: {
+                    serverRouted: {
+                        maxBytes: null,
+                    },
+                },
+            },
+            server: {},
+            serverIdentity: { serverIdentityId: null },
+            social: {
+                friends: {
+                    allowUsername: overrides.friendsAllowUsername ?? false,
+                    requiredIdentityProviderId: overrides.friendsRequiredIdentityProviderId ?? null,
+                },
+            },
+            oauth: {
+                providers: oauthProviders,
+            },
+            auth: {
+                methods: [],
+                signup: { methods: [{ id: 'anonymous', enabled: true }] },
+                login: { methods: [{ id: 'key_challenge', enabled: true }], requiredProviders: [] },
+                recovery: {
+                    providerReset: { providers: [] },
+                },
+                mtls: {
+                    mode: 'forwarded',
+                    autoProvision: false,
+                    identitySource: 'san_email',
+                    policy: {
+                        trustForwardedHeaders: false,
+                        issuerAllowlist: { enabled: false, count: 0 },
+                        emailDomainAllowlist: { enabled: false, count: 0 },
+                    },
+                },
+                ui: {
+                    autoRedirect: { enabled: false, providerId: null },
+                },
+                providers: authProvidersWithDetails,
+                misconfig: [],
+            },
+        },
+    };
+}
+
+export function stubServerFeaturesFetch(overrides: FixtureOverrides = {}): void {
+    const response = buildServerFeaturesResponse(overrides);
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => ({
+            ok: true,
+            json: async () => response,
+        })) as any,
+    );
+}
+
+export function stubServerFeaturesFetchFailure(): void {
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+            const url = typeof input === 'string' ? input : String((input as any)?.url ?? input);
+            if (url.endsWith('/health')) {
+                return { ok: true, status: 200 } as any;
+            }
+            if (url.endsWith('/v1/auth/ping')) {
+                return { ok: true, status: 200 } as any;
+            }
+            throw new Error('network down');
+        }) as any,
+    );
+}

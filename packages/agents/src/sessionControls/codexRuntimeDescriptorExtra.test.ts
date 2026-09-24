@@ -1,0 +1,70 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  buildCodexRuntimeDescriptorProviderExtra,
+  readCodexRuntimeDescriptorProviderExtra,
+} from './codexRuntimeDescriptorExtra.js';
+
+describe('codexRuntimeDescriptorExtra', () => {
+  it('builds and reads canonical codex provider extra payloads', () => {
+    const built = buildCodexRuntimeDescriptorProviderExtra({
+      backendMode: 'appServer',
+      vendorSessionId: 'thread_1',
+      home: 'connectedService',
+      connectedServiceId: 'openai-codex',
+      connectedServiceProfileId: 'work',
+      homePath: '/tmp/codex-home',
+    });
+
+    expect(readCodexRuntimeDescriptorProviderExtra(built)).toEqual({
+      backendMode: 'appServer',
+      vendorSessionId: 'thread_1',
+      home: 'connectedService',
+      connectedServiceId: 'openai-codex',
+      connectedServiceProfileId: 'work',
+      connectedServiceGroupId: null,
+      homePath: '/tmp/codex-home',
+      sqliteHomePath: null,
+    });
+  });
+
+  it('drops connected-service fields when the home is not connectedService', () => {
+    expect(readCodexRuntimeDescriptorProviderExtra({
+      v: 1,
+      runtimeAffinity: {
+        home: 'user',
+        connectedServiceId: 'openai-codex',
+        connectedServiceProfileId: 'work',
+        connectedServiceGroupId: 'main',
+        homePath: '/tmp/codex-home',
+      },
+    })).toEqual({
+      backendMode: null,
+      vendorSessionId: null,
+      home: 'user',
+      connectedServiceId: null,
+      connectedServiceProfileId: null,
+      connectedServiceGroupId: null,
+      homePath: '/tmp/codex-home',
+      sqliteHomePath: null,
+    });
+  });
+
+  it('normalizes whitespace-padded codex backend modes when reading provider extras', () => {
+    expect(readCodexRuntimeDescriptorProviderExtra({
+      v: 1,
+      runtimeAffinity: {
+        backendMode: '  appServer  ',
+      },
+    })).toEqual({
+      backendMode: 'appServer',
+      vendorSessionId: null,
+      home: null,
+      connectedServiceId: null,
+      connectedServiceProfileId: null,
+      connectedServiceGroupId: null,
+      homePath: null,
+      sqliteHomePath: null,
+    });
+  });
+});
