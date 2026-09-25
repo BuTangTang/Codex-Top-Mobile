@@ -27,6 +27,10 @@ describe('readCodexCandidateLifecycle', () => {
   it.each([
     ['start', start, 'running'],
     ['complete', start + complete, 'completed'],
+    ['terminal is an explicit tail anchor without start', complete, 'completed'],
+    ['failed without start', event('task_failed', { turn_id: 'turn' }), 'failed'],
+    ['cancelled without start', event('turn_aborted', { turn_id: 'turn' }), 'cancelled'],
+    ['tail request still outlives orphan completion', question('q', 'request_user_input_async') + complete, 'needs_input'],
     ['failed', start + event('task_failed', { turn_id: 'turn' }), 'failed'],
     ['cancelled', start + event('turn_aborted', { turn_id: 'turn' }), 'cancelled'],
     ['approval', start + event('exec_approval_request', { call_id: 'approval' }), 'needs_input'],
@@ -46,7 +50,12 @@ describe('readCodexCandidateLifecycle', () => {
   });
 
   it.each([
-    ['missing turn start', complete],
+    ['orphan terminal without ID', event('task_complete')],
+    ['orphan terminal followed by a conflicting turn', complete + event('task_complete', { turn_id: 'other' })],
+    ['orphan terminal conflicts with preceding explicit activity turn', event('agent_message', { turn_id: 'other', message: 'not inspected' }) + complete],
+    ['orphan terminal followed by incomplete turn context', complete + row('turn_context', {})],
+    ['orphan terminal followed by new context', complete + row('turn_context', { turn_id: 'new' })],
+    ['orphan terminal after invalid record', 'not-json\n' + complete],
     ['missing turn ID', event('task_started')],
     ['missing terminal ID', start + event('task_complete')],
     ['malformed tail', start + complete + '{"type":'],
@@ -81,19 +90,70 @@ describe('readCodexCandidateLifecycle', () => {
     expect(await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).toEqual(result);
   });
 
-  it('bounds large histories and needs a full latest turn in the tail window', async () => {
+  it('bounds large histories and accepts an explicit terminal when start is outside the tail window', async () => {
     const large = row('response_item', { type: 'message', role: 'assistant', content: 'x'.repeat(200_000) });
-    expect((await read(start + large + complete)).state).toBe('unknown');
+    expect((await read(start + large + complete)).state).toBe('completed');
     expect((await read(large + start + complete)).state).toBe('completed');
   });
 
-  it('rejects a changed file instead of returning the old complete state', async () => {
+  it.each(['not-json\n', 'null\n'])('rejects a complete invalid line after the truncated large-line prefix (%s)', async (invalid) => {
+    const large = row('response_item', { type: 'message', role: 'assistant', content: 'x'.repeat(200_000) });
+    expect((await read(start + large + invalid + complete)).state).toBe('unknown');
+  });
+
+  it.each([false, true])('rechecks one append but rejects continuing writes (continuous=%s)', async (continuous) => {
     await read(start + complete);
     let reads = 0;
     vi.doMock('node:fs/promises', async (importOriginal) => {
       const actual = await importOriginal<typeof import('node:fs/promises')>();
       return { ...actual, lstat: async (path: Parameters<typeof actual.lstat>[0]) => {
-        if (++reads === 2) await actual.appendFile(filePath, event('task_started', { turn_id: 'new' }));
+        if (++reads === 2 || (continuous && reads === 4)) await actual.appendFile(filePath, event('task_started', { turn_id: reads === 2 ? 'new' : 'newer' }));
+        return actual.lstat(path);
+      } };
+    });
+    const { readCodexCandidateLifecycle: readDuringChange } = await import('./readCodexCandidateLifecycle');
+    expect((await readDuringChange({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe(continuous ? 'unknown' : 'running');
+    expect(reads).toBe(4);
+  });
+
+  it.each(['rewrite', 'truncate', 'replace', 'identity-growth'] as const)('rejects %s while reading without reusing old completion', async (kind) => {
+    await read(start + complete);
+    let reads = 0;
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>();
+      return { ...actual, lstat: async (path: Parameters<typeof actual.lstat>[0]) => {
+        if (++reads === 2) {
+          if (kind === 'replace') {
+            await actual.rename(filePath, filePath + '.old');
+            await actual.writeFile(filePath, row('session_meta', { id: 'root', source: 'cli' }) + start + complete);
+          } else if (kind === 'truncate') await actual.writeFile(filePath, row('session_meta', { id: 'root' }));
+          else if (kind === 'identity-growth') await actual.writeFile(filePath,
+            row('session_meta', { id: 'other', source: 'cli' }) + start + complete + event('task_started', { turn_id: 'new' }));
+          else {
+            await actual.writeFile(filePath, row('session_meta', { id: 'root', source: 'cli' }) + start + complete);
+            await actual.utimes(filePath, 1, 1);
+          }
+        }
+        return actual.lstat(path);
+      } };
+    });
+    const { readCodexCandidateLifecycle: readDuringChange } = await import('./readCodexCandidateLifecycle');
+    expect((await readDuringChange({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('unknown');
+    expect(reads).toBe(kind === 'identity-growth' ? 3 : 2);
+  });
+
+  it('rejects a source replacement between the append and retry', async () => {
+    await read(start + complete);
+    let reads = 0;
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>();
+      return { ...actual, lstat: async (path: Parameters<typeof actual.lstat>[0]) => {
+        reads++;
+        if (reads === 2) await actual.appendFile(filePath, event('task_started', { turn_id: 'new' }));
+        if (reads === 3) {
+          await actual.rename(filePath, filePath + '.old');
+          await actual.writeFile(filePath, row('session_meta', { id: 'root' }) + start + complete);
+        }
         return actual.lstat(path);
       } };
     });

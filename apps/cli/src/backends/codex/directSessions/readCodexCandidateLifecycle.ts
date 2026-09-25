@@ -1,7 +1,9 @@
-import { lstat } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
+import { lstat, open } from 'node:fs/promises';
 
 import { unknownCodexLifecycleV1, type CodexLifecycleV1 } from '@happier-dev/protocol';
 
+import { tryParseJsonlLine } from '@/api/directSessions/filePaging/jsonlParse';
 import { readJsonlFileForward } from '@/api/directSessions/filePaging/jsonlForwardReader';
 import type { JsonlParsedLine } from '@/api/directSessions/filePaging/jsonlBackwardPager';
 import { isSubagentRollout } from '../localControl/rolloutDiscovery';
@@ -34,6 +36,9 @@ function questionIds(payload: Record<string, unknown>): string[] | null {
 /** 只消费完整主轮事件元数据；正文和工具输出内容不能决定完成、失败或等待。 */
 function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: string, checkedAtMs: number): CodexLifecycleV1 {
   const unknown = () => unknownCodexLifecycleV1(checkedAtMs);
+  // 尾窗可从完整终止事件建立锚；一旦见到缺口或无法归属的新轮，不能再靠终止事件恢复。
+  let terminalAnchorAllowed = true;
+  let unanchoredTurnId: string | null = null;
   let turnId: string | null = null;
   let state: CodexLifecycleV1['state'] = 'unknown';
   let eventAtMs: number | null = null;
@@ -46,12 +51,12 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
 
   for (const line of lines) {
     if (nextOffset !== null && nextOffset !== line.startOffsetBytes) {
-      turnId = null; state = 'unknown'; pending.clear();
+      turnId = null; state = 'unknown'; pending.clear(); terminalAnchorAllowed = false;
     }
     nextOffset = line.endOffsetBytes + 1;
     const envelope = record(line.value);
     const payload = record(envelope?.payload);
-    if (!envelope || !payload) { turnId = null; state = 'unknown'; continue; }
+    if (!envelope || !payload) { turnId = null; state = 'unknown'; terminalAnchorAllowed = false; continue; }
     if (envelope.type === 'session_meta') {
       if (payload.id !== remoteSessionId || isSubagentRollout(payload)) return unknown();
       continue;
@@ -64,15 +69,19 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
     const eventTurnId = id(payload.turn_id) ?? id(payload.turnId);
     const isEvent = envelope.type === 'event_msg';
     const isResponse = envelope.type === 'response_item';
-    if (envelope.type === 'turn_context' && eventTurnId && eventTurnId !== turnId) {
-      turnId = null; state = 'unknown'; pending.clear();
+    if (envelope.type === 'turn_context' && (!eventTurnId || eventTurnId !== turnId)) {
+      turnId = null; state = 'unknown'; pending.clear(); terminalAnchorAllowed = false;
       continue;
     }
     const start = isEvent && (type === 'task_started' || type === 'turn_started');
-    if (!start && !turnId) continue;
-    if (!start && eventTurnId && eventTurnId !== turnId) {
+    // 窗口内的显式轮标识必须一致；活动正文不是运行证明，但其轮ID冲突不能被忽略。
+    if (!start && !turnId && eventTurnId) {
+      if (unanchoredTurnId && unanchoredTurnId !== eventTurnId) terminalAnchorAllowed = false;
+      unanchoredTurnId = eventTurnId;
+    }
+    if (!start && turnId && eventTurnId && eventTurnId !== turnId) {
       if (observedTurns.has(eventTurnId)) continue;
-      turnId = null; state = 'unknown'; pending.clear();
+      turnId = null; state = 'unknown'; pending.clear(); terminalAnchorAllowed = false;
       continue;
     }
 
@@ -95,6 +104,10 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
     const user = (isResponse && type === 'message' && payload.role === 'user')
       || (isEvent && (type === 'user_message' || (type === 'item_completed' && record(payload.item)?.type === 'UserMessage')));
     const active = isEvent && (type === 'agent_message' || type === 'agent_reasoning');
+    const terminalWithoutStart = !turnId && Boolean(boundary || failed) && !start;
+    if (terminalWithoutStart && (!terminalAnchorAllowed || !eventTurnId)) return unknown();
+    // 尚无轮锚时仍记录明确待处理请求；缺失开始事件不应把等待错误显示为完成。
+    if (!start && !turnId && !terminalWithoutStart && !request && !question && !resolved && !output && !user) continue;
     if (!boundary && !failed && !request && !question && !resolved && !user && !active && !(output && callId && pending.has(callId))) continue;
     const at = typeof envelope.timestamp === 'string' ? Date.parse(envelope.timestamp) : NaN;
     if (!Number.isSafeInteger(at) || at < 0 || at > checkedAtMs || (lastAtMs !== null && at < lastAtMs)) return unknown();
@@ -106,6 +119,7 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
       pending.clear(); state = 'running'; eventAtMs = at;
     } else if (boundary || failed) {
       if (!eventTurnId) return unknown();
+      if (terminalWithoutStart) { turnId = eventTurnId; observedTurns.add(eventTurnId); }
       terminal = failed ? 'failed' : normalizedType === 'turn_aborted' ? 'cancelled' : 'completed';
       terminalAtMs = at;
       if (terminal !== 'completed') pending.clear();
@@ -118,7 +132,7 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
       state = 'needs_input'; eventAtMs = at;
     } else if (user) {
       // 用户形状的记录也可能是注入通知；不能从其正文猜测回答了哪个问题。
-      if (terminal || pending.size) { turnId = null; state = 'unknown'; pending.clear(); }
+      if (terminal || pending.size || !turnId) { turnId = null; state = 'unknown'; pending.clear(); terminalAnchorAllowed = false; }
     } else if (resolved || output) {
       const pendingRequest = callId ? pending.get(callId) : null;
       if (resolved && (!pendingRequest || (type === 'approval_resolved') !== (pendingRequest.kind === 'approval'))) return unknown();
@@ -146,7 +160,10 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
   return { v: 1, state, eventAtMs, checkedAtMs };
 }
 
-/** 一次候选读取最多两个64KiB窗口；改写、未闭合尾行和证据缺口显式覆盖旧状态。 */
+/**
+ * 正常读取首行与尾段各最多64KiB；同inode增长时丢弃旧结果，仅再独立校验一次来源和最新尾段。
+ * 两次合计最多256KiB，不扩历史范围；再次变化、改写、未闭合尾行和证据缺口均返回未知。
+ */
 export async function readCodexCandidateLifecycle(params: Readonly<{
   filePath: string;
   remoteSessionId: string;
@@ -155,24 +172,47 @@ export async function readCodexCandidateLifecycle(params: Readonly<{
   const checkedAtMs = params.checkedAtMs ?? Date.now();
   const unknown = () => unknownCodexLifecycleV1(checkedAtMs);
   try {
-    const before = await lstat(params.filePath);
-    if (!before.isFile()) return unknown();
-    const options = { filePath: params.filePath, maxBytes: READ_BYTES, maxOversizeLineBytes: READ_BYTES, strictRead: true };
-    const head = await readJsonlFileForward({ ...options, offsetBytes: 0, maxItems: 1 });
-    const first = head.items[0];
-    const metaEnvelope = record(first?.value);
-    const meta = record(metaEnvelope?.payload);
-    if (!first || first.startOffsetBytes !== 0 || metaEnvelope?.type !== 'session_meta'
-      || meta?.id !== params.remoteSessionId || isSubagentRollout(meta)) return unknown();
-    const offsetBytes = Math.max(0, before.size - READ_BYTES);
-    const tail = await readJsonlFileForward({ ...options, offsetBytes, maxItems: READ_BYTES });
-    const after = await lstat(params.filePath);
-    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs
-      || tail.truncated || !tail.reachedEnd || tail.nextOffsetBytes !== before.size
-      || tail.items.at(-1)?.endOffsetBytes !== before.size - 1) return unknown();
-    // 从任意字节起读时，首段可能是被截断但偶然能解析的 JSON，不能当完整事件。
-    const lines = offsetBytes ? tail.items.filter((line) => line.startOffsetBytes > offsetBytes) : tail.items;
-    return projectLifecycle(lines, params.remoteSessionId, checkedAtMs);
+    let retrySource: Stats | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const before = await lstat(params.filePath);
+      if (!before.isFile()) return unknown();
+      // 追加后的重读仍属于同一文件代次；两次尝试之间替换、截短或等长改写也不能接续。
+      if (retrySource && (before.dev !== retrySource.dev || before.ino !== retrySource.ino || before.size < retrySource.size
+        || (before.size === retrySource.size && (before.mtimeMs !== retrySource.mtimeMs || before.ctimeMs !== retrySource.ctimeMs)))) return unknown();
+      const options = { filePath: params.filePath, maxBytes: READ_BYTES, maxOversizeLineBytes: READ_BYTES, strictRead: true };
+      const head = await readJsonlFileForward({ ...options, offsetBytes: 0, maxItems: 1 });
+      const first = head.items[0];
+      const metaEnvelope = record(first?.value);
+      const meta = record(metaEnvelope?.payload);
+      if (!first || first.startOffsetBytes !== 0 || metaEnvelope?.type !== 'session_meta'
+        || meta?.id !== params.remoteSessionId || isSubagentRollout(meta)) return unknown();
+      const offsetBytes = Math.max(0, before.size - READ_BYTES);
+      // 分页reader会丢弃非法行，不能用于终止锚的无缺口证明；本窗口只读一次原始字节。
+      const tailBytes = Buffer.alloc(before.size - offsetBytes);
+      const file = await open(params.filePath, 'r');
+      let bytesRead: number;
+      try { ({ bytesRead } = await file.read(tailBytes, 0, tailBytes.length, offsetBytes)); }
+      finally { await file.close(); }
+      const after = await lstat(params.filePath);
+      if (before.dev !== after.dev || before.ino !== after.ino || !after.isFile() || after.size < before.size) return unknown();
+      if (after.size > before.size) {
+        // 追加可能带入新轮，旧尾窗的完成状态不能返回；只允许一次从新身份和大小重新开始。
+        if (attempt === 0) { retrySource = after; continue; }
+        return unknown();
+      }
+      if (before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs
+        || bytesRead !== tailBytes.length || tailBytes.at(-1) !== 0x0a) return unknown();
+      // 任意偏移的首片段只丢到首个换行；从此以后，每条完整行都必须被显式校验，不能跳过null或坏JSON。
+      const lines: JsonlParsedLine[] = [];
+      let lineStart = offsetBytes ? tailBytes.indexOf(0x0a) + 1 : 0;
+      for (let newline = tailBytes.indexOf(0x0a, lineStart); newline >= 0; newline = tailBytes.indexOf(0x0a, lineStart)) {
+        const value = tryParseJsonlLine(tailBytes.subarray(lineStart, newline));
+        if (value === null) return unknown();
+        lines.push({ value, startOffsetBytes: offsetBytes + lineStart, endOffsetBytes: offsetBytes + newline });
+        lineStart = newline + 1;
+      }
+      return projectLifecycle(lines, params.remoteSessionId, checkedAtMs);
+    }
+    return unknown();
   } catch { return unknown(); }
 }
