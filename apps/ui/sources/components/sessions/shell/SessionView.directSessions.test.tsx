@@ -135,11 +135,13 @@ const setWorkspaceReviewCommentDraftIncludedSpy = vi.hoisted(() => vi.fn());
 const publishSessionAcpSessionModeOverrideToMetadataSpy = vi.hoisted(() => vi.fn(async () => {}));
 const publishSessionAcpConfigOptionOverrideToMetadataSpy = vi.hoisted(() => vi.fn(async () => {}));
 const modalAlertSpy = vi.hoisted(() => vi.fn());
+const modalShowSpy = vi.hoisted(() => vi.fn(() => 'desktop-notice-details'));
+const modalUpdateSpy = vi.hoisted(() => vi.fn());
 const routerPushSpy = vi.hoisted(() => vi.fn());
 const chatListPropsSpy = vi.hoisted(() => vi.fn());
 const chatHeaderPropsSpy = vi.hoisted(() => vi.fn());
 const chatHeaderHarnessState = vi.hoisted(() => ({ renderRightElement: false }));
-const responsiveHarnessState = vi.hoisted(() => ({ deviceType: 'tablet' as 'phone' | 'tablet' }));
+const responsiveHarnessState = vi.hoisted(() => ({ deviceType: 'tablet' as 'phone' | 'tablet', platformOs: 'web' as 'web' | 'android', landscape: false }));
 const voiceSurfacePropsSpy = vi.hoisted(() => vi.fn());
 const showDirectSessionTakeoverDialogSpy = vi.hoisted(() =>
   vi.fn<() => Promise<{ action: 'direct' | 'persisted' | null; forceStop: boolean }>>(async () => ({ action: null, forceStop: false })),
@@ -308,6 +310,10 @@ installSessionShellCommonModuleMocks({
   reactNative: async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
     return createReactNativeWebMock({
+      Platform: {
+        get OS() { return responsiveHarnessState.platformOs; },
+        select: (values: Record<string, unknown>) => values[responsiveHarnessState.platformOs] ?? values.default,
+      },
       View: 'View',
       Text: 'Text',
       Pressable: 'Pressable',
@@ -339,7 +345,7 @@ installSessionShellCommonModuleMocks({
   },
   modal: async () => {
     const { createModalModuleMock } = await import('@/dev/testkit/mocks/modal');
-    const modalMock = createModalModuleMock();
+    const modalMock = createModalModuleMock({ spies: { show: modalShowSpy, update: modalUpdateSpy } });
     modalMock.spies.alert.mockImplementation((...args) => modalAlertSpy(...args));
     return modalMock.module;
   },
@@ -362,10 +368,12 @@ installSessionShellCommonModuleMocks({
       return (override ?? settingsDefaults[key]) as Settings[K];
     };
 
+    const testStorage = createStorageStoreMock(storageState as any);
     return createStorageModuleMock({
       importOriginal,
       overrides: {
-        storage: createStorageStoreMock(storageState as any),
+        storage: testStorage,
+        getStorage: () => testStorage,
         useSession: (sessionId: string) => (
           (storageState.sessions as Record<string, any>)[sessionId] ?? null
         ),
@@ -473,7 +481,7 @@ vi.mock('@/components/sessions/panes/url/useSessionPaneUrlSync', () => ({
 vi.mock('@/components/sessions/transcript/ChatHeaderView', () => ({
   ChatHeaderView: (props: any) => {
     chatHeaderPropsSpy(props);
-    return chatHeaderHarnessState.renderRightElement ? props.rightElement ?? null : null;
+    return <>{props.statusElement}{chatHeaderHarnessState.renderRightElement ? props.rightElement ?? null : null}</>;
   },
 }));
 vi.mock('@/components/sessions/transcript/ChatList', () => ({
@@ -505,7 +513,7 @@ vi.mock('@/utils/platform/responsive', () => ({
   getDeviceType: () => responsiveHarnessState.deviceType,
   useDeviceType: () => responsiveHarnessState.deviceType,
   useHeaderHeight: () => 0,
-  useIsLandscape: () => false,
+  useIsLandscape: () => responsiveHarnessState.landscape,
   useIsTablet: () => true,
 }));
 vi.mock('@/hooks/session/useDraft', () => ({
@@ -603,15 +611,6 @@ vi.mock('@/hooks/session/useDraft', () => ({
     draftScope: TEST_SERVER_ACCOUNT_SCOPE,
   };
   },
-}));
-vi.mock('@/components/sessions/model/inactiveSessionUi', () => ({
-  getInactiveSessionUiState: () => ({ noticeKind: 'none', inactiveStatusTextKey: null, shouldShowInput: true }),
-}));
-vi.mock('@/components/sessions/model/resolveSessionMachineReachability', () => ({
-  resolveSessionMachineReachability: () => true,
-}));
-vi.mock('@/components/sessions/model/useSessionMachineReachability', () => ({
-  useSessionMachineReachability: () => ({ machineReachable: true, machineOnline: true, machineRpcTargetAvailable: true }),
 }));
 vi.mock('@/sync/domains/server/serverRuntime', () => ({
   getActiveServerSnapshot: () => ({ serverId: 'server-1' }),
@@ -921,6 +920,83 @@ describe('SessionView (direct sessions)', () => {
       expect(findAgentInput(screen).props.showAbortButton).toBe(false);
     },
   );
+
+  /** 真正走 Android 手机分支：控制读取失败不覆盖运行事实，也不再撑高输入区域。 */
+  it.each([false, true])('keeps native desktop observation in the header during a control failure without duplicate composer notices (landscape: %s)', async (landscape) => {
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
+    responsiveHarnessState.landscape = landscape;
+    machineDirectSessionStatusGetSpy.mockResolvedValue({
+      ok: true, machineOnline: true, runnerActive: false, activity: 'idle', canForceStop: false,
+      externalControl: { canSend: false, unavailableReason: 'router_unavailable' },
+      observation: { v: 1, state: 'running', source: 'desktop', turnId: 'turn-1' },
+    });
+    const screen = await renderSessionViewAndSettle();
+    expect(findAgentInput(screen).props.connectionStatus).toBeUndefined();
+    expect(findAgentInput(screen).props.showAbortButton).toBe(false);
+    expect(screen.findByTestId('desktop-approval-panel')).toBeNull();
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].directControlFooter).toBeNull();
+    expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toContain('directSessions.observation.running');
+    expect(screen.findByTestId('desktop-session-header-details')?.props.disabled).not.toBe(true);
+    expect(screen.findByTestId('desktop-session-header-attention')).not.toBeNull();
+  });
+
+  /** 真实不可达与 inactive owner 产生同一份提示：仅原生手机迁往顶栏详情，大屏保留原页脚。 */
+  it.each([
+    { platformOs: 'android' as const, deviceType: 'phone' as const, headerNotice: true, switchScope: false },
+    { platformOs: 'android' as const, deviceType: 'phone' as const, headerNotice: true, switchScope: true },
+    { platformOs: 'android' as const, deviceType: 'tablet' as const, headerNotice: false, switchScope: false },
+    { platformOs: 'web' as const, deviceType: 'phone' as const, headerNotice: false, switchScope: false },
+  ])('keeps offline notice readable without a native phone footer ($platformOs/$deviceType, switch scope: $switchScope)', async ({ platformOs, deviceType, headerNotice, switchScope }) => {
+    responsiveHarnessState.platformOs = platformOs;
+    responsiveHarnessState.deviceType = deviceType;
+    storageState.sessions.s1 = { ...storageState.sessions.s1, active: false };
+    // 电脑最后心跳已过期；保留真实身份使 reachability owner 能判定离线。
+    storageState.machines['machine-1'] = { id: 'machine-1', active: true, activeAt: 1 };
+    const { storage: machineStorage } = await import('@/sync/domains/state/storageStore');
+    machineStorage.setState({ machines: storageState.machines });
+    machineDirectSessionStatusGetSpy.mockResolvedValue({
+      ok: true, machineOnline: false, runnerActive: false, activity: 'idle', canForceStop: false,
+      externalControl: { canSend: false, unavailableReason: 'machine_offline' },
+      observation: { v: 1, state: 'completed', source: 'desktop', turnId: 'turn-1' },
+    });
+    const screen = await renderSessionViewAndSettle();
+    const notice = { title: 'session.machineOfflineNoticeTitle', body: 'session.machineOfflineNoticeBody' };
+    if (!headerNotice) {
+      expect(chatListPropsSpy.mock.calls.at(-1)?.[0].bottomNotice).toEqual(notice);
+      expect(screen.findByTestId('desktop-session-header-status')).toBeNull();
+      return;
+    }
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].bottomNotice).toBeNull();
+    expect(findAgentInput(screen).props.connectionStatus).toBeUndefined();
+    await screen.pressByTestIdAsync('desktop-session-header-details');
+    const config = (modalShowSpy.mock.calls.at(-1) as unknown as [import('@/modal/types').CustomModalConfig])[0];
+    const details = await renderScreen(React.createElement(config.component, { ...config.props, onClose: vi.fn() }));
+    expect(details.getTextContent()).toContain(notice.title);
+    expect(details.getTextContent()).toContain(notice.body);
+    expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toBe('directSessions.observation.unknown');
+
+    if (switchScope) {
+        // 切换会话后旧提示不可再出现；原生 memo 不依赖测试夹具的手动重复重绘。
+        (storageState.sessions as Record<string, any>).s2 = { ...storageState.sessions.s1, id: 's2', active: true };
+        await updateSessionViewAndSettle(screen, { sessionId: 's2', routeServerId: 'server-other' });
+        await screen.pressByTestIdAsync('desktop-session-header-details');
+        const nextConfig = (modalShowSpy.mock.calls.at(-1) as unknown as [import('@/modal/types').CustomModalConfig])[0];
+        const nextDetails = await renderScreen(React.createElement(nextConfig.component, { ...nextConfig.props, onClose: vi.fn() }));
+        expect(nextDetails.getTextContent()).not.toContain(notice.title);
+        expect(chatListPropsSpy.mock.calls.at(-1)?.[0].bottomNotice).toBeNull();
+        return;
+    }
+
+    // 同会话恢复时已打开详情同步移除旧说明，输入区域仍没有额外提示。
+    storageState.sessions.s1 = { ...storageState.sessions.s1, active: true };
+    await updateSessionViewAndSettle(screen);
+    const updated = modalUpdateSpy.mock.calls.at(-1)?.[1];
+    await act(async () => { details.tree.update(React.createElement(config.component, { ...updated, onClose: vi.fn() })); });
+    expect(details.getTextContent()).not.toContain(notice.title);
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].bottomNotice).toBeNull();
+
+  });
 
   it('offers daemon follow independently of pin and changes the action after canonical readback', async () => {
     chatHeaderHarnessState.renderRightElement = true;
@@ -1345,6 +1421,8 @@ describe('SessionView (direct sessions)', () => {
     chatHeaderPropsSpy.mockReset();
     chatHeaderHarnessState.renderRightElement = false;
     responsiveHarnessState.deviceType = 'tablet';
+    responsiveHarnessState.platformOs = 'web';
+    responsiveHarnessState.landscape = false;
     voiceSurfacePropsSpy.mockReset();
     featureEnabledState.voice = false;
     featureEnabledState['mcp.servers'] = false;
@@ -1357,6 +1435,8 @@ describe('SessionView (direct sessions)', () => {
     settingsState.current = {};
     settingByKeyState.current = {};
     modalAlertSpy.mockReset();
+    modalShowSpy.mockClear();
+    modalUpdateSpy.mockClear();
     routerPushSpy.mockReset();
     syncRefreshSessionMessagesSpy.mockReset();
     syncSubmitMessageSpy.mockReset();

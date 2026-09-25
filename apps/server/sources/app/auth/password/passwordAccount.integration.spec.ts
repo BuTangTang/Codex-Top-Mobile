@@ -47,10 +47,45 @@ afterAll(async () => {
     rmSync(folder, { recursive: true, force: true });
 });
 
+/** 通过真实临时数据库验证管理员开户规则与原密码登录链，不操作已有账号数据。 */
 describe('local provision and password login', () => {
+    /** 越界密码在开户前失败，不能留下账号或凭据。 */
+    it.each([7, 1025])('拒绝 %i 位密码且不写入账号', async (length) => {
+        const loginName = `rejected-length-${length}`;
+        const before = await db.account.count();
+        await expect(provisionPasswordAccount({ loginName, password: 'p'.repeat(length), env: process.env })).rejects.toThrow();
+        expect(await db.account.count()).toBe(before);
+        expect(await db.passwordCredential.findUnique({ where: { loginName } })).toBeNull();
+    });
+
+    /** 下限、用户所需长度和上限均能开户，再通过原登录链恢复同一账号。 */
+    it.each([8, 9, 1024])('允许 %i 位密码开户并登录', async (length) => {
+        const loginName = `accepted-length-${length}`;
+        const password = 'p'.repeat(length);
+        const { accountId } = await provisionPasswordAccount({ loginName, password, env: process.env });
+        const parameters = PasswordAuthParametersSchema.parse((await post('/v1/auth/password/parameters', { loginName })).value);
+        const keys = await derivePasswordKeys(password, parameters);
+        try {
+            const response = await post('/v1/auth/password/login', {
+                loginName, credentialId: parameters.credentialId,
+                loginSecret: encodeBase64(Uint8Array.from(keys.loginSecret), 'base64url').replace(/=+$/, ''),
+            });
+            expect(response.status).toBe(200);
+            expect(PasswordLoginResponseSchema.parse(response.value).accountId).toBe(accountId);
+        } finally {
+            keys.loginSecret.fill(0);
+            keys.wrappingKey.fill(0);
+        }
+    });
+
+    /** 已有账号不被不同密码覆盖，重复登录恢复原密钥，错误或禁用凭据仍被拒绝。 */
     it('同一账号两次恢复相同密钥并签发原token，拒绝错密/未知/禁用', async () => {
         const { accountId } = await provisionPasswordAccount({ loginName: ' Alice ', password, env: process.env });
-        await expect(provisionPasswordAccount({ loginName: 'alice', password, env: process.env })).rejects.toThrow();
+        const originalCredential = await db.passwordCredential.findUniqueOrThrow({ where: { accountId } });
+        const accountCount = await db.account.count();
+        await expect(provisionPasswordAccount({ loginName: 'alice', password: 'Different-synthetic-password-567!', env: process.env })).rejects.toThrow();
+        expect(await db.passwordCredential.findUniqueOrThrow({ where: { accountId } })).toEqual(originalCredential);
+        expect(await db.account.count()).toBe(accountCount);
         const params = PasswordAuthParametersSchema.parse((await post('/v1/auth/password/parameters', { loginName: 'ALICE' })).value);
         const unknown = PasswordAuthParametersSchema.parse((await post('/v1/auth/password/parameters', { loginName: 'missing' })).value);
         expect(Object.keys(unknown)).toEqual(Object.keys(params));

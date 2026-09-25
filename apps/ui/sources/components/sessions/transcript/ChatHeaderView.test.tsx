@@ -109,11 +109,13 @@ function flattenStyle(style: unknown): Record<string, unknown> {
 }
 
 describe('ChatHeaderView', () => {
-    afterEach(() => {
+    afterEach(async () => {
         platformOs = 'ios';
         headerMocks.deviceType = 'tablet';
         headerMocks.identityMode = 'avatar';
         standardCleanup();
+        const { storage } = await import('@/sync/domains/state/storageStore');
+        storage.setState((state) => ({ localSettings: { ...state.localSettings, uiFontScale: 1 } }));
         resetTranscriptCommonModuleMockState();
     });
 
@@ -125,6 +127,59 @@ describe('ChatHeaderView', () => {
         expect(screen.getTextContent()).toContain('Office Mac · Project');
         expect(screen.findAllByType('Avatar' as any)).toHaveLength(0);
         headerMocks.deviceType = 'tablet';
+    });
+
+    /** 真正读取本地字号并经过 AppText，父标题行必须同时容纳单行文字、留白和返回按钮。 */
+    it.each([1, 2.5])('fits the scaled native title and navigation target in its row (scale %s)', async (uiFontScale) => {
+        platformOs = 'android';
+        headerMocks.deviceType = 'phone';
+        const { storage } = await import('@/sync/domains/state/storageStore');
+        storage.setState((state) => ({ localSettings: { ...state.localSettings, uiFontScale } }));
+        const { ChatHeaderView } = await import('./ChatHeaderView');
+        const screen = await renderScreen(<ChatHeaderView title="放大后的会话标题" statusElement={<React.Fragment>状态入口</React.Fragment>} />);
+        const text = screen.findAllByType('Text').find((node) => node.props.accessibilityLabel === '放大后的会话标题');
+        const textStyle = flattenStyle(text?.props.style);
+        expect(textStyle.fontSize).toBe(16 * uiFontScale);
+        const back = screen.findAllByType('Pressable').find((node) => node.props.accessibilityLabel === 'common.back');
+        let row = back?.parent;
+        while (row && String(row.type) !== 'View') row = row.parent;
+        const rowHeight = Number(flattenStyle(row?.props.style).height);
+        const backHeight = Number(flattenStyle(back?.props.style).height);
+        expect(backHeight).toBeGreaterThanOrEqual(48);
+        expect(rowHeight).toBeGreaterThanOrEqual(backHeight);
+        // 若没有显式行高，至少也不能小于真实字号加原标题上下留白。
+        expect(rowHeight).toBeGreaterThanOrEqual(Number(textStyle.lineHeight ?? textStyle.fontSize) + 12);
+    });
+
+    /** 固定状态入口替代副标题，仍保留返回和右侧操作；状态变化不重建按钮。 */
+    it('keeps phone status actions and navigation reachable without duplicating the old subtitle', async () => {
+        platformOs = 'android';
+        headerMocks.deviceType = 'phone';
+        const { ChatHeaderView } = await import('./ChatHeaderView');
+        const { Pressable, Text } = await import('react-native');
+        const back = vi.fn();
+        const openDetails = vi.fn();
+        const more = vi.fn();
+        /** 合成短状态沿用同一按钮身份，不把状态更新当作路由或菜单操作。 */
+        const render = (state: string) => <ChatHeaderView
+            title="一段很长但可通过辅助功能完整读取的真实会话标题"
+            subtitle="不再重复的旧电脑来源"
+            onBackPress={back}
+            statusElement={<Pressable testID="status-details" onPress={openDetails}><Text>{state}</Text></Pressable>}
+            rightElement={<Pressable testID="header-more" onPress={more} />}
+        />;
+        const screen = await renderScreen(render('运行中'));
+        const detailsButton = screen.findByTestId('status-details');
+        expect(screen.getTextContent()).not.toContain('不再重复的旧电脑来源');
+        const title = screen.findAllByType('Text').find((node) => node.props.accessibilityLabel === '一段很长但可通过辅助功能完整读取的真实会话标题');
+        expect(title?.props.numberOfLines).toBe(1);
+        await act(async () => { screen.tree.update(render('状态未知')); });
+        expect(screen.findByTestId('status-details')).toBe(detailsButton);
+        await screen.pressByTestIdAsync('status-details');
+        await screen.pressByTestIdAsync('header-more');
+        expect(openDetails).toHaveBeenCalledOnce();
+        expect(more).toHaveBeenCalledOnce();
+        expect(back).not.toHaveBeenCalled();
     });
 
     it('uses elevation to keep the header above scroll content on Android', async () => {

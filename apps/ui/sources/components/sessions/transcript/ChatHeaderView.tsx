@@ -1,11 +1,12 @@
 import * as React from 'react';
-import { View, Platform, Pressable, type LayoutChangeEvent } from 'react-native';
+import { View, Platform, Pressable, useWindowDimensions, type LayoutChangeEvent } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { Avatar } from '@/components/ui/avatar/Avatar';
 import { AgentIcon } from '@/agents/registry/AgentIcon';
 import type { AgentId } from '@/agents/registry/registryCore';
 import { useSetting } from '@/sync/domains/state/storage';
+import { useLocalSetting } from '@/sync/store/hooks';
 import { Typography } from '@/constants/Typography';
 import { useHeaderHeight, useDeviceType } from '@/utils/platform/responsive';
 import { useLayoutMaxWidth } from '@/components/ui/layout/layout';
@@ -26,10 +27,13 @@ const GUTTER_MIN_WIDTH_PX = 60;
 
 /** The header's own horizontal inset — the margin every other control in it is measured from. */
 const HEADER_HORIZONTAL_PADDING_PX = Platform.OS === 'ios' ? 8 : 16;
+const PHONE_STATUS_TITLE_LINE_HEIGHT = 24;
 
 interface ChatHeaderViewProps {
     title: string;
     subtitle?: string;
+    /** 手机桌面会话使用固定状态行，取代会随错误详情增高的底部状态区。 */
+    statusElement?: React.ReactNode;
     subtitleEllipsizeMode?: 'head' | 'tail';
     badges?: ReadonlyArray<string>;
     onBackPress?: () => void;
@@ -59,10 +63,11 @@ interface ChatHeaderViewProps {
     gutterElement?: React.ReactNode;
 }
 
-/** 展示真实会话标题与来源，手机居中显示两行标题与短来源，保留正文空间。 */
+/** 展示真实标题与来源；手机状态入口独立占固定行，不随生命周期变化挤动正文。 */
 export const ChatHeaderView = React.memo(function ChatHeaderView({
     title,
     subtitle,
+    statusElement,
     subtitleEllipsizeMode = 'tail',
     badges,
     onBackPress,
@@ -83,6 +88,12 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     const headerHeight = useHeaderHeight();
     // 手机标题保留真实会话和电脑上下文，省去装饰头像占用。
     const isPhone = useDeviceType() === 'phone' && Platform.OS !== 'web';
+    const uiFontScale = useLocalSetting('uiFontScale');
+    const { fontScale = 1 } = useWindowDimensions();
+    // 只按字体设置决定整行高度，容纳真实缩放后的文字、留白和按钮；状态变化不参与计算。
+    const titleRowHeight = isPhone && statusElement
+        ? Math.max(resolveSessionHeaderActionTargetPx(), Math.ceil(PHONE_STATUS_TITLE_LINE_HEIGHT * uiFontScale * fontScale) + 12)
+        : headerHeight;
     const maxWidth = useLayoutMaxWidth();
     const sessionScreenTestIdsEnabled = useSessionScreenTestIdsEnabled();
     const backButtonTestId = resolveOptionalSessionScreenTestId(sessionScreenTestIdsEnabled, 'session-header-back');
@@ -144,7 +155,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
             >
                 <View style={[
                     styles.content,
-                    { minHeight: headerHeight, height: isPhone ? undefined : headerHeight, maxWidth },
+                    { minHeight: titleRowHeight, height: isPhone && !statusElement ? undefined : titleRowHeight, maxWidth },
                     constrainWidth ? null : { maxWidth: '100%' },
                     wrapperWidth > 0 && contentTrailingInsetPx > 0 && constrainWidth ? {
                         alignSelf: 'flex-start',
@@ -183,12 +194,13 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
                 <View style={[styles.titleContainer, isPhone ? styles.phoneTitleContainer : null]}>
                     <View style={[styles.titleRow, isPhone ? styles.phoneTitleRow : null]}>
                         <Text
-                            numberOfLines={isPhone ? 2 : 1}
+                            numberOfLines={isPhone && !statusElement ? 2 : 1}
                             ellipsizeMode="tail"
                             accessibilityLabel={title}
                             style={[
                                 styles.title,
                                 isPhone ? styles.phoneTitle : null,
+                                isPhone && statusElement ? styles.phoneStatusTitle : null,
                                 {
                                     color: theme.colors.chrome.header.foreground,
                                     ...Typography.default('semiBold')
@@ -223,7 +235,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
                             ))
                         ) : null}
                     </View>
-                    {subtitle && (
+                    {!statusElement && subtitle && (
                         <Text
                             numberOfLines={1}
                             accessibilityLabel={subtitle}
@@ -255,6 +267,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
 
                 {gutterHoldsElement ? null : gutterElement}
                 </View>
+                {statusElement ? <View style={{ width: '100%', maxWidth }}>{statusElement}</View> : null}
                 {gutterHoldsElement ? (
                     <View
                         pointerEvents="box-none"
@@ -321,6 +334,7 @@ const styles = StyleSheet.create((theme) => ({
     phoneTitleContainer: { alignItems: 'center', paddingVertical: 6 },
     phoneTitleRow: { justifyContent: 'center' },
     phoneTitle: { textAlign: 'center', fontSize: 16 },
+    phoneStatusTitle: { lineHeight: PHONE_STATUS_TITLE_LINE_HEIGHT },
     phoneSubtitle: { textAlign: 'center', lineHeight: 16 },
     titleContainer: {
         flex: 1,

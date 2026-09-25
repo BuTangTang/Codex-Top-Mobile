@@ -7,10 +7,10 @@ import { createPasswordVerifier, normalizePasswordLoginName } from './passwordVe
 import { readEncryptionFeatureEnv } from '@/app/features/catalog/readFeatureEnv';
 import { resolveEffectiveDefaultAccountEncryptionMode } from '@happier-dev/protocol';
 
-/** 仅供本地管理员命令预建独立账号；已存在账号直接失败，绝不迁移或覆盖旧密钥。 */
+/** 仅供本地管理员用 8 至 1024 位密码预建独立账号；已存在账号直接失败，绝不迁移或覆盖旧密钥。 */
 export async function provisionPasswordAccount(input: { loginName: string; password: string; env: NodeJS.ProcessEnv }): Promise<{ accountId: string }> {
     const loginName = normalizePasswordLoginName(input.loginName);
-    if (input.password.length < 12 || input.password.length > 1024) throw new Error('Password must contain 12 to 1024 characters');
+    if (input.password.length < 8 || input.password.length > 1024) throw new Error('Password must contain 8 to 1024 characters');
     const parameters = createPasswordAuthParameters(randomBytes);
     const keys = await derivePasswordKeys(input.password, parameters);
     const secret = randomBytes(32);

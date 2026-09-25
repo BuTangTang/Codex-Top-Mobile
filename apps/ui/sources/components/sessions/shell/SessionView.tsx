@@ -309,6 +309,7 @@ import { useSessionResumeRequestListener } from '@/components/sessions/model/ses
 import { resolveSessionResumeMachineTarget } from './sessionResumeMachineTarget';
 import { useDirectSessionTakeover } from '@/components/sessions/model/useDirectSessionTakeover';
 import { DesktopApprovalPanel } from '@/components/sessions/directSessions/DesktopApprovalPanel';
+import { DesktopSessionHeaderStatus } from '@/components/sessions/directSessions/DesktopSessionHeaderStatus';
 import { useDirectSessionRuntime } from '@/components/sessions/model/useDirectSessionRuntime';
 import { resolveDirectSessionObservationStatus } from '@/components/sessions/directSessions/resolveDirectSessionObservationStatus';
 import { SessionDirectSessionRuntimeProvider } from '@/components/sessions/model/useSessionDirectSessionRuntime';
@@ -865,6 +866,7 @@ type SessionViewLoadedProps = Readonly<{
     directSessionRuntime: ReturnType<typeof useDirectSessionRuntime>;
     directSessionTakeover: ReturnType<typeof useDirectSessionTakeover>;
     directControlFooter: ChatListProps['directControlFooter'];
+    onDesktopNoticeChange: (notice: ChatListProps['bottomNotice']) => void;
     inheritsDesktopSettings: boolean;
     chatBottomSpacing: 'default' | 'none';
     paneUrlSyncRouteActive: boolean;
@@ -1480,12 +1482,16 @@ type SessionAgentInputRuntimeStatusBoundaryProps = Omit<
 > & {
     inactiveStatusText: string | null;
     desktopObservationStatus: ReturnType<typeof resolveDirectSessionObservationStatus> | null;
+    /** 手机状态已在固定页头呈现，输入区不再重复占位。 */
+    desktopStatusInHeader?: boolean;
     connectedServicesRestartState: SessionConnectedServicesAuthSwitchRestartState;
 };
 
+/** 输入权限沿用原生命周期，状态移到页头时只隐藏重复文案。 */
 const SessionAgentInputRuntimeStatusBoundary = React.memo(function SessionAgentInputRuntimeStatusBoundary({
     inactiveStatusText,
     desktopObservationStatus,
+    desktopStatusInHeader,
     connectedServicesRestartState,
     session,
     ...props
@@ -1532,7 +1538,7 @@ const SessionAgentInputRuntimeStatusBoundary = React.memo(function SessionAgentI
             {...props}
             session={session}
             sessionActive={sessionRuntimeStatusSource.active === true}
-            connectionStatus={connectionStatus}
+            connectionStatus={desktopStatusInHeader ? undefined : connectionStatus}
             showAbortButton={!desktopObservationStatus && shouldShowAbortButtonForSessionState(sessionStatus.state)}
         />
     );
@@ -1686,6 +1692,17 @@ export const SessionView = React.memo((props: SessionViewProps) => {
         explicitRouteServerId
         || resolveServerIdForSessionIdFromLocalCache(sessionId)
         || activeRouteServer.serverId;
+    const desktopNoticeScope = JSON.stringify([currentSessionRouteServerId, sessionId]);
+    const [desktopHeaderNotice, setDesktopHeaderNotice] = React.useState<Readonly<{
+        scope: string;
+        notice: ChatListProps['bottomNotice'];
+    }> | null>(null);
+    /** 仅转发正文 owner 已判定的展示载荷；换会话立即隔离旧提示，不另算离线或恢复能力。 */
+    const handleDesktopNoticeChange = React.useCallback((notice: ChatListProps['bottomNotice']) => {
+        setDesktopHeaderNotice((previous) => (!previous && !notice)
+            || (previous?.scope === desktopNoticeScope && previous.notice === notice)
+            ? previous : { scope: desktopNoticeScope, notice });
+    }, [desktopNoticeScope]);
     const automationsSupport = useAutomationsSupport({ scopeKind: 'spawn', serverId: currentSessionRouteServerId });
     const showAutomations = automationsSupport?.enabled !== false;
     const executionRunsEnabled = useFeatureEnabled('execution.runs', {
@@ -1823,7 +1840,8 @@ export const SessionView = React.memo((props: SessionViewProps) => {
     }, [compactPhone, machinesById, stableSessionForHeader, workspaceLabelsV1, workspacePathDisplayModeV1]);
     const sessionEncryptionMode: 'e2ee' | 'plain' = (session?.encryptionMode ?? 'e2ee');
     const isEncryptedSessionLocked = Boolean(session && sessionEncryptionMode === 'e2ee' && !hasAuthCredentials);
-    const showTopHeader = !(isLandscape && deviceType === 'phone' && Platform.OS !== 'web');
+    // 桌面会话的待处理入口已迁到顶部，手机横屏时也保留，避免审批入口消失。
+    const showTopHeader = (compactPhone && inheritsDesktopSettings) || !(isLandscape && compactPhone);
     const paneUrlSyncRouteActive = surfaceFocused && isOwnedSessionRootPathname(pathname, sessionId);
     // 只将当前路由所属服务的明确离线状态用于冷加载恢复，缓存正文保持原样。
     const routeServerOffline = !session && !routeHydrationTerminalMissing && endpointConnectivity.status === 'offline'
@@ -1892,7 +1910,7 @@ export const SessionView = React.memo((props: SessionViewProps) => {
     }, []);
     const shouldFoldHeaderIconActions = windowWidth < 520;
 
-    /** 标题只从真实会话与工作区投影读取，手机来源在第二行完整保留。 */
+    /** 标题和手机固定状态行复用真实会话来源及唯一桌面运行控制器。 */
     const headerProps = useMemo(() => {
         if (!shouldRenderSessionSurface) {
             return {
@@ -1987,6 +2005,16 @@ export const SessionView = React.memo((props: SessionViewProps) => {
                 ? [sessionWorkspacePresentation?.machineLabel, sessionWorkspacePresentation?.displayTitle].filter(Boolean).join(' · ') || undefined
                 : sessionWorkspacePresentation?.displayTitle || undefined,
             subtitleEllipsizeMode: !compactPhone && sessionWorkspacePresentation?.displayPath && !sessionWorkspacePresentation.hasCustomLabel ? 'head' as const : undefined,
+            statusElement: compactPhone && inheritsDesktopSettings ? <DesktopSessionHeaderStatus
+                key={JSON.stringify([currentSessionRouteServerId, sessionId])}
+                sourceLabel={[sessionWorkspacePresentation?.machineLabel, sessionWorkspacePresentation?.displayTitle].filter(Boolean).join(' · ')}
+                status={directSessionRuntime.status}
+                control={directSessionRuntime.control}
+                refreshNow={directSessionRuntime.refreshNow}
+                canWrite={hasSessionWriteAccess(headerSession.accessLevel)}
+                active={surfaceFocused}
+                notice={desktopHeaderNotice?.scope === desktopNoticeScope ? desktopHeaderNotice.notice : null}
+            /> : undefined,
             avatarId: getSessionAvatarId(headerSession),
             agentId: resolveAgentIdFromSessionMetadata(headerSession.metadata)
                 ?? resolveAgentIdFromFlavor(headerSession.metadata?.flavor ?? null),
@@ -2002,6 +2030,11 @@ export const SessionView = React.memo((props: SessionViewProps) => {
 	        };
 	    }, [
         compactPhone,
+        desktopHeaderNotice,
+        desktopNoticeScope,
+        currentSessionRouteServerId,
+        inheritsDesktopSettings,
+        surfaceFocused,
         deviceType,
         directSessionRuntime,
         directControlFooter,
@@ -2034,6 +2067,7 @@ export const SessionView = React.memo((props: SessionViewProps) => {
                 directSessionRuntime={directSessionRuntime}
                 directSessionTakeover={directSessionTakeover}
                 directControlFooter={directControlFooter}
+                onDesktopNoticeChange={handleDesktopNoticeChange}
                 inheritsDesktopSettings={inheritsDesktopSettings}
                 onBackPress={handleBackPress}
                 isEncryptedSessionLocked={isEncryptedSessionLocked}
@@ -2571,6 +2605,7 @@ function SessionViewLoaded({
     directSessionRuntime,
     directSessionTakeover,
     directControlFooter,
+    onDesktopNoticeChange,
     inheritsDesktopSettings,
     chatBottomSpacing,
     paneUrlSyncRouteActive,
@@ -2595,6 +2630,8 @@ function SessionViewLoaded({
     const isLandscape = useIsLandscape();
     const deviceType = useDeviceType();
     const { width: windowWidth } = useWindowDimensions();
+    // 仅原生手机的桌面会话把状态和审批搬到页头，其他会话入口保留原布局。
+    const desktopStatusInHeader = deviceType === 'phone' && Platform.OS !== 'web' && inheritsDesktopSettings;
     const reducedMotionPreferred = useReducedMotionPreference();
     // Seed from the pane-keyed width source so the first frame after a session switch already has the
     // settled content width (no window-width fallback frame -> no bottom-spacing flip). Resize is
@@ -5139,6 +5176,12 @@ function SessionViewLoaded({
         return null;
     }, [machineName, providerName, showInactiveNotResumableNotice, showMachineOfflineNotice]);
 
+    /** 手机将原页脚说明送入顶部详情；离开正文或切换作用域时撤回旧载荷。 */
+    React.useEffect(() => {
+        onDesktopNoticeChange(desktopStatusInHeader ? bottomNotice : null);
+        return () => onDesktopNoticeChange(null);
+    }, [bottomNotice, desktopStatusInHeader, onDesktopNoticeChange]);
+
     const isReadOnly = session.accessLevel === 'view';
     const transcriptInteraction = React.useMemo(() => {
         return deriveTranscriptInteractionFromSession({
@@ -5301,11 +5344,11 @@ function SessionViewLoaded({
             isLocallyAttached={isLocallyAttached}
             pendingMessagesCount={pendingMessages.length}
             reducedMotionPreferred={reducedMotionPreferred}
-            bottomNotice={bottomNotice}
+            bottomNotice={desktopStatusInHeader ? null : bottomNotice}
             controlledByUserOverride={isLocallyAttached}
             controlSwitchTo={controlSwitchTo}
             onRequestSwitchToRemote={isHiddenSystemSessionSession || !canRequestRemoteControl ? undefined : handleRequestSwitchToRemote}
-            directControlFooter={directControlFooter}
+            directControlFooter={desktopStatusInHeader ? null : directControlFooter}
             approvalRequests={openApprovalRequests}
             jumpToSeq={jumpToSeq}
             followBottomIntentKey={followBottomIntentSeq}
@@ -6575,10 +6618,11 @@ function SessionViewLoaded({
                     />
                 </ComposerAuxiliaryFrame>
             ) : null}
-            {inheritsDesktopSettings && directSessionRuntime.control ? <ComposerAuxiliaryFrame>
+            {inheritsDesktopSettings && !desktopStatusInHeader && directSessionRuntime.control ? <ComposerAuxiliaryFrame>
                 <DesktopApprovalPanel control={directSessionRuntime.control} canWrite={hasWriteAccess} />
             </ComposerAuxiliaryFrame> : null}
             <SessionAgentInputRuntimeStatusBoundary
+                desktopStatusInHeader={desktopStatusInHeader}
                 desktopObservationStatus={inheritsDesktopSettings ? resolveDirectSessionObservationStatus(directSessionRuntime.status) : null}
                 session={session}
                 sessionLatestUsage={session.latestUsage}
