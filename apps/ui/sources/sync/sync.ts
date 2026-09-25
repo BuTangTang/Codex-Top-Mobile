@@ -198,6 +198,10 @@ import { createSyncGenerationGuard } from './domains/scope/syncGenerationGuard';
 import { SessionMessagePageDecryptionError } from './engine/sessions/sessionMessagesPagePipeline';
 import {
     clearWarmCacheAccountScope,
+    clearDirectSessionTranscriptWarmCache,
+    loadDirectSessionTranscriptWarmCache,
+    saveDirectSessionTranscriptWarmCache,
+    type DirectSessionTranscriptWarmCache,
     loadMachineDisplayWarmCacheEntries,
     loadSessionListWarmCacheEntries,
     loadSessionOrganizationWarmCacheSnapshot,
@@ -1012,6 +1016,11 @@ class Sync {
       private directSessionOlderCursorBySessionId = new Map<string, string | null>();
       private directSessionHasMoreOlderBySessionId = new Map<string, boolean>();
       private directSessionLatestSnapshotPendingBySessionId = new Set<string>();
+      private directTranscriptCacheWrites = new Map<string, {
+          serverId: string; accountId: string; snapshot: DirectSessionTranscriptWarmCache; replace: boolean;
+      }>();
+      private directTranscriptCacheReceipts = new Map<string, string>();
+      private directTranscriptCacheOnlySessionIds = new Set<string>();
       // An observed source reset cannot be forgotten: index/offset cursors may become valid
       // again after the replacement source grows, without restoring the accepted history.
       private directSessionTailStateBySessionId = new Map<string, {
@@ -2061,6 +2070,8 @@ class Sync {
         this.serverScopeGeneration += 1;
         this.flushPendingSettingsForCurrentScopeNow();
         this.flushSessionMaterializedMaxSeq();
+        this.directTranscriptCacheOnlySessionIds.clear();
+        this.directTranscriptCacheReceipts.clear();
         this.clearActiveAccountSettingsScope();
         this.disconnectSocketIntentionally();
         this.activityAccumulator.reset();
@@ -2199,6 +2210,7 @@ class Sync {
 
     public disconnectServer(): void {
         this.resetServerScopedRuntimeState();
+        clearDirectSessionTranscriptWarmCache(getActiveServerSnapshot().serverId, this.serverID);
         clearWarmCacheAccountScope();
     }
 
@@ -2342,6 +2354,8 @@ class Sync {
             const forceRefresh = options?.forceRefresh === true;
             const scopedServerId = resolveMessageRouteHydrationServerId(normalized, options?.serverId);
             const explicitServerId = normalizeScopedServerId(options?.serverId);
+            // 先恢复本账号已读正文；后续远端校验仍继续，缓存不初始化加密、活动或操作授权。
+            this.restoreDirectTranscriptWarmCache(normalized, scopedServerId);
             const inFlightKey = createSessionRouteHydrationInFlightKey(normalized, scopedServerId);
             const hydrationGeneration = this.serverScopeGeneration;
             const activeServerIdAtHydrationStart = normalizeScopedServerId(getActiveServerSnapshot().serverId);
@@ -2366,7 +2380,7 @@ class Sync {
             // Fast-path when we already know the session exists on this server and the stored record is
             // already authoritatively hydrated (deep links can occur before the sessions snapshot bootstraps).
             const existingSession = storage.getState().sessions[normalized];
-            if (!forceRefresh && this.isSessionKnownOnActiveServer(normalized) && existingSession) {
+            if (!forceRefresh && !this.isDirectSessionCacheOnly(normalized) && this.isSessionKnownOnActiveServer(normalized) && existingSession) {
                 const encryptionMode: 'e2ee' | 'plain' = existingSession.encryptionMode === 'plain' ? 'plain' : 'e2ee';
                 const hasEncryption = encryptionMode === 'plain'
                     ? false
@@ -2430,6 +2444,7 @@ class Sync {
                         const code = typeof result.errorCode === 'string' ? result.errorCode : '';
                         const missingCause = mapSessionByIdTerminalCodeToMissingCause(code);
                         if (missingCause) {
+                            this.discardDirectTranscriptWarmCache(normalized, scopedServerId);
                             if (missingCause === 'unauthorized') {
                                 recordTerminalAuthSyncError(new Error('Authentication required'), { serverId: scopedServerId });
                             }
@@ -4331,7 +4346,10 @@ class Sync {
                         stagedSessionDataKeyEnvelopes.delete(sessionId);
                         handleDeleteSessionSocketUpdate({
                             sessionId,
-                            deleteSession: (targetSessionId) => storage.getState().deleteSession(targetSessionId),
+                            deleteSession: (targetSessionId) => {
+                                this.discardDirectTranscriptWarmCache(targetSessionId);
+                                storage.getState().deleteSession(targetSessionId);
+                            },
                             removeSessionEncryption: (targetSessionId) => activeEncryption.removeSessionEncryption(targetSessionId),
                             removeProjectManagerSession: (targetSessionId) => projectManager.removeSession(targetSessionId),
                             clearScmStatusForSession: (targetSessionId) => scmStatusSync.clearForSession(targetSessionId),
@@ -5530,6 +5548,7 @@ class Sync {
     }
 
     private fetchMessages = async (sessionId: string) => {
+        this.restoreDirectTranscriptWarmCache(sessionId);
         if (this.hasFetchedSessionsSnapshotForActiveServer && !this.isSessionKnownOnResolvedOwnerServer(sessionId)) {
             // Do not fetch messages when we cannot resolve the session to either the active server
             // or a locally known owner server. This avoids cross-server message fetches. The owner
@@ -5965,6 +5984,7 @@ class Sync {
               requiresRefresh: true,
           });
           this.deferredForwardLoadingSessions.add(sessionId);
+          this.queueDirectTranscriptWarmCache(sessionId, []);
       }
 
       private createServerScopeGuard(): () => boolean {
@@ -5978,6 +5998,123 @@ class Sync {
           // metadata may change without retiring its accepted transcript window.
           return stableJsonStringify({ machineId: link.machineId, providerId: link.providerId,
               remoteSessionId: link.remoteSessionId, source: link.source });
+      }
+
+      /** 正文缓存只属于当前已登录账号；非活动服务器仍走其原在线读取路径，不能误用当前账号。 */
+      private directTranscriptCacheScope(sessionId: string, requestedServerId?: string | null) {
+          const activeServerId = getActiveServerSnapshot().serverId;
+          const serverId = requestedServerId || storage.getState().sessions[sessionId]?.serverId || this.getDirectSessionServerScope(sessionId) || activeServerId;
+          return this.serverID && areServerProfileIdentifiersEquivalent(serverId, activeServerId)
+              ? { serverId: activeServerId, accountId: this.serverID } : null;
+      }
+
+      /** 远端明确删除或拒绝读取时，撤销该缓存及尚未刷盘的写入，不保留可复活的旧正文。 */
+      private discardDirectTranscriptWarmCache(sessionId: string, serverId?: string | null): void {
+          const scope = this.directTranscriptCacheScope(sessionId, serverId);
+          if (!scope) return;
+          const cached = loadDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, sessionId);
+          const cachedOnly = this.directTranscriptCacheOnlySessionIds.has(sessionId);
+          this.directTranscriptCacheWrites.delete(sessionId);
+          this.directTranscriptCacheOnlySessionIds.delete(sessionId);
+          clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, sessionId);
+          if (cached || cachedOnly) {
+              this.resetSessionTranscriptState(sessionId);
+              storage.getState().deleteSession(sessionId);
+          }
+      }
+
+      /** 将已接受的原始记录合入原检查点队列；流式更新只覆盖同 ID，不逐字符序列化整个缓存。 */
+      private queueDirectTranscriptWarmCache(sessionId: string, items: readonly DirectTranscriptRawMessageV1[], replace = false): void {
+          const session = storage.getState().sessions[sessionId];
+          const link = readDirectSessionLink(session?.metadata);
+          const scope = this.directTranscriptCacheScope(sessionId);
+          if (!scope || !session?.metadata || link?.providerId !== 'codex') return;
+          const sourceKey = this.getDirectSessionTranscriptSourceKey(link)!;
+          const previous = this.directTranscriptCacheWrites.get(sessionId);
+          const sameSource = previous?.snapshot.sourceKey === sourceKey && previous.accountId === scope.accountId && previous.serverId === scope.serverId;
+          const merged = new Map((!replace && sameSource ? previous.snapshot.items : []).map((item) => [item.id, item]));
+          for (const item of items) merged.set(item.id, item);
+          const gap = this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId);
+          const receipt = stableJsonStringify([scope, sourceKey, this.getDirectSessionTailCursor(sessionId),
+              this.directSessionOlderCursorBySessionId.get(sessionId), this.directSessionHasMoreOlderBySessionId.get(sessionId),
+              this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh,
+              storage.getState().sessionMessages[sessionId]?.directHistoryAvailability, gap]);
+          if (!replace && items.length === 0 && this.directTranscriptCacheReceipts.get(sessionId) === receipt) return;
+          this.directTranscriptCacheReceipts.set(sessionId, receipt);
+          const reducer = storage.getState().sessionMessages[sessionId]?.reducerState;
+          const boundary = gap?.kind === 'opaque' ? new Set(gap.boundaryMessageIds) : null;
+          this.directTranscriptCacheWrites.set(sessionId, { ...scope, replace: replace || Boolean(sameSource && previous.replace), snapshot: {
+              version: 1, sourceKey, cachedAtMs: Date.now(),
+              session: { id: session.id, createdAt: session.createdAt, updatedAt: session.updatedAt,
+                  metadataVersion: session.metadataVersion, encryptionMode: session.encryptionMode, metadata: session.metadata },
+              items: [...merged.values()], tailCursor: this.getDirectSessionTailCursor(sessionId),
+              olderCursor: this.directSessionOlderCursorBySessionId.get(sessionId) ?? null,
+              hasMoreOlder: this.directSessionHasMoreOlderBySessionId.get(sessionId) ?? true,
+              requiresRefresh: this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh === true,
+              historyAvailability: storage.getState().sessionMessages[sessionId]?.directHistoryAvailability,
+              gap: gap?.kind === 'opaque' ? { prefixMessageIds: [...gap.prefixMessageIds], walkCursor: gap.walkCursor,
+                  boundarySourceIds: [...(reducer?.messageIds ?? [])].filter(([, id]) => boundary?.has(id)).map(([id]) => id) } : null,
+          } });
+          this.scheduleSessionMaterializedMaxSeqFlush();
+      }
+
+      /** 与已有检查点一起提交正文和对应游标；单会话失败不影响同步或其他分区。 */
+      private flushDirectTranscriptWarmCache(): void {
+          for (const [sessionId, pending] of this.directTranscriptCacheWrites) {
+              const previous = pending.replace ? null : loadDirectSessionTranscriptWarmCache(pending.serverId, pending.accountId, sessionId, pending.snapshot.sourceKey);
+              const rows = new Map((previous?.items ?? []).map((item) => [item.id, item]));
+              for (const item of pending.snapshot.items) rows.set(item.id, item);
+              saveDirectSessionTranscriptWarmCache(pending.serverId, pending.accountId, {
+                  ...pending.snapshot, items: [...rows.values()].sort((left, right) => left.createdAtMs - right.createdAtMs),
+                  // 整会话已被容量淘汰时，后续单条增量不是完整基线；恢复后仍需正常快照补齐。
+                  ...(!previous && !pending.replace ? { requiresRefresh: true, olderCursor: null, hasMoreOlder: true } : {}),
+              });
+          }
+          this.directTranscriptCacheWrites.clear();
+      }
+
+      /** 只为尚未加载的已缓存正文恢复 reducer、游标和原阅读锚点，不恢复旧运行状态或审批快照。 */
+      private restoreDirectTranscriptWarmCache(sessionId: string, serverId?: string | null): void {
+          if (storage.getState().sessionMessages[sessionId]?.isLoaded) return;
+          const scope = this.directTranscriptCacheScope(sessionId, serverId);
+          if (!scope || !this.credentials) return;
+          const existing = storage.getState().sessions[sessionId];
+          const currentLink = readDirectSessionLink(existing?.metadata);
+          if (existing?.metadata && currentLink?.providerId !== 'codex') return;
+          const sourceKey = this.getDirectSessionTranscriptSourceKey(currentLink);
+          const cached = loadDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, sessionId, sourceKey ?? undefined);
+          if (!cached || !MetadataSchema.safeParse(cached.session.metadata).success) return;
+          const cachedLink = readDirectSessionLink(cached?.session.metadata);
+          if (!cached || cachedLink?.providerId !== 'codex' || this.getDirectSessionTranscriptSourceKey(cachedLink) !== cached.sourceKey) return;
+          if (!existing?.metadata) {
+              this.directTranscriptCacheOnlySessionIds.add(sessionId);
+              storage.getState().applySessions([{ ...cached.session, serverId: scope.serverId, seq: 0,
+                  active: false, activeAt: 0, agentState: null, agentStateVersion: 0,
+                  thinking: false, thinkingAt: 0, optimisticThinkingAt: null, presence: 0 }]);
+          }
+          this.ensureSessionViewportHydrated();
+          // 重放不会产生已完成通知、语音或发送回执；消息身份仍由正式 normalizer/reducer 生成。
+          storage.getState().applyMessages(sessionId, normalizeDirectTranscriptMessages(cached.items));
+          this.directSessionOlderCursorBySessionId.set(sessionId, cached.olderCursor);
+          this.directSessionHasMoreOlderBySessionId.set(sessionId, cached.hasMoreOlder);
+          this.directSessionTailStateBySessionId.set(sessionId, {
+              cursor: cached.tailCursor, sourceKey: cached.sourceKey, requiresRefresh: cached.requiresRefresh === true,
+              lastSourceMessageIds: cached.items.map((item) => item.id),
+          });
+          if (cached.gap) {
+              const identities = storage.getState().sessionMessages[sessionId]?.reducerState.messageIds;
+              /** 持久化只保存源消息 ID，重新映射本次 reducer 的展示 ID。 */
+              const materialized = (ids: readonly string[]) => ids.flatMap((id) => identities?.get(id) ? [identities.get(id)!] : []);
+              this.commitSessionTailDiscontinuity(sessionId, { kind: 'opaque', ...cached.gap,
+                  prefixMaterializedMessageIds: materialized(cached.gap.prefixMessageIds), boundaryMessageIds: materialized(cached.gap.boundarySourceIds) });
+          }
+          storage.getState().applyMessagesLoaded(sessionId);
+          storage.getState().setDirectSessionHistoryAvailability(sessionId, cached.historyAvailability);
+      }
+
+      /** 只读缓存壳可显示正文，但必须继续原路由的线上元数据校验和恢复。 */
+      public isDirectSessionCacheOnly(sessionId: string): boolean {
+          return this.directTranscriptCacheOnlySessionIds.has(sessionId);
       }
 
       private createSessionTranscriptSourceGuard(
@@ -6047,6 +6184,7 @@ class Sync {
           if (link.providerId !== 'codex') return true;
           if (page.historyAvailability === 'available') return true;
           storage.getState().setDirectSessionHistoryAvailability(sessionId, page.historyAvailability);
+          this.queueDirectTranscriptWarmCache(sessionId, []);
           if (!page.historyAvailability) return true;
           if (allowInitialPreview && page.historyAvailability === 'preview_only'
               && !storage.getState().sessionMessages[sessionId]?.messageIdsOldestFirst.length) {
@@ -6108,6 +6246,8 @@ class Sync {
               return;
           }
           const normalizedMessages = normalizeDirectTranscriptMessages(page.items);
+          const startsTranscript = storage.getState().sessionMessages[sessionId]?.isLoaded !== true
+              && (storage.getState().sessionMessages[sessionId]?.reducerState.messageIds.size ?? 0) === 0;
           if (options?.mode === 'replace') this.resetSessionTranscriptState(sessionId);
           let changedMessageIds: readonly string[] = [];
           if (normalizedMessages.length > 0) {
@@ -6139,6 +6279,7 @@ class Sync {
           if (directSessionLink.providerId === 'codex') {
               storage.getState().setDirectSessionHistoryAvailability(sessionId, page.historyAvailability);
           }
+          this.queueDirectTranscriptWarmCache(sessionId, page.items, options?.mode === 'replace' || startsTranscript);
       }
 
       /**
@@ -6252,6 +6393,7 @@ class Sync {
               }
               this.setDirectSessionTailCursor(sessionId, tail.nextCursor ?? null);
               this.recordDirectSessionSourcePage(sessionId, tail.items);
+              this.queueDirectTranscriptWarmCache(sessionId, tail.items);
               if (continuation === 'complete') this.deferredForwardLoadingSessions.delete(sessionId);
               return normalizedMessages.length;
           };
@@ -6329,6 +6471,7 @@ class Sync {
               this.setDirectSessionTailCursor(sessionId, options?.nextCursor ?? null);
           }
           this.recordDirectSessionSourcePage(sessionId, items);
+          this.queueDirectTranscriptWarmCache(sessionId, items);
       }
 
       private resolveDirectSessionTranscriptDeltaCursor(ephemeralUpdate: Readonly<{
@@ -6555,12 +6698,14 @@ class Sync {
                               nextCursor: page.hasMore ? page.nextCursor ?? null : null,
                           });
                           this.commitSessionTailDiscontinuity(params.sessionId, nextGap);
+                          this.queueDirectTranscriptWarmCache(params.sessionId, page.items);
                           const hasMore = nextGap ? nextGap.walkCursor !== null : knownHasMore ?? false;
                           return { loaded: normalizedMessages.length, hasMore, status: hasMore ? 'loaded' : 'no_more' };
                       }
 
                       this.directSessionOlderCursorBySessionId.set(params.sessionId, page.nextCursor ?? null);
                       this.directSessionHasMoreOlderBySessionId.set(params.sessionId, page.hasMore === true);
+                      this.queueDirectTranscriptWarmCache(params.sessionId, page.items);
 
                       return {
                           loaded: normalizedMessages.length,
@@ -7544,12 +7689,14 @@ class Sync {
        * transcript state, so re-opening runs the first-open page-limited load pipeline.
        */
       private evictSessionTranscript(sessionId: string): void {
+          this.flushDirectTranscriptWarmCache();
           storage.getState().evictSessionMessages(sessionId);
           this.resetSessionTranscriptState(sessionId);
           syncPerformanceTelemetry.count('sync.sessions.transcript.evicted', { evicted: 1 });
       }
 
       private resetSessionTranscriptState(sessionId: string): void {
+          this.directTranscriptCacheReceipts.delete(sessionId);
           storage.getState().resetSessionMessages(sessionId);
 
           this.sessionReceivedMessages.delete(sessionId);
@@ -8392,6 +8539,7 @@ class Sync {
         // "known" on the active server too, otherwise message fetches can be incorrectly skipped.
         for (const session of sessions) {
             if (session?.id) {
+                this.directTranscriptCacheOnlySessionIds.delete(session.id);
                 this.activeServerSessionIds.add(session.id);
             }
         }
@@ -8460,6 +8608,7 @@ class Sync {
     }
 
     private flushSessionMaterializedMaxSeqForCurrentScopeNow(): void {
+        this.flushDirectTranscriptWarmCache();
         if (this.sessionMaterializedMaxSeqFlushTimer) {
             clearTimeout(this.sessionMaterializedMaxSeqFlushTimer);
             this.sessionMaterializedMaxSeqFlushTimer = null;

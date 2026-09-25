@@ -16,6 +16,8 @@ enablePatches();
 // 同类协议参考：Emanuele-web04/remodex@e0e342dac5cddd40db661bfcf76e5ab0e3913ef8。
 // 这里独立实现协议边界，没有复制 Remodex 实现。
 const REQUEST_TIMEOUT_MS = 5_000;
+// 真实长会话的关联回执在 9.4 秒到达；仅本地只读水合等待 15 秒，线上请求仍为 5 秒。
+const CONTROL_READ_TIMEOUT_MS = 15_000;
 const MAX_FRAME_BYTES = 268_435_456;
 
 export type DesktopIpcResponse = Record<string, unknown>;
@@ -91,13 +93,16 @@ export function desktopResponseFailure(response: DesktopIpcResponse): string {
 export class DesktopIpc {
     private readonly socket: Socket;
     private clientId = 'initializing-client';
-    private bytes: Buffer = Buffer.alloc(0);
+    private readonly frameHeader: Buffer = Buffer.alloc(4);
+    private frameHeaderBytes = 0;
+    private frameBody: Buffer | null = null;
+    private frameBodyBytes = 0;
     private failure: DesktopIpcError | null = null;
     private ownerClientId: string | null = null;
     private observation: { conversationId: string; listener: (observation: DirectSessionObservationV1, continuity: 'snapshot' | 'event') => void;
         revision: number | null; state: unknown; anchor: KnownObservation | null; confirmed: boolean } | null = null;
     private snapshotAnchor: { subscription: NonNullable<DesktopIpc['observation']>; frames: Record<string, unknown>[];
-        bytes: number; revision: number | null; timer: ReturnType<typeof setTimeout> } | null = null;
+        bytes: number; revision: number | null; discardedRevisions: Set<number>; timer: ReturnType<typeof setTimeout> } | null = null;
     private readonly disconnectedClients = new Set<string>();
     private controlSnapshotAnchored = false;
     private controlSnapshotReject: ((error: Error) => void) | null = null;
@@ -212,7 +217,7 @@ export class DesktopIpc {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
             const ready = new Promise<void>((resolve, reject) => {
-                timer = setTimeout(() => reject(new DesktopIpcError('timeout')), REQUEST_TIMEOUT_MS);
+                timer = setTimeout(() => reject(new DesktopIpcError('timeout')), CONTROL_READ_TIMEOUT_MS);
                 this.controlSnapshotReject = reject;
                 this.controlSnapshotListener = () => {
                     if (this.controlSnapshotAnchored && !this.snapshotAnchor) resolve();
@@ -247,7 +252,7 @@ export class DesktopIpc {
         const subscription = this.observation;
         if (!subscription || this.snapshotAnchor || !this.ownerClientId) return;
         const anchor = { subscription, frames: [] as Record<string, unknown>[], bytes: 0, revision: null as number | null,
-            timer: setTimeout(() => this.fail('timeout'), REQUEST_TIMEOUT_MS) };
+            discardedRevisions: new Set<number>(), timer: setTimeout(() => this.fail('timeout'), CONTROL_READ_TIMEOUT_MS) };
         this.snapshotAnchor = anchor;
         void this.request('thread-follower-load-complete-history', 1, { conversationId: subscription.conversationId },
             randomUUID(), this.ownerClientId).then((response) => {
@@ -258,6 +263,7 @@ export class DesktopIpc {
                 || response.handledByClientId !== this.ownerClientId || !Number.isSafeInteger(result?.revision)
                 || Number(result?.revision) < 0) { this.fail('invalid_response'); return; }
             anchor.revision = Number(result!.revision);
+            if (anchor.discardedRevisions.has(anchor.revision)) { this.fail('revision_gap'); return; }
             this.finishSnapshotAnchor();
         }).catch((error) => {
             if (this.snapshotAnchor === anchor) this.fail(error instanceof DesktopIpcError ? error.reason : 'connection_closed');
@@ -321,7 +327,7 @@ export class DesktopIpc {
     }
 
     /** 仅控制读取关联快照；长订阅保留原行为，控制遇未关联完整快照即拒绝且不重请求。 */
-    private receiveObservation(message: Record<string, unknown>): void {
+    private receiveObservation(message: Record<string, unknown>, encodedBodyBytes?: number): void {
         const followed = this.observation;
         const params = ipcRecord(message.params);
         if (!followed || params?.conversationId !== followed.conversationId || params.hostId !== 'local') return;
@@ -338,9 +344,25 @@ export class DesktopIpc {
         }
         const anchor = this.snapshotAnchor;
         if (!anchor) { this.applyObservation(message); return; }
-        // 沿用协议单帧资源上限作为一次关联缓存的总字节边界，不累计无限历史。
-        anchor.bytes += Buffer.byteLength(JSON.stringify(message));
-        if (anchor.bytes > MAX_FRAME_BYTES) { this.fail('invalid_snapshot'); return; }
+        if (anchor.discardedRevisions.has(Number(change.revision))) { this.fail('invalid_snapshot'); return; }
+        if (change.type !== 'snapshot' && change.type !== 'patches') { this.fail('invalid_snapshot'); return; }
+        // 保持原候选字节上限；只有完整快照可以替换窗口，补丁不能独立成为基线。
+        // 真实接收沿用帧体原始字节数，避免为了计量再次序列化整份历史。
+        const frameBytes = encodedBodyBytes ?? Buffer.byteLength(JSON.stringify(message));
+        if (frameBytes > MAX_FRAME_BYTES) { this.fail('invalid_snapshot'); return; }
+        if (anchor.bytes + frameBytes > MAX_FRAME_BYTES) {
+            if (change.type !== 'snapshot') { this.fail('invalid_snapshot'); return; }
+            for (const frame of anchor.frames) {
+                const previous = ipcRecord(ipcRecord(frame.params)?.change);
+                anchor.discardedRevisions.add(Number(previous?.revision));
+            }
+            // 不再持有旧正文时无法证明同号内容相等，因此保守拒绝跨窗口同号重发。
+            if (anchor.discardedRevisions.has(Number(change.revision))) { this.fail('invalid_snapshot'); return; }
+            anchor.frames = [];
+            anchor.bytes = 0;
+            if (anchor.revision !== null && anchor.discardedRevisions.has(anchor.revision)) { this.fail('revision_gap'); return; }
+        }
+        anchor.bytes += frameBytes;
         if (change.type === 'snapshot') {
             for (const frame of anchor.frames) {
                 const previous = ipcRecord(ipcRecord(frame.params)?.change);
@@ -349,7 +371,7 @@ export class DesktopIpc {
                     this.fail('invalid_snapshot'); return;
                 }
             }
-        } else if (change.type !== 'patches') { this.fail('invalid_snapshot'); return; }
+        }
         anchor.frames.push(message);
         this.finishSnapshotAnchor();
     }
@@ -433,7 +455,7 @@ export class DesktopIpc {
             const timer = setTimeout(() => {
                 this.pending.delete(requestId);
                 reject(new DesktopIpcError('timeout'));
-            }, REQUEST_TIMEOUT_MS);
+            }, method === 'thread-follower-load-complete-history' ? CONTROL_READ_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
             this.pending.set(requestId, { resolve, reject, timer });
             try {
                 // 本地请求必须省略顶层 hostId；否则 Desktop 使用另一方法版本。
@@ -454,25 +476,39 @@ export class DesktopIpc {
         this.socket.write(Buffer.concat([header, body]));
     }
 
-    /** 处理碎片帧与合并帧，非法帧关闭连接并保留未知发送结果。 */
+    /** 帧头跨片累积，正文只分配一次并顺序写入；避免大帧每片重新复制已有正文。 */
     private readFrames(chunk: Buffer): void {
-        this.bytes = Buffer.concat([this.bytes, chunk]);
-        while (this.bytes.length >= 4 && !this.failure) {
-            const size = this.bytes.readUInt32LE(0);
-            if (size === 0 || size > MAX_FRAME_BYTES) { this.fail('invalid_response'); return; }
-            if (this.bytes.length < size + 4) return;
-            const body = this.bytes.subarray(4, size + 4);
-            this.bytes = this.bytes.subarray(size + 4);
+        let offset = 0;
+        while (offset < chunk.length && !this.failure) {
+            if (!this.frameBody) {
+                const headerBytes = Math.min(4 - this.frameHeaderBytes, chunk.length - offset);
+                chunk.copy(this.frameHeader, this.frameHeaderBytes, offset, offset + headerBytes);
+                this.frameHeaderBytes += headerBytes;
+                offset += headerBytes;
+                if (this.frameHeaderBytes < 4) return;
+                const size = this.frameHeader.readUInt32LE(0);
+                if (size === 0 || size > MAX_FRAME_BYTES) { this.fail('invalid_response'); return; }
+                this.frameHeaderBytes = 0;
+                this.frameBody = Buffer.allocUnsafe(size);
+            }
+            const bodyBytes = Math.min(this.frameBody.length - this.frameBodyBytes, chunk.length - offset);
+            chunk.copy(this.frameBody, this.frameBodyBytes, offset, offset + bodyBytes);
+            this.frameBodyBytes += bodyBytes;
+            offset += bodyBytes;
+            if (this.frameBodyBytes < this.frameBody.length) return;
+            const body = this.frameBody;
+            this.frameBody = null;
+            this.frameBodyBytes = 0;
             try {
                 const message = ipcRecord(JSON.parse(body.toString('utf8')));
                 if (!message) { this.fail('invalid_response'); return; }
-                this.handleMessage(message);
+                this.handleMessage(message, body.length);
             } catch { this.fail('invalid_response'); }
         }
     }
 
     /** 拒绝 owner 发现邀请，仅接受匹配的响应和失联通知。 */
-    private handleMessage(message: Record<string, unknown>): void {
+    private handleMessage(message: Record<string, unknown>, encodedBodyBytes?: number): void {
         if (message.type === 'client-discovery-request' && ipcString(message.requestId)) {
             this.write({ type: 'client-discovery-response', requestId: message.requestId, response: { canHandle: false } });
             return;
@@ -482,7 +518,7 @@ export class DesktopIpc {
             return;
         }
         if (message.type === 'broadcast') {
-            if (message.method === 'thread-stream-state-changed') this.receiveObservation(message);
+            if (message.method === 'thread-stream-state-changed') this.receiveObservation(message, encodedBodyBytes);
             const params = ipcRecord(message.params);
             if (message.method === 'client-status-changed' && params?.status === 'disconnected' && ipcString(params.clientId)) {
                 this.disconnectedClients.add(params.clientId);
@@ -519,7 +555,9 @@ export class DesktopIpc {
             pending.reject(this.failure);
         }
         this.pending.clear();
-        this.bytes = Buffer.alloc(0);
+        this.frameHeaderBytes = 0;
+        this.frameBody = null;
+        this.frameBodyBytes = 0;
         this.socket.destroy();
     }
 

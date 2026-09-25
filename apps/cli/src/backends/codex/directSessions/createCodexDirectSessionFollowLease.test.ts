@@ -144,8 +144,8 @@ it('recovers a timed-out initial baseline once without waiting for a new rollout
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
     const before = harness.lease.getObservation?.();
     expect(before).toMatchObject({ state: 'unknown' });
-    // 首请求完全不应答，经过正式 DesktopIpc 的原 5 秒期限，而不改变产品超时。
-    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2), { timeout: 7_000 });
+    // 首请求完全不应答，经过正式 DesktopIpc 的 15 秒只读期限后仅恢复一次。
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2), { timeout: 17_000 });
     expect(harness.historyRequests[0]!.socket).not.toBe(harness.historyRequests[1]!.socket);
     harness.replyBaseline({ turnId: 'recovered-idle', status: 'completed' });
     await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', source: 'desktop', turnId: 'recovered-idle' }));

@@ -4,9 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 const [, , mappingPath, outPath] = process.argv;
 const mapping = JSON.parse(readFileSync(mappingPath, 'utf8'));
 
-// Phosphor's canonical export for every icon is `<Name>Icon`. The bare alias also exists for most,
-// but NOT where it would clash with a JS global (`Circle`, `Infinity`), so always use the suffix —
-// one rule, and the clash class disappears.
+// 将映射名称转换为规范组件名；保留 Icon 后缀，避免 Circle、Infinity 等名称与全局对象冲突。
 const pascal = (kebab) => kebab.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('') + 'Icon';
 // Keyed by the PHOSPHOR name, not the old Ionicons/Octicons one. The mapping is a migration
 // artifact — the app's vocabulary after this is Phosphor's, so carrying the old names forward as
@@ -30,12 +28,8 @@ const components = [...new Set(entries.map(([, p]) => pascal(p)))].sort();
 const out = `// GENERATED — do not edit by hand.
 // Source: scripts/icons/mapping.json  ·  Regenerate: node scripts/icons/genRegistry.mjs
 //
-// Only the icons this app actually uses are imported. Phosphor ships 1,512 icons; importing the
-// whole catalogue would bundle ~12MB of path data, so the registry is the allowlist. Adding a new
-// icon is a one-line addition to the mapping, which keeps the icon set curated on purpose.
-import {
-${components.map(c => `    ${c},`).join('\n')}
-} from 'phosphor-react-native';
+// 使用包公开的逐图标入口，避免 Metro 经总入口收集整套图标；保留原组件及所有字重。
+${components.map(c => `import { ${c} } from 'phosphor-react-native/src/icons/${c.slice(0, -'Icon'.length)}';`).join('\n')}
 import type { Icon as PhosphorIcon } from 'phosphor-react-native';
 
 export const ICON_REGISTRY = {

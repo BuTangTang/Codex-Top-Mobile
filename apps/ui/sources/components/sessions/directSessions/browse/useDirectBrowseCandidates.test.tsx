@@ -5,6 +5,7 @@ import { renderHook } from '@/dev/testkit';
 import { createTextModuleMock } from '@/dev/testkit/mocks/text';
 import { useDirectBrowseCandidates } from './useDirectBrowseCandidates';
 import { readPhoneCandidateLifecycle } from './phoneBrowseAggregation';
+import { prepareWarmCacheStorage, saveDirectSessionTranscriptWarmCache, clearDirectSessionTranscriptWarmCache } from '@/sync/domains/state/warmCachePersistence';
 
 const list = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<DirectSessionsCandidatesListResponse>>());
 vi.mock('@/sync/ops/machineDirectSessions', () => ({ machineDirectSessionsCandidatesList: list }));
@@ -40,6 +41,24 @@ function statusPage(ids: string[], state: 'running' | 'completed' | 'unknown' | 
 describe('direct browse discovery window', () => {
     beforeEach(() => { list.mockReset(); list.mockResolvedValue(page(['initial'])); });
     afterEach(() => vi.useRealTimers());
+
+    it('offers previously read conversations offline without restoring their live status or another account', async () => {
+        await prepareWarmCacheStorage();
+        clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId);
+        saveDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, {
+            version: 1, sourceKey: 'fixture', cachedAtMs: 1,
+            session: { id: 'local-cached', createdAt: 1, updatedAt: 2, metadataVersion: 1,
+                metadata: { path: '/synthetic', host: 'fixture', name: '已读任务', directSessionV1: { v: 1, providerId: 'codex', machineId: scope.machineId, remoteSessionId: 'cached', source: scope.source } } },
+            items: [], tailCursor: 'tail', olderCursor: null, hasMoreOlder: false,
+        });
+        const hook = await renderHook((accountId: string) => useDirectBrowseCandidates({ ...scope, accountId, autoRefreshEnabled: false }), { initialProps: scope.accountId as string });
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['cached']);
+        expect(readPhoneCandidateLifecycle(hook.getCurrent().candidates[0]!, true, Date.now()).state).toBe('unknown');
+        expect(list).not.toHaveBeenCalled();
+        await hook.rerender('another-account');
+        expect(hook.getCurrent().candidates).toEqual([]);
+        clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId);
+    });
 
     /** 数量偏好改变时重新查询首屏，旧游标与进行中的深页结果都不能流入新范围。 */
     it('invalidates an old cursor and late page when the request limit changes', async () => {

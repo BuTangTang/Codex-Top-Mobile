@@ -202,6 +202,19 @@ export function useTranscriptSessionEntryLifecycle(
     const resolvedEntryViewportForRender = resolveSessionEntryViewportState(
         entryViewportSnapshotForRender.snapshot,
     );
+    const activityBaselineRef = React.useRef<{ sessionId: string; initialized: boolean } | null>(null);
+    // 首批正文可能晚于入口恢复到达；只在首次装载完成时建立基线，后续真实新消息照常计数。
+    React.useLayoutEffect(() => {
+        const previous = activityBaselineRef.current;
+        if (previous?.sessionId === deps.sessionId && previous.initialized) return;
+        activityBaselineRef.current = { sessionId: deps.sessionId, initialized: deps.isLoaded };
+        if (!deps.isLoaded) return;
+        deps.commitScrollPinState({
+            isPinned: deps.isPinnedRef.current,
+            lastActivityKey: deps.latestCommittedActivityKey ?? null,
+            newActivityCount: 0,
+        });
+    }, [deps.commitScrollPinState, deps.isLoaded, deps.isPinnedRef, deps.latestCommittedActivityKey, deps.sessionId]);
     const resetTransientSessionEntryUiState = React.useCallback(() => {
         deps.clearWebPrependRestoreWindow('abandoned-identity');
         deps.setExpandedToolCallsAnchorMessageIds(new Set());
@@ -237,7 +250,8 @@ export function useTranscriptSessionEntryLifecycle(
             deps.isPinnedRef.current = effect.isPinned;
             deps.commitScrollPinState({
                 isPinned: effect.isPinned,
-                lastActivityKey: null,
+                // 入口恢复沿当前已加载正文建立基线，不把缓存回放算成一条新活动。
+                lastActivityKey: deps.latestCommittedActivityKey ?? null,
                 newActivityCount: 0,
             });
             deps.commitJumpToBottomDistanceForVisibility(effect.jumpButtonDistanceFromLiveTailPx);
@@ -253,6 +267,7 @@ export function useTranscriptSessionEntryLifecycle(
     }, [
         deps.commitScrollPinState,
         deps.emitViewportChange,
+        deps.latestCommittedActivityKey,
         deps.sessionId,
     ]);
 

@@ -310,6 +310,8 @@ const baseExpoConfig = {
                 usesNonExemptEncryption: false
             },
             infoPlist: {
+                // 保留现有语音后台能力，直接由应用声明，不再依赖未使用的 AudioAPI 插件。
+                ...(iosBackgroundAudioEnabled ? { UIBackgroundModes: ["audio"] } : {}),
                 NSMicrophoneUsageDescription: "Allow $(PRODUCT_NAME) to access your microphone for voice conversations with AI.",
                 // Required because we use on-device speech recognition (and some SDKs may reference it).
                 // Apple requires a purpose string even if the code path is not exercised.
@@ -401,19 +403,11 @@ const baseExpoConfig = {
             "expo-mail-composer",
             "expo-secure-store",
             "expo-web-browser",
-            "react-native-vision-camera",
             "@more-tech/react-native-libsodium",
             [
                 "react-native-enriched-markdown",
                 {
                     enableMath: true
-                }
-            ],
-            [
-                "react-native-audio-api",
-                {
-                    // Enables UIBackgroundModes=audio when true (required for realtime voice calls in background).
-                    iosBackgroundMode: iosBackgroundAudioEnabled
                 }
             ],
             "@livekit/react-native-expo-plugin",

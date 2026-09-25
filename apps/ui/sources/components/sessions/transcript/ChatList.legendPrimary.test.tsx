@@ -236,6 +236,44 @@ describe('ChatList Legend-primary host axis', () => {
         await screen.unmount();
     });
 
+    // 历史位置重进以首份已加载正文为活动基线，缓存本身不能制造“新活动”。
+    it.each(['warm', 'late', 'empty'] as const)('does not count the cached entry as new activity (%s)', async (entry) => {
+        // 已加载的空会话也建立空基线，之后第一条真正到达的消息必须仍计为新活动。
+        const cachedMessages = entry === 'empty' ? [] : flashListChatListHarnessState.sessionMessagesState.messages;
+        const lateHydration = entry === 'late';
+        resetLegendChatListHarness({ platformOs: 'ios' });
+        sessionViewportState = { anchor: null, isPinned: false, lastUpdatedAt: 1, offsetY: 320, source: 'observed' };
+        flashListChatListHarnessState.sessionMessagesState = {
+            isLoaded: !lateHydration,
+            messages: lateHydration ? [] : cachedMessages,
+        };
+        const screen = await renderLegendPrimaryChatList();
+        /** 读取真实跳底按钮的计数；没有徽标按钮时即为零，不代替计数 owner。 */
+        const readActivityBadge = () => screen.findAllByTestId('transcript-jump-to-bottom')
+            .find((node) => typeof node.props.count === 'number')?.props.count ?? 0;
+        /** 保留同一真实列表实例，只更新 store 边界提供的正文快照。 */
+        const publishMessages = async (messages: typeof cachedMessages) => {
+            flashListChatListHarnessState.sessionMessagesState = { isLoaded: true, messages };
+            // 此既有 harness 的 store hook 是快照函数；用更新回执触发相同实例读取新快照。
+            flashListChatListHarnessState.sessionState = { ...flashListChatListHarnessState.sessionState,
+                seq: (flashListChatListHarnessState.sessionState.seq ?? 0) + 1 };
+            await screen.update(React.createElement(ChatList, { session: { ...flashListChatListHarnessState.sessionState } }));
+            await screen.settle();
+        };
+        if (lateHydration) await publishMessages(cachedMessages);
+        expect(requireCapturedLegendListProps().initialScrollAtEnd).toBe(false);
+        expect(readActivityBadge()).toBe(0);
+        await publishMessages([...cachedMessages]);
+        expect(readActivityBadge()).toBe(0);
+        const withNewMessage = [...cachedMessages,
+            { kind: 'agent-text' as const, id: 'new-live-message', localId: null, createdAt: 3, text: 'new reply', isThinking: false }];
+        await publishMessages(withNewMessage);
+        expect(readActivityBadge()).toBe(1);
+        await publishMessages([...withNewMessage]);
+        expect(readActivityBadge()).toBe(1);
+        await screen.unmount();
+    });
+
     it.each([-2, 0, 2])(
         'uses the keyed native entry-placement command for a Legend anchor at offset %i without an entry slice',
         async (itemOffsetPx) => {

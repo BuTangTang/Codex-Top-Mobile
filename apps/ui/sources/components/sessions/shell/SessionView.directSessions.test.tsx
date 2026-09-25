@@ -4211,6 +4211,37 @@ describe('SessionView (direct sessions)', () => {
     expect(chatHeaderPropsSpy.mock.calls.at(-1)?.[0].badges).not.toContain('sessionsList.storageDirectTab');
   });
 
+  // 冷启动展示缓存名，在线资料优先；跨服务器不能借用当前账号分区中的同名机器 ID。
+  it.each([
+    { routeServerId: 'server-1', ready: false, liveName: null, expectedName: '缓存测试电脑' },
+    { routeServerId: 'server-1', ready: true, liveName: '在线更新电脑', expectedName: '在线更新电脑' },
+    { routeServerId: 'server-2', ready: false, liveName: null, expectedName: 'machine-1' },
+  ])('uses the scoped cached machine name in the native header: $routeServerId/$ready', async ({ routeServerId, ready, liveName, expectedName }) => {
+    responsiveHarnessState.deviceType = 'phone';
+    responsiveHarnessState.platformOs = 'android';
+    const { storage: machineStorage } = await import('@/sync/domains/state/storageStore');
+    const previous = machineStorage.getState();
+    const display = { id: 'machine-1', updatedAt: 1, active: false, activeAt: 0, metadataVersion: 1,
+      metadata: { displayName: '缓存测试电脑', host: 'cached-host', homeDir: '/tmp' } };
+    machineStorage.setState({
+      isDataReady: ready,
+      machineDisplayById: { 'machine-1': display },
+      machineListByServerId: {},
+      machines: liveName ? { 'machine-1': { ...display, active: true, createdAt: 1,
+        metadata: { ...display.metadata, displayName: liveName } } } : {},
+    } as never);
+    try {
+      await renderSessionViewAndSettle({ routeServerId });
+      const header = chatHeaderPropsSpy.mock.calls.at(-1)?.[0];
+      expect(header.statusElement.props.sourceLabel.split(' · ')[0]).toBe(expectedName);
+      // 页头只读取展示缓存，不把离线机器升级成可操作的真实机器。
+      expect(Object.keys(machineStorage.getState().machines)).toEqual(liveName ? ['machine-1'] : []);
+    } finally {
+      standardCleanup();
+      machineStorage.setState(previous, true);
+    }
+  });
+
   it('owns one direct-session status and transcript poller for the mounted session surface', async () => {
     vi.useFakeTimers();
     chatHeaderHarnessState.renderRightElement = true;

@@ -6265,6 +6265,76 @@ describe('ChatList (FlashList v2)', () => {
         });
     });
 
+    // 离线只影响当前服务器 Direct 的转圈；请求、缓存正文和恢复连接后的同一次工作仍保留。
+    it.each([
+        { kind: 'active direct', serverId: 'server-1', direct: true, offlineVisible: false, short: false },
+        { kind: 'other-server direct', serverId: 'server-2', direct: true, offlineVisible: true, short: false },
+        { kind: 'HTTP transcript', serverId: 'server-1', direct: false, offlineVisible: true, short: false },
+        { kind: 'short active direct', serverId: 'server-1', direct: true, offlineVisible: false, short: true },
+    ])('keeps pending older progress truthful for $kind', async ({ serverId, direct, offlineVisible, short }) => {
+        const { storage } = await import('@/sync/domains/state/storageStore');
+        const previousState = storage.getState();
+        try {
+            await withWebFlashListFakeTimers(0, async () => {
+                sessionState = {
+                    ...sessionState,
+                    seq: 25,
+                    serverId,
+                    metadata: direct ? {
+                        directSessionV1: {
+                            v: 1, providerId: 'codex', machineId: 'machine-1', remoteSessionId: 'native-1',
+                            source: { kind: 'codexHome', home: 'user' },
+                        },
+                    } : null,
+                };
+                sessionMessagesState = {
+                    isLoaded: true,
+                    messages: [{ kind: 'user-text', id: 'cached-message', localId: null, createdAt: 1, text: 'cached history' }],
+                };
+                storage.setState({
+                    profileScope: { serverId: 'server-1', accountId: 'account-1' },
+                    socketStatus: 'disconnected',
+                    endpointStatus: 'offline',
+                    sessions: { [sessionState.id]: sessionState },
+                });
+                let finishOlder = createMissingLoadOlderResolver();
+                const syncMod = await import('@/sync/sync');
+                const loadOlder = vi.mocked(syncMod.sync.loadOlderMessages);
+                loadOlder.mockImplementation(() => new Promise((resolve) => { finishOlder = resolve; }));
+                loadOlder.mockClear();
+                syncTuningState = {
+                    ...syncTuningState,
+                    transcriptBackwardPrefetchThresholdPx: 800,
+                    transcriptOlderLoadSpinnerDelayMs: 500,
+                };
+                const { ChatList } = await import('./ChatList');
+                const screen = await renderTrackedFlashListChatList(<ChatList session={{ ...sessionState }} />);
+                await primeFlashListMetrics(600, 1200, { turns: 1 });
+                await scrollFlashListTo(100);
+                await screen.settle({ advanceTimersMs: 500, cycles: 1, turns: 1 });
+                expect(loadOlder).toHaveBeenCalledTimes(1);
+                expect(countExactTestId(screen, 'transcript-older-load-progress-overlay')).toBe(offlineVisible ? 1 : 0);
+                // 请求仍在途中时正文测量成不足一屏，不能把隐藏转圈误当作可再次加载。
+                if (short) await triggerFlashListChatListContentSizeChange(400, 400, { turns: 1 });
+                const cachedRows = screen.getCapturedFlashListProps().data;
+                await act(async () => { storage.setState({ socketStatus: 'connected', endpointStatus: 'online' }); });
+                expect(countExactTestId(screen, 'transcript-older-load-progress-overlay')).toBe(1);
+                expect(screen.getCapturedFlashListProps().data).toBe(cachedRows);
+                expect(loadOlder).toHaveBeenCalledTimes(1);
+                await act(async () => { storage.setState({ endpointStatus: 'offline' }); });
+                expect(countExactTestId(screen, 'transcript-older-load-progress-overlay')).toBe(offlineVisible ? 1 : 0);
+                expect(countAnyTestId(screen, 'transcript-older-load-continue')).toBe(0);
+                await act(async () => { finishOlder({ loaded: 0, hasMore: short, status: 'loaded' }); });
+                await screen.settle({ turns: 2 });
+                await act(async () => { storage.setState({ endpointStatus: 'online' }); });
+                expect(countExactTestId(screen, 'transcript-older-load-progress-overlay')).toBe(0);
+                if (short) expect(countAnyTestId(screen, 'transcript-older-load-continue')).toBeGreaterThan(0);
+            });
+        } finally {
+            await act(async () => { storage.setState(previousState, true); });
+        }
+    });
+
     it('keeps older-load progress out of scrollable header geometry during prepend loading', async () => {
         await withWebFlashListFakeTimers(0, async () => {
             sessionState = { ...sessionState, seq: 25 };

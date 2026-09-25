@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { createServer as createIpcServer, type Server as IpcServer, type Socket } from 'node:net';
 import { execFile } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { deriveBoxPublicKeyFromSeed } from '@happier-dev/protocol';
@@ -58,6 +58,8 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
   const desktopId = '01a0d20c-5a82-7ea1-86b9-16c6eb50c1c9';
   let desktopLoaded = false;
   let desktopDiscoveryCount = 0;
+  let desktopDiscoveryError: string | null = null;
+  let beforeDesktopDiscoveryResponse: (() => void) | null = null;
 
   /** 仅为 LINK 的真实 provider 边界提供原生发现应答，不接入真实桌面或生成任务。 */
   async function prepareDesktop(): Promise<void> {
@@ -85,10 +87,14 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
           pending = pending.subarray(4 + length);
           if (request.method !== 'initialize' && request.method !== 'thread-owner-discovery') continue;
           const initialize = request.method === 'initialize';
-          if (!initialize) desktopDiscoveryCount++;
+          if (!initialize) {
+            desktopDiscoveryCount++;
+            beforeDesktopDiscoveryResponse?.();
+          }
           const response = { type: 'response', method: request.method, requestId: request.requestId,
             ...(initialize ? { resultType: 'success', handledByClientId: 'synthetic-follower', result: { clientId: 'synthetic-follower' } }
-              : desktopLoaded ? { resultType: 'success', handledByClientId: 'synthetic-owner', result: { supportsUntrustedAppInput: true } }
+              : desktopDiscoveryError ? { resultType: 'error', error: desktopDiscoveryError }
+                : desktopLoaded ? { resultType: 'success', handledByClientId: 'synthetic-owner', result: { supportsUntrustedAppInput: true } }
                 : { resultType: 'error', error: 'no-client-found' }) };
           const body = Buffer.from(JSON.stringify(response));
           const header = Buffer.alloc(4);
@@ -115,6 +121,8 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
     vi.mocked(execFile).mockReset();
     desktopLoaded = false;
     desktopDiscoveryCount = 0;
+    desktopDiscoveryError = null;
+    beforeDesktopDiscoveryResponse = null;
     sessionsByTag.clear();
     sessionsById.clear();
     envScope = createEnvKeyScope(envKeys);
@@ -381,6 +389,92 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
     expect(reopened).toMatchObject({ ok: true, sessionId: res.sessionId, created: false });
     expect(execFile).toHaveBeenCalledTimes(2);
     expect(desktopDiscoveryCount).toBe(4);
+  });
+
+  it.each(['request-timeout', 'no-client-found'])('keeps the canonical reading link when desktop discovery returns %s', async (reason) => {
+    await prepareDesktop();
+    desktopDiscoveryError = reason;
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    const request = { machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' } };
+    const handler = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!;
+    const first = await handler(request) as { ok: boolean; sessionId: string };
+    expect(first).toMatchObject({ ok: true, created: true });
+    const credentials = await readCredentialsMock();
+    if (!credentials) throw new Error('Synthetic credentials missing');
+    expect(tryDecryptSessionMetadata({ credentials, rawSession: sessionsById.get(first.sessionId) })).toMatchObject({
+      directSessionV1: { machineId: request.machineId, providerId: 'codex', remoteSessionId: desktopId },
+    });
+    await expect(handler(request)).resolves.toEqual({ ok: true, sessionId: first.sessionId, created: false });
+    expect(sessionsByTag.size).toBe(1);
+    expect(execFile).toHaveBeenCalledTimes(2);
+    expect(desktopDiscoveryCount).toBe(6);
+    // 阅读成功不构成控制证明；能力仍不可用，CONTROL 仍返回原失败结果。
+    await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!({
+      ...request, sessionId: first.sessionId,
+    })).resolves.toMatchObject({ ok: true, externalControl: { canSend: false }, observation: { state: 'unknown' } });
+    await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ)!({
+      machineId: request.machineId, sessionId: first.sessionId,
+    })).resolves.toMatchObject({ ok: false, errorCode: 'provider_unavailable', error: 'desktop_control_unavailable' });
+  });
+
+  it('does not return a reading link after the initiating lifecycle ends during discovery', async () => {
+    await prepareDesktop();
+    desktopDiscoveryError = 'request-timeout';
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    const lifecycle = registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    let suspended: Promise<void> | undefined;
+    // 最后一次发现回执到达前退出旧账号，不能把已过期调用降级成阅读成功。
+    beforeDesktopDiscoveryResponse = () => { if (desktopDiscoveryCount === 3) suspended = lifecycle.suspend(); };
+    await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({
+      machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' },
+    })).resolves.toMatchObject({ ok: false, errorCode: 'provider_unavailable' });
+    await suspended;
+    expect(desktopDiscoveryCount).toBe(3);
+  });
+
+  it.each([
+    ['request-version-mismatch', 'incompatible_protocol'],
+    ['permission-denied', 'remote_outcome_unknown'],
+  ])('keeps desktop rejection %s visible after the reading link exists', async (reason, expected) => {
+    await prepareDesktop();
+    desktopDiscoveryError = reason;
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({
+      machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' },
+    })).resolves.toMatchObject({ ok: false, errorCode: 'provider_unavailable', error: expected });
+    expect(sessionsByTag.size).toBe(1);
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it('does not turn a missing local source into a successful reading link', async () => {
+    await prepareDesktop();
+    await rm(join(desktopHome, 'sessions', `rollout-${desktopId}.jsonl`));
+    desktopDiscoveryError = 'no-client-found';
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({
+      machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' },
+    })).resolves.toMatchObject({ ok: false, errorCode: 'provider_unavailable', error: 'session_not_found' });
+    expect(sessionsByTag.size).toBe(1);
+    expect(execFile).not.toHaveBeenCalled();
   });
 
   it('rejects a different authenticated account before an explicit desktop open', async () => {

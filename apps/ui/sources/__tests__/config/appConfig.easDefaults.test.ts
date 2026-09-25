@@ -423,14 +423,29 @@ describe('app.config.js', () => {
         expect(exp.extra?.eas?.projectId).toBe(DEFAULT_EAS_PROJECT_ID);
     });
 
+    it('omits unused native audio and camera packages while retaining active native features', () => {
+        const exp = withCleanEnv(() => getPublicConfig());
+        const dependencies = readUiPackageJson().dependencies;
+        const plugins = (exp.plugins ?? []).map((entry) => Array.isArray(entry) ? entry[0] : entry);
+        for (const removed of ['react-native-audio-api', 'react-native-vision-camera']) {
+            expect(dependencies[removed]).toBeUndefined();
+            expect(plugins).not.toContain(removed);
+        }
+        for (const retained of ['expo-camera', '@shopify/react-native-skia', '@happier-dev/sherpa-native', '@livekit/react-native-webrtc']) {
+            expect(dependencies[retained]).toBeDefined();
+        }
+        expect(plugins).toContain('expo-camera');
+        expect(plugins).toContain('@livekit/react-native-expo-plugin');
+        expect(plugins).toContain('@config-plugins/react-native-webrtc');
+    });
+
     it('enables iOS background audio by default in development', () => {
         const exp = withCleanEnv(() => {
             process.env.APP_ENV = 'development';
             return getPublicConfig();
         });
 
-        const plugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'react-native-audio-api');
-        expect(plugin).toEqual(['react-native-audio-api', expect.objectContaining({ iosBackgroundMode: true })]);
+        expect(exp.ios?.infoPlist?.UIBackgroundModes).toContain('audio');
     });
 
     it('enables iOS background audio by default in preview', () => {
@@ -439,8 +454,7 @@ describe('app.config.js', () => {
             return getPublicConfig();
         });
 
-        const plugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'react-native-audio-api');
-        expect(plugin).toEqual(['react-native-audio-api', expect.objectContaining({ iosBackgroundMode: true })]);
+        expect(exp.ios?.infoPlist?.UIBackgroundModes).toContain('audio');
     });
 
     it('allows overriding iOS background audio via env', () => {
@@ -450,8 +464,7 @@ describe('app.config.js', () => {
             return getPublicConfig();
         });
 
-        const plugin = (exp.plugins ?? []).find((entry: any) => Array.isArray(entry) && entry[0] === 'react-native-audio-api');
-        expect(plugin).toEqual(['react-native-audio-api', expect.objectContaining({ iosBackgroundMode: false })]);
+        expect(exp.ios?.infoPlist?.UIBackgroundModes ?? []).not.toContain('audio');
     });
 
     it('does not enable OTA-native debug development-client launch overrides by default', () => {

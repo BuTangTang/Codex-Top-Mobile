@@ -96,7 +96,7 @@ import { buildNewSessionSourceContextNavigation } from '@/components/sessions/ne
 import { resolveNewSessionDraftRouteIdentity } from '@/components/sessions/new/navigation/newSessionDraftRouteIdentity';
 import { buildNewSessionLaunchRouteParams } from '@/components/sessions/new/navigation/newSessionRouteParams';
 import { sessionAbort, resumeSession } from '@/sync/ops';
-import { storage, useActiveServerAccountScope, useEndpointConnectivity, useIsDataReady, useLaunchSelectionMachines, useLocalSetting, useMachine, useOpenApprovalArtifactsForSession, useProfile, useRealtimeStatus, useSessionAutomationsEnabledCount, useSessionConnectedServiceAccountSwitchEvents, useSessionMessages, useSessionOrganizationProjection, useSessionPendingMessages, useSessionTranscriptIds, useSessionUsage, useSessionVisibleReadSeq, useSetting, useSettingMutable, useSettings, useSocketStatus, useSyncError, useWorkspaceReviewCommentsDrafts } from '@/sync/domains/state/storage';
+import { storage, useActiveServerAccountScope, useEndpointConnectivity, useIsDataReady, useLaunchSelectionMachines, useLocalSetting, useMachine, useMachineDisplayById, useOpenApprovalArtifactsForSession, useProfile, useRealtimeStatus, useSessionAutomationsEnabledCount, useSessionConnectedServiceAccountSwitchEvents, useSessionMessages, useSessionOrganizationProjection, useSessionPendingMessages, useSessionTranscriptIds, useSessionUsage, useSessionVisibleReadSeq, useSetting, useSettingMutable, useSettings, useSocketStatus, useSyncError, useWorkspaceReviewCommentsDrafts } from '@/sync/domains/state/storage';
 import { canContinueSessionWithFreshSpawn, canResumeSessionWithOptions } from '@/agents/runtime/resumeCapabilities';
 import { DEFAULT_AGENT_ID, getAgentCore, resolveAgentIdFromFlavor, buildResumeSessionExtrasFromUiState } from '@/agents/catalog/catalog';
 import {
@@ -1810,13 +1810,18 @@ export const SessionView = React.memo((props: SessionViewProps) => {
             };
     const syncError = useSyncError();
     const allMachines = useLaunchSelectionMachines();
+    const machineDisplays = useMachineDisplayById();
+    const machineDisplayScope = useActiveServerAccountScope();
+    /** 页头复用当前账号分区的展示缓存，在线资料覆盖；不向可执行机器集合注入缓存实体。 */
     const machinesById = React.useMemo(() => {
-        const next: Record<string, (typeof allMachines)[number]> = {};
+        const scopeMatches = Boolean(machineDisplayScope?.accountId && machineDisplayScope.serverId
+            && areServerProfileIdentifiersEquivalent(machineDisplayScope.serverId, currentSessionRouteServerId));
+        const next: Record<string, (typeof machineDisplays)[string]> = scopeMatches ? { ...machineDisplays } : {};
         for (const machine of allMachines) {
             next[machine.id] = machine;
         }
         return next;
-    }, [allMachines]);
+    }, [allMachines, machineDisplays, machineDisplayScope, currentSessionRouteServerId]);
     const sessionOrganizationProjection = useSessionOrganizationProjection(currentSessionRouteServerId);
     const organizationListViewState = React.useMemo(() => buildSessionOrganizationListViewState({
         serverId: currentSessionRouteServerId,

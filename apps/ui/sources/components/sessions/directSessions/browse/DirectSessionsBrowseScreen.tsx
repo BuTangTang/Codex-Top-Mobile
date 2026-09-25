@@ -14,7 +14,7 @@ import { PopoverScope } from '@/components/ui/popover';
 import { Modal } from '@/modal';
 import { useAllMachines } from '@/sync/domains/state/storage';
 import { machineDirectSessionCandidateDelete, machineDirectSessionLinkEnsure } from '@/sync/ops/machineDirectSessions';
-import { useActiveServerAccountScope, useProfile, useSettings } from '@/sync/store/hooks';
+import { useActiveServerAccountScope, useProfile, useSettings, useSocketStatus } from '@/sync/store/hooks';
 import type { Theme } from '@/theme';
 import { t } from '@/text';
 
@@ -31,6 +31,9 @@ import { useDirectBrowseCandidates, type DirectBrowseCandidate, type DirectBrows
 import { Icon } from '@/components/ui/icons/Icon';
 import type { PhoneBrowseSnapshot } from './phoneBrowseAggregation';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
+import { loadDirectSessionTranscriptWarmCacheIndex, loadDirectSessionTranscriptWarmCache } from '@/sync/domains/state/warmCachePersistence';
+import { readDirectSessionLink } from '@/sync/domains/session/directSessions/readDirectSessionLink';
+import { getVisibleSessionIds } from '@/sync/domains/session/activeViewingSession';
 
 type DirectBrowseProviderId = DirectSessionsProviderId;
 type AppTheme = Theme;
@@ -105,6 +108,7 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
     const settings = useSettings();
     // 未锁定来源时也固定实际服务器，让切换服务器作废旧分页回包。
     const activeScope = useActiveServerAccountScope();
+    const socket = useSocketStatus();
     const browseServerId = lockScope?.serverId ?? activeScope?.serverId ?? null;
     // 手机账号作用域卸载后忽略旧打开结果，避免把新账号导航到旧账号任务。
     const mountedRef = React.useRef(true);
@@ -220,6 +224,25 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         actionPendingRef.current = false;
     }
     const actionActivation = actionScopeRef.current;
+    const deferredCachedOpen = React.useRef<{
+        activation: typeof actionActivation; sessionId: string; request: Parameters<typeof machineDirectSessionLinkEnsure>[0];
+    } | null>(null);
+    /** 只补当前仍在阅读的那次离线点开；复用连接恢复，不让状态轮询反复打开桌面窗口。 */
+    React.useEffect(() => {
+        const pending = deferredCachedOpen.current;
+        if (!pending) return;
+        if (pending.activation !== actionActivation) { deferredCachedOpen.current = null; return; }
+        if (socket.status !== 'connected') return;
+        deferredCachedOpen.current = null;
+        if (!getVisibleSessionIds().includes(pending.sessionId)) return;
+        void machineDirectSessionLinkEnsure(pending.request, browseServerId ? { serverId: browseServerId } : undefined)
+            .then((result) => {
+                if (result.ok && result.sessionId !== pending.sessionId && mountedRef.current
+                    && actionScopeRef.current === pending.activation && getVisibleSessionIds().includes(pending.sessionId)) {
+                    return navigateToSession(result.sessionId, { serverId: browseServerId });
+                }
+            }).catch(() => { /* 原正文保持可读；失败仍由正文页真实连接状态反馈。 */ });
+    }, [actionActivation, browseServerId, navigateToSession, socket.status]);
     /** 账号或来源变化后释放旧行的动作状态，旧异步结果由作用域校验拒绝。 */
     React.useEffect(() => { setLinkingSessionId(null); setDeletingSessionId(null); }, [actionActivation]);
     /** 同步阻止动作开始与 React 提交之间的自动请求。 */
@@ -325,6 +348,7 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         }
         actionPendingRef.current = true;
         setLinkingSessionId(candidate.remoteSessionId);
+        let cachedSessionId: string | null = null;
         try {
             const linkEnsureExtras = resolveDirectBrowseLinkEnsureRequestExtras({
                 providerId: selectedProviderId,
@@ -346,25 +370,43 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
                 ...linkEnsureExtras,
                 source: effectiveSource,
             };
+            // 已读会话按完整真实来源复用原关联；只导航阅读，不以缓存替代后续 CONTROL/STATUS。
+            if (browseServerId && activeScope?.accountId && selectedProviderId === 'codex') {
+                const cached = Object.values(loadDirectSessionTranscriptWarmCacheIndex(browseServerId, activeScope.accountId)).find((entry) => {
+                    const link = readDirectSessionLink(entry.session.metadata);
+                    return link?.machineId === effectiveSelectedMachineId && link.providerId === selectedProviderId
+                        && link.remoteSessionId === candidate.remoteSessionId && stableJsonStringify(link.source) === stableJsonStringify(effectiveSource);
+                });
+                if (cached && loadDirectSessionTranscriptWarmCache(browseServerId, activeScope.accountId, cached.session.id, cached.sourceKey)) {
+                    cachedSessionId = cached.session.id;
+                    await navigateToSession(cached.session.id, { serverId: browseServerId });
+                    if (socket.status !== 'connected') {
+                        deferredCachedOpen.current = { activation: actionActivation, sessionId: cached.session.id, request };
+                        return;
+                    }
+                    // 在线明确点开仍完成原 LINK 的桌面加载，不让缓存短路尚未加载的原任务。
+                    if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
+                }
+            }
             const result = browseServerId
                 ? await machineDirectSessionLinkEnsure(request, { serverId: browseServerId })
                 : await machineDirectSessionLinkEnsure(request);
             if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
             if (!result.ok) {
-                Modal.alert(t('common.error'), result.error);
+                if (!cachedSessionId) Modal.alert(t('common.error'), result.error);
                 return;
             }
-            await navigateToSession(result.sessionId);
+            if (result.sessionId !== cachedSessionId) await navigateToSession(result.sessionId);
         } catch (linkError) {
             if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
-            Modal.alert(t('common.error'), linkError instanceof Error ? linkError.message : t('directSessions.browseLinkFailed'));
+            if (!cachedSessionId) Modal.alert(t('common.error'), linkError instanceof Error ? linkError.message : t('directSessions.browseLinkFailed'));
         } finally {
             if (mountedRef.current && actionScopeRef.current === actionActivation) {
                 actionPendingRef.current = false;
                 setLinkingSessionId(null);
             }
         }
-    }, [actionActivation, browseServerId, effectiveSelectedMachineId, interaction, navigateToSession, props.onPickRemoteSessionId, selectedProviderId, selectedSource]);
+    }, [actionActivation, activeScope?.accountId, browseServerId, effectiveSelectedMachineId, interaction, navigateToSession, props.onPickRemoteSessionId, selectedProviderId, selectedSource, socket.status]);
 
     // 首页只订阅这个 owner 的快照及原动作；刷新、搜索与分页继续由原 hook 负责。
     const onPhoneSnapshot = props.phoneData?.onSnapshot;

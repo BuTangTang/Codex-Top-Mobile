@@ -41,6 +41,9 @@ vi.mock('react-native-mmkv', () => {
 });
 
 import {
+    loadDirectSessionTranscriptWarmCache,
+    saveDirectSessionTranscriptWarmCache,
+    clearDirectSessionTranscriptWarmCache,
     clearWarmCacheAccountScope,
     loadMachineDisplayWarmCacheEntries,
     loadSessionListWarmCacheEntries,
@@ -66,6 +69,42 @@ describe('warmCachePersistence', () => {
         // the map it was constructed with, so dropping the registry entry would not reach it.
         for (const instanceStore of storesById.values()) instanceStore.clear();
         clearWarmCacheAccountScope();
+    });
+
+    /** 合成直接会话只携带阅读所需元数据，正文与游标属于同一个落盘快照。 */
+    function directSnapshot(sessionId = 'cached-direct') {
+        return {
+            version: 1 as const, sourceKey: 'machine/source/remote', cachedAtMs: 10,
+            session: { id: sessionId, createdAt: 1, updatedAt: 2, metadataVersion: 1,
+                metadata: { path: '/synthetic/project', host: 'fixture', directSessionV1: {
+                    v: 1 as const, providerId: 'codex' as const, machineId: 'machine', remoteSessionId: 'remote',
+                    source: { kind: 'codexHome' as const, home: 'user' },
+                } } },
+            items: [{ id: 'message-1', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: '本地正文' } } }],
+            tailCursor: 'tail-1', olderCursor: 'older-1', hasMoreOlder: true,
+        };
+    }
+
+    it('keeps direct transcript bodies and cursor receipts isolated by account/server/source', () => {
+        const snapshot = directSnapshot();
+        saveDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot);
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id, snapshot.sourceKey)).toEqual(snapshot);
+        expect(loadDirectSessionTranscriptWarmCache('server-b', 'account-a', snapshot.session.id)).toBeNull();
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-b', snapshot.session.id)).toBeNull();
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id, 'other-source')).toBeNull();
+        clearDirectSessionTranscriptWarmCache('server-a', 'account-a');
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id)).toBeNull();
+    });
+
+    it('evicts whole least-recent cached conversations within the account byte budget', () => {
+        const first = directSnapshot('first');
+        const second = { ...directSnapshot('second'), cachedAtMs: 20 };
+        const bytes = new TextEncoder().encode(JSON.stringify(first)).length;
+        saveDirectSessionTranscriptWarmCache('server-a', 'account-a', first, { maxBytes: bytes + 50 });
+        saveDirectSessionTranscriptWarmCache('server-a', 'account-a', second, { maxBytes: bytes + 50 });
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', 'first')).toBeNull();
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', 'second')?.items).toEqual(second.items);
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', 'second')?.tailCursor).toBe('tail-1');
     });
 
     it('roundtrips session list entries by server and account scope', () => {

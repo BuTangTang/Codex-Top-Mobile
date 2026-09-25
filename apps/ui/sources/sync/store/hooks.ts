@@ -769,10 +769,24 @@ export function useForkedTranscriptSnapshot(sessionId: string): ForkedTranscript
  * Fail-closed: unknown session reads false.
  */
 export function useSessionCatchingUpNewer(sessionId: string, enabled: boolean = true): boolean {
-  return getStorage()((state) => {
-    if (!enabled) return false;
-    return (state.sessionCatchUpNewerInFlight[sessionId] ?? 0) > 0;
-  });
+  return getStorage()((state) => enabled
+    && (state.sessionCatchUpNewerInFlight[sessionId] ?? 0) > 0
+    && canShowSessionTranscriptNetworkProgress(state, sessionId));
+}
+
+/** 复用连接事实约束 Direct 加载动效；不改变请求、工作计数或会话操作权限。 */
+function canShowSessionTranscriptNetworkProgress(state: StorageState, sessionId: string): boolean {
+  const activeServerId = state.profileScope?.serverId;
+  const ownerServerId = resolveServerIdForSessionIdFromLocalState(state, sessionId) ?? activeServerId;
+  // 当前 socket 仅能约束当前服务器 Direct，其他服务器和 HTTP 正文保持原行为。
+  return !(activeServerId && ownerServerId && areServerProfileIdentifiersEquivalent(ownerServerId, activeServerId)
+    && readDirectSessionLink(state.sessions[sessionId]?.metadata)
+    && (state.socketStatus !== 'connected' || state.endpointStatus === 'offline'));
+}
+
+/** 只订阅加载提示是否可见，让等待网络的历史请求保持有效但不持续转圈。 */
+export function useSessionTranscriptNetworkProgressVisible(sessionId: string): boolean {
+  return getStorage()((state) => canShowSessionTranscriptNetworkProgress(state, sessionId));
 }
 
 /**

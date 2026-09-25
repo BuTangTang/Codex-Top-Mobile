@@ -4,6 +4,9 @@ import type { DirectSessionActivityV1, DirectSessionsProviderId, DirectSessionsS
 import { machineDirectSessionsCandidatesList } from '@/sync/ops/machineDirectSessions';
 import { t } from '@/text';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
+import { loadDirectSessionTranscriptWarmCacheIndex } from '@/sync/domains/state/warmCachePersistence';
+import { readDirectSessionLink } from '@/sync/domains/session/directSessions/readDirectSessionLink';
+import { shouldUseCandidateSource } from './shouldUseCandidateSource';
 
 /** 一个前台观测范围；原生 AppState 变化后可在 React 提交前同步拒绝旧请求。 */
 export type DirectBrowseObservationScope = Readonly<{ isCurrent: () => boolean }>;
@@ -296,9 +299,21 @@ export function useDirectBrowseCandidates(params: Readonly<{
         flightRef.current = null;
         // 查询和前台范围同批改变时，这次初始加载已经使用新范围，不再被恢复 effect 重启。
         appliedObservationScopeRef.current = controlsRef.current.observationScope;
-        pagesRef.current = [];
+        // 离线入口只派生已读正文的目录，不持久化 LIST 活动观测或赋予旧候选发送能力。
+        const cached = providerId === 'codex' && machineId && source
+            ? Object.values(loadDirectSessionTranscriptWarmCacheIndex(serverId, params.accountId)).flatMap((entry): DirectBrowseCandidate[] => {
+                const metadata = entry.session.metadata;
+                const link = readDirectSessionLink(metadata);
+                if (!link || link.providerId !== providerId || link.machineId !== machineId || !shouldUseCandidateSource(source, link.source)) return [];
+                if (source.kind === 'codexHome' && source.homePath && link.source.kind === 'codexHome' && source.homePath !== link.source.homePath) return [];
+                const title = metadata.name || metadata.summary?.text || link.remoteSessionId;
+                if (query && !`${title} ${metadata.path}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())) return [];
+                return [{ remoteSessionId: link.remoteSessionId, title, updatedAtMs: entry.session.updatedAt,
+                    details: { cwd: metadata.path, source: link.source } }];
+            }).sort(compareDirectBrowseCandidates).slice(0, requestLimit) : [];
+        pagesRef.current = cached.length ? [{ candidates: cached, nextCursor: null, incomplete: true }] : [];
         refreshRequiredRef.current = false;
-        setCandidates([]);
+        setCandidates(cached);
         setNextCursor(null);
         setRefreshRequired(false);
         setError(null);

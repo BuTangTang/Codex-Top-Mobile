@@ -2,6 +2,7 @@ import * as React from 'react';
 import { act } from 'react-test-renderer';
 import type { DirectSessionCandidateDeleteResponse, DirectSessionsCandidatesListRequest, DirectSessionsCandidatesListResponse } from '@happier-dev/protocol';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { prepareWarmCacheStorage, saveDirectSessionTranscriptWarmCache, clearDirectSessionTranscriptWarmCache } from '@/sync/domains/state/warmCachePersistence';
 import { flushHookEffects, renderScreen } from '@/dev/testkit';
 import { createPassThroughModule } from '@/dev/testkit/mocks/components';
 import { createExpoRouterMock } from '@/dev/testkit/mocks/router';
@@ -59,6 +60,7 @@ const profileMock = vi.hoisted(() => ({
     ],
 }));
 const activeScopeState = vi.hoisted(() => ({ value: null as { serverId: string; accountId: string } | null }));
+const cachedMachineDisplays = vi.hoisted(() => ({ value: {} as Record<string, unknown> }));
 const focusState = vi.hoisted(() => ({ value: true }));
 const socketState = vi.hoisted(() => ({ status: 'connected' }));
 const appStateBoundary = createReactNativeAppStateEmitter();
@@ -133,6 +135,8 @@ vi.mock('@/sync/store/hooks', () => ({
     useSocketStatus: () => socketState,
     useSettings: () => settingsMock,
     useLocalSetting: (key: string) => key === 'uiItemDensity' ? 'comfortable' : undefined,
+    useMachineDisplayById: () => cachedMachineDisplays.value,
+    useIsDataReady: () => false,
 }));
 
 vi.mock('@/components/ui/lists/ItemList', () => createPassThroughModule(['ItemList']));
@@ -231,7 +235,36 @@ function phoneCandidate(remoteSessionId: string, state: 'running' | 'needs_input
 }
 
 describe('DirectSessionsBrowseScreen', () => {
+    it.each(['disconnected', 'connected'] as const)('opens the exact already-read native source immediately while %s, preserving online LINK', async (connection) => {
+        await prepareWarmCacheStorage();
+        activeScopeState.value = { serverId: 'cached-server', accountId: 'cached-account' };
+        socketState.status = connection;
+        const source = { kind: 'codexHome', home: 'user', homePath: '/tmp/custom-home' } as const;
+        saveDirectSessionTranscriptWarmCache('cached-server', 'cached-account', {
+            version: 1, sourceKey: 'fixture', cachedAtMs: 1,
+            session: { id: 'local-cached', createdAt: 1, updatedAt: 2, metadataVersion: 1,
+                metadata: { path: '/synthetic', host: 'fixture', directSessionV1: { v: 1, providerId: 'codex', machineId: 'machine-1', remoteSessionId: 'codex-session-1', source } } },
+            items: [], tailCursor: 'tail', olderCursor: null, hasMoreOlder: false,
+        });
+        linkEnsureSpy.mockResolvedValueOnce({ ok: true, sessionId: 'local-cached', created: false });
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(<DirectSessionsBrowseScreen />);
+        await screen.pressByTestIdAsync('direct-session-candidate:codex-session-1');
+        expect(linkEnsureSpy).toHaveBeenCalledTimes(connection === 'connected' ? 1 : 0);
+        expect(routerNavigateSpy.mock.calls.at(-1)?.[0]).toContain('/session/local-cached');
+        if (connection === 'disconnected') {
+            const { markSessionVisible, markSessionHidden } = await import('@/sync/domains/session/activeViewingSession');
+            markSessionVisible('local-cached');
+            socketState.status = 'connected';
+            await screen.update(<DirectSessionsBrowseScreen interaction="openSession" />);
+            await flushHookEffects();
+            expect(linkEnsureSpy).toHaveBeenCalledTimes(1);
+            markSessionHidden('local-cached');
+        }
+        clearDirectSessionTranscriptWarmCache('cached-server', 'cached-account');
+    });
     beforeEach(() => {
+        cachedMachineDisplays.value = {};
         settingsMock.phoneRecentSessionLimit = 50;
         projectsListSpy.mockReset().mockResolvedValue({ ok: true, projects: [], nativeCreate: false, unavailableReason: 'desktop_native_create_unavailable' });
         routeParams.value = {};
@@ -252,6 +285,28 @@ describe('DirectSessionsBrowseScreen', () => {
         modalAlertSpy.mockClear();
         modalConfirmSpy.mockClear();
         modalConfirmSpy.mockResolvedValue(true);
+    });
+
+    it('keeps cached conversations reachable after a fully offline cold start without real machine records', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        await prepareWarmCacheStorage();
+        activeScopeState.value = { serverId: 'offline-cold', accountId: 'offline-account' };
+        machinesState = [];
+        socketState.status = 'disconnected';
+        cachedMachineDisplays.value = { 'cached-machine': { id: 'cached-machine', active: true, activeAt: Date.now(), metadata: { displayName: '缓存电脑' } } };
+        saveDirectSessionTranscriptWarmCache('offline-cold', 'offline-account', {
+            version: 1, sourceKey: 'fixture', cachedAtMs: 1,
+            session: { id: 'cached-home', createdAt: 1, updatedAt: 2, metadataVersion: 1,
+                metadata: { path: '/synthetic', host: 'fixture', directSessionV1: { v: 1, providerId: 'codex', machineId: 'cached-machine', remoteSessionId: 'offline-row', source: { kind: 'codexHome', home: 'user' } } } },
+            items: [], tailCursor: 'tail', olderCursor: null, hasMoreOlder: false,
+        });
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        const screen = await renderScreen(<PhoneSessionsOverview />);
+        const rows = screen.findAllByType('FlatList')[0]!.props.data;
+        expect(rows.map((row: { candidate: { remoteSessionId: string } }) => row.candidate.remoteSessionId)).toEqual(['offline-row']);
+        expect(rows[0].lifecycle.state).toBe('unknown');
+        expect(candidatesListSpy).not.toHaveBeenCalled();
+        clearDirectSessionTranscriptWarmCache('offline-cold', 'offline-account');
     });
 
     /** 保持真实聚合与共享时钟，断开 LIST 后也必须准确过期，并继续更新相对时间。 */

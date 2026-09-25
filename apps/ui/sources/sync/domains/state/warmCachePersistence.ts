@@ -6,6 +6,7 @@ import {
     SessionRuntimeActivityStateSchema,
     SessionRuntimeIssueV1Schema,
     PendingActivationAuthorizationV1Schema,
+    DirectTranscriptRawMessageV1Schema,
     type SessionOrganizationSnapshot,
 } from '@happier-dev/protocol';
 import { z } from 'zod';
@@ -13,6 +14,8 @@ import { z } from 'zod';
 import { readStorageScopeFromEnv, scopedStorageId } from '@/utils/system/storageScope';
 import { prepareWarmCacheEncryptionKey, readResolvedWarmCacheEncryptionKey } from './warmCacheEncryptionKey';
 import { selectMostRecentWarmCacheSessionIds } from './warmCacheAdapters';
+import type { Metadata } from './storageTypes';
+import { encodeUTF8 } from '@/encryption/text';
 
 /**
  * The same predicate the rest of this corridor uses (`state/persistence.ts`,
@@ -28,6 +31,33 @@ function isWebRuntime(): boolean {
 const SESSION_LIST_WARM_CACHE_PREFIX = 'session-list-warm-cache-v1';
 const MACHINE_DISPLAY_WARM_CACHE_PREFIX = 'machine-display-warm-cache-v1';
 const SESSION_ORGANIZATION_WARM_CACHE_PREFIX = 'session-organization-warm-cache-v1';
+const DIRECT_TRANSCRIPT_WARM_CACHE_PREFIX = 'direct-transcript-warm-cache-v1';
+// 已批准的按账号容量上限；仅缓存按需读过的正文，超额淘汰整会话，不截断正文或游标。
+const DIRECT_TRANSCRIPT_WARM_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+
+const DirectSessionTranscriptWarmCacheSchema = z.object({
+    version: z.literal(1),
+    sourceKey: z.string().min(1),
+    cachedAtMs: z.number().finite(),
+    session: z.object({
+        id: z.string().min(1), createdAt: z.number(), updatedAt: z.number(), metadataVersion: z.number(),
+        encryptionMode: z.enum(['plain', 'e2ee']).optional(),
+        // 存储只核对外壳，恢复时仍由 Sync 的正式 MetadataSchema 校验；避免缓存层加载 UI/agent 注册链。
+        metadata: z.object({ path: z.string(), host: z.string() }).passthrough().transform((value) => value as Metadata),
+    }),
+    items: z.array(DirectTranscriptRawMessageV1Schema),
+    tailCursor: z.string().nullable(), olderCursor: z.string().nullable(), hasMoreOlder: z.boolean(),
+    requiresRefresh: z.boolean().optional(),
+    historyAvailability: z.enum(['available', 'preview_only', 'unavailable']).optional(),
+    gap: z.object({
+        prefixMessageIds: z.array(z.string()), boundarySourceIds: z.array(z.string()), walkCursor: z.string().nullable(),
+    }).nullable().optional(),
+});
+export type DirectSessionTranscriptWarmCache = z.infer<typeof DirectSessionTranscriptWarmCacheSchema>;
+const DirectTranscriptCacheIndexSchema = z.record(z.string(), z.object({
+    bytes: z.number().nonnegative(), cachedAtMs: z.number(), sourceKey: z.string(),
+    session: DirectSessionTranscriptWarmCacheSchema.shape.session,
+}));
 /**
  * Superseded by `SESSION_ORGANIZATION_WARM_CACHE_PREFIX`, which carries the pinned ids as part
  * of the whole organization snapshot. Only deleted here, never read; drop this constant once no
@@ -345,6 +375,70 @@ function buildScopedKey(prefix: string, serverId: string | null | undefined, acc
     const normalizedAccountId = normalizeScopePart(accountId);
     if (!normalizedServerId || !normalizedAccountId) return null;
     return `${prefix}:${normalizedServerId}:${normalizedAccountId}`;
+}
+
+/** 只读轻量目录供原列表 owner 恢复已缓存入口；不返回实时活动、审批或发送授权。 */
+export function loadDirectSessionTranscriptWarmCacheIndex(serverId: string | null | undefined, accountId: string | null | undefined) {
+    return loadScopedRecord(buildScopedKey(DIRECT_TRANSCRIPT_WARM_CACHE_PREFIX, serverId, accountId), DirectTranscriptCacheIndexSchema) ?? {};
+}
+
+/** 正文按会话单独读取；可选来源身份必须完全一致，不能把另一机器的同名会话当缓存命中。 */
+export function loadDirectSessionTranscriptWarmCache(
+    serverId: string | null | undefined, accountId: string | null | undefined, sessionId: string, sourceKey?: string,
+): DirectSessionTranscriptWarmCache | null {
+    const prefix = buildScopedKey(DIRECT_TRANSCRIPT_WARM_CACHE_PREFIX, serverId, accountId);
+    if (!prefix || !sessionId) return null;
+    const snapshot = loadScopedRecord(`${prefix}:${encodeURIComponent(sessionId)}`, DirectSessionTranscriptWarmCacheSchema);
+    return snapshot?.session.id === sessionId && (!sourceKey || snapshot.sourceKey === sourceKey) ? snapshot : null;
+}
+
+/** 每次只序列化被改动的一份正文；轻量目录负责账号总容量与整会话淘汰。 */
+export function saveDirectSessionTranscriptWarmCache(
+    serverId: string | null | undefined, accountId: string | null | undefined, snapshot: DirectSessionTranscriptWarmCache,
+    options?: Readonly<{ maxBytes?: number }>,
+): void {
+    const prefix = buildScopedKey(DIRECT_TRANSCRIPT_WARM_CACHE_PREFIX, serverId, accountId);
+    const store = getWarmCacheStorage();
+    if (!prefix || !store) return;
+    try {
+        const serialized = JSON.stringify(snapshot);
+        const bytes = encodeUTF8(serialized).byteLength;
+        const maxBytes = options?.maxBytes ?? DIRECT_TRANSCRIPT_WARM_CACHE_MAX_BYTES;
+        if (bytes > maxBytes) return;
+        const entries = loadDirectSessionTranscriptWarmCacheIndex(serverId, accountId);
+        entries[snapshot.session.id] = { bytes, cachedAtMs: snapshot.cachedAtMs, sourceKey: snapshot.sourceKey, session: snapshot.session };
+        let total = Object.values(entries).reduce((sum, entry) => sum + entry.bytes, 0);
+        for (const [id, entry] of Object.entries(entries).sort((a, b) => a[1].cachedAtMs - b[1].cachedAtMs)) {
+            if (total <= maxBytes) break;
+            if (id === snapshot.session.id) continue;
+            store.delete(`${prefix}:${encodeURIComponent(id)}`);
+            delete entries[id];
+            total -= entry.bytes;
+        }
+        store.set(`${prefix}:${encodeURIComponent(snapshot.session.id)}`, serialized);
+        store.set(prefix, JSON.stringify(entries));
+    } catch {
+        // 缓存失败不改变已显示正文及联网同步结果。
+    }
+}
+
+/** 退出账号沿原断连入口只清当前账号分区，其他账号及服务器互不影响。 */
+export function clearDirectSessionTranscriptWarmCache(serverId: string | null | undefined, accountId: string | null | undefined, sessionId?: string): void {
+    const prefix = buildScopedKey(DIRECT_TRANSCRIPT_WARM_CACHE_PREFIX, serverId, accountId);
+    const store = getWarmCacheStorage();
+    if (!prefix || !store) return;
+    try {
+        if (sessionId) {
+            const entries = loadDirectSessionTranscriptWarmCacheIndex(serverId, accountId);
+            delete entries[sessionId];
+            store.delete(`${prefix}:${encodeURIComponent(sessionId)}`);
+            store.set(prefix, JSON.stringify(entries));
+            return;
+        }
+        for (const key of store.getAllKeys()) {
+            if (key === prefix || key.startsWith(`${prefix}:`)) store.delete(key);
+        }
+    } catch { /* 缓存不可读时不阻塞账号退出。 */ }
 }
 
 function loadScopedRecord<T>(

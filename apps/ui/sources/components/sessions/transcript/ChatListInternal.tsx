@@ -7,7 +7,7 @@ import { Dimensions, Platform, View } from 'react-native';
 import { useCallback } from 'react';
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import { sync, type SessionViewportAnchorSnapshot } from '@/sync/sync';
-import { useSessionCatchingUpNewer, useSessionTailContiguousBoundary } from '@/sync/store/hooks';
+import { useSessionCatchingUpNewer, useSessionTailContiguousBoundary, useSessionTranscriptNetworkProgressVisible } from '@/sync/store/hooks';
 import { useSessionScreenIsFocused } from '@/components/sessions/shell/useSessionScreenIsFocused';
 import { useSessionActionFieldOptionsForRowHeight } from '@/components/sessions/actions/useSessionActionFieldOptions';
 import { fireAndForget } from '@/utils/system/fireAndForget';
@@ -680,7 +680,8 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
     const [scrollPin, setScrollPin] = React.useState<TranscriptScrollPinState>(() => ({
         isPinned: resolveSessionEntryViewportState(readSessionViewportForEntry(props.sessionId)).shouldFollowBottom,
         newActivityCount: 0,
-        lastActivityKey: null,
+        // 本次进入时已经显示的尾消息是阅读基线，不是进入后到达的新活动。
+        lastActivityKey: props.latestCommittedActivityKey ?? null,
     }));
     const scrollPinRef = React.useRef(scrollPin);
     const commitScrollPinState = React.useCallback((next: TranscriptScrollPinState) => {
@@ -1161,6 +1162,7 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
         return observeNativeStreamAppendOffsetEscapeHostRef.current(params);
     }, []);
     const isCatchingUpNewer = useSessionCatchingUpNewer(props.sessionId);
+    const networkProgressVisible = useSessionTranscriptNetworkProgressVisible(props.sessionId);
     // Tail-reset discontinuity floor: bounds the tail display to content contiguous with
     // the live tail while an older-page walk is filling a catch-up hole.
     const tailContiguousBoundary = useSessionTailContiguousBoundary(props.sessionId);
@@ -2364,12 +2366,15 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
         directControlFooter: props.directControlFooter,
         handleComposerInsetHeightChange,
         handleNativeHotTailHeightChange,
-        isLoadingOlder,
+        // 仅控制动效显示，离线仍允许展开已缓存的 entry-slice 和接收原分页结果。
+        isLoadingOlder: isLoadingOlder && networkProgressVisible,
         mainTranscriptListShellFrame: mainTranscriptRendererBinding.frame,
-        olderPaginationIsLoadingOlder: olderPagination.isLoadingOlder,
+        olderPaginationIsLoadingOlder: olderPagination.isLoadingOlder && networkProgressVisible,
         // Bounded fill can leave only raw/sidechain rows. Reader intent uses the
         // same prepend loader; target windows retain their separate cursors.
-        olderPaginationCanContinue: !targetWindowActive && olderPagination.hasMore && !isScrollable(),
+        // 离线隐藏动效不会结束原工作；短正文也必须等两路加载结束后才显示继续入口。
+        olderPaginationCanContinue: !isLoadingOlder && !olderPagination.isLoadingOlder
+            && !targetWindowActive && olderPagination.hasMore && !isScrollable(),
         onContinueOlderPagination: olderPagination.continueOlderLoad,
         onRequestSwitchToRemote: props.onRequestSwitchToRemote,
         prependRangeReservePx: prependHost.slots.rangeReservePx,

@@ -114,6 +114,8 @@ function resolveHydratedServerIdForRouteResult(
 }
 
 export function hasAuthoritativeHydratedSessionForRoute(sessionId: string, serverId?: string | null): boolean {
+    // 缓存壳只用于先读正文；plain 账号也不能因此跳过原有联网校验与退避恢复。
+    if (sync.isDirectSessionCacheOnly(sessionId)) return false;
     const session = storage.getState().sessions[sessionId] ?? null;
     if (!session || session.metadata == null) {
         return false;

@@ -18,6 +18,7 @@ const ensureSessionVisibleForMessageRouteSpy = vi.hoisted(() =>
     vi.fn<(sessionId: string, options?: Readonly<{ serverId?: string; forceRefresh?: boolean }>) => Promise<EnsureRouteResult>>(),
 );
 const getSessionEncryptionSpy = vi.hoisted(() => vi.fn<(sessionId: string) => unknown>());
+const cachedOnlySpy = vi.hoisted(() => vi.fn(() => false));
 const activeServerSnapshotMock = vi.hoisted(() => ({
     current: {
         serverId: '',
@@ -34,6 +35,7 @@ vi.mock('@/sync/domains/server/serverRuntime', () => ({
 
 vi.mock('@/sync/sync', () => ({
     sync: {
+        isDirectSessionCacheOnly: cachedOnlySpy,
         ensureSessionVisibleForMessageRoute: (sessionId: string, options?: Readonly<{ serverId?: string; forceRefresh?: boolean }>) =>
             ensureSessionVisibleForMessageRouteSpy(sessionId, options),
         encryption: {
@@ -118,6 +120,7 @@ describe('useHydrateSessionForRoute', () => {
     let previousStorageState: ReturnType<typeof storage.getState>;
 
     beforeEach(() => {
+        cachedOnlySpy.mockReset().mockReturnValue(false);
         previousStorageState = storage.getState();
         ensureSessionVisibleForMessageRouteSpy.mockReset();
         ensureSessionVisibleForMessageRouteSpy.mockResolvedValue(retryableResult('session-1', 'unknown'));
@@ -129,6 +132,15 @@ describe('useHydrateSessionForRoute', () => {
             activeLocalRelayUrl: null,
             generation: 0,
         };
+    });
+
+    it('keeps cached plain-session content readable while continuing the original online route check', async () => {
+        cachedOnlySpy.mockReturnValue(true);
+        storage.setState({ sessions: { 'cached-plain': createSessionFixture({ id: 'cached-plain', encryptionMode: 'plain' }) } });
+        const hook = await renderHook(() => useHydrateSessionForRoute('cached-plain', 'cached-test'));
+        expect(ensureSessionVisibleForMessageRouteSpy).toHaveBeenCalledWith('cached-plain', undefined);
+        expect(hook.getCurrent().kind).not.toBe('available');
+        expect(storage.getState().sessions['cached-plain']).toBeDefined();
     });
 
     afterEach(() => {

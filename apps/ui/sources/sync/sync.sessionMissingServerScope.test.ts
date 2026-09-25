@@ -193,6 +193,60 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         vi.clearAllMocks();
     });
 
+    it.each(['plain', 'e2ee'] as const)('restores an opened direct conversation offline after memory eviction and catches up by the saved cursor (%s)', async (encryptionMode) => {
+        const { prepareWarmCacheStorage } = await import('./domains/state/warmCachePersistence');
+        await prepareWarmCacheStorage();
+        const { sync } = await import('./sync');
+        const owner = upsertServerProfile({ serverUrl: 'https://cached.example', name: 'Cached' });
+        setActiveServerId(owner.id, { scope: 'device' });
+        const previousAccount = (sync as any).serverID;
+        const previousCredentials = (sync as any).credentials;
+        (sync as any).serverID = 'cached-account';
+        (sync as any).credentials = { token: buildTokenWithSub('cached-account'), secret: 'synthetic' };
+        const sessionId = 'cached-after-restart';
+        storage.getState().applySessions([{ ...createDirectSession(sessionId), encryptionMode, serverId: owner.id }]);
+        machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+            { id: 'cached-raw-1', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: '重启仍可阅读' } } },
+        ], tailCursor: 'cached-tail-1', nextCursor: null, hasMore: false });
+        await (sync as any).fetchMessages(sessionId);
+        (sync as any).flushSessionMaterializedMaxSeq();
+        (sync as any).evictSessionTranscript(sessionId);
+        storage.setState({ sessions: {} });
+        (sync as any).encryption = { getSessionEncryption: () => null };
+        requestMock.mockRejectedValue(new Error('offline'));
+        await sync.ensureSessionVisibleForMessageRoute(sessionId, { serverId: owner.id });
+        const cached = storage.getState().sessionMessages[sessionId];
+        expect(Object.values(cached?.messagesById ?? {}).some((message) => message.kind === 'user-text' && message.text === '重启仍可阅读')).toBe(true);
+        expect(cached?.isLoaded).toBe(true);
+        expect(sync.isDirectSessionCacheOnly(sessionId)).toBe(true);
+        expect(storage.getState().sessions[sessionId]?.thinking).toBe(false);
+        machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+            { id: 'cached-raw-2', createdAtMs: 2, raw: { role: 'user', content: { type: 'text', text: '只追加新消息' } } },
+        ], nextCursor: 'cached-tail-2', hasMore: false });
+        await (sync as any).fetchMessages(sessionId);
+        expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'cached-tail-1' }), expect.anything());
+        expect(Object.values(storage.getState().sessionMessages[sessionId].messagesById).filter((message) => message.kind === 'user-text')).toHaveLength(2);
+        expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+        machineDirectSessionTranscriptReadAfterMock.mockRejectedValueOnce(new Error('offline again'));
+        await expect((sync as any).fetchMessages(sessionId)).rejects.toThrow('offline again');
+        expect(storage.getState().sessionMessages[sessionId].messagesById).toHaveProperty(Object.keys(cached!.messagesById)[0]!);
+        // 已观察到的源重置即使没有新正文，也必须随原检查点保存。
+        (sync as any).requireDirectSessionTranscriptRefresh(sessionId);
+        (sync as any).flushSessionMaterializedMaxSeq();
+        const { loadDirectSessionTranscriptWarmCache } = await import('./domains/state/warmCachePersistence');
+        expect(loadDirectSessionTranscriptWarmCache(owner.id, 'cached-account', sessionId)?.requiresRefresh).toBe(true);
+        // 迟到的远端明确不存在撤销旧缓存；再打开不能复活已删除的原会话。
+        requestMock.mockResolvedValue(new Response(null, { status: 404 }));
+        await sync.ensureSessionVisibleForMessageRoute(sessionId, { serverId: owner.id, forceRefresh: true });
+        (sync as any).flushSessionMaterializedMaxSeq();
+        expect(loadDirectSessionTranscriptWarmCache(owner.id, 'cached-account', sessionId)).toBeNull();
+        expect(storage.getState().sessions[sessionId]).toBeUndefined();
+        await sync.ensureSessionVisibleForMessageRoute(sessionId, { serverId: owner.id });
+        expect(storage.getState().sessionMessages[sessionId]?.isLoaded).not.toBe(true);
+        (sync as any).serverID = previousAccount;
+        (sync as any).credentials = previousCredentials;
+    });
+
     it('does not publish an empty loaded transcript while the route owner is unresolved', async () => {
         const sessionId = 'route_owner_race';
         const { sync } = await import('./sync');

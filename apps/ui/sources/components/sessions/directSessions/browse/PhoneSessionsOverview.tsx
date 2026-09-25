@@ -10,7 +10,9 @@ import { BrandLogo } from '@/components/ui/navigation/BrandLogo';
 import { ITEM_TITLE_TEXT_METRICS, ITEM_SUBTITLE_TEXT_METRICS } from '@/components/ui/lists/itemDensityMetrics';
 import { Typography } from '@/constants/Typography';
 import { useAllMachines } from '@/sync/domains/state/storage';
-import { useActiveServerAccountScope, useProfile, useSettings, useSocketStatus } from '@/sync/store/hooks';
+import { useActiveServerAccountScope, useIsDataReady, useMachineDisplayById, useProfile, useSettings, useSocketStatus } from '@/sync/store/hooks';
+import { loadDirectSessionTranscriptWarmCacheIndex } from '@/sync/domains/state/warmCachePersistence';
+import { readDirectSessionLink } from '@/sync/domains/session/directSessions/readDirectSessionLink';
 import { useSessionListRelativeTimeNowMs, useSessionListRuntimeNowMs, useSessionListRuntimeWake } from '@/hooks/session/sessionListRuntimeClock';
 import { resolveDirectBrowseSourceOptions } from './resolveDirectBrowseSourceOptions';
 import { usePhoneMachineProjects } from '@/components/settings/machines/usePhoneMachineProjects';
@@ -111,6 +113,8 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     const discoveryEnabled = focused && appActive && socket.status === 'connected';
     const { theme } = useUnistyles();
     const machines = useAllMachines();
+    const machineDisplays = useMachineDisplayById();
+    const dataReady = useIsDataReady();
     const profile = useProfile();
     const settings = useSettings();
     const clockActive = focused && appActive;
@@ -133,12 +137,28 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     const recentLimit = settings.phoneRecentSessionLimit ?? ACCOUNT_DISPLAY_SETTING_DEFINITIONS.phoneRecentSessionLimit.default;
     const visibleMachines = React.useMemo(() => scope.machineId ? machines.filter((machine) => machine.id === scope.machineId) : machines, [machines, scope.machineId]);
     const sourceOptions = React.useMemo(() => resolveDirectBrowseSourceOptions({ providerId: 'codex', profile, settings }), [profile, settings]);
-    const sources = React.useMemo<PhoneBrowseSource[]>(() => visibleMachines.flatMap((machine) => sourceOptions.map((option) => ({
+    const sources = React.useMemo<PhoneBrowseSource[]>(() => {
+        const onlineOwned = visibleMachines.flatMap((machine) => sourceOptions.map((option) => ({
         key: stableJsonStringify([scope.serverId, scope.accountId, machine.id, option.key, option.source]),
         machineId: machine.id, machineLabel: getMachineDisplayName(machine) ?? '电脑',
         sourceKey: option.key, source: option.source, online: isMachineOnline(machine, nowMs),
-    }))), [visibleMachines, sourceOptions, scope.serverId, scope.accountId, nowMs]);
+        })));
+        // 冷开离线只借用既有显示缓存作为入口，不创建机器实体或沿用上次在线事实。
+        const cachedMachineIds = new Set(Object.values((socket.status !== 'connected' || !dataReady) && visibleMachines.length === 0
+            ? loadDirectSessionTranscriptWarmCacheIndex(scope.serverId, scope.accountId) : {})
+            .map((entry) => readDirectSessionLink(entry.session.metadata)?.machineId).filter((id): id is string => Boolean(id)));
+        for (const id of cachedMachineIds) {
+            const display = machineDisplays[id];
+            if (!display || display.revokedAt || display.replacedByMachineId || visibleMachines.some((machine) => machine.id === id) || (scope.machineId && scope.machineId !== id)) continue;
+            for (const option of sourceOptions) onlineOwned.push({
+                key: stableJsonStringify([scope.serverId, scope.accountId, id, option.key, option.source]),
+                machineId: id, machineLabel: getMachineDisplayName(display) ?? '电脑', sourceKey: option.key, source: option.source, online: false,
+            });
+        }
+        return onlineOwned;
+    }, [visibleMachines, machineDisplays, dataReady, sourceOptions, scope.serverId, scope.accountId, scope.machineId, socket.status, nowMs]);
     const selectedComputer = scope.machineId ? visibleMachines[0] : null;
+    const selectedComputerDisplay = selectedComputer ?? (scope.machineId && sources.some((source) => source.machineId === scope.machineId) ? machineDisplays[scope.machineId] : null);
     const projectState = usePhoneMachineProjects({ machineId: selectedComputer?.id ?? null, serverId: scope.serverId, enabled: Boolean(scope.projectKey && selectedComputer && isMachineOnline(selectedComputer, nowMs)) });
     const selectedProject = projectState.projects?.find((project) => JSON.stringify([project.sourceKey, project.id]) === scope.projectKey);
     const projectUnavailable = Boolean(scope.projectKey && projectState.projects !== null && (!selectedProject || !selectedProject.available));
@@ -196,12 +216,12 @@ function ScopedPhoneSessionsOverview(scope: Readonly<{ serverId: string; account
     }, []);
 
     return <View testID="phone-sessions-overview" style={styles.screen}>
-        <PhoneSessionsHeader title={history ? selectedProject?.name || getMachineDisplayName(selectedComputer) || '电脑会话' : undefined}
-            subtitle={history ? scope.projectKey ? getMachineDisplayName(selectedComputer) || undefined : '全部会话' : undefined} onBack={scope.onBack}
+        <PhoneSessionsHeader title={history ? selectedProject?.name || getMachineDisplayName(selectedComputerDisplay) || '电脑会话' : undefined}
+            subtitle={history ? scope.projectKey ? getMachineDisplayName(selectedComputerDisplay) || undefined : '全部会话' : undefined} onBack={scope.onBack}
             searchOpen={searchOpen} onToggleSearch={() => setSearchOpen((open) => !open)} />
         {searchOpen ? <TextInput testID="phone-sessions-search" accessibilityLabel={t('sessionsList.searchSessions')} placeholder={t('directSessions.browseSearchPlaceholder')} placeholderTextColor={theme.colors.input.placeholder} value={query} onChangeText={setQuery} style={styles.search} /> : null}
-        {machines.length === 0 ? <Text style={styles.hint}>还没有连接的电脑，请在电脑端登录同一账号。</Text> : null}
-        {scope.machineId && visibleMachines.length === 0 ? <Text testID="phone-sessions-machine-unavailable" style={styles.hint}>当前账号下没有所选电脑，请返回重新选择。</Text> : null}
+        {sources.length === 0 && machines.length === 0 ? <Text style={styles.hint}>还没有连接的电脑，请在电脑端登录同一账号。</Text> : null}
+        {scope.machineId && sources.length === 0 ? <Text testID="phone-sessions-machine-unavailable" style={styles.hint}>当前账号下没有所选电脑，请返回重新选择。</Text> : null}
         {scope.projectKey && projectState.loading && !projectState.projects ? <Text style={styles.hint}>{t('codexTopProjects.loading')}</Text> : null}
         {projectUnavailable ? <Text testID="phone-sessions-project-unavailable" style={styles.hint}>{t('codexTopProjects.missing')}</Text> : null}
         {scope.projectKey && selectedComputer && !isMachineOnline(selectedComputer, nowMs) ? <Text style={styles.hint}>{t('codexTopProjects.offline')}</Text> : null}

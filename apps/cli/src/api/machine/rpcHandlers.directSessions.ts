@@ -580,8 +580,16 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         const openSource = validateDirectMachineSource({ providerId: linked.session.providerId, source: linked.session.source, env: process.env });
         if (!openSource.ok) return err('invalid_request', 'source_mismatch') satisfies DirectSessionLinkEnsureResponse;
         if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable') satisfies DirectSessionLinkEnsureResponse;
-        await linkOps.openExistingSession({ source: openSource.source, remoteSessionId: linked.session.remoteSessionId,
-          isCurrent: () => isCurrentLifecycle(currentEpoch) });
+        try {
+          await linkOps.openExistingSession({ source: openSource.source, remoteSessionId: linked.session.remoteSessionId,
+            isCurrent: () => isCurrentLifecycle(currentEpoch) });
+        } catch (error) {
+          // 关联已核验时，桌面发现暂时不可用不阻断阅读；控制和发送仍由原 STATUS/CONTROL 判断。
+          if (!(error instanceof DirectSessionsProviderUnavailableError)
+            || !['timeout', 'owner_unavailable'].includes(error.message)) throw error;
+        }
+        // 等待发现期间可能退出或更换账号，旧关联不能在新生命周期里继续导航。
+        if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable') satisfies DirectSessionLinkEnsureResponse;
       }
       return { ok: true, sessionId: res.sessionId, created: res.created } satisfies DirectSessionLinkEnsureResponse;
     } catch (error) {
