@@ -36,7 +36,7 @@ export function PhoneMachineDetails(props: Readonly<{ machineId: string; serverI
         </SettingsSection>
         <SettingsSection compact>
             <Item style={{ minHeight: 48 }} testID="phone-machine-view-sessions" title="查看会话" density="cozy" icon={<Icon name="chat-circle-dots" size={22} color={theme.colors.text.secondary} />}
-                onPress={() => router.push({ pathname: '/', params: { machineId: machine.id, serverId: scope.serverId } })} />
+                onPress={() => router.push({ pathname: '/machine/[id]/sessions', params: { id: machine.id, serverId: scope.serverId } })} />
         </SettingsSection>
         <SettingsSection compact title={t('codexTopProjects.title')}>
             {!machineOnline ? <Item style={{ minHeight: 48 }} testID="phone-machine-projects-offline" title={t('codexTopProjects.offline')} density="cozy" mode="info" /> : null}
@@ -46,7 +46,7 @@ export function PhoneMachineDetails(props: Readonly<{ machineId: string; serverI
             {projects.projects?.map((project) => <Item style={{ minHeight: 48 }} titleLines={0} key={JSON.stringify([project.sourceKey, project.id])} testID={`phone-machine-project-${project.id}`}
                 title={project.name || project.id} subtitle={project.available ? t('codexTopProjects.openSessions') : t('codexTopProjects.unavailableFolder')}
                 density="cozy" disabled={!project.available} icon={<Icon name="folder" size={22} color={theme.colors.text.secondary} />}
-                onPress={() => router.push({ pathname: '/', params: { machineId: machine.id, serverId: scope.serverId, projectId: project.id, sourceKey: project.sourceKey } })} />)}
+                onPress={() => router.push({ pathname: '/machine/[id]/sessions', params: { id: machine.id, serverId: scope.serverId, projectId: project.id, sourceKey: project.sourceKey } })} />)}
             {machineOnline ? <Item style={{ minHeight: 48 }} testID="phone-machine-projects-refresh" title={t('codexTopProjects.refresh')} density="cozy" disabled={projects.loading} onPress={() => { void projects.refresh(); }} /> : null}
         </SettingsSection>
     </ItemList>;

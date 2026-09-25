@@ -93,6 +93,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
     providerId: DirectSessionsProviderId | null;
     source: DirectSessionsSource | null;
     searchTerm?: string;
+    requestLimit?: number;
     autoRefreshEnabled?: boolean;
     observationScope?: DirectBrowseObservationScope;
     actionPending?: boolean;
@@ -100,8 +101,9 @@ export function useDirectBrowseCandidates(params: Readonly<{
 }>) {
     const { machineId, providerId, source, serverId } = params;
     const query = params.searchTerm?.trim() ?? '';
-    // 来源对象重新分配不代表身份变化；账号也必须属于分页和回包的隔离范围。
-    const scopeKey = stableJsonStringify([serverId, params.accountId, machineId, providerId, source, query]);
+    const requestLimit = params.requestLimit ?? CANDIDATES_PAGE_LIMIT;
+    // 数量改变同样废弃旧分页与回包；电脑和项目历史不传偏好，仍按原来的每页 50 条读取。
+    const scopeKey = stableJsonStringify([serverId, params.accountId, machineId, providerId, source, query, requestLimit]);
     const scopeRef = React.useRef(scopeKey);
     scopeRef.current = scopeKey;
     const controlsRef = React.useRef(params);
@@ -151,7 +153,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
             if (!isCurrent() || latest.actionPending || latest.isActionPending?.()
                 || (opts?.automatic && latest.autoRefreshEnabled !== true)) return null;
             const input = {
-                machineId, providerId, source, limit: CANDIDATES_PAGE_LIMIT,
+                machineId, providerId, source, limit: requestLimit,
                 ...(pageCursor ? { cursor: pageCursor } : {}),
                 ...(query ? { searchTerm: query } : {}),
                 ...(searchMode ? { searchMode } : {}),
@@ -168,7 +170,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
             const listObservation = { requestedAtMs, receivedAtMs, requestedMonotonicMs, receivedMonotonicMs, requestSequence, scope: observationScope };
             return { ...result, candidates: result.candidates.map((candidate) => ({ ...candidate, listObservation })) };
         };
-        /** 失败保留整个旧窗口，继续使用既有错误或游标不完整提示。 */
+        /** 页面失败保留已发布事实与浏览范围，继续使用既有错误或游标不完整提示。 */
         const readPage = (result: Awaited<ReturnType<typeof request>>, augmentation = false): CandidatePage | null => {
             if (!isCurrent() || !result) return null;
             if (!result.ok) {
@@ -182,9 +184,39 @@ export function useDirectBrowseCandidates(params: Readonly<{
             if (augmentation && result.searchIncomplete && result.candidates.length === 0) return null;
             return { candidates: result.candidates, nextCursor: result.nextCursor ?? null, incomplete: result.searchIncomplete === true };
         };
-        /** 原游标未变时复用深页；变化时仅沿新游标重建用户已加载的页数。 */
+        /** 发布同一 owner 的分页投影；等值行和数组保持引用，不单独缓存另一套列表。 */
+        const publishCandidates = (pages: readonly CandidatePage[]) => {
+            const items = pages.reduce<readonly DirectBrowseCandidate[]>((all, page) => mergeDirectBrowseCandidates(all, page.candidates, 'append'), []);
+            setCandidates((current) => {
+                const byId = new Map(current.map((candidate) => [candidate.remoteSessionId, candidate]));
+                const reconciled = items.map((candidate) => {
+                    const previous = byId.get(candidate.remoteSessionId);
+                    return previous && stableJsonStringify(previous) === stableJsonStringify(candidate) ? previous : candidate;
+                });
+                return current.length === reconciled.length && current.every((item, index) => item === reconciled[index]) ? current : reconciled;
+            });
+        };
+        /** 重建前及时替换已显示行的首屏事实；保留原页边界和键顺序，未重读行不能冒充当前状态。 */
+        const publishFirstPageFacts = (first: CandidatePage) => {
+            if (!isCurrent()) return;
+            const observed = new Map(first.candidates.map((candidate) => [candidate.remoteSessionId, candidate]));
+            const retainedPages = pagesRef.current.map((page) => ({ ...page, candidates: page.candidates.map((candidate) => {
+                const latest = observed.get(candidate.remoteSessionId);
+                if (latest) return mergeDirectBrowseCandidate(candidate, latest);
+                if (candidate.details?.codexLifecycle === undefined) return candidate;
+                // 只撤销生命周期，不给保留行盖本次观测时间；标题、动作和已浏览范围保持。
+                return { ...candidate, details: { ...candidate.details, codexLifecycle: undefined } };
+            }) }));
+            pagesRef.current = retainedPages;
+            publishCandidates(retainedPages);
+            // 旧游标只用于保留显示位置，完整重建成功前禁止沿它继续翻页。
+            refreshRequiredRef.current = true;
+            setRefreshRequired(true);
+        };
+        /** 已验证且首游标未变时复用深页；失效窗口必须按原加载页数重新核验，不能因游标回到旧值跳过。 */
         const rebuildWindow = async (first: CandidatePage): Promise<readonly CandidatePage[] | null> => {
-            if (oldPages.length > 1 && oldPages[0]?.nextCursor === first.nextCursor) return [first, ...oldPages.slice(1)];
+            if (oldPages.length > 1 && oldPages[0]?.nextCursor === first.nextCursor && !refreshRequiredRef.current) return [first, ...oldPages.slice(1)];
+            if (oldPages.length > 1 && first.nextCursor) publishFirstPageFacts(first);
             const pages = [first];
             const seen = new Set<string>();
             while (pages.length < oldPages.length && pages.at(-1)?.nextCursor) {
@@ -201,19 +233,11 @@ export function useDirectBrowseCandidates(params: Readonly<{
             }
             return pages;
         };
-        /** 一次发布完整窗口；等值行和等值数组保留引用，减少刷新造成的重绘。 */
+        /** 完整窗口通过后才替换页边界与成员，并解除旧游标门禁。 */
         const commitPages = (pages: readonly CandidatePage[], result: Awaited<ReturnType<typeof request>>) => {
             if (!isCurrent() || !result?.ok) return;
             pagesRef.current = pages;
-            const items = pages.reduce<readonly DirectBrowseCandidate[]>((all, page) => mergeDirectBrowseCandidates(all, page.candidates, 'append'), []);
-            setCandidates((current) => {
-                const byId = new Map(current.map((candidate) => [candidate.remoteSessionId, candidate]));
-                const reconciled = items.map((candidate) => {
-                    const previous = byId.get(candidate.remoteSessionId);
-                    return previous && stableJsonStringify(previous) === stableJsonStringify(candidate) ? previous : candidate;
-                });
-                return current.length === reconciled.length && current.every((item, index) => item === reconciled[index]) ? current : reconciled;
-            });
+            publishCandidates(pages);
             setNextCursor(pages.at(-1)?.nextCursor ?? null);
             setSearchIncomplete(pages.some((page) => page.incomplete));
             refreshRequiredRef.current = false;
@@ -323,7 +347,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
 
     /** 翻页只追加一个有效游标页，和刷新共享进行中的请求。 */
     const loadMore = React.useCallback(() => loadCandidates({ append: true }), [loadCandidates]);
-    /** 用户刷新保留已读窗口，只有新窗口完整成功后才替换。 */
+    /** 用户刷新先更新已显示行的事实，完整成功后才替换已读窗口的成员与页边界。 */
     const refresh = React.useCallback(() => loadCandidates(), [loadCandidates]);
     /** 成功删除同时移除各页中的条目并作废旧回包，防止会话被旧刷新复活。 */
     const removeCandidate = React.useCallback((remoteSessionId: string) => {

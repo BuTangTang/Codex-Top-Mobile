@@ -26,7 +26,7 @@ describe('phone computer detail', () => {
         expect(screen.findByTestId('phone-machine-last-seen')?.props.detail).toBe('未知');
         expect(screen.findByTestId('phone-machine-identity')?.props.title).toBe('真实电脑');
         await act(async () => { screen.pressByTestId('phone-machine-view-sessions'); });
-        expect(state.push).toHaveBeenCalledWith({ pathname: '/', params: { machineId: 'm1', serverId: 'server-a' } });
+        expect(state.push).toHaveBeenCalledWith({ pathname: '/machine/[id]/sessions', params: { id: 'm1', serverId: 'server-a' } });
         expect(screen.findByTestId('phone-machine-projects-offline')).not.toBeNull();
     });
     it('reads real projects and opens an existing-conversation filter with identity rather than a path', async () => {
@@ -35,7 +35,7 @@ describe('phone computer detail', () => {
         const { PhoneMachineDetails } = await import('./PhoneMachineDetails');
         const screen = await renderScreen(<PhoneMachineDetails machineId="m1" serverId="server-a" />);
         await act(async () => { screen.pressByTestId('phone-machine-project-real-project'); });
-        expect(state.push).toHaveBeenCalledWith({ pathname: '/', params: { machineId: 'm1', serverId: 'server-a', projectId: 'real-project', sourceKey: 'codex:user' } });
+        expect(state.push).toHaveBeenCalledWith({ pathname: '/machine/[id]/sessions', params: { id: 'm1', serverId: 'server-a', projectId: 'real-project', sourceKey: 'codex:user' } });
     });
     it('does not navigate another server using an identically named machine', async () => {
         const { PhoneMachineDetails } = await import('./PhoneMachineDetails');

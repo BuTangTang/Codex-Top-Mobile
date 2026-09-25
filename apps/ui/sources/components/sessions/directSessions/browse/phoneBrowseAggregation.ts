@@ -54,19 +54,28 @@ function readPhoneCandidateObservation(candidate: DirectBrowseCandidate, monoton
     return { elapsedMs: monotonicNowMs - requested };
 }
 
-/** 电脑事件仅和同次检查时间相减；缓存过期用手机单调经过时长，不能比较两端墙钟。 */
-export function readPhoneCandidateLifecycle(candidate: DirectBrowseCandidate, online: boolean, nowMs: number,
-    monotonicNowMs = globalThis.performance?.now?.() ?? NaN): CodexLifecycleV1 {
+/** 同时投影事实与下次过期时刻；只用单调年龄判断有效性，墙钟仅承载共享时钟的唤醒地址。 */
+function projectPhoneCandidateLifecycle(candidate: DirectBrowseCandidate, online: boolean, nowMs: number,
+    monotonicNowMs: number): Readonly<{ lifecycle: CodexLifecycleV1; nextWakeAtMs: number | null }> {
     const parsed = CodexLifecycleV1Schema.safeParse(candidate.details?.codexLifecycle);
-    const unknown: CodexLifecycleV1 = { v: 1, state: 'unknown', eventAtMs: null, checkedAtMs: nowMs };
+    const unknown = { lifecycle: { v: 1, state: 'unknown', eventAtMs: null, checkedAtMs: nowMs } as CodexLifecycleV1, nextWakeAtMs: null };
     if (!online || !parsed.success) return unknown;
     const observation = readPhoneCandidateObservation(candidate, monotonicNowMs);
     if (!observation || observation.elapsedMs > LIFECYCLE_MAX_AGE_MS) return unknown;
     const fact = parsed.data;
     // 协议已校验 eventAt <= checkedAt；running 还需要检查当时年龄加本机缓存年龄。
-    if (fact.state === 'running' && (fact.eventAtMs === null
-        || fact.checkedAtMs - fact.eventAtMs + observation.elapsedMs > LIFECYCLE_MAX_AGE_MS)) return unknown;
-    return fact;
+    if (fact.state === 'running' && fact.eventAtMs === null) return unknown;
+    const initialAgeMs = fact.state === 'running' ? fact.checkedAtMs - fact.eventAtMs! : 0;
+    const remainingMs = LIFECYCLE_MAX_AGE_MS - observation.elapsedMs - initialAgeMs;
+    if (remainingMs < 0) return unknown;
+    // 既有边界是严格大于 TTL：安排在有效期之后的首个毫秒，过期或原本未知时不再重复唤醒。
+    return { lifecycle: fact, nextWakeAtMs: fact.state === 'unknown' ? null : nowMs + Math.floor(remainingMs) + 1 };
+}
+
+/** 电脑事件仅和同次检查时间相减；外部只读调用与列表唤醒复用同一个有效期投影。 */
+export function readPhoneCandidateLifecycle(candidate: DirectBrowseCandidate, online: boolean, nowMs: number,
+    monotonicNowMs = globalThis.performance?.now?.() ?? NaN): CodexLifecycleV1 {
+    return projectPhoneCandidateLifecycle(candidate, online, nowMs, monotonicNowMs).lifecycle;
 }
 
 /** 用同一候选的 LIST 检查时间换算更新时间；无参照时保留有效原值，不误判电脑领先为未来。 */
@@ -109,6 +118,7 @@ export function aggregatePhoneBrowseSources(input: Readonly<{
     let hasMore = false;
     let incomplete = false;
     let hasUnclassified = false;
+    let nextLifecycleWakeAtMs: number | null = null;
     for (const source of input.sources) {
         const snapshot = input.snapshots[source.key];
         if (!source.online) hasUnclassified = true;
@@ -125,7 +135,9 @@ export function aggregatePhoneBrowseSources(input: Readonly<{
         for (const candidate of snapshot.candidates) {
             if (input.projectRequired && !input.project) continue;
             if (input.project && !belongsToPhoneProject(candidate, source, input.project)) continue;
-            const lifecycle = readPhoneCandidateLifecycle(candidate, source.online, input.nowMs, monotonicNowMs);
+            const { lifecycle, nextWakeAtMs } = projectPhoneCandidateLifecycle(candidate, source.online, input.nowMs, monotonicNowMs);
+            if (nextWakeAtMs !== null) nextLifecycleWakeAtMs = nextLifecycleWakeAtMs === null
+                ? nextWakeAtMs : Math.min(nextLifecycleWakeAtMs, nextWakeAtMs);
             if (lifecycle.state === 'unknown' || lifecycle.state === 'failed' || lifecycle.state === 'cancelled') hasUnclassified = true;
             if (input.phase && lifecycle.state !== input.phase) continue;
             const extras = resolveDirectBrowseLinkEnsureRequestExtras({ providerId: 'codex', source: source.source, candidate });
@@ -146,5 +158,5 @@ export function aggregatePhoneBrowseSources(input: Readonly<{
     }
     // 时间只用于排序及显示，完全不参与状态分类；相同时间使用完整身份稳定排序。
     const rows = [...rowsByIdentity.values()].sort((left, right) => (right.timeMs ?? 0) - (left.timeMs ?? 0) || left.key.localeCompare(right.key));
-    return { rows, loading, loadingMore, hasMore, incomplete, hasUnclassified, refreshSources, loadMoreSources };
+    return { rows, loading, loadingMore, hasMore, incomplete, hasUnclassified, refreshSources, loadMoreSources, nextLifecycleWakeAtMs };
 }

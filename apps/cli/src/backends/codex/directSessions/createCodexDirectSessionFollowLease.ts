@@ -4,7 +4,7 @@ import type { DirectSessionFollowLease, DirectSessionObservationFact } from '@/a
 import { configuration } from '@/configuration';
 import { readAfterCodexTranscript } from './readAfterCodexTranscript';
 import { resolveCodexHomeEntriesForDirectSessionsSource } from './resolveCodexHomeEntriesForDirectSessionsSource';
-import { DesktopIpc } from './desktop/desktopIpc';
+import { DesktopIpc, DesktopIpcError } from './desktop/desktopIpc';
 import { readDesktopConversationObservation } from './desktop/desktopConversationObservation';
 import { readDesktopControlSnapshot } from './desktop/desktopControlSnapshot';
 
@@ -16,6 +16,7 @@ export async function createCodexDirectSessionFollowLease(params: {
   let ipc: DesktopIpc | null = null;
   let released = false;
   let baselineStarted = false;
+  let baselineAttempts = 0;
   let baselineSelected = false;
   let baselineInvalidated = false;
   let observation: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
@@ -71,9 +72,11 @@ export async function createCodexDirectSessionFollowLease(params: {
       if (opened.isClosed()) ipc = null;
     });
   };
-  /** 每份租约只读取一次关联当前快照；先有文件边界，等待期间的新事实优先于迟到基线。 */
+  /** 首次关联读取遇到暂时传输失败只恢复一次；每次先有文件边界，新事实仍优先于迟到基线。 */
   const initializeBaseline = async (opened: DesktopIpc) => {
     baselineStarted = true;
+    baselineAttempts += 1;
+    baselineInvalidated = false;
     const before = observation;
     try {
       const raw = await opened.readControlSnapshot(params.remoteSessionId);
@@ -84,8 +87,14 @@ export async function createCodexDirectSessionFollowLease(params: {
         publish(next, 'snapshot');
         baselineSelected = true;
       }
-    } catch {
+    } catch (error) {
       // 基线不可证时保持现有未知或前向事实，不能把历史首包降级为当前状态。
+      if (error instanceof DesktopIpcError && ['timeout', 'connection_closed', 'owner_changed', 'owner_unavailable'].includes(error.reason)
+        && baselineAttempts === 1 && !released && ipc === opened && !baselineInvalidated && observation.state === 'unknown') {
+        // 清掉本次失败订阅，由同一按需 poller 验证来源后重新发现 owner；不添加定时器或后台循环。
+        opened.close(); ipc = null; baselineStarted = false;
+        return;
+      }
     }
     if (released || ipc !== opened) return;
     try {
@@ -95,7 +104,7 @@ export async function createCodexDirectSessionFollowLease(params: {
       if (observation.state === 'unknown' || observation.source !== 'rollout') markSourceUnavailable();
     }
   };
-  /** 重连只恢复 Desktop 订阅；探测失败不撤销仍有效的 rollout 读取来源。 */
+  /** 一般重连只恢复订阅；首次基线恢复由原 poller 的有效来源边界放行。 */
   const connect = async () => {
     if (ipc || released || homes.length !== 1) return;
     let opened: DesktopIpc | null = null;
@@ -104,7 +113,7 @@ export async function createCodexDirectSessionFollowLease(params: {
       await opened.discoverOwner(params.remoteSessionId);
       if (released) { opened.close(); return; }
       ipc = opened;
-      // 初次连接先由下方文件读取建立边界，再异步读取一次基线；后续连接直接订阅。
+      // 初次或唯一恢复连接等待下方基线读取；成功基线之后的重连仍只订阅。
       if (baselineStarted) follow(opened);
     } catch {
       opened?.close(); ipc = null;
@@ -115,7 +124,8 @@ export async function createCodexDirectSessionFollowLease(params: {
     initialCursor: params.initialCursor,
     /** 先读取来源连续性，再消费前向事实；来源失效会撤销 rollout，而不是依赖 IPC 是否连接。 */
     readAfterTranscript: async ({ cursor, maxBytes, maxItems }) => {
-      await connect();
+      const recoveringBaseline = !baselineStarted && baselineAttempts === 1;
+      if (!recoveringBaseline) await connect();
       const result = await readAfterCodexTranscript({ ...params, activeServerDir: configuration.activeServerDir, cursor, maxBytes, maxItems }).catch((error) => {
         // 文件读取失败只撤销依赖 rollout 的状态，已确认的 Desktop 来源仍独立有效。
         if (!hasUsableDesktopObservation()) markSourceUnavailable();
@@ -132,6 +142,8 @@ export async function createCodexDirectSessionFollowLease(params: {
             && observation.turnId === fact.data.turnId && isTerminal(observation)) continue;
         publish(fact.data, 'event');
       }
+      // 恢复前先确认本批来源仍连续可用；失效来源和已释放租约不能启动恢复连接。
+      if (recoveringBaseline && !released && !rolloutUnavailable) await connect();
       // 不 await 水合请求，原轮询继续接收等待期间的新轮和来源失效事实。
       if (!released && ipc && !baselineStarted && !rolloutUnavailable) void initializeBaseline(ipc);
       return { ...result, observations: pending.splice(0) };

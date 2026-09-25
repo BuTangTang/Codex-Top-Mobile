@@ -19,6 +19,13 @@ function bucketBytes(value: number, smallMax: number, mediumMax: number): 'small
 }
 
 export const ACCOUNT_DISPLAY_SETTING_DEFINITIONS = defineSettingDefinitions({
+    phoneRecentSessionLimit: {
+        // D-12：首页最近列表的可选上限；电脑和项目历史继续使用完整分页。
+        schema: z.union([z.literal(20), z.literal(50), z.literal(100), z.literal(200)]),
+        default: 50,
+        description: '手机首页最近会话的显示数量',
+        storageScope: 'account',
+    },
     sessionThinkingDisplayMode: {
         schema: z.enum(['inline', 'tool', 'hidden']),
         default: 'inline',

@@ -79,6 +79,7 @@ const stylesheet = StyleSheet.create((theme: AppTheme) => ({
 export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
     phoneData?: Readonly<{
         searchQuery: string;
+        requestLimit?: number;
         discoveryEnabled: boolean;
         observationScope: DirectBrowseObservationScope;
         actionPending: boolean;
@@ -269,6 +270,7 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         providerId: selectedProviderId,
         source: selectedSource,
         searchTerm: candidateSearchTerm,
+        requestLimit: props.phoneData?.requestLimit,
         autoRefreshEnabled: props.phoneData?.discoveryEnabled,
         observationScope: props.phoneData?.observationScope,
         actionPending: Boolean(linkingSessionId || deletingSessionId || props.phoneData?.actionPending),

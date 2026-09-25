@@ -111,13 +111,6 @@ vi.mock('expo-constants', () => ({
     default: { expoConfig: { version: '0.0.0-test' } },
 }));
 
-vi.mock('@/constants/Typography', () => ({
-    Typography: {
-        default: () => ({}),
-        mono: () => ({}),
-    },
-}));
-
 vi.mock('@/components/ui/lists/ItemList', () => ({
     ItemList: createPassthroughNode('ItemList'),
 }));

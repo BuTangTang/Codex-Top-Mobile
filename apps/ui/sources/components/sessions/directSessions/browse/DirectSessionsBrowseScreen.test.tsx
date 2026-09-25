@@ -47,6 +47,7 @@ const candidateDeleteSpy = vi.hoisted(() => vi.fn(async (): Promise<DirectSessio
 })));
 const routerPushSpy = vi.hoisted(() => vi.fn());
 const routerNavigateSpy = vi.hoisted(() => vi.fn());
+const routerBackSpy = vi.hoisted(() => vi.fn());
 const modalAlertSpy = vi.hoisted(() => vi.fn());
 const modalConfirmSpy = vi.hoisted(() => vi.fn(async () => true));
 const profileMock = vi.hoisted(() => ({
@@ -66,6 +67,7 @@ vi.mock('@react-navigation/native', () => ({
     useIsFocused: () => createReactNavigationNativeMock({ isFocused: focusState.value }).useIsFocused(),
 }));
 const settingsMock = vi.hoisted(() => ({
+    phoneRecentSessionLimit: 50,
     connectedServicesProfileLabelByKey: {
         'openai-codex/work': 'Work Profile',
     },
@@ -78,7 +80,7 @@ let machinesState = [
 const routeParams = vi.hoisted(() => ({ value: {} as Record<string, string> }));
 const expoRouterMock = createExpoRouterMock({
     params: () => routeParams.value,
-    router: { push: routerPushSpy, navigate: routerNavigateSpy },
+    router: { push: routerPushSpy, navigate: routerNavigateSpy, back: routerBackSpy },
 });
 
 installNewSessionComponentsCommonModuleMocks({
@@ -230,6 +232,7 @@ function phoneCandidate(remoteSessionId: string, state: 'running' | 'needs_input
 
 describe('DirectSessionsBrowseScreen', () => {
     beforeEach(() => {
+        settingsMock.phoneRecentSessionLimit = 50;
         projectsListSpy.mockReset().mockResolvedValue({ ok: true, projects: [], nativeCreate: false, unavailableReason: 'desktop_native_create_unavailable' });
         routeParams.value = {};
         activeScopeState.value = null;
@@ -245,9 +248,70 @@ describe('DirectSessionsBrowseScreen', () => {
         candidateDeleteSpy.mockClear();
         routerPushSpy.mockClear();
         routerNavigateSpy.mockClear();
+        routerBackSpy.mockClear();
         modalAlertSpy.mockClear();
         modalConfirmSpy.mockClear();
         modalConfirmSpy.mockResolvedValue(true);
+    });
+
+    /** 保持真实聚合与共享时钟，断开 LIST 后也必须准确过期，并继续更新相对时间。 */
+    it('expires phone lifecycle and advances relative time without another LIST publication', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        vi.useFakeTimers();
+        let screen: Awaited<ReturnType<typeof renderScreen>> | undefined;
+        try {
+            activeScopeState.value = { serverId: 's', accountId: 'a' };
+            machinesState = [machinesState[0]!];
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('aging', 'running', 899_500)], nextCursor: null });
+            screen = await renderScreen(<PhoneSessionsOverview />);
+            const list = () => screen!.findAllByType('FlatList')[0]!;
+            socketState.status = 'disconnected';
+            await screen.update(<PhoneSessionsOverview />);
+            const requestCount = candidatesListSpy.mock.calls.length;
+            const relativeBefore = list().props.extraData.nowMs;
+            expect(list().props.data[0]?.lifecycle.state).toBe('running');
+            await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+            expect(list().props.data[0]?.lifecycle.state).toBe('running');
+            await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+            expect(list().props.data[0]?.lifecycle.state).toBe('unknown');
+            await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+            expect(list().props.extraData.nowMs).toBeGreaterThanOrEqual(relativeBefore + 60_000);
+            expect(candidatesListSpy).toHaveBeenCalledTimes(requestCount);
+            expect(vi.getTimerCount()).toBe(1);
+        } finally { await screen?.unmount(); vi.useRealTimers(); }
+    });
+
+    /** 页面不活跃时撤销自身唤醒；重返页面立刻重算，不等待 socket 重连或下一次节拍。 */
+    it.each(['blur', 'background'] as const)('stops phone clock while %s and catches up immediately on return', async (inactive) => {
+        await directSessionsBrowseScreenModulePromise;
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        vi.useFakeTimers();
+        let screen: Awaited<ReturnType<typeof renderScreen>> | undefined;
+        try {
+            activeScopeState.value = { serverId: 's', accountId: 'a' };
+            machinesState = [machinesState[0]!];
+            candidatesListSpy.mockResolvedValue({ ok: true, candidates: [phoneCandidate('retained', 'completed')], nextCursor: null });
+            screen = await renderScreen(<PhoneSessionsOverview />);
+            const list = () => screen!.findAllByType('FlatList')[0]!;
+            socketState.status = 'disconnected';
+            await screen.update(<PhoneSessionsOverview />);
+            const requestCount = candidatesListSpy.mock.calls.length;
+            if (inactive === 'blur') { focusState.value = false; await screen.update(<PhoneSessionsOverview />); }
+            else await act(async () => { appStateBoundary.emit('background'); });
+            const frozen = list().props.extraData;
+            expect(vi.getTimerCount()).toBe(0);
+            await act(async () => { await vi.advanceTimersByTimeAsync(960_000); });
+            expect(list().props.extraData).toBe(frozen);
+            if (inactive === 'blur') { focusState.value = true; await screen.update(<PhoneSessionsOverview />); }
+            else await act(async () => { appStateBoundary.emit('active'); });
+            expect(list().props.data[0]?.lifecycle.state).toBe('unknown');
+            expect(list().props.extraData.nowMs).toBeGreaterThan(frozen.nowMs);
+            expect(candidatesListSpy).toHaveBeenCalledTimes(requestCount);
+            await screen.unmount();
+            screen = undefined;
+            expect(vi.getTimerCount()).toBe(0);
+        } finally { await screen?.unmount(); vi.useRealTimers(); }
     });
 
     it.each([false, true])('keeps retained deep-page rows unknown after AppState sleep with batched events %s and a stopped monotonic clock', async (batched) => {
@@ -360,7 +424,7 @@ describe('DirectSessionsBrowseScreen', () => {
         } finally { vi.useRealTimers(); }
     });
 
-    /** 自动 LIST 继续更新事实，但阅读期间只冻结行顺序，回到顶部再采用最新排序。 */
+    /** 自动发现把新会话置前，旧行在阅读时保持相对顺序，回顶后恢复完整最新排序。 */
     it('keeps reading rows in place through automatic discovery and releases their order at the top', async () => {
         await directSessionsBrowseScreenModulePromise;
         const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
@@ -385,8 +449,9 @@ describe('DirectSessionsBrowseScreen', () => {
             refreshed = true;
             await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
             expect(candidatesListSpy).toHaveBeenCalledTimes(sourceCount * 2);
-            expect(list().props.data.map((row: { candidate: { remoteSessionId: string } }) => row.candidate.remoteSessionId)).toEqual(['first', 'second', 'new']);
-            const currentSecond = list().props.data[1];
+            expect(list().props.data.map((row: { candidate: { remoteSessionId: string } }) => row.candidate.remoteSessionId)).toEqual(['new', 'first', 'second']);
+            expect(list().props.maintainVisibleContentPosition).toMatchObject({ minIndexForVisible: 0 });
+            const currentSecond = list().props.data[2];
             expect(currentSecond).not.toBe(oldSecond);
             expect(currentSecond.lifecycle.state).toBe('completed');
             await act(async () => { screen.pressByTestId(`phone-session:${currentSecond.key}`); });
@@ -394,6 +459,133 @@ describe('DirectSessionsBrowseScreen', () => {
             await act(async () => { list().props.onScroll?.({ nativeEvent: { contentOffset: { y: 0 } } }); });
             expect(list().props.data.map((row: { candidate: { remoteSessionId: string } }) => row.candidate.remoteSessionId)).toEqual(['new', 'second', 'first']);
         } finally { vi.useRealTimers(); }
+    });
+
+    /** 最近数量在跨电脑排序后统一裁剪，调整数量后仍不出现超额行或继续加载入口。 */
+    it('caps recent sessions globally across machines and applies the selected limit', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        activeScopeState.value = { serverId: 's', accountId: 'a' };
+        machinesState = machinesState.map((machine) => ({ ...machine, active: true }));
+        const nowMs = Date.now();
+        let hasNewSession = false;
+        candidatesListSpy.mockImplementation(async (request) => ({ ok: true,
+            candidates: request.source.kind === 'codexHome' && request.source.home === 'user'
+                ? [...(hasNewSession && request.machineId === 'machine-1' ? [{ ...phoneCandidate('new-session', 'running'), updatedAtMs: nowMs }] : []), ...Array.from({ length: 40 }, (_, index) => ({
+                    ...phoneCandidate(`${request.machineId}:${index}`, 'running'),
+                    updatedAtMs: nowMs - 1000 - index * 2 - (request.machineId === 'machine-1' ? 0 : 1),
+                }))].slice(0, request.limit ?? 50) : [],
+            nextCursor: 'more-history',
+        }));
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        const screen = await renderScreen(<PhoneSessionsOverview />);
+        const rows = () => screen.findAllByType('FlatList')[0]!.props.data;
+        expect(rows()).toHaveLength(50);
+        expect(rows().map((row: any) => row.candidate.remoteSessionId)).toEqual(Array.from({ length: 25 }, (_, index) => [`machine-1:${index}`, `machine-2:${index}`]).flat());
+        expect(screen.findByTestId('phone-sessions-load-more')).toBeNull();
+        const previousRequests = candidatesListSpy.mock.calls.length;
+        settingsMock.phoneRecentSessionLimit = 20;
+        await screen.update(<PhoneSessionsOverview />);
+        expect(rows()).toHaveLength(20);
+        expect(screen.findByTestId('phone-sessions-load-more')).toBeNull();
+        expect(candidatesListSpy.mock.calls.slice(previousRequests).every(([request]) => request.limit === 20)).toBe(true);
+        await act(async () => { screen.findAllByType('FlatList')[0]!.props.onScroll({ nativeEvent: { contentOffset: { y: 160 } } }); });
+        hasNewSession = true;
+        await act(async () => { screen.findAllByType('FlatList')[0]!.props.onRefresh(); });
+        await flushHookEffects();
+        expect(rows()).toHaveLength(20);
+        expect(rows()[0].candidate.remoteSessionId).toBe('new-session');
+        expect(screen.findByTestId('phone-sessions-load-more')).toBeNull();
+    });
+
+    /** 项目内首屏无命中时仍能续页，完整历史超过 50 条也不受首页数量偏好限制。 */
+    it('keeps project history pageable beyond 50 despite a smaller recent limit', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        activeScopeState.value = { serverId: 's', accountId: 'a' };
+        settingsMock.phoneRecentSessionLimit = 20;
+        routeParams.value = { serverId: 's', id: 'machine-1', projectId: 'p', sourceKey: 'codex:user' };
+        const nowMs = Date.now();
+        projectsListSpy.mockResolvedValue({ ok: true, projects: [{ id: 'p', name: 'Real project', rootPaths: ['/tmp/worktree'], available: true }], nativeCreate: false, unavailableReason: 'desktop_native_create_unavailable' } as any);
+        candidatesListSpy.mockImplementation(async (request) => {
+            if (request.source.kind !== 'codexHome' || request.source.home !== 'user') return { ok: true, candidates: [], nextCursor: null };
+            const last = request.cursor === 'last';
+            return { ok: true, candidates: Array.from({ length: last ? 10 : 50 }, (_, index) => ({
+                ...phoneCandidate(`${request.cursor ?? 'first'}:${index}`, 'completed', index),
+                updatedAtMs: nowMs - (last ? 1000 : 0) - index,
+                details: { cwd: request.cursor ? '/tmp/worktree' : '/tmp/other' },
+            })), nextCursor: request.cursor ? last ? null : 'last' : 'matches' };
+        });
+        const { default: MachineSessionsScreen } = await import('@/app/(app)/machine/[id]/sessions');
+        const screen = await renderScreen(<MachineSessionsScreen />);
+        const rows = () => screen.findAllByType('FlatList')[0]!.props.data;
+        expect(screen.findByTestId('phone-sessions-title')?.props.children).toBe('Real project');
+        expect(screen.findAllByType('Text').some((node) => node.props.children === 'MacBook Pro')).toBe(true);
+        const titleGroup = screen.findByTestId('phone-sessions-title-group');
+        expect(titleGroup?.props.style).toMatchObject({ flexDirection: 'column', alignItems: 'center', minWidth: 0 });
+        const titleLines = titleGroup!.findAllByType('Text');
+        expect(titleLines.map((node) => node.props.children)).toEqual(['Real project', 'MacBook Pro']);
+        expect(titleLines.every((node) => node.props.numberOfLines === 1 && node.props.ellipsizeMode === 'tail')).toBe(true);
+        expect(rows()).toHaveLength(0);
+        expect(screen.findByTestId('phone-sessions-load-more')?.props.disabled).toBe(false);
+        await screen.pressByTestIdAsync('phone-sessions-load-more');
+        expect(rows()).toHaveLength(50);
+        await act(async () => { screen.findAllByType('FlatList')[0]!.props.onScroll({ nativeEvent: { contentOffset: { y: 240 } } }); });
+        await screen.pressByTestIdAsync('phone-sessions-load-more');
+        expect(rows()).toHaveLength(60);
+        expect(rows()[0].candidate.remoteSessionId).toBe('matches:0');
+        expect(rows()[59].candidate.remoteSessionId).toBe('last:9');
+        expect(candidatesListSpy.mock.calls.every(([request]) => request.limit === 50)).toBe(true);
+        expect(screen.findByTestId('phone-sessions-load-more')).toBeNull();
+        await screen.pressByTestIdAsync(`phone-session:${rows()[0].key}`);
+        expect(routerNavigateSpy).toHaveBeenCalledWith('/session/happy-session-1', expect.any(Object));
+        await screen.pressByTestIdAsync('phone-sessions-back');
+        expect(routerBackSpy).toHaveBeenCalledOnce();
+        expect(routerPushSpy).not.toHaveBeenCalled();
+        // 子页不写首页筛选或数量；回到首页重新挂载后仍聚合全部电脑并使用最近数量。
+        await act(async () => { screen.tree.unmount(); });
+        routeParams.value = {};
+        machinesState = machinesState.map((machine) => ({ ...machine, active: true }));
+        candidatesListSpy.mockClear();
+        const { PhoneSessionsOverview } = await import('./PhoneSessionsOverview');
+        const home = await renderScreen(<PhoneSessionsOverview />);
+        expect(home.findByTestId('phone-sessions-back')).toBeNull();
+        expect(home.findAllByType('FlatList')[0]!.props.data).toHaveLength(20);
+        expect(new Set(candidatesListSpy.mock.calls.map(([request]) => request.machineId))).toEqual(new Set(['machine-1', 'machine-2']));
+        expect(candidatesListSpy.mock.calls.every(([request]) => request.limit === 20)).toBe(true);
+        expect(settingsMock.phoneRecentSessionLimit).toBe(20);
+    });
+
+    /** 查看会话停留在所选电脑的子页面，标题与返回按钮不依赖首页参数。 */
+    it('opens all machine history as a child page with its own title and back action', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        activeScopeState.value = { serverId: 's', accountId: 'a' };
+        settingsMock.phoneRecentSessionLimit = 20;
+        routeParams.value = { id: 'machine-1', serverId: 's' };
+        machinesState = machinesState.map((machine) => ({ ...machine, active: true }));
+        const { default: MachineSessionsScreen } = await import('@/app/(app)/machine/[id]/sessions');
+        const screen = await renderScreen(<MachineSessionsScreen />);
+        expect(screen.findByTestId('phone-sessions-title')?.props.children).toBe('MacBook Pro');
+        expect(screen.findAllByType('Text').some((node) => node.props.children === '全部会话')).toBe(true);
+        expect(candidatesListSpy.mock.calls.every(([request]) => request.machineId === 'machine-1' && request.limit === 50)).toBe(true);
+        expect(screen.findByTestId('phone-sessions-logo')).toBeNull();
+        await screen.pressByTestIdAsync('phone-sessions-back');
+        expect(routerBackSpy).toHaveBeenCalledOnce();
+        expect(routerPushSpy).not.toHaveBeenCalled();
+    });
+
+    /** 失效电脑链接仍可逐层返回，不能降级成全账号首页列表。 */
+    it('retains child-page back navigation for invalid machine or server scope', async () => {
+        await directSessionsBrowseScreenModulePromise;
+        activeScopeState.value = { serverId: 's', accountId: 'a' };
+        routeParams.value = { serverId: 's' };
+        const { default: MachineSessionsScreen } = await import('@/app/(app)/machine/[id]/sessions');
+        const screen = await renderScreen(<MachineSessionsScreen />);
+        expect(screen.findByTestId('phone-sessions-machine-unavailable')).not.toBeNull();
+        routeParams.value = { id: 'machine-1', serverId: 'other' };
+        await screen.update(<MachineSessionsScreen />);
+        expect(screen.findByTestId('phone-sessions-unavailable')).not.toBeNull();
+        expect(candidatesListSpy).not.toHaveBeenCalled();
+        await screen.pressByTestIdAsync('phone-sessions-back');
+        expect(routerBackSpy).toHaveBeenCalledOnce();
     });
 
     /** 持续动效只由真实可见行和现有页面活动信号启停，离开视口不能继续旋转。 */

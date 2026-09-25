@@ -19,6 +19,7 @@ import { resolveCodexAppServerProcessEnv } from '../appServer/resolveCodexAppSer
 import { getDesktopSessionControl, sendDesktopSessionUserMessage, getDesktopSessionControlSnapshot, performDesktopSessionControlAction } from './desktop/desktopSessionControl';
 import { DirectSessionsProviderUnavailableError } from '@/backends/directSessions/providerOps';
 import { readDesktopProjects } from './desktop/readDesktopProjects';
+import { openDesktopSession } from './desktop/openDesktopSession';
 
 // 这些字段只记录普通文本的 UI 来源和设置快照；实际运行设置仍继承 Desktop。
 const DESKTOP_TEXT_TRACKING_META_KEYS = new Set([
@@ -26,6 +27,12 @@ const DESKTOP_TEXT_TRACKING_META_KEYS = new Set([
 ]);
 
 export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
+  /** 手机明确打开时复用唯一来源与原任务入口，已加载任务不切换桌面。 */
+  openExistingSession: async ({ source, remoteSessionId, isCurrent }) => {
+    const homes = await resolveCodexHomeEntriesForDirectSessionsSource({ source, activeServerDir: configuration.activeServerDir, env: process.env });
+    if (homes.length !== 1) throw new DirectSessionsProviderUnavailableError('source_unavailable');
+    await openDesktopSession({ codexHome: homes[0]!.codexHome, remoteSessionId, isCurrent });
+  },
   /** 使用与历史浏览相同的来源解析，再只读原桌面保存的项目集合。 */
   listProjects: async ({ source }) => {
     const homes = await resolveCodexHomeEntriesForDirectSessionsSource({ source, activeServerDir: configuration.activeServerDir, env: process.env });

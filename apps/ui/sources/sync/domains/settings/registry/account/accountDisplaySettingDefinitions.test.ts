@@ -6,8 +6,19 @@ import {
 } from '@happier-dev/protocol';
 
 import { ACCOUNT_DISPLAY_SETTING_DEFINITIONS } from './accountDisplaySettingDefinitions';
+import { settingsParse } from '../../settings';
+import { loadSettings, saveSettings } from '@/sync/domains/state/persistence';
 
 describe('ACCOUNT_DISPLAY_SETTING_DEFINITIONS', () => {
+    /** 老账号缺省为最近 50 条，保存后的用户选择必须经正式设置解析保留。 */
+    it('restores the phone recent limit from account settings and defaults older settings to 50', () => {
+        expect(settingsParse({}).phoneRecentSessionLimit).toBe(50);
+        saveSettings(settingsParse({ phoneRecentSessionLimit: 100 }), 17);
+        const restored = settingsParse(loadSettings().settings);
+        expect(restored.phoneRecentSessionLimit).toBe(100);
+        expect(settingsParse({ phoneRecentSessionLimit: 0 }).phoneRecentSessionLimit).toBe(50);
+    });
+
     it('defaults Happier run instructions on while preserving an explicit opt-out', () => {
         const definition = ACCOUNT_DISPLAY_SETTING_DEFINITIONS.executionRunsGuidanceEnabled;
 

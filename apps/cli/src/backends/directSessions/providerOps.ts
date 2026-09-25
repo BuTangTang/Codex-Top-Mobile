@@ -87,6 +87,8 @@ export class DirectSessionsProviderUnavailableError extends Error {
  * can enumerate candidates without owning the provider's transcript store or process lifecycle.
  */
 export type DirectSessionProviderOps = Readonly<{
+  /** 仅 LINK 明确打开已有任务时调用；后台状态、续租和发送不能触发桌面跳转。 */
+  openExistingSession?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string; isCurrent: () => boolean }>) => Promise<void>;
   listCandidates: (params: Readonly<{
     source: DirectSessionsSource;
     cursor?: string;

@@ -305,7 +305,7 @@ function PhoneBrowseCandidateRow(props: Readonly<{ row: PhoneBrowseRow; nowMs: n
     </Pressable>;
 }
 
-/** 多电脑共用唯一列表；阅读时只保留键的顺序，候选、状态和点击动作始终取当前 owner 对象。 */
+/** 多电脑共用唯一列表；阅读时新键置前、旧键保留相对顺序，事实和动作仍取当前 owner。 */
 export function PhoneDirectBrowseCandidatesList(props: Readonly<{
     rows: readonly PhoneBrowseRow[];
     nowMs: number;
@@ -342,9 +342,15 @@ export function PhoneDirectBrowseCandidatesList(props: Readonly<{
             if (row) ordered.push(row);
             byKey.delete(key);
         }
-        // 新行追加在阅读区域后；已移除的键不会留在展示缓存里。
-        ordered.push(...byKey.values());
-        return ordered;
+        // 排在现有会话之前的新键置前，翻页补到的旧历史仍接在后面；原生列表负责保持可见锚。
+        const leading: PhoneBrowseRow[] = [];
+        const trailing: PhoneBrowseRow[] = [];
+        let reachedRetainedRow = false;
+        for (const row of props.rows) {
+            if (!byKey.has(row.key)) reachedRetainedRow = true;
+            else (reachedRetainedRow ? trailing : leading).push(row);
+        }
+        return [...leading, ...ordered, ...trailing];
     }, [props.rows, readingBelowTop]);
     React.useLayoutEffect(() => { orderRef.current = rows.map((row) => row.key); }, [rows]);
     /** 只在进入阅读区或回到顶部时更新展示状态，滚动帧不写入 React 状态。 */

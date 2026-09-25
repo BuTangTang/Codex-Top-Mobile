@@ -64,11 +64,11 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
     send(request.socket, { type: 'response', requestId: request.requestId, method: 'thread-follower-load-complete-history',
       resultType: 'success', handledByClientId: 'owner', result: { revision: 7 } });
   }
-  /** 模拟原 owner 明确不支持水合请求，保留正式失败与重连路径。 */
-  function rejectBaseline() {
+  /** 模拟原 owner 的明确协议拒绝或暂时超时，保留正式失败与重连路径。 */
+  function rejectBaseline(error = 'no-handler-for-request') {
     const request = historyRequests.at(-1)!;
     send(request.socket, { type: 'response', requestId: request.requestId, method: 'thread-follower-load-complete-history',
-      resultType: 'error', error: 'no-handler-for-request' });
+      resultType: 'error', error });
   }
   /** 仅模拟 initialize、owner 发现、一次只读历史关联与订阅；永不执行业务动作。 */
   const server = createServer((socket) => {
@@ -136,6 +136,79 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
     roundTrip,
     /** 仅释放测试消费者的提交屏障，让正式轮询继续读取下一批。 */ resumeUpdates: () => resumeUpdates?.() };
 }
+
+/** 首次真实超时后由原 poller 恢复一次；没有新正文事件也能取得已关联的当前终态。 */
+it('recovers a timed-out initial baseline once without waiting for a new rollout event', async () => {
+  const harness = await createFallbackHarness({ holdBaseline: true });
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    const before = harness.lease.getObservation?.();
+    expect(before).toMatchObject({ state: 'unknown' });
+    // 首请求完全不应答，经过正式 DesktopIpc 的原 5 秒期限，而不改变产品超时。
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2), { timeout: 7_000 });
+    expect(harness.historyRequests[0]!.socket).not.toBe(harness.historyRequests[1]!.socket);
+    harness.replyBaseline({ turnId: 'recovered-idle', status: 'completed' });
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', source: 'desktop', turnId: 'recovered-idle' }));
+    await vi.waitFor(() => expect(harness.updates.flatMap((update) => update.observations ?? []).some((fact) =>
+      fact.continuity === 'snapshot' && fact.observation.state === 'completed')).toBe(true));
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { await harness.close(); }
+});
+
+/** 第二次仍失败就维持未知；随后正常重连不能变成重复全历史水合循环。 */
+it('stops initial baseline recovery after a second transient failure', async () => {
+  const harness = await createFallbackHarness({ holdBaseline: true });
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
+    await harness.append('agent_message');
+    await harness.roundTrip();
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { await harness.close(); }
+});
+
+/** 等待原消费链提交时来源失效，恢复预算也不能越过失效边界去新建连接。 */
+it('does not reconnect a pending baseline recovery while its source is unavailable', async () => {
+  const harness = await createFallbackHarness({ holdBaseline: true, holdUpdates: true });
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    // 初始空 tail 不通知消费者；先追加中性事件并确认真实批次已进入门控，再制造失败。
+    await appendFile(harness.path, `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'synthetic boundary' } })}\n`);
+    await vi.waitFor(() => expect(harness.updates.length).toBeGreaterThan(0));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests[0]!.socket.destroyed).toBe(true));
+    await rm(harness.path);
+    harness.resumeUpdates();
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'source_unavailable' }));
+    expect(harness.followers).toHaveLength(1);
+    expect(harness.historyRequests).toHaveLength(1);
+  } finally { await harness.close(); }
+});
+
+/** 恢复请求也遵守原租约的释放和前向事实边界，迟到基线不能改写它们。 */
+it.each(['forward', 'source', 'release'])('does not publish a recovery baseline after %s invalidates its boundary', async (change) => {
+  const harness = await createFallbackHarness({ holdBaseline: true });
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    if (change === 'forward') await harness.append('task_started', 'new-running');
+    else if (change === 'source') {
+      await writeFile(harness.path, harness.meta);
+      await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'source_unavailable' }));
+    } else await harness.lease.release();
+    harness.replyBaseline({ turnId: 'old-idle', status: 'completed' });
+    if (change !== 'release') await harness.append('agent_message');
+    expect(harness.lease.getObservation?.()).toMatchObject(change === 'forward'
+      ? { state: 'running', source: 'rollout', turnId: 'new-running' } : { state: 'unknown' });
+    expect(harness.updates.flatMap((update) => update.observations ?? []).some((fact) => fact.observation.state === 'completed')).toBe(false);
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { await harness.close(); }
+});
 
 /** 首批来源不可用时根本不请求基线；恢复连续来源后才允许这份租约唯一一次读取。 */
 it('waits for an available source before requesting its cold baseline', async () => {
@@ -352,6 +425,8 @@ it.each(['removed', 'rewritten'] as const)('invalidates a cold baseline when rol
   const harness = await createFallbackHarness({ baseline: { turnId: 'historical', status: 'completed' } });
   try {
     await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed' }));
+    // 先确认原来源的前向边界已提交，再验证撤销；等待 getter 不代表初始批次已提交。
+    await harness.append('agent_message');
     if (change === 'removed') await rm(harness.path);
     else await writeFile(harness.path, harness.meta);
     await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'source_unavailable' }));

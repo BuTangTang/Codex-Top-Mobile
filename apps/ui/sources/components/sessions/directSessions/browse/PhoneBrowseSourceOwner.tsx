@@ -8,15 +8,16 @@ export const PhoneBrowseSourceOwner = React.memo(function PhoneBrowseSourceOwner
     source: PhoneBrowseSource;
     serverId: string;
     searchQuery: string;
+    requestLimit?: number;
     discoveryEnabled: boolean;
     observationScope: DirectBrowseObservationScope;
     actionPending: boolean;
     isActionPending: () => boolean;
     onSnapshot: (key: string, snapshot: PhoneBrowseSnapshot | null) => void;
 }>) {
-    const { source, serverId, searchQuery, discoveryEnabled, observationScope, actionPending, isActionPending, onSnapshot } = props;
+    const { source, serverId, searchQuery, requestLimit, discoveryEnabled, observationScope, actionPending, isActionPending, onSnapshot } = props;
     const lockScope = React.useMemo(() => ({ machineId: source.machineId, serverId, providerId: 'codex' as const, source: source.source }), [source.machineId, source.source, serverId]);
     const publishSnapshot = React.useCallback((snapshot: PhoneBrowseSnapshot | null) => onSnapshot(source.key, snapshot), [onSnapshot, source.key]);
-    const phoneData = React.useMemo(() => ({ searchQuery, discoveryEnabled, observationScope, actionPending, isActionPending, onSnapshot: publishSnapshot }), [searchQuery, discoveryEnabled, observationScope, actionPending, isActionPending, publishSnapshot]);
+    const phoneData = React.useMemo(() => ({ searchQuery, requestLimit, discoveryEnabled, observationScope, actionPending, isActionPending, onSnapshot: publishSnapshot }), [searchQuery, requestLimit, discoveryEnabled, observationScope, actionPending, isActionPending, publishSnapshot]);
     return <DirectSessionsBrowseScreen lockScope={lockScope} phoneData={phoneData} />;
 });

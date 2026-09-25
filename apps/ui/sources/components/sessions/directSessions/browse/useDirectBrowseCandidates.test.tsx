@@ -18,8 +18,9 @@ function page(ids: string[], nextCursor: string | null = null): DirectSessionsCa
 /** 创建可控慢响应，以观察请求期间的真实竞态。 */
 function deferred() {
     let resolve!: (value: DirectSessionsCandidatesListResponse) => void;
-    const promise = new Promise<DirectSessionsCandidatesListResponse>((done) => { resolve = done; });
-    return { resolve, promise };
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<DirectSessionsCandidatesListResponse>((done, fail) => { resolve = done; reject = fail; });
+    return { resolve, reject, promise };
 }
 
 /** 电脑端真实协议事实与手机本地时钟分别赋值，避免测试天然同钟。 */
@@ -28,9 +29,36 @@ function lifecyclePage(id: string, checkedAtMs: number, nextCursor: string | nul
         details: { codexLifecycle: { v: 1, state: 'running', eventAtMs: checkedAtMs - 1000, checkedAtMs } } }] };
 }
 
+/** 生成包含已完成、未知或缺失生命周期的页，单独控制每次 LIST 的检查时间。 */
+function statusPage(ids: string[], state: 'running' | 'completed' | 'unknown' | 'missing', checkedAtMs: number,
+    nextCursor: string | null = null): DirectSessionsCandidatesListResponse {
+    return { ok: true, nextCursor, candidates: ids.map((remoteSessionId) => ({ remoteSessionId, updatedAtMs: checkedAtMs - 1000,
+        details: state === 'missing' ? {} : { codexLifecycle: { v: 1, state, eventAtMs: state === 'unknown' ? null : checkedAtMs - 1000, checkedAtMs } },
+    })) };
+}
+
 describe('direct browse discovery window', () => {
     beforeEach(() => { list.mockReset(); list.mockResolvedValue(page(['initial'])); });
     afterEach(() => vi.useRealTimers());
+
+    /** 数量偏好改变时重新查询首屏，旧游标与进行中的深页结果都不能流入新范围。 */
+    it('invalidates an old cursor and late page when the request limit changes', async () => {
+        const oldPage = deferred();
+        list.mockResolvedValueOnce(page(['old'], 'old-next')).mockReturnValueOnce(oldPage.promise)
+            .mockResolvedValueOnce(page(['new'], 'new-next'));
+        const hook = await renderHook((requestLimit: number) => useDirectBrowseCandidates({ ...scope, requestLimit }), { initialProps: 20 });
+        const oldLoadMore = hook.getCurrent().loadMore;
+        let pending!: Promise<void>;
+        await act(async () => { pending = oldLoadMore(); });
+        await hook.rerender(100);
+        expect(list.mock.calls.map(([input]) => (input as { limit: number }).limit)).toEqual([20, 20, 100]);
+        expect(hook.getCurrent().candidates.map((candidate) => candidate.remoteSessionId)).toEqual(['new']);
+        await act(async () => { oldPage.resolve(page(['stale'], 'stale-next')); await pending; await oldLoadMore(); });
+        expect(hook.getCurrent().candidates.map((candidate) => candidate.remoteSessionId)).toEqual(['new']);
+        expect(hook.getCurrent().nextCursor).toBe('new-next');
+        expect(hook.getCurrent().loadingMore).toBe(false);
+        expect(list).toHaveBeenCalledTimes(3);
+    });
 
     it('starts only one new query when resume and a search change commit together', async () => {
         let activation = 0;
@@ -205,6 +233,85 @@ describe('direct browse discovery window', () => {
         expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['old', 'deep']);
         expect(hook.getCurrent().nextCursor).toBe('third');
         expect(Boolean(hook.getCurrent().error) || hook.getCurrent().refreshRequired).toBe(true);
+    });
+
+    // 首屏事实及时生效和分页完整性是不同边界：失败不能恢复旧完成状态，也不能丢掉已浏览行。
+    it.each(['running', 'unknown', 'missing'] as const)('publishes first-page %s while deeper history is pending and retains it after failure', async (state) => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_800_000_000_000);
+        list.mockResolvedValueOnce(statusPage(['root', 'displaced'], 'completed', Date.now(), 'second'));
+        list.mockResolvedValueOnce(statusPage(['deep'], 'completed', Date.now(), 'third'));
+        const hook = await renderHook(() => useDirectBrowseCandidates(scope));
+        await act(async () => { await hook.getCurrent().loadMore(); });
+        const previousObservation = hook.getCurrent().candidates[0]!.listObservation!;
+        await act(async () => { await vi.advanceTimersByTimeAsync(480_000); });
+        const deep = deferred();
+        list.mockResolvedValueOnce(statusPage(['root', 'new-unseen'], state, Date.now(), 'moved')).mockReturnValueOnce(deep.promise);
+        let refresh!: Promise<void>;
+        await act(async () => { refresh = hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['root', 'displaced', 'deep']);
+        expect(hook.getCurrent().candidates.map((row) => readPhoneCandidateLifecycle(row, true, Date.now()).state))
+            .toEqual([state === 'running' ? 'running' : 'unknown', 'unknown', 'unknown']);
+        expect(hook.getCurrent().candidates[0]!.listObservation!.requestSequence).toBeGreaterThan(previousObservation.requestSequence!);
+        expect(hook.getCurrent().candidates[0]!.updatedAtMs).toBe(Date.now() - 1000);
+        expect(hook.getCurrent().nextCursor).toBe('third');
+        expect(hook.getCurrent().refreshRequired).toBe(true);
+        await act(async () => { deep.resolve({ ok: false, errorCode: 'internal_error', error: 'changed', refreshRequired: true }); await refresh; });
+        expect(hook.getCurrent().candidates.map((row) => readPhoneCandidateLifecycle(row, true, Date.now()).state))
+            .toEqual([state === 'running' ? 'running' : 'unknown', 'unknown', 'unknown']);
+        await act(async () => { await hook.getCurrent().loadMore(); });
+        expect(list).toHaveBeenCalledTimes(4);
+        expect(hook.getCurrent().nextCursor).toBe('third');
+    });
+
+    // 普通失败、抛错和游标环都不能使失效的旧页尾重新获得续页资格。
+    it.each(['error', 'throw', 'cycle'] as const)('locks the old cursor after a rebuild %s and retains the fresh first-page fact', async (failure) => {
+        const now = Date.now();
+        list.mockResolvedValueOnce(statusPage(['root'], 'completed', now, 'second')).mockResolvedValueOnce(page(['deep'], 'third'));
+        const hook = await renderHook(() => useDirectBrowseCandidates(scope));
+        await act(async () => { await hook.getCurrent().loadMore(); });
+        const deep = deferred();
+        list.mockResolvedValueOnce(statusPage(['root'], 'unknown', now + 1000, 'moved')).mockReturnValueOnce(deep.promise);
+        let refresh!: Promise<void>;
+        await act(async () => { refresh = hook.getCurrent().refresh(); });
+        await act(async () => {
+            if (failure === 'throw') deep.reject(new Error('synthetic deep page failure'));
+            else deep.resolve(failure === 'cycle' ? page(['root'], 'moved') : { ok: false, errorCode: 'internal_error', error: 'unavailable' });
+            await refresh;
+        });
+        expect(hook.getCurrent().refreshRequired).toBe(true);
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['root', 'deep']);
+        expect(readPhoneCandidateLifecycle(hook.getCurrent().candidates[0]!, true, Date.now()).state).toBe('unknown');
+        await act(async () => { await hook.getCurrent().loadMore(); });
+        expect(list).toHaveBeenCalledTimes(4);
+    });
+
+    // 旧游标字符串恢复原值也不代表尾页已验证；恢复必须重新读取原加载页数并在成功后换游标。
+    it('rebuilds an invalidated window even when its first cursor matches again, then deduplicates and resumes paging', async () => {
+        const now = Date.now();
+        list.mockResolvedValueOnce(statusPage(['root', 'displaced'], 'completed', now, 'second')).mockResolvedValueOnce(page(['deep'], 'third'));
+        const hook = await renderHook(() => useDirectBrowseCandidates(scope));
+        await act(async () => { await hook.getCurrent().loadMore(); });
+        list.mockResolvedValueOnce(statusPage(['root'], 'unknown', now + 1000, 'moved'))
+            .mockResolvedValueOnce({ ok: false, errorCode: 'internal_error', error: 'changed', refreshRequired: true });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        const deep = deferred();
+        list.mockResolvedValueOnce(statusPage(['root', 'new-row'], 'running', now + 2000, 'second')).mockReturnValueOnce(deep.promise);
+        let refresh!: Promise<void>;
+        await act(async () => { refresh = hook.getCurrent().refresh(); });
+        expect(list).toHaveBeenCalledTimes(6);
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['root', 'displaced', 'deep']);
+        expect(hook.getCurrent().refreshRequired).toBe(true);
+        await act(async () => { deep.resolve(statusPage(['root', 'deep'], 'completed', now + 3000, 'recovered-next')); await refresh; });
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['root', 'new-row', 'deep']);
+        expect(hook.getCurrent().candidates.filter((row) => row.remoteSessionId === 'root')).toHaveLength(1);
+        expect(readPhoneCandidateLifecycle(hook.getCurrent().candidates[0]!, true, Date.now()).state).toBe('completed');
+        expect(hook.getCurrent().nextCursor).toBe('recovered-next');
+        expect(hook.getCurrent().refreshRequired).toBe(false);
+        list.mockResolvedValueOnce(page(['extra']));
+        await act(async () => { await hook.getCurrent().loadMore(); });
+        expect(list.mock.calls.at(-1)?.[0]).toMatchObject({ cursor: 'recovered-next' });
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['root', 'new-row', 'deep', 'extra']);
     });
 
     it('coalesces repeated refresh and paging during a slow request without starving its result', async () => {

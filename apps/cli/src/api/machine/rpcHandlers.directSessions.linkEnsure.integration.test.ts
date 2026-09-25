@@ -1,12 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createServer, type Server } from 'node:http';
+import { createServer as createIpcServer, type Server as IpcServer, type Socket } from 'node:net';
+import { execFile } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { deriveBoxPublicKeyFromSeed } from '@happier-dev/protocol';
+import { buildCodexAgentRuntimeDescriptor } from '@happier-dev/agents';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { z } from 'zod';
 
-import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
+import { encryptStoredSessionPayload, resolveSessionEncryptionContextFromCredentials, tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
 import { bindApiSessionSocketMock, createApiSessionSocketStub } from '@/testkit/backends/apiSessionSocketHarness';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
@@ -20,6 +25,10 @@ const { mockIo, readCredentialsMock } = vi.hoisted(() => ({
 
 vi.mock('socket.io-client', () => ({
   io: mockIo,
+}));
+// 原生应用启动属于操作系统边界；关联、provider 分派与 IPC 均保持真实实现。
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>(), execFile: vi.fn(),
 }));
 
 vi.mock('@/persistence', async (importOriginal) => {
@@ -37,15 +46,75 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
     'HAPPIER_HOME_DIR',
     'HAPPIER_CLAUDE_CONFIG_DIR',
     'PI_CODING_AGENT_DIR',
+    'CODEX_HOME',
   ] as const;
   let envScope = createEnvKeyScope(envKeys);
   let server: Server | null = null;
   let happyHomeDir = '';
+  let desktopHome = '';
+  let desktopServer: IpcServer | undefined;
+  const desktopSockets = new Set<Socket>();
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const desktopId = '01a0d20c-5a82-7ea1-86b9-16c6eb50c1c9';
+  let desktopLoaded = false;
+  let desktopDiscoveryCount = 0;
+
+  /** 仅为 LINK 的真实 provider 边界提供原生发现应答，不接入真实桌面或生成任务。 */
+  async function prepareDesktop(): Promise<void> {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    desktopHome = await createTempDir('hlo-');
+    process.env.CODEX_HOME = desktopHome;
+    await mkdir(join(desktopHome, 'ipc'), { recursive: true, mode: 0o700 });
+    await mkdir(join(desktopHome, 'sessions'));
+    await writeFile(join(desktopHome, 'sessions', `rollout-${desktopId}.jsonl`),
+      JSON.stringify({ type: 'session_meta', payload: { id: desktopId } }) + '\n');
+    const credentials = await readCredentialsMock();
+    if (!credentials) throw new Error('Synthetic credentials missing');
+    readCredentialsMock.mockResolvedValue({ ...credentials,
+      token: `synthetic.${Buffer.from(JSON.stringify({ sub: 'account_test' })).toString('base64url')}.signature` });
+    desktopServer = createIpcServer((socket) => {
+      desktopSockets.add(socket);
+      socket.on('error', () => { /* 合成客户端关闭时无需外部恢复。 */ });
+      socket.on('close', () => desktopSockets.delete(socket));
+      let pending = Buffer.alloc(0);
+      socket.on('data', (chunk: Buffer) => {
+        pending = Buffer.concat([pending, chunk]);
+        while (pending.length >= 4 && pending.length >= 4 + pending.readUInt32LE(0)) {
+          const length = pending.readUInt32LE(0);
+          const request = JSON.parse(pending.subarray(4, 4 + length).toString()) as { method: string; requestId: string };
+          pending = pending.subarray(4 + length);
+          if (request.method !== 'initialize' && request.method !== 'thread-owner-discovery') continue;
+          const initialize = request.method === 'initialize';
+          if (!initialize) desktopDiscoveryCount++;
+          const response = { type: 'response', method: request.method, requestId: request.requestId,
+            ...(initialize ? { resultType: 'success', handledByClientId: 'synthetic-follower', result: { clientId: 'synthetic-follower' } }
+              : desktopLoaded ? { resultType: 'success', handledByClientId: 'synthetic-owner', result: { supportsUntrustedAppInput: true } }
+                : { resultType: 'error', error: 'no-client-found' }) };
+          const body = Buffer.from(JSON.stringify(response));
+          const header = Buffer.alloc(4);
+          header.writeUInt32LE(body.length);
+          socket.write(Buffer.concat([header, body]));
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      desktopServer!.once('error', reject);
+      desktopServer!.listen(join(desktopHome, 'ipc', 'ipc.sock'), resolve);
+    });
+    vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+      desktopLoaded = true;
+      (args[3] as (error: Error | null) => void)(null);
+      return {} as ReturnType<typeof execFile>;
+    });
+  }
 
   const sessionsByTag = new Map<string, any>();
   const sessionsById = new Map<string, any>();
 
   beforeEach(async () => {
+    vi.mocked(execFile).mockReset();
+    desktopLoaded = false;
+    desktopDiscoveryCount = 0;
     sessionsByTag.clear();
     sessionsById.clear();
     envScope = createEnvKeyScope(envKeys);
@@ -182,6 +251,13 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
   });
 
   afterEach(async () => {
+    Object.defineProperty(process, 'platform', originalPlatform);
+    for (const socket of desktopSockets) socket.destroy();
+    desktopSockets.clear();
+    if (desktopServer) await new Promise<void>((resolve) => desktopServer!.close(() => resolve()));
+    desktopServer = undefined;
+    if (desktopHome) await removeTempDir(desktopHome);
+    desktopHome = '';
     if (server) {
       await new Promise<void>((resolve, reject) => {
         server!.close((error) => (error ? reject(error) : resolve()));
@@ -253,6 +329,7 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
   });
 
   it('persists codex backend affinity when linking a codex direct session', async () => {
+    await prepareDesktop();
     const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
 
     const registered = new Map<string, (params: any) => Promise<any>>();
@@ -262,20 +339,22 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
       },
     } as any;
 
-    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager });
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
 
     const handler = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE);
     expect(handler).toBeDefined();
 
-    const res = await handler!({
+    const request = {
       machineId: 'machine_1',
       providerId: 'codex',
-      remoteSessionId: 'remote_codex_123',
+      remoteSessionId: desktopId,
       titleHint: 'Linked Codex Session',
       directoryHint: '/tmp/project-codex',
       codexBackendMode: 'appServer',
       source: { kind: 'codexHome', home: 'user' },
-    });
+    };
+    const res = await handler!(request);
 
     expect(res.ok).toBe(true);
 
@@ -295,6 +374,82 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
 
     expect(parsedMeta.data.codexBackendMode).toBe('appServer');
     expect(parsedMeta.data.directSessionV1.codexBackendMode).toBe('appServer');
+    expect(execFile).toHaveBeenCalledTimes(1);
+    // 再次明确点开已有关联也必须唤起未加载任务，不能被 ensure 的复用返回跳过。
+    desktopLoaded = false;
+    const reopened = await handler!(request);
+    expect(reopened).toMatchObject({ ok: true, sessionId: res.sessionId, created: false });
+    expect(execFile).toHaveBeenCalledTimes(2);
+    expect(desktopDiscoveryCount).toBe(4);
+  });
+
+  it('rejects a different authenticated account before an explicit desktop open', async () => {
+    await prepareDesktop();
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'other_account', machineId: 'machine_1' }) });
+    const result = await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({
+      machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' },
+    });
+    expect(result).toMatchObject({ ok: false, error: 'not_authenticated' });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(desktopDiscoveryCount).toBe(0);
+    expect(sessionsByTag.size).toBe(0);
+  });
+
+  it('opens the same canonical target that the linked runtime descriptor will navigate to', async () => {
+    await prepareDesktop();
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    const result = await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({
+      machineId: 'machine_1', providerId: 'codex', remoteSessionId: '01a0c6f6-f8ba-7380-8d9b-61f75792fc17',
+      directoryHint: '/tmp/synthetic-project', source: { kind: 'codexHome', home: 'user' },
+      runtimeDescriptor: buildCodexAgentRuntimeDescriptor({ backendMode: 'appServer', vendorSessionId: desktopId,
+        home: 'user', homePath: desktopHome }),
+    });
+    expect(result).toMatchObject({ ok: true });
+    expect(execFile).toHaveBeenCalledWith('/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${desktopId}?hostId=local`],
+      expect.any(Object), expect.any(Function));
+  });
+
+  it('reuses an imported persisted task without reopening the desktop or restoring its direct runner metadata', async () => {
+    await prepareDesktop();
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager,
+      getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    const request = { machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      directoryHint: '/tmp/synthetic-imported-project', source: { kind: 'codexHome', home: 'user' } };
+    const handler = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!;
+    const initial = await handler(request) as { ok: boolean; sessionId: string };
+    expect(initial.ok).toBe(true);
+    const rawSession = sessionsById.get(initial.sessionId);
+    const credentials = await readCredentialsMock();
+    if (!credentials) throw new Error('Synthetic credentials missing');
+    const metadata = tryDecryptSessionMetadata({ credentials, rawSession });
+    if (!metadata) throw new Error('Synthetic session metadata missing');
+    // 复现已有导入完成状态：direct 标识已移除，导入来源保留在同一任务记录内。
+    const imported: Record<string, unknown> = { ...metadata, externalHistoryImportV1: {
+      v: 1, providerId: 'codex', remoteSessionId: desktopId, importedAtMs: 1, source: request.source,
+    } };
+    delete imported.directSessionV1;
+    rawSession.metadata = encryptStoredSessionPayload({ mode: 'e2ee',
+      ctx: resolveSessionEncryptionContextFromCredentials(credentials, rawSession), payload: imported });
+    desktopLoaded = false;
+    const discoveriesBeforeReopen = desktopDiscoveryCount;
+    vi.mocked(execFile).mockClear();
+    await expect(handler(request)).resolves.toMatchObject({ ok: true, sessionId: initial.sessionId, created: false });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(desktopDiscoveryCount).toBe(discoveriesBeforeReopen);
+    expect(sessionsByTag.size).toBe(1);
+    expect(tryDecryptSessionMetadata({ credentials, rawSession })).toEqual(imported);
   });
 
   it('creates a linked pi direct session with piSessionId metadata and an active-branch source', async () => {

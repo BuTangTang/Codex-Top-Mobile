@@ -18,6 +18,7 @@ import {
   DirectTranscriptPageRequestSchema,
   DirectTranscriptReadAfterRequestSchema,
   normalizeCodexBackendMode,
+  readCanonicalAgentRuntimeDescriptorV1ForProvider,
   type DirectSessionAttachResponse,
   type DirectSessionCandidateDeleteResponse,
   type DirectSessionDetachResponse,
@@ -514,7 +515,9 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
     }
   });
 
+  /** 明确点击可唤起已有桌面任务；身份校验与关联复用完成后才允许 provider 执行打开。 */
   registerHandler(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE, async (raw: unknown) => {
+    const currentEpoch = epoch;
     const parsed = DirectSessionLinkEnsureRequestSchema.safeParse(raw);
     if (!parsed.success) return err('invalid_request') satisfies DirectSessionLinkEnsureResponse;
     const validatedSource = validateDirectMachineSource({
@@ -536,6 +539,10 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       // (ACP session/list) has none, so linking it would create a session Happier cannot show.
       const linkOps = await getDirectSessionProviderOps(parsed.data.providerId);
       requireProviderOp(linkOps.pageTranscript, parsed.data.providerId, 'linking');
+      if (linkOps.openExistingSession) {
+        const identity = await resolveExternalControlIdentity({ credentials, linkedMachineId: parsed.data.machineId, getDaemonIdentity: params.getDaemonIdentity });
+        if (!identity.ok) return err('provider_unavailable', identity.error) satisfies DirectSessionLinkEnsureResponse;
+      }
       const codexBackendMode = normalizeCodexBackendMode(parsed.data.codexBackendMode) ?? undefined;
       const res = await ensureDirectSessionLink({
         credentials,
@@ -548,6 +555,34 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         directoryHint: parsed.data.directoryHint,
         source: validatedSource.source,
       });
+      // 放在 ensure 返回之后，首次关联和再次点开已有关联都走同一明确打开路径。
+      if (linkOps.openExistingSession) {
+        // runtimeDescriptor 可规范任务 ID 和来源，打开目标必须与最终进入的关联一致。
+        const linked = await loadLinkedDirectSession({ credentials, sessionId: res.sessionId, machineId: parsed.data.machineId });
+        if (!linked.ok) {
+          // ensure 已支持导入后复用同一任务；这种记录没有 direct 标识，不能重新唤起原桌面 runner。
+          if (!res.created && linked.error === 'session_is_not_direct') {
+            const rawSession = await fetchSessionById({ token: credentials.token, sessionId: res.sessionId }).catch(() => null);
+            const metadata = rawSession ? tryDecryptSessionMetadata({ credentials, rawSession }) : null;
+            const imported = directMetadataRecord(metadata?.externalHistoryImportV1);
+            const runtime = parsed.data.providerId === 'codex'
+              ? readCanonicalAgentRuntimeDescriptorV1ForProvider(parsed.data.runtimeDescriptor, 'codex') : null;
+            const remoteSessionId = runtime?.vendorSessionId || parsed.data.remoteSessionId;
+            if (metadata && !directMetadataRecord(metadata.directSessionV1) && imported?.v === 1
+              && imported.providerId === parsed.data.providerId && imported.remoteSessionId === remoteSessionId
+              && isCurrentLifecycle(currentEpoch)) {
+              return { ok: true, sessionId: res.sessionId, created: false } satisfies DirectSessionLinkEnsureResponse;
+            }
+          }
+          return err(linked.errorCode, linked.error) satisfies DirectSessionLinkEnsureResponse;
+        }
+        if (linked.session.providerId !== parsed.data.providerId) return err('invalid_request', 'source_mismatch') satisfies DirectSessionLinkEnsureResponse;
+        const openSource = validateDirectMachineSource({ providerId: linked.session.providerId, source: linked.session.source, env: process.env });
+        if (!openSource.ok) return err('invalid_request', 'source_mismatch') satisfies DirectSessionLinkEnsureResponse;
+        if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable') satisfies DirectSessionLinkEnsureResponse;
+        await linkOps.openExistingSession({ source: openSource.source, remoteSessionId: linked.session.remoteSessionId,
+          isCurrent: () => isCurrentLifecycle(currentEpoch) });
+      }
       return { ok: true, sessionId: res.sessionId, created: res.created } satisfies DirectSessionLinkEnsureResponse;
     } catch (error) {
       return errFromProviderFailure(error) satisfies DirectSessionLinkEnsureResponse;

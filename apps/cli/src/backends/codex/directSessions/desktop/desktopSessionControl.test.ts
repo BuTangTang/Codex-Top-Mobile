@@ -1,4 +1,5 @@
 import { createServer, type Server, type Socket } from 'node:net';
+import { execFile } from 'node:child_process';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,10 +9,15 @@ import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 const environment = vi.hoisted(() => ({ activeServerDir: '' }));
 // 配置是环境边界；内部去重、文件持久化和 IPC 解析都执行真实实现。
 vi.mock('@/configuration', () => ({ configuration: environment }));
+// 只替换操作系统启动边界；owner 发现、元数据校验和快照均执行实际实现。
+vi.mock('node:child_process', async (importOriginal) => ({
+    ...await importOriginal<typeof import('node:child_process')>(), execFile: vi.fn(),
+}));
 
 import { getDesktopSessionControl, getDesktopSessionControlSnapshot, sendDesktopSessionUserMessage, performDesktopSessionControlAction } from './desktopSessionControl';
 import { readDesktopControlSnapshot } from './desktopControlSnapshot';
 import { DesktopIpc } from './desktopIpc';
+import { openDesktopSession } from './openDesktopSession';
 
 type Request = {
     type: string;
@@ -29,7 +35,7 @@ type Request = {
 describe('Desktop-owned session control', () => {
     let root: string;
     let codexHome: string;
-    let server: Server | undefined;
+    const servers = new Set<Server>();
     let requests: Request[];
     const sockets = new Set<Socket>();
     let onStart: (request: Request, socket: Socket) => void;
@@ -39,6 +45,20 @@ describe('Desktop-owned session control', () => {
     const snapshotRevisions = new Map<Socket, number>();
     let onAction: (request: Request, socket: Socket) => void;
     const input = { remoteSessionId: 'thread-synthetic', text: 'synthetic prompt', localId: 'message-synthetic', accountId: 'account-synthetic' };
+    const openId = '01a0d20c-5a82-7ea1-86b9-16c6eb50c1c9';
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+
+    /** 保存有明确原生 ID 的合成首行，不读取或修改任何真实任务。 */
+    async function writeOpenTarget(id = openId, home = codexHome): Promise<void> {
+        await mkdir(join(home, 'sessions'), { recursive: true });
+        await writeFile(join(home, 'sessions', `rollout-${id}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id } }) + '\n');
+    }
+
+    /** 用原协议的明确拒绝模拟尚未加载、没有 owner 的任务。 */
+    function missingOwner(request: Request, socket: Socket): void {
+        respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+            resultType: 'error', error: 'no-client-found' });
+    }
 
     /** 独立编码外部协议帧，让单次 write 可以重现同一批内的 owner 失联。 */
     function frame(value: unknown): Buffer {
@@ -82,9 +102,9 @@ describe('Desktop-owned session control', () => {
     }
 
     /** 只在临时目录启动合成 router，禁止测试接触真实 Codex socket。 */
-    async function startRouter(): Promise<void> {
-        await mkdir(join(codexHome, 'ipc'), { recursive: true, mode: 0o700 });
-        server = createServer((socket) => {
+    async function startRouter(home = codexHome): Promise<void> {
+        await mkdir(join(home, 'ipc'), { recursive: true, mode: 0o700 });
+        const server = createServer((socket) => {
             sockets.add(socket);
             // 控制拒绝会主动断开；合成服务器只容忍该关闭竞态的传输错误。
             socket.on('error', (error: NodeJS.ErrnoException) => {
@@ -117,9 +137,10 @@ describe('Desktop-owned session control', () => {
                 }
             });
         });
+        servers.add(server);
         await new Promise<void>((resolve, reject) => {
-            server!.once('error', reject);
-            server!.listen(join(codexHome, 'ipc', 'ipc.sock'), resolve);
+            server.once('error', reject);
+            server.listen(join(home, 'ipc', 'ipc.sock'), resolve);
         });
     }
 
@@ -129,6 +150,7 @@ describe('Desktop-owned session control', () => {
         codexHome = join(root, 'codex');
         environment.activeServerDir = join(root, 'happier');
         requests = [];
+        vi.mocked(execFile).mockReset();
         snapshotRevisions.clear();
         onHistory = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
             method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
@@ -147,11 +169,148 @@ describe('Desktop-owned session control', () => {
 
     /** 关闭全部合成连接，避免测试残留句柄或触碰用户进程。 */
     afterEach(async () => {
+        Object.defineProperty(process, 'platform', originalPlatform);
         for (const socket of sockets) socket.destroy();
         sockets.clear();
-        if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
-        server = undefined;
+        for (const server of servers) await new Promise<void>((resolve) => server.close(() => resolve()));
+        servers.clear();
         await removeTempDir(root);
+    });
+
+    it('opens an unloaded existing task once and then uses the original correlated control path', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        onDiscover = missingOwner;
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            onDiscover = loaded;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        onFollow = (request, socket) => {
+            if (request.params.following) respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+                sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: openId,
+                    change: { type: 'snapshot', revision: 1, conversationState: { ...idleControlState(), id: openId } } } });
+        };
+        await startRouter();
+        const target = { codexHome, remoteSessionId: openId, isCurrent: () => true };
+        await Promise.all([openDesktopSession(target), openDesktopSession(target)]);
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(execFile).toHaveBeenCalledWith('/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${openId}?hostId=local`],
+            expect.objectContaining({ timeout: 2_000 }), expect.any(Function));
+        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(0);
+        await expect(getDesktopSessionControlSnapshot(target)).resolves.toMatchObject({ state: 'completed', textSendMode: 'start', requests: [] });
+        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+    });
+
+    it('leaves an already loaded task in place without launching its desktop URL', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await startRouter();
+        await openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true });
+        expect(execFile).not.toHaveBeenCalled();
+    });
+
+    it.each(['../new?prompt=unexpected', 'new', `${openId}?prompt=unexpected`])('rejects a non-task URL target before a launch (%s)', async (remoteSessionId) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await startRouter();
+        await expect(openDesktopSession({ codexHome, remoteSessionId, isCurrent: () => true })).rejects.toThrow('invalid_request');
+        expect(execFile).not.toHaveBeenCalled();
+        expect(requests).toHaveLength(0);
+    });
+
+    it('does not launch an unloaded ID missing from the selected source', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        onDiscover = missingOwner;
+        await startRouter();
+        await expect(openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true })).rejects.toThrow('session_not_found');
+        expect(execFile).not.toHaveBeenCalled();
+    });
+
+    it('does not launch after the initiating account lifecycle has changed', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        onDiscover = missingOwner;
+        await startRouter();
+        await expect(openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => false })).rejects.toThrow('source_unavailable');
+        expect(execFile).not.toHaveBeenCalled();
+    });
+
+    it('bounds failed discovery retries and allows only a later explicit click to try opening again', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        onDiscover = missingOwner;
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        const target = { codexHome, remoteSessionId: openId, isCurrent: () => true };
+        await expect(openDesktopSession(target)).rejects.toThrow('owner_unavailable');
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(3);
+        await expect(openDesktopSession(target)).rejects.toThrow('owner_unavailable');
+        expect(execFile).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['task', 'source'])('keeps explicit opens independent for different %s targets', async (difference) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const secondId = difference === 'task' ? '01a0c6f6-f8ba-7380-8d9b-61f75792fc17' : openId;
+        const secondHome = difference === 'source' ? join(root, 'other') : codexHome;
+        await writeOpenTarget();
+        await writeOpenTarget(secondId, secondHome);
+        const loaded = onDiscover;
+        onDiscover = missingOwner;
+        const completions: Array<(error: Error | null) => void> = [];
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            completions.push(args[3] as (error: Error | null) => void);
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        if (secondHome !== codexHome) await startRouter(secondHome);
+        const first = openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true });
+        const second = openDesktopSession({ codexHome: secondHome, remoteSessionId: secondId, isCurrent: () => true });
+        try {
+            await vi.waitFor(() => expect(completions).toHaveLength(2));
+        } finally {
+            onDiscover = loaded;
+            for (const complete of completions) complete(null);
+            await Promise.all([first, second]);
+        }
+        expect(execFile).toHaveBeenCalledTimes(2);
+        expect(vi.mocked(execFile).mock.calls.map((call) => call[1])).toEqual(expect.arrayContaining([
+            ['-b', 'com.openai.codex', `codex://threads/${openId}?hostId=local`],
+            ['-b', 'com.openai.codex', `codex://threads/${secondId}?hostId=local`],
+        ]));
+    });
+
+    it('stops after the single operating-system open fails', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        onDiscover = missingOwner;
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(new Error('synthetic launch failure'));
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        await expect(openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true })).rejects.toThrow('desktop_open_failed');
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+    });
+
+    it('never launches the desktop from ordinary status or control failures', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        onDiscover = missingOwner;
+        await startRouter();
+        await expect(getDesktopSessionControl({ codexHome, remoteSessionId: openId })).resolves.toMatchObject({ available: false });
+        await expect(getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: openId })).rejects.toThrow('owner_unavailable');
+        expect(execFile).not.toHaveBeenCalled();
+    });
+
+    it('does not invoke the macOS URL launcher on another platform', async () => {
+        Object.defineProperty(process, 'platform', { value: 'linux' });
+        await openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true });
+        expect(execFile).not.toHaveBeenCalled();
+        expect(requests).toHaveLength(0);
     });
 
     it('anchors control to the correlated owner revision instead of the stale first high snapshot', async () => {

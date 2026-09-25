@@ -13,7 +13,9 @@ import { SettingsSection } from '@/components/settings/SettingsSection';
 import { ItemList } from '@/components/ui/lists/ItemList';
 import { useConnectTerminal } from '@/hooks/session/useConnectTerminal';
 import { useAuth } from '@/auth/context/AuthContext';
-import { useEntitlement, useLocalSettingMutable, useSetting, useProfile } from '@/sync/domains/state/storage';
+import { useEntitlement, useLocalSettingMutable, useSetting, useSettingMutable, useProfile } from '@/sync/domains/state/storage';
+import { DropdownMenu } from '@/components/ui/forms/dropdown/DropdownMenu';
+import { ACCOUNT_DISPLAY_SETTING_DEFINITIONS } from '@/sync/domains/settings/registry/account/accountDisplaySettingDefinitions';
 import { sync } from '@/sync/sync';
 import { trackPaywallButtonClicked } from '@/track';
 import { Modal } from '@/modal';
@@ -48,6 +50,26 @@ import { Icon } from '@/components/ui/icons/Icon';
 
 const DEFER_BELOW_FOLD_SETTINGS_SECTIONS_DELAY_MS = 0;
 const DEFER_BELOW_FOLD_SETTINGS_STAGE_DELAY_MS = 16;
+
+/** 最近列表数量只在手机设置叶节点订阅，沿用账号设置保存与同步，不新增存储入口。 */
+function PhoneRecentSessionLimitSetting() {
+    const { theme } = useUnistyles();
+    const [limit, setLimit] = useSettingMutable('phoneRecentSessionLimit');
+    const [open, setOpen] = React.useState(false);
+    /** 仅接受设置定义支持的选项，用户选择后保存并关闭菜单。 */
+    const selectLimit = React.useCallback((id: string) => {
+        const next = ACCOUNT_DISPLAY_SETTING_DEFINITIONS.phoneRecentSessionLimit.schema.parse(Number(id));
+        setLimit(next);
+        setOpen(false);
+    }, [setLimit]);
+    return <DropdownMenu open={open} onOpenChange={setOpen} selectedId={String(limit)} onSelect={selectLimit}
+        variant="selectable" search={false} rowKind="item" showCategoryTitles={false} matchTriggerWidth connectToTrigger
+        itemTrigger={{ title: '最近会话数量', icon: <Icon name="chat-circle-dots" size={22} color={theme.colors.text.secondary} />,
+            itemProps: { testID: 'settings-phone-recent-limit', density: 'cozy', titleLines: 0, style: { minHeight: 48 } } }}
+        items={ACCOUNT_DISPLAY_SETTING_DEFINITIONS.phoneRecentSessionLimit.schema.options.map((option) => ({
+            id: String(option.value), title: `${option.value} 条`,
+        }))} />;
+}
 
 /** 手机突出账号、通知与关于，桌面继续使用完整设置分类。 */
 export const SettingsView = React.memo(function SettingsView() {
@@ -358,6 +380,7 @@ export const SettingsView = React.memo(function SettingsView() {
     // 常用行允许大字体自然换行，入口仍交给原详情页处理。
     const phoneGeneralSection = React.useMemo(() => (
         <SettingsSection compact>
+            <PhoneRecentSessionLimitSetting />
             <Item
                 density="cozy"
                 titleLines={0}

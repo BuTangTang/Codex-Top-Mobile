@@ -19,6 +19,44 @@ function fixture(machineId: string, remoteSessionId: string, state = 'running', 
 describe('phone browse aggregation', () => {
     beforeEach(() => { vi.spyOn(performance, 'now').mockReturnValue(0); });
     afterEach(() => vi.restoreAllMocks());
+
+    /** 状态与唤醒共用单调年龄；跨电脑墙钟偏差不能改变剩余有效期。 */
+    it('returns the earliest lifecycle expiry and consumes expired deadlines without spinning', () => {
+        const running = fixture('running', 'run', 'running', nowMs - 899_000);
+        const completed = fixture('completed', 'done', 'completed');
+        const args = { serverId: 's', accountId: 'a', sources: [running.descriptor, completed.descriptor],
+            snapshots: { running: running.snapshot, completed: completed.snapshot }, phase: null };
+        const initial = aggregatePhoneBrowseSources({ ...args, nowMs });
+        expect(initial.nextLifecycleWakeAtMs).toBe(nowMs + 1_001);
+        vi.mocked(performance.now).mockReturnValue(1_000);
+        const boundary = aggregatePhoneBrowseSources({ ...args, nowMs: nowMs - 10_000 });
+        expect(boundary.rows.find((row) => row.ownerKey === 'running')?.lifecycle.state).toBe('running');
+        expect(boundary.nextLifecycleWakeAtMs).toBe(nowMs - 9_999);
+        vi.mocked(performance.now).mockReturnValue(1_001);
+        const afterRunning = aggregatePhoneBrowseSources({ ...args, nowMs: nowMs - 9_999 });
+        expect(afterRunning.rows.find((row) => row.ownerKey === 'running')?.lifecycle.state).toBe('unknown');
+        expect(afterRunning.nextLifecycleWakeAtMs).toBe(nowMs - 9_999 + 899_000);
+        vi.mocked(performance.now).mockReturnValue(900_001);
+        const expired = aggregatePhoneBrowseSources({ ...args, nowMs: nowMs + 3_600_000 });
+        expect(expired.rows.every((row) => row.lifecycle.state === 'unknown')).toBe(true);
+        expect(expired.nextLifecycleWakeAtMs).toBeNull();
+    });
+
+    /** 无有效观测、离线和未知事实不再申请状态唤醒，项目外候选也不能贡献期限。 */
+    it('does not schedule lifecycle expiry for ineligible candidates', () => {
+        const f = fixture('a', 'candidate');
+        for (const snapshot of [
+            { ...f.snapshot, candidates: [{ ...f.snapshot.candidates[0]!, listObservation: undefined }] },
+            fixture('a', 'unknown', 'unknown').snapshot,
+        ]) {
+            expect(aggregatePhoneBrowseSources({ serverId: 's', accountId: 'a', sources: [f.descriptor],
+                snapshots: { a: snapshot }, phase: null, nowMs }).nextLifecycleWakeAtMs).toBeNull();
+        }
+        expect(aggregatePhoneBrowseSources({ serverId: 's', accountId: 'a', sources: [{ ...f.descriptor, online: false }],
+            snapshots: { a: f.snapshot }, phase: null, nowMs }).nextLifecycleWakeAtMs).toBeNull();
+        expect(aggregatePhoneBrowseSources({ serverId: 's', accountId: 'a', sources: [f.descriptor],
+            snapshots: { a: f.snapshot }, phase: null, nowMs, projectRequired: true }).nextLifecycleWakeAtMs).toBeNull();
+    });
     it.each([34_900, -3_600_000])('keeps valid desktop facts with a %i ms clock offset and expires them in phone time', (offset) => {
         const f = fixture('a', 'running');
         for (const state of ['running', 'completed', 'needs_input']) {
