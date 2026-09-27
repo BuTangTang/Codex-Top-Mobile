@@ -834,6 +834,54 @@ describe('SessionView (direct sessions)', () => {
       expect.objectContaining({ localId: pending[0].localId, directSessionExternalControl: true }));
     expect(findAgentInput(screen).props.value).toBe('desktop next draft');
   });
+
+  // 前置 STATUS 等待期间页面失活尚未发送；失败正文可编辑，后续草稿仍由原输入 owner 保留。
+  it('keeps desktop text failed and editable when the surface deactivates before STATUS permits send', async () => {
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
+    const status = { ok: true as const, machineOnline: true, runnerActive: false,
+      activity: 'idle' as const, canForceStop: false, externalControl: { canSend: true } };
+    machineDirectSessionStatusGetSpy.mockResolvedValue(status);
+    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
+    const screen = await renderSessionViewAndSettle();
+    const statusBeforeSend = machineDirectSessionStatusGetSpy.mock.calls.length;
+    const readiness = createDeferred<typeof status>();
+    machineDirectSessionStatusGetSpy.mockReturnValueOnce(readiness.promise);
+    await act(async () => { findAgentInput(screen).props.onChangeText('unsent cold recovery text'); });
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    expect(machineDirectSessionStatusGetSpy.mock.calls.length).toBe(statusBeforeSend + 1);
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    expect(findAgentInput(screen).props.value).toBe('');
+    await act(async () => { findAgentInput(screen).props.onChangeText('next draft to preserve'); });
+
+    const { SessionView } = await import('./SessionView');
+    await screen.update(<AppPaneProvider><SessionView id="s1" surfaceFocusedOverride={false} routeAnchorOverride /></AppPaneProvider>);
+    await act(async () => { readiness.resolve(status); });
+    await flushHookEffects();
+    const { storage } = await import('@/sync/domains/state/storage');
+    const rows = storage.getState().sessionPending.s1?.messages ?? [];
+    expect(rows).toEqual([expect.objectContaining({ text: 'unsent cold recovery text', sendState: 'failed',
+      directSessionExternalControl: true, deliveryStatus: 'queued' })]);
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    expect(draftHookState.valuesBySessionId.get('s1')).toBe('next draft to preserve');
+
+    await screen.update(<AppPaneProvider><SessionView id="s1" surfaceFocusedOverride routeAnchorOverride /></AppPaneProvider>);
+    await settleDirectSessionView();
+    expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+    await act(async () => { chatListPropsSpy.mock.calls.at(-1)?.[0].onEditPendingMessage({
+      id: rows[0].id, text: rows[0].text, message: rows[0],
+    }); });
+    expect(findAgentInput(screen).props.value).toBe('unsent cold recovery text');
+    await act(async () => {
+      findAgentInput(screen).props.statusBadges.find((badge: { key: string }) => badge.key === 'pending-message-edit').onPress();
+    });
+    expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+  });
+
   // 已确认的同寿命快照只选路；先投递，受理后异步回读，不篡改历史观察状态。
   it('sends through its confirmed start mode before refreshing control history', async () => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,

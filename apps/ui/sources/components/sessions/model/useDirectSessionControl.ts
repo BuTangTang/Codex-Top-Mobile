@@ -166,7 +166,8 @@ export function useDirectSessionControl(params: Readonly<{
         requiredMode?: 'steer',
         localId?: string,
     ): Promise<TextSendResult> => {
-        if (!isCurrent()) return { outcome: 'unknown' };
+        // 尚未进入任何投递边界；连接或目标失活表示本次未发送，正文可由用户编辑重试。
+        if (!isCurrent()) return { outcome: 'rejected' };
         if (!params.machineId || !text.trim()) return { outcome: 'rejected' };
         const flight = acquireFlight();
         if (!flight) return { outcome: 'unknown' };
@@ -180,7 +181,7 @@ export function useDirectSessionControl(params: Readonly<{
                 || (mode === 'start' && !['completed', 'failed', 'cancelled'].includes(fresh.state))
                 || (requiredMode && mode !== requiredMode)) {
                 if (isFlightCurrent()) updateView({ outcome: 'rejected' });
-                return { outcome: isFlightCurrent() ? 'rejected' : 'unknown' };
+                return { outcome: 'rejected' };
             }
             // 种类与基准轮次仅用于提示措辞和失效判断，不参与发送授权或锁的生命周期。
             const outcomeContext: ControlOutcomeContext = { kind: mode, turnId: fresh.turnId };
@@ -200,7 +201,8 @@ export function useDirectSessionControl(params: Readonly<{
                 // start 的既有发送 owner 未给明确拒绝时，不假定消息没有发出。
                 result = 'unknown';
             }
-            if (!isFlightCurrent()) return { outcome: 'unknown', mode };
+            // 原发送 owner 已明确拒绝时无需猜测；只有可能已提交的迟到结果保持未知。
+            if (!isFlightCurrent()) return { outcome: result === 'rejected' ? 'rejected' : 'unknown', mode };
             if (result !== 'unknown') lifetime.uncertainTextSendKey = null;
             // 观察可能先于 ACK 到达；用同一上下文合并，避免迟到受理重新挂回旧文案。
             updateView({ outcome: result, outcomeContext });

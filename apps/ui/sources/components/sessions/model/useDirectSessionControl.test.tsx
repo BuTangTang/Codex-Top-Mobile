@@ -150,6 +150,36 @@ describe('desktop control lifecycle', () => {
         expect(start).toHaveBeenCalledTimes(1);
     });
 
+    /** 未调用任何投递边界前失活应明确失败，不能把只读 CONTROL 当成投递结果未知。 */
+    it.each(['before_click', 'during_read'] as const)('rejects an unissued text send disabled %s', async (phase) => {
+        mocks.read.mockRejectedValueOnce(new Error('initially offline'));
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        let params = { ...input };
+        const hook = await renderHook(() => useDirectSessionControl(params));
+        const click = hook.getCurrent().sendText;
+        const pending = createDeferred<unknown>();
+        mocks.read.mockReturnValueOnce(pending.promise);
+        const start = vi.fn(async () => 'accepted' as const);
+        let sending!: ReturnType<ReturnType<typeof useDirectSessionControl>['sendText']>;
+        if (phase === 'during_read') {
+            await act(async () => { sending = click('keep unsent text', start); });
+        }
+        params = { ...input, enabled: false };
+        await hook.rerender();
+        if (phase === 'before_click') {
+            await act(async () => { sending = click('keep unsent text', start); });
+        }
+        let result!: Awaited<typeof sending>;
+        await act(async () => {
+            pending.resolve({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+            result = await sending;
+        });
+        expect(start).not.toHaveBeenCalled();
+        expect(mocks.action).not.toHaveBeenCalled();
+        await hook.unmount();
+        expect(result).toEqual({ outcome: 'rejected' });
+    });
+
     /** 换号后再返回同账号也属于新寿命，旧读取不可授权发送。 */
     it('discards an old click read after an account A to B to A cycle', async () => {
         mocks.read.mockRejectedValueOnce(new Error('initially offline'));
@@ -230,6 +260,26 @@ describe('desktop control lifecycle', () => {
         expect(newStart).toHaveBeenCalledTimes(1);
         await act(async () => { newReply.resolve(); expect((await newOperation).outcome).toBe('accepted'); });
         expect(hook.getCurrent().busy).toBe(false);
+    });
+
+    /** 发送 owner 明确未提交时保留拒绝；已受理或无法确认的迟到结果仍隔离为未知。 */
+    it.each(['rejected', 'accepted', 'unknown'] as const)('preserves the submission boundary for a late %s start result', async (outcome) => {
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        let params = { ...input };
+        const hook = await renderHook(() => useDirectSessionControl(params));
+        const reply = createDeferred<typeof outcome>();
+        const start = vi.fn(() => reply.promise);
+        let sending!: ReturnType<ReturnType<typeof useDirectSessionControl>['sendText']>;
+        await act(async () => { sending = hook.getCurrent().sendText('synthetic text', start); });
+        expect(start).toHaveBeenCalledTimes(1);
+        params = { ...input, enabled: false };
+        await hook.rerender();
+        let result!: Awaited<typeof sending>;
+        await act(async () => { reply.resolve(outcome); result = await sending; });
+        expect(mocks.action).not.toHaveBeenCalled();
+        await hook.unmount();
+        expect(result).toEqual({ outcome: outcome === 'rejected' ? 'rejected' : 'unknown', mode: 'start' });
     });
 
     /** 首次发送的旧已完成尾轮不能消除等待；新轮次快照到达才收起已过时的受理提示。 */

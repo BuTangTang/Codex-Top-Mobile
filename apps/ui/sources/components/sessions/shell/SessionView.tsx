@@ -6230,7 +6230,8 @@ function SessionViewLoaded({
                 const readyForSend = await directSessionTakeover.ensureReadyForSend({ intent: 'text',
                     ...(inheritsDesktopSettings && outboundHandoffLocalId ? { suppressFailureAlert: true } : {}),
                 });
-                if (!isCurrent()) return 'unknown';
+                // 就绪探测期间失活尚未提交消息，明确拒绝才能保留可编辑的失败正文。
+                if (!isCurrent()) return 'rejected';
                 if (!readyForSend) return 'rejected';
                 // 控制快照之后若已换成 runner，本次桌面意图不得降级到另一个执行器。
                 if (inheritsDesktopSettings && readyForSend !== 'external') {
