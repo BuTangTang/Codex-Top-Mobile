@@ -109,6 +109,8 @@ async function withDesktopRpcFixture(
     publishTurnsPatch: (revision: number, turns: Array<{ turnId: string; status: string }>) => void;
     setOwnerAvailable: (available: boolean) => void;
     getActiveFollowerCount: () => number;
+    disconnectFollowers: () => void;
+    holdHistoryResponses: () => void;
     releaseFollowDiscovery: () => void;
     releaseHistory: () => void;
     lifecycle: ReturnType<typeof registerMachineDirectSessionsRpcHandlers>;
@@ -246,6 +248,9 @@ async function withDesktopRpcFixture(
     await run({ handlers, requests, rawSession, source, spawnSession, stopSession, credentials, invokeTransport, lifecycle,
       setOwnerAvailable: (available) => { ownerAvailable = available; },
       getActiveFollowerCount: () => followers.size,
+      /** 只关闭合成 router 的既有连接，触发真实 DesktopIpc 的断线回调。 */
+      disconnectFollowers: () => { for (const socket of followers) socket.destroy(); },
+      holdHistoryResponses: () => { holdHistory = true; },
       releaseFollowDiscovery: () => { pendingDiscovery?.(); pendingDiscovery = undefined; },
       releaseHistory: () => { holdHistory = false; for (const reply of pendingHistory.splice(0)) reply(); },
       /** 换轮沿已关联基线的连续补丁发布，runtime 同步更新；无关联完整快照另有 IPC 撤权测试。 */
@@ -373,6 +378,52 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       for (const result of await Promise.all(controls)) expect(result).toMatchObject({ ok: true, snapshot: { textSendMode: 'start' } });
       expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
     }, { holdFollowDiscovery: phase === 'acquiring', holdHistory: true });
+  });
+
+  it('shares one recovery history when control arrives before the disconnected viewer poll resumes', async () => {
+    // 只冻结系统定时器以固定原 250ms poll 的先后，socket 与所有内部 owner 保持真实。
+    const runSocketIo = setTimeout;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await withDesktopRpcFixture('accepted', async ({ handlers, invokeTransport, request, source, requests,
+        getActiveFollowerCount, disconnectFollowers, holdHistoryResponses, releaseHistory }) => {
+        const target = { machineId: request.machineId, sessionId: request.sessionId };
+        const viewer = { ...target, providerId: 'codex', remoteSessionId: 'native-linked-thread', source, leaseId: 'viewer', ttlMs: 45_000 };
+        const status = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!;
+        await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!(viewer)).resolves.toMatchObject({ ok: true });
+        await vi.waitFor(async () => expect(await status(viewer)).toMatchObject({ observation: { state: 'completed' } }));
+        expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+
+        holdHistoryResponses();
+        const connectionsBeforeDisconnect = requests.filter((entry) => entry.method === 'initialize').length;
+        disconnectFollowers();
+        await vi.waitFor(() => expect(getActiveFollowerCount()).toBe(0), { interval: 1 });
+        await expect(status(viewer)).resolves.toMatchObject({ observation: { state: 'unknown' } });
+        const control = invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ, target);
+        // 为真实文件/socket I/O 留出处理机会，原恢复 poll 的虚拟时钟仍未前进。
+        await new Promise<void>((resolve) => runSocketIo(resolve, 100));
+        await vi.advanceTimersByTimeAsync(250);
+        await new Promise<void>((resolve) => runSocketIo(resolve, 100));
+        releaseHistory();
+        const recoveredControl = await control;
+        await new Promise<void>((resolve) => runSocketIo(resolve, 100));
+        await expect(status(viewer)).resolves.toMatchObject({ observation: { state: 'completed' } });
+
+        // 既有基线一次，加恢复一次；CONTROL 应加入恢复，不能另发完整历史。
+        expect({
+          historyRequests: requests.filter((entry) => entry.method === 'thread-follower-load-complete-history').length,
+          nativeConnections: requests.filter((entry) => entry.method === 'initialize').length - connectionsBeforeDisconnect,
+          control: recoveredControl,
+        }).toMatchObject({
+          historyRequests: 2,
+          // 断线后的 STATUS 保留原独立 discovery；CONTROL 和 poll 只共享另一个恢复连接。
+          nativeConnections: 2,
+          control: { ok: true, snapshot: { state: 'completed', textSendMode: 'start' } },
+        });
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each(['detach', 'relink'] as const)('rejects control waiting on a cold viewer after %s without replacement hydration', async (revocation) => {

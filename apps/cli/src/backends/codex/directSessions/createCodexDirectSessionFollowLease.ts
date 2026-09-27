@@ -139,7 +139,7 @@ export async function createCodexDirectSessionFollowLease(params: {
     /** 先读取来源连续性，再消费前向事实；来源失效会撤销 rollout，而不是依赖 IPC 是否连接。 */
     readAfterTranscript: ({ cursor, maxBytes, maxItems }) => {
       const reading = (async () => {
-        const recoveringBaseline = !baselineStarted && baselineAttempts === 1;
+        const recoveringBaseline = !baselineStarted && baseline !== null;
         if (!recoveringBaseline) await connect();
         const result = await readAfterCodexTranscript({ ...params, activeServerDir: configuration.activeServerDir, cursor, maxBytes, maxItems }).catch((error) => {
           // 文件读取失败只撤销依赖 rollout 的状态，已确认的 Desktop 来源仍独立有效。
@@ -158,12 +158,12 @@ export async function createCodexDirectSessionFollowLease(params: {
           publish(fact.data, 'event');
         }
         // 恢复前先确认本批来源仍连续可用；失效来源和已释放租约不能启动恢复连接。
-        if (recoveringBaseline && !released && !rolloutUnavailable) await connect();
+        if (!baselineStarted && baseline !== null && !released && !rolloutUnavailable) await connect();
         // 不 await 水合请求，原轮询继续接收等待期间的新轮和来源失效事实。
         if (!released && ipc && !baselineStarted && !rolloutUnavailable) baseline = initializeBaseline(ipc);
         return { ...result, observations: pending.splice(0) };
       })();
-      // 恢复游标的首轮仍由原 poller 发起；控制只等待该轮，不主动读取或重试。
+      // 读取进度仍属于原 poller；控制等待同一轮，不另开文件读取。
       sourceRead = reading.then(() => undefined, () => undefined);
       return reading;
     },
@@ -171,8 +171,14 @@ export async function createCodexDirectSessionFollowLease(params: {
   return { ...polling,
     /** 只交回现有连续连接，通用 lease 层不读取 provider 私有状态。 */
     getProviderControl: () => !released && ipc?.getControlSnapshot(params.remoteSessionId) ? ipc : null,
-    /** 只等待原在途基线；活 lease 缺锚仍可沿原控制冷读，释放或等待期间换连接才撤权。 */
+    /** 已成功连接的恢复加入原 poll；活 lease 缺锚仍可冷读，释放或等待期间换连接才撤权。 */
     waitForProviderControl: async () => {
+      if (!baselineStarted && baseline !== null && baselineAttempts === 0) {
+        const previousRead = sourceRead;
+        await polling.pollNow();
+        // 若仅确认了断线前的旧批次，再由原 poller 读取；不能跳过 ACK 或提前推进游标。
+        if (!released && !baselineStarted && sourceRead === previousRead) await polling.pollNow();
+      }
       if (!baselineStarted) await sourceRead;
       const opened = ipc;
       await baseline;

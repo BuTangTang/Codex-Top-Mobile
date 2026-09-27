@@ -20,7 +20,7 @@ afterAll(() => rm(environment.logsDir, { recursive: true, force: true }));
 
 /** 使用真正的第三方 socket 帧与独立 rollout；只替换配置边界，不 mock 内部状态归约。 */
 async function createFallbackHarness(options: { baseline?: { turnId: string; status: string; runtime?: string }; holdBaseline?: boolean;
-  missingSource?: boolean; initialCursor?: string; holdUpdates?: boolean } = {}) {
+  missingSource?: boolean; initialCursor?: string; holdUpdates?: boolean; pollMs?: string } = {}) {
   const root = await mkdtemp('/tmp/hcf-fallback-');
   environment.activeServerDir = join(root, 'state');
   const remoteSessionId = '33333333-3333-3333-3333-333333333333';
@@ -31,7 +31,7 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
   // 订阅前已有的历史终态必须留在初始 tail 之前。
   await writeFile(path, meta + `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'historical' } })}\n`);
   if (options.missingSource) await rm(path);
-  vi.stubEnv('HAPPIER_DIRECT_SESSIONS_FOLLOW_POLL_MS', '10');
+  vi.stubEnv('HAPPIER_DIRECT_SESSIONS_FOLLOW_POLL_MS', options.pollMs ?? '10');
   const sockets = new Set<Socket>();
   const followers: Socket[] = [];
   const updates: DirectSessionTranscriptUpdate[] = [];
@@ -448,6 +448,61 @@ it.each(['gap', 'disconnect', 'owner_changed'] as const)('revokes control on %s 
     await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', turnId: 'current' }));
     expect(harness.lease.getProviderControl?.()).toBeTruthy();
     await harness.append('agent_message');
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { await harness.close(); }
+});
+
+/** 断线前已读出的正文先由原消费链确认，控制不能绕过这份批次独立冷读。 */
+it('recovers control after acknowledging the disconnected poll batch without rereading it', async () => {
+  const options = { baseline: { turnId: 'current', status: 'completed' }, holdBaseline: false };
+  const harness = await createFallbackHarness(options);
+  let acknowledge!: () => void;
+  const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+  const unsubscribe = harness.lease.subscribeToTranscriptUpdates!(async (update) => {
+    if (Array.from(update.items).length) await acknowledgement;
+  });
+  try {
+    await vi.waitFor(() => expect(harness.lease.getProviderControl?.()).toBeTruthy());
+    await appendFile(harness.path, `${JSON.stringify({ type: 'response_item', payload: {
+      type: 'message', role: 'assistant', content: [{ type: 'text', text: 'synthetic boundary' }],
+    } })}\n`);
+    await vi.waitFor(() => expect(harness.updates.flatMap((update) => Array.from(update.items))).toHaveLength(1));
+    const committedCursor = harness.lease.getTailCursor?.();
+    options.holdBaseline = true;
+    harness.followers[0]!.destroy();
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' }));
+    let settled = false;
+    const waiting = harness.lease.waitForProviderControl!().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(harness.lease.getTailCursor?.()).toBe(committedCursor);
+    expect(harness.historyRequests).toHaveLength(1);
+    acknowledge();
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    expect(settled).toBe(false);
+    harness.replyBaseline();
+    await waiting;
+    expect(harness.lease.getProviderControl?.()).toBeTruthy();
+    expect(harness.updates.flatMap((update) => Array.from(update.items)).filter((item) => item.raw.role === 'agent')).toHaveLength(1);
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { acknowledge(); unsubscribe(); await harness.close(); }
+});
+
+/** 控制等待立即复用既有恢复读取；释放后不等待定时 tick 或接受迟到基线。 */
+it('rejects a control waiter released during immediate recovery without waiting for the next scheduled poll', async () => {
+  const options = { baseline: { turnId: 'current', status: 'completed' }, holdBaseline: false, pollMs: '60000' };
+  const harness = await createFallbackHarness(options);
+  try {
+    await vi.waitFor(() => expect(harness.lease.getProviderControl?.()).toBeTruthy());
+    options.holdBaseline = true;
+    harness.followers[0]!.destroy();
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' }));
+    const waiting = harness.lease.waitForProviderControl!().then(() => 'ready', () => 'unavailable');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    expect(harness.lease.getProviderControl?.()).toBeNull();
+    await harness.lease.release();
+    expect(await waiting).toBe('unavailable');
+    harness.replyBaseline();
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'connection_closed' });
     expect(harness.historyRequests).toHaveLength(2);
   } finally { await harness.close(); }
 });

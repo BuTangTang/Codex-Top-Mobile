@@ -58,7 +58,7 @@ async function notifyTranscriptListeners(
 
 export async function createPollingDirectSessionFollowLease(
   params: DirectSessionPollingFollowLeaseParams,
-): Promise<DirectSessionFollowLease> {
+): Promise<DirectSessionFollowLease & Readonly<{ pollNow: () => Promise<void> }>> {
   const env = params.env ?? process.env;
   const pollIntervalMs = resolvePollIntervalMs(env);
   const maxBytes = resolveMaxBytes(env);
@@ -87,7 +87,7 @@ export async function createPollingDirectSessionFollowLease(
     : null;
   let tailCursor = params.initialCursor ?? (pendingBatch ? null : initial?.nextCursor ?? null);
   let released = false;
-  let polling = false;
+  let polling: Promise<void> | null = null;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
   const clearPollTimer = (): void => {
@@ -104,9 +104,8 @@ export async function createPollingDirectSessionFollowLease(
     }, pollIntervalMs);
   };
 
-  const pollOnce = async (): Promise<void> => {
-    if (released || polling || listeners.size === 0) return;
-    polling = true;
+  /** 沿原批次确认链读取和提交；失败保留原批次与游标，交回既有轮询重试。 */
+  const runPoll = async (): Promise<void> => {
     try {
       if (!pendingBatch) {
         const fromCursor = tailCursor ?? 'tail';
@@ -135,13 +134,23 @@ export async function createPollingDirectSessionFollowLease(
     } catch (error) {
       // 原轮询 tick 重试原批次；明确撤销由消费方正常返回，不能当作异常反复处理。
       if (!released) reportReadFailure(error);
-    } finally {
-      polling = false;
-      schedulePoll();
     }
   };
 
+  /** 主动读取和定时 tick 共用同一轮，包含消费方确认；不能越过待提交批次。 */
+  const pollOnce = (): Promise<void> => {
+    if (released || listeners.size === 0) return Promise.resolve();
+    if (polling) return polling;
+    clearPollTimer();
+    polling = runPoll().finally(() => {
+      polling = null;
+      schedulePoll();
+    });
+    return polling;
+  };
+
   return {
+    pollNow: pollOnce,
     release: () => {
       released = true;
       clearPollTimer();

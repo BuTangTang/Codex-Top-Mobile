@@ -4,6 +4,82 @@ import { createPollingDirectSessionFollowLease } from './createPollingDirectSess
 import { logger } from '@/ui/logger';
 
 describe('createPollingDirectSessionFollowLease', () => {
+  it('joins an immediate poll through read and acknowledgement without racing the scheduled poll', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => { vi.useRealTimers(); });
+    let finishRead!: (value: { items: []; nextCursor: string; truncated: false }) => void;
+    const reading = new Promise<{ items: []; nextCursor: string; truncated: false }>((resolve) => { finishRead = resolve; });
+    const readAfterTranscript = vi.fn()
+      .mockResolvedValueOnce({ items: [], nextCursor: 'cursor-0', truncated: false })
+      .mockReturnValueOnce(reading)
+      .mockResolvedValue({ items: [], nextCursor: 'cursor-1', truncated: false });
+    const lease = await createPollingDirectSessionFollowLease({ readAfterTranscript, initialCursor: 'cursor-0',
+      env: { HAPPIER_DIRECT_SESSIONS_FOLLOW_POLL_MS: '250' } });
+    onTestFinished(() => lease.release());
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+    const listener = vi.fn(() => acknowledgement);
+    lease.subscribeToTranscriptUpdates?.(listener);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const immediate = lease.pollNow();
+    const joining = lease.pollNow();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(readAfterTranscript).toHaveBeenCalledTimes(2);
+    finishRead({ items: [], nextCursor: 'cursor-1', truncated: false });
+    let settled = false;
+    void joining.then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+    expect(lease.getTailCursor?.()).toBe('cursor-0');
+    expect(readAfterTranscript).toHaveBeenCalledTimes(2);
+    acknowledge();
+    await Promise.all([immediate, joining]);
+    expect(lease.getTailCursor?.()).toBe('cursor-1');
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(readAfterTranscript).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries the pending batch on immediate poll without rereading or committing before acknowledgement', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => { vi.useRealTimers(); });
+    const readAfterTranscript = vi.fn().mockResolvedValue({ items: [{ id: 'once', createdAtMs: 1, raw: {} }],
+      nextCursor: 'cursor-1', truncated: false });
+    const lease = await createPollingDirectSessionFollowLease({ readAfterTranscript, initialCursor: 'cursor-0' });
+    onTestFinished(() => lease.release());
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+    const listener = vi.fn().mockRejectedValueOnce(new Error('checkpoint failed')).mockImplementation(() => acknowledgement);
+    lease.subscribeToTranscriptUpdates?.(listener);
+    await vi.advanceTimersByTimeAsync(0);
+    const retry = lease.pollNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(listener.mock.calls[1][0]).toEqual(listener.mock.calls[0][0]);
+    expect(readAfterTranscript).toHaveBeenCalledTimes(1);
+    expect(lease.getTailCursor?.()).toBe('cursor-0');
+    acknowledge();
+    await retry;
+    expect(lease.getTailCursor?.()).toBe('cursor-1');
+  });
+
+  it('settles immediate polls without reading when no listener remains or the lease was released', async () => {
+    const readAfterTranscript = vi.fn().mockResolvedValue({ items: [], nextCursor: 'cursor-0', truncated: false });
+    const lease = await createPollingDirectSessionFollowLease({ readAfterTranscript, initialCursor: 'cursor-0' });
+    onTestFinished(() => lease.release());
+    await lease.pollNow();
+    expect(readAfterTranscript).not.toHaveBeenCalled();
+    const unsubscribe = lease.subscribeToTranscriptUpdates!(() => {});
+    await lease.pollNow();
+    unsubscribe();
+    await lease.pollNow();
+    await lease.release();
+    await lease.pollNow();
+    expect(readAfterTranscript).toHaveBeenCalledTimes(1);
+  });
+
   it('retries the same unacknowledged Desktop batch before reading the provider again', async () => {
     const observations = [{ observation: { v: 1 as const, source: 'desktop' as const, state: 'completed' as const, turnId: 'short-turn' }, continuity: 'event' as const }];
     const readAfterTranscript = vi.fn().mockResolvedValueOnce({ items: [{ id: 'stable-message', createdAtMs: 1, raw: {} }],
