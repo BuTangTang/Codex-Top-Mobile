@@ -1,8 +1,8 @@
 import * as React from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as LegendNative from '@legendapp/list/react-native';
-import { LegendList } from '@legendapp/list/react-native';
+import { LegendList, type LegendListRef } from '@legendapp/list/react-native';
 import { Platform } from 'react-native';
 
 import {
@@ -198,5 +198,225 @@ describe('shipped native Legend lane', () => {
             after: PREPENDED_ROWS * ROW_HEIGHT,
             before: 0,
         });
+    });
+});
+
+// Android Fabric can deliver the MVCP carrier's mount after a scrollToEnd command.
+// Exercise the shipped module; only native host layout/commands/events are simulated.
+// No Legend state is seeded, and native compensation comes from its real carrier delta.
+describe.skipIf(resolveShippedNativeHarnessPlatform() !== 'android')('held-end size-only native mounts', () => {
+    const rowHeight = 46;
+    const viewport = 300;
+    let resizeScreen: ReactTestRenderer | null = null;
+
+    beforeEach(() => { vi.useFakeTimers(); });
+    afterEach(() => {
+        if (resizeScreen) act(() => resizeScreen!.unmount());
+        resizeScreen = null;
+        vi.useRealTimers();
+    });
+
+    /** 挂载真实列表，仅模拟原生布局、滚动命令与回执，分别保留物理位置和列表计算位置。 */
+    async function mountResizeList() {
+        const ref = React.createRef<LegendListRef>();
+        let data = buildRows(20);
+        let heldEnd = true;
+        let physicalY = 0;
+        let nativeContent = data.length * rowHeight;
+        let nativeAdjust = 0;
+        const commands: number[] = [];
+        const clamp = (y: number) => Math.max(0, Math.min(y, nativeContent - viewport));
+        const scroller = {
+            measure: (cb: (...args: number[]) => void) => cb(0, 0, 800, viewport),
+            scrollTo: ({ y = 0 }: { y?: number }) => { physicalY = clamp(y); commands.push(physicalY); },
+            scrollToEnd: () => { physicalY = clamp(nativeContent - viewport); commands.push(physicalY); },
+            getScrollableNode: () => scroller,
+            getScrollResponder: () => scroller,
+            getNativeScrollRef: () => scroller,
+            flashScrollIndicators: () => {},
+            setNativeProps: () => {},
+        };
+        // 原生测量值随布局变化；不直接改写列表内部状态。
+        const createNodeMock = (element: React.ReactElement) => {
+            if (String(element.type) === 'ScrollView') return scroller;
+            const node = {
+                measuredHeight: rowHeight,
+                measure: (cb: (...args: number[]) => void) => cb(0, 0, 800, node.measuredHeight),
+                setNativeProps: () => {},
+            };
+            return node;
+        };
+        const view = () => <LegendList
+            ref={ref} data={data} estimatedItemSize={rowHeight}
+            keyExtractor={(row: Row) => row.id}
+            maintainScrollAtEnd={{ animated: false, isMaintainingScrollAtEnd: () => heldEnd }}
+            maintainVisibleContentPosition={{ data: true, size: true }}
+            recycleItems={false}
+            renderItem={({ item }: { item: Row }) => React.createElement('SyntheticSizedRow', { id: item.id })}
+        />;
+        await act(async () => { resizeScreen = create(view(), { createNodeMock }); });
+        const screen = resizeScreen!;
+        assertShippedNativeLegendRuntime(screen, moduleFacts());
+        const captureScroll = () => ({ nativeEvent: {
+            contentOffset: { x: 0, y: physicalY },
+            contentSize: { width: 800, height: nativeContent },
+            layoutMeasurement: { width: 800, height: viewport },
+            contentInset: { top: 0, bottom: 0, left: 0, right: 0 },
+            timestamp: Date.now(),
+        } });
+        // 允许延迟送达之前捕获的原生事件，验证布局和事件交错。
+        const emitScroll = async (event = captureScroll()) => {
+            await act(async () => { screen.root.findByType('ScrollView' as never).props.onScroll(event); });
+        };
+        const advance = async (ms: number) => {
+            await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+        };
+        await act(async () => { void ref.current!.scrollToEnd({ animated: false }); });
+        for (let n = 0; n < 5; n++) { await advance(100); await emitScroll(); }
+        expect(ref.current!.getState().scroll).toBe(nativeContent - viewport);
+
+        return {
+            ref, commands, advance, captureScroll, emitScroll,
+            get physicalY() { return physicalY; },
+            get expectedEnd() { return Math.max(0, ref.current!.getState().contentLength - viewport); },
+            /** 经实际行布局回调触发尺寸变化。 */
+            async resize(index: number, height: number) {
+                const row = screen.root.findAllByType('SyntheticSizedRow' as never)
+                    .find((item) => item.props.id === data[index].id)!;
+                expect(row).toBeTruthy();
+                let host: typeof row | null = row;
+                while (host && !(typeof host.type === 'string' && typeof host.props.onLayout === 'function')) host = host.parent;
+                expect(host).toBeTruthy();
+                const node = ref.current!.getState().elementAtIndex(index) as unknown as { measuredHeight: number };
+                expect(node).toBeTruthy();
+                node.measuredHeight = height;
+                await act(async () => { host!.props.onLayout({ nativeEvent: { layout: { x: 0, y: 0, width: 800, height } } }); });
+            },
+            /** 模拟原生提交内容尺寸，并将越界位置收束到有效范围。 */
+            commitContent(height = ref.current!.getState().contentLength) {
+                nativeContent = height;
+                physicalY = clamp(physicalY);
+            },
+            /** 只应用真实补偿载体的差值，不人为注入候选已经取消的负补偿。 */
+            commitAnchor() {
+                const nextAdjust = readShippedNativeTreeFacts(screen).scrollAdjustPx!;
+                physicalY = clamp(physicalY + nextAdjust - nativeAdjust);
+                nativeAdjust = nextAdjust;
+            },
+            /** 通过正常数据更新追加一行，覆盖数据与尺寸变化合并提交的场景。 */
+            async append() {
+                data = [...data, { id: 'appended-row' }];
+                await act(async () => { screen.update(view()); });
+            },
+            /** 用户阅读历史时释放跟随意图，取消待执行的末尾维护。 */
+            async readHistory(y: number) {
+                heldEnd = false;
+                ref.current!.cancelScroll();
+                physicalY = y;
+                await emitScroll();
+            },
+            /** 排空有限维护动作，确认物理末尾正确且没有残留定时器。 */
+            async assertSettledAtEnd() {
+                await advance(5_000);
+                expect(physicalY).toBe(this.expectedEnd);
+                expect(vi.getTimerCount()).toBe(0);
+            },
+        };
+    }
+
+    it.each(['native-before-end', 'native-after-end', 'content-after-end'] as const)(
+        'keeps the last row visible with %s ordering', async (order) => {
+            const list = await mountResizeList();
+            await list.resize(19, 0);
+            if (order === 'content-after-end') await list.advance(20);
+            list.commitContent();
+            if (order === 'native-before-end') { list.commitAnchor(); await list.emitScroll(); }
+            if (order !== 'content-after-end') await list.advance(20);
+            if (order !== 'native-before-end') list.commitAnchor();
+            await list.emitScroll();
+            await list.assertSettledAtEnd();
+        },
+    );
+
+    it.each([23, 46])('coalesces shrink with a %i px growth without waiting for a nonexistent native event', async (growth) => {
+        const list = await mountResizeList();
+        await list.resize(19, 0);
+        await list.resize(18, rowHeight + growth);
+        list.commitContent();
+        await list.advance(20);
+        list.commitAnchor();
+        // Full cancellation has no physical movement, so native need not emit onScroll.
+        if (growth !== rowHeight) await list.emitScroll();
+        await list.assertSettledAtEnd();
+        await list.resize(18, rowHeight + growth + rowHeight);
+        list.commitContent();
+        await list.advance(20);
+        list.commitAnchor();
+        await list.assertSettledAtEnd();
+    });
+
+    it('accepts two native clamp events delivered after the second size change', async () => {
+        const list = await mountResizeList();
+        await list.resize(19, 0);
+        list.commitContent();
+        const firstEvent = list.captureScroll();
+        await list.resize(18, 0);
+        list.commitContent();
+        const secondEvent = list.captureScroll();
+        await list.emitScroll(firstEvent);
+        await list.advance(20);
+        list.commitAnchor();
+        await list.emitScroll(secondEvent);
+        await list.emitScroll();
+        await list.assertSettledAtEnd();
+    });
+
+    it('handles a native clamp that precedes the delayed row measurement without another scroll event', async () => {
+        const list = await mountResizeList();
+        list.commitContent(20 * rowHeight - rowHeight);
+        await list.emitScroll();
+        await list.resize(19, 0);
+        await list.assertSettledAtEnd();
+    });
+
+    it('does not block when a data append cancels a size shrink in the same native mount', async () => {
+        const list = await mountResizeList();
+        await list.resize(19, 0);
+        await list.append();
+        list.commitContent();
+        await list.advance(20);
+        list.commitAnchor();
+        await list.assertSettledAtEnd();
+        await list.resize(20, rowHeight * 2);
+        list.commitContent();
+        await list.advance(20);
+        list.commitAnchor();
+        await list.assertSettledAtEnd();
+    });
+
+    it('releases queued end maintenance when the reader scrolls into history', async () => {
+        const list = await mountResizeList();
+        await list.resize(19, 0);
+        list.commitContent();
+        await list.readHistory(450);
+        const commandsBefore = list.commands.length;
+        await list.advance(5_000);
+        expect(list.physicalY).toBe(450);
+        expect(list.commands).toHaveLength(commandsBefore);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('preserves the reading anchor for a size shrink above the viewport when held-end is released', async () => {
+        const list = await mountResizeList();
+        await list.readHistory(450);
+        const commandsBefore = list.commands.length;
+        await list.resize(8, 0);
+        list.commitContent();
+        list.commitAnchor();
+        await list.emitScroll();
+        await list.advance(5_000);
+        expect(list.physicalY).toBe(450 - rowHeight);
+        expect(list.commands).toHaveLength(commandsBefore);
+        expect(vi.getTimerCount()).toBe(0);
     });
 });
