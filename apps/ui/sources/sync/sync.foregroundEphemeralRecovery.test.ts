@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('expo-network', () => ({
+    addNetworkStateListener: vi.fn(() => ({ remove: vi.fn() })),
+}));
+
 const appStateHandlers = vi.hoisted(() => new Set<(state: string) => void>());
 const appStateAddListener = vi.hoisted(() => vi.fn((_event: string, handler: (state: string) => void) => {
     appStateHandlers.add(handler);

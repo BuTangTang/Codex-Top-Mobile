@@ -1,4 +1,5 @@
 import Constants from 'expo-constants';
+import { addNetworkStateListener } from 'expo-network';
 import { apiSocket } from '@/sync/api/session/apiSocket';
 import { ensureSessionRuntimeForPendingInput } from '@/sync/ops';
 import { shouldDelegatePendingActivationToDaemon } from '@/sync/domains/session/input/pendingActivationWakeDecision';
@@ -1372,6 +1373,16 @@ class Sync {
                   }
               }
           });
+
+          // 全局只订阅一次；前台联网提示只唤醒原认证探测，在线状态仍由探测结果决定。
+          if (Platform.OS === 'android' || Platform.OS === 'ios') {
+              addNetworkStateListener((state) => {
+                  if (!this.isForeground || state.isConnected !== true) return;
+                  fireAndForget(invalidateAllServerReachabilitySupervisors(), {
+                      tag: 'Sync.invalidateAllServerReachabilitySupervisors.network',
+                  });
+              });
+          }
 
           // Web: AppState events are not always reliable when tabs are backgrounded. Mirror the
           // pause/resume behavior using document visibility.

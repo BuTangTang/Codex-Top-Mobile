@@ -24,12 +24,13 @@ type UseDirectSessionRuntimeParams = Readonly<{
 // 与 daemon 的既有租约约定一致；从本地请求开始计时，不比较电脑与手机的绝对时间。
 const VIEWER_TTL_MS = 45_000;
 const VIEWER_RENEW_MS = 15_000;
+type ViewerAttachResult = 'ready' | 'unavailable' | 'expired';
 type ViewerLease = {
     key: string;
     serverId: string | undefined;
     input: DirectSessionAttachRequest & { leaseId: string };
     validUntilMs: number;
-    inFlight: Promise<boolean> | null;
+    inFlight: Promise<ViewerAttachResult> | null;
     timer: ReturnType<typeof setTimeout> | null;
 };
 
@@ -250,8 +251,8 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
     }, [markUnavailable, releaseViewer, targetKey, viewerActive]);
 
     /** 同一页面激活只允许一份 attach/续租；迟到成功只清理捕获的旧租约。 */
-    const attachViewer = React.useCallback(function attach(viewer: ViewerLease): Promise<boolean> {
-        if (viewerRef.current !== viewer || !foregroundRef.current) return Promise.resolve(false);
+    const attachViewer = React.useCallback(function attach(viewer: ViewerLease): Promise<ViewerAttachResult> {
+        if (viewerRef.current !== viewer || !foregroundRef.current) return Promise.resolve('unavailable');
         if (viewer.inFlight) return viewer.inFlight;
         const startedAt = Date.now();
         if (viewer.timer !== null) clearTimeout(viewer.timer);
@@ -264,29 +265,29 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
                 markUnavailable();
             }, Math.max(0, viewer.validUntilMs - startedAt));
         }
-        const operation = (async () => {
+        const operation = (async (): Promise<ViewerAttachResult> => {
             try {
                 const response = await machineDirectSessionAttach(viewer.input, { serverId: viewer.serverId });
                 if (viewerRef.current !== viewer || !foregroundRef.current) {
                     if (response.ok) detachViewer(viewer, response.leaseId);
-                    return false;
+                    return 'unavailable';
                 }
                 if (response.ok) viewer.input = { ...viewer.input, leaseId: response.leaseId };
                 if (!response.ok || Date.now() >= startedAt + VIEWER_TTL_MS) {
                     viewer.validUntilMs = 0;
                     generationRef.current += 1;
                     markUnavailable();
-                    return false;
+                    return response.ok ? 'expired' : 'unavailable';
                 }
                 viewer.validUntilMs = startedAt + VIEWER_TTL_MS;
-                return true;
+                return 'ready';
             } catch {
                 if (viewerRef.current === viewer) {
                     viewer.validUntilMs = 0;
                     generationRef.current += 1;
                     markUnavailable();
                 }
-                return false;
+                return 'unavailable';
             } finally {
                 viewer.inFlight = null;
                 if (viewerRef.current === viewer) {
@@ -340,11 +341,24 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
             return inFlightRefreshRef.current;
         }
 
-        const currentGeneration = generationRef.current;
+        let currentGeneration = generationRef.current;
+        const isRefreshCurrent = () => viewerRef.current === viewer
+            && generationRef.current === currentGeneration && foregroundRef.current && viewerActive
+            && committedViewerDemandRef.current?.active === true
+            && committedViewerDemandRef.current.targetKey === targetKey;
         let refreshPromise: Promise<DirectSessionRuntimeStatus | null> | null = null;
         refreshPromise = (async () => {
-            if (viewer.validUntilMs <= Date.now() && !await attachViewer(viewer)) return null;
-            if (viewerRef.current !== viewer || generationRef.current !== currentGeneration || !foregroundRef.current) return null;
+            if (viewer.validUntilMs <= Date.now()) {
+                let attached = await attachViewer(viewer);
+                // 只接续本次过期成功自身的一次撤代；其他失活仍作废原刷新，不接受旧租约。
+                if (attached === 'expired' && generationRef.current === currentGeneration + 1) {
+                    currentGeneration += 1;
+                    if (!isRefreshCurrent()) return null;
+                    attached = await attachViewer(viewer);
+                }
+                if (attached !== 'ready') return null;
+            }
+            if (!isRefreshCurrent()) return null;
             const statusPromise = machineDirectSessionStatusGet({
                 machineId: directSessionLink.machineId,
                 sessionId: params.sessionId,
@@ -367,7 +381,7 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
 
             const statusResult = await statusPromise;
             // 先检查归属，过期请求无论成功或失败都不能改写新目标。
-            if (viewerRef.current !== viewer || generationRef.current !== currentGeneration || !foregroundRef.current) {
+            if (!isRefreshCurrent()) {
                 return null;
             }
             if (viewer.validUntilMs <= Date.now() || !statusResult.ok || !statusResult.response.ok) {

@@ -107,15 +107,17 @@ describe('useDirectSessionRuntime', () => {
   });
 
   // 初次超时可能已在电脑建立租约，重试必须复用同一 ID，避免遗留多个 viewer。
-  it('retries a failed attach with the same lease without querying stale status', async () => {
+  it.each(['rejected', 'error'] as const)('retries a failed attach with the same lease without querying stale status (%s)', async (outcome) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-    machineDirectSessionAttachSpy.mockRejectedValueOnce(new Error('offline'));
+    if (outcome === 'error') machineDirectSessionAttachSpy.mockRejectedValueOnce(new Error('offline'));
+    else machineDirectSessionAttachSpy.mockResolvedValueOnce({ ok: false, errorCode: 'machine_offline', error: 'offline' });
     machineDirectSessionStatusGetSpy.mockResolvedValue(observedStatus);
     refreshSessionMessagesSpy.mockResolvedValue(undefined);
     const hook = await renderHarness();
     try {
       expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
       expect(hook.getCurrent().status?.observation?.state ?? 'unknown').toBe('unknown');
+      expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(1);
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
       const inputs = machineDirectSessionAttachSpy.mock.calls.map(([input]) => input);
       expect(inputs).toHaveLength(2);
@@ -232,21 +234,41 @@ describe('useDirectSessionRuntime', () => {
   });
 
   // 电脑时钟不参与本地 TTL 判断，响应晚于本次请求的有效窗口必须先重新续租。
-  it('does not consume status from an attach response received after its local TTL', async () => {
+  it.each(['ready', 'expired', 'rejected', 'error', 'background'] as const)('renews an expired successful attach only once before consuming status (%s)', async (outcome) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const lateAttach = createDeferred<any>();
-    machineDirectSessionAttachSpy.mockReturnValueOnce(lateAttach.promise);
+    const freshAttach = createDeferred<any>();
+    machineDirectSessionAttachSpy.mockReturnValueOnce(lateAttach.promise).mockReturnValueOnce(freshAttach.promise);
     machineDirectSessionStatusGetSpy.mockResolvedValue(observedStatus);
     refreshSessionMessagesSpy.mockResolvedValue(undefined);
     const hook = await renderHarness();
     try {
+      let pending!: Promise<HookValue['status']>;
+      await act(async () => { pending = hook.getCurrent().refreshNow(); });
       const leaseId = machineDirectSessionAttachSpy.mock.calls[0][0].leaseId;
       await act(async () => { await vi.advanceTimersByTimeAsync(45_001); });
       await act(async () => { lateAttach.resolve({ ok: true, leaseId, expiresAtMs: Date.now() + 9_000_000 }); });
       expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
-      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(2);
       expect(machineDirectSessionAttachSpy.mock.calls[1][0].leaseId).toBe(leaseId);
-      expect(hook.getCurrent().status?.observation?.state).toBe('completed');
+      if (outcome === 'expired') await act(async () => { await vi.advanceTimersByTimeAsync(45_001); });
+      if (outcome === 'background') await act(async () => { (await appStateEmitter).emit('inactive'); });
+      let result: HookValue['status'] = null;
+      await act(async () => {
+        if (outcome === 'error') freshAttach.reject(new Error('offline'));
+        else if (outcome === 'rejected') freshAttach.resolve({ ok: false, errorCode: 'machine_offline', error: 'offline' });
+        else freshAttach.resolve({ ok: true, leaseId, expiresAtMs: Date.now() + 9_000_000 });
+        result = await pending;
+      });
+      expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(2);
+      if (outcome === 'ready') {
+        expect(result).toEqual(observedStatus);
+        expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+      } else {
+        expect(result).toBeNull();
+        expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
+        if (outcome === 'background') expect(machineDirectSessionDetachSpy.mock.calls.map(([input]) => input.leaseId)).toEqual([leaseId, leaseId]);
+      }
     } finally { await hook.unmount(); vi.useRealTimers(); }
   });
 

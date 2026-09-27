@@ -38,6 +38,9 @@ import {
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 (globalThis as any).__DEV__ = false;
 
+// 页面使用真实 Sync 提交 owner；原生网络事件由 sync 专项覆盖。
+vi.mock('expo-network', () => ({ addNetworkStateListener: () => ({ remove() {} }) }));
+
 const TEST_SERVER_ACCOUNT_SCOPE = { serverId: 'server-1', accountId: 'account-1' } as const;
 const TEST_SESSION_DRAFT_ADDRESS = { kind: 'session' as const, sessionId: 's1' };
 
@@ -835,20 +838,26 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.value).toBe('desktop next draft');
   });
 
-  // 冷开首个 STATUS 未返回时，点击等待同一真实探测；不能先拒绝，也不能抢跑 runner 归属判断。
-  it.each(['start', 'steer', 'runner', 'offline'] as const)('prepares a cold desktop click before mutation (%s)', async (next) => {
+  // 冷恢复点击复用的旧 ATTACH 跨过 TTL 时，先续同一租约，再等真实 STATUS 确认 runner 归属。
+  it.each(['start', 'steer', 'runner', 'offline'] as const)('prepares a cold desktop click after an expired attach before mutation (%s)', async (next) => {
     vi.useFakeTimers();
     responsiveHarnessState.platformOs = 'android';
     responsiveHarnessState.deviceType = 'phone';
+    const oldAttach = createDeferred<any>();
+    const freshAttach = createDeferred<any>();
+    machineDirectSessionAttachSpy.mockReturnValueOnce(oldAttach.promise).mockReturnValueOnce(freshAttach.promise);
     const status = createDeferred<any>();
     machineDirectSessionStatusGetSpy.mockReturnValue(status.promise);
     machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'cold-turn',
-      state: next === 'start' ? 'completed' : 'running', textSendMode: next === 'start' ? 'start' : 'steer', requests: [] } });
+      state: next === 'start' ? 'completed' : 'running', textSendMode: next === 'start' ? 'start' : 'steer', requests: [] } })
+      .mockResolvedValueOnce({ ok: false, error: 'offline' });
     const receipt = createDeferred<any>();
     syncSubmitMessageSpy.mockReturnValue(receipt.promise);
     machineControlActionSpy.mockReturnValue(receipt.promise);
     const screen = await renderSessionViewAndSettle();
-    expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+    const leaseId = machineDirectSessionAttachSpy.mock.calls[0][0].leaseId;
+    await act(async () => { await vi.advanceTimersByTimeAsync(41_621); });
+    expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
     await act(async () => { findAgentInput(screen).props.onChangeText('cold recovery text'); });
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
@@ -858,10 +867,31 @@ describe('SessionView (direct sessions)', () => {
     const localId = rows[0].localId;
     expect(rows[0].sendState).toBeUndefined();
     expect(findAgentInput(screen).props.value).toBe('');
-    expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+    expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
     expect(machineControlActionSpy).not.toHaveBeenCalled();
     await act(async () => { findAgentInput(screen).props.onChangeText('next draft to preserve'); });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_036);
+      oldAttach.resolve({ ok: true, leaseId, expiresAtMs: Date.now() + 45_000 });
+    });
+    await flushHookEffects();
+    expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(2);
+    expect(machineDirectSessionAttachSpy.mock.calls[1][0].leaseId).toBe(leaseId);
+    expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    expect(storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ localId,
+      text: 'cold recovery text', directSessionExternalControl: true })]);
+    expect(storage.getState().sessionPending.s1?.messages[0].sendState).toBeUndefined();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60);
+      freshAttach.resolve({ ok: true, leaseId, expiresAtMs: Date.now() + 45_000 });
+    });
+    await flushHookEffects();
+    expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
     await act(async () => { status.resolve({ ok: true, machineOnline: next !== 'offline', runnerActive: next === 'runner',
       activity: 'idle', canForceStop: false, externalControl: { canSend: next !== 'offline' } }); });
     await flushHookEffects();
