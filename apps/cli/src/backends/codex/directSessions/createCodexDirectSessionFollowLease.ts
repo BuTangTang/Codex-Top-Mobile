@@ -16,6 +16,8 @@ export async function createCodexDirectSessionFollowLease(params: {
   let ipc: DesktopIpc | null = null;
   let released = false;
   let baselineStarted = false;
+  let baseline: Promise<void> | null = null;
+  let sourceRead: Promise<void> | null = null;
   let baselineAttempts = 0;
   let baselineSelected = false;
   let baselineInvalidated = false;
@@ -135,35 +137,49 @@ export async function createCodexDirectSessionFollowLease(params: {
   const polling = await createPollingDirectSessionFollowLease({
     initialCursor: params.initialCursor,
     /** 先读取来源连续性，再消费前向事实；来源失效会撤销 rollout，而不是依赖 IPC 是否连接。 */
-    readAfterTranscript: async ({ cursor, maxBytes, maxItems }) => {
-      const recoveringBaseline = !baselineStarted && baselineAttempts === 1;
-      if (!recoveringBaseline) await connect();
-      const result = await readAfterCodexTranscript({ ...params, activeServerDir: configuration.activeServerDir, cursor, maxBytes, maxItems }).catch((error) => {
-        // 文件读取失败只撤销依赖 rollout 的状态，已确认的 Desktop 来源仍独立有效。
-        if (!hasUsableDesktopObservation()) markSourceUnavailable();
-        throw error;
-      });
-      const rolloutUnavailable = result.historyAvailability !== 'available'
-        || resolveDirectTranscriptContinuation(result) === 'source_discontinuity';
-      if (!hasUsableDesktopObservation() && rolloutUnavailable) markSourceUnavailable();
-      // 断点变化批次不能作为新轮事件；只有同一来源的前向显式记录能恢复已知状态。
-      if (!released && !hasUsableDesktopObservation() && !rolloutUnavailable) for (const item of result.items) {
-        const fact = DirectSessionObservationV1Schema.safeParse(item.raw.directSessionObservationV1);
-        if (!fact.success) continue;
-        if (observation.state !== 'unknown' && fact.data.state !== 'unknown'
-            && observation.turnId === fact.data.turnId && isTerminal(observation)) continue;
-        publish(fact.data, 'event');
-      }
-      // 恢复前先确认本批来源仍连续可用；失效来源和已释放租约不能启动恢复连接。
-      if (recoveringBaseline && !released && !rolloutUnavailable) await connect();
-      // 不 await 水合请求，原轮询继续接收等待期间的新轮和来源失效事实。
-      if (!released && ipc && !baselineStarted && !rolloutUnavailable) void initializeBaseline(ipc);
-      return { ...result, observations: pending.splice(0) };
+    readAfterTranscript: ({ cursor, maxBytes, maxItems }) => {
+      const reading = (async () => {
+        const recoveringBaseline = !baselineStarted && baselineAttempts === 1;
+        if (!recoveringBaseline) await connect();
+        const result = await readAfterCodexTranscript({ ...params, activeServerDir: configuration.activeServerDir, cursor, maxBytes, maxItems }).catch((error) => {
+          // 文件读取失败只撤销依赖 rollout 的状态，已确认的 Desktop 来源仍独立有效。
+          if (!hasUsableDesktopObservation()) markSourceUnavailable();
+          throw error;
+        });
+        const rolloutUnavailable = result.historyAvailability !== 'available'
+          || resolveDirectTranscriptContinuation(result) === 'source_discontinuity';
+        if (!hasUsableDesktopObservation() && rolloutUnavailable) markSourceUnavailable();
+        // 断点变化批次不能作为新轮事件；只有同一来源的前向显式记录能恢复已知状态。
+        if (!released && !hasUsableDesktopObservation() && !rolloutUnavailable) for (const item of result.items) {
+          const fact = DirectSessionObservationV1Schema.safeParse(item.raw.directSessionObservationV1);
+          if (!fact.success) continue;
+          if (observation.state !== 'unknown' && fact.data.state !== 'unknown'
+              && observation.turnId === fact.data.turnId && isTerminal(observation)) continue;
+          publish(fact.data, 'event');
+        }
+        // 恢复前先确认本批来源仍连续可用；失效来源和已释放租约不能启动恢复连接。
+        if (recoveringBaseline && !released && !rolloutUnavailable) await connect();
+        // 不 await 水合请求，原轮询继续接收等待期间的新轮和来源失效事实。
+        if (!released && ipc && !baselineStarted && !rolloutUnavailable) baseline = initializeBaseline(ipc);
+        return { ...result, observations: pending.splice(0) };
+      })();
+      // 恢复游标的首轮仍由原 poller 发起；控制只等待该轮，不主动读取或重试。
+      sourceRead = reading.then(() => undefined, () => undefined);
+      return reading;
     },
   });
   return { ...polling,
     /** 只交回现有连续连接，通用 lease 层不读取 provider 私有状态。 */
     getProviderControl: () => !released && ipc?.getControlSnapshot(params.remoteSessionId) ? ipc : null,
+    /** 只等待原在途基线；活 lease 缺锚仍可沿原控制冷读，释放或等待期间换连接才撤权。 */
+    waitForProviderControl: async () => {
+      if (!baselineStarted) await sourceRead;
+      const opened = ipc;
+      await baseline;
+      if (released || ipc !== opened) {
+        throw new DesktopIpcError('owner_unavailable');
+      }
+    },
     /** 只返回当前已选择来源的事实，释放后的旧引用一律未知。 */
     getObservation: () => released ? { v: 1, state: 'unknown', reason: 'connection_closed' } : observation,
     /** 先撤销观察，再等待轮询释放，迟到回调不能恢复已释放的 lease。 */

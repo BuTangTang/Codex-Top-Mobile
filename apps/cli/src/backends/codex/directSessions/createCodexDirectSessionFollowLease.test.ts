@@ -137,6 +137,27 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
     /** 仅释放测试消费者的提交屏障，让正式轮询继续读取下一批。 */ resumeUpdates: () => resumeUpdates?.() };
 }
 
+/** 恢复既有游标时，lease 先发布、原 poller 随后连接；控制等待这一次读取和关联基线。 */
+it('waits for the existing source read before sharing a resumed lease baseline', async () => {
+  const options = { baseline: { turnId: 'current', status: 'completed' }, holdBaseline: false };
+  const harness = await createFallbackHarness(options);
+  try {
+    await vi.waitFor(() => expect(harness.lease.getProviderControl?.()).toBeTruthy());
+    const cursor = harness.lease.getTailCursor?.();
+    expect(cursor).toEqual(expect.any(String));
+    await harness.lease.release();
+    options.holdBaseline = true;
+    await harness.openLease(cursor!);
+    const ready = harness.lease.waitForProviderControl!().then(() => 'ready', () => 'unavailable');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    harness.replyBaseline();
+    expect(await ready).toBe('ready');
+    expect(harness.lease.getProviderControl?.()).toBeTruthy();
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { await harness.close(); }
+});
+
 /** 首次真实超时后由原 poller 恢复一次；没有新正文事件也能取得已关联的当前终态。 */
 it('recovers a timed-out initial baseline once without waiting for a new rollout event', async () => {
   const harness = await createFallbackHarness({ holdBaseline: true });

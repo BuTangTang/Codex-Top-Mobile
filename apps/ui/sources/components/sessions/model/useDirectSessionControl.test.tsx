@@ -20,10 +20,11 @@ describe('desktop control lifecycle', () => {
     /** 原状态 owner 尚未确认可操作时不抢跑；明确失败不能消耗本次审批或追加的去重锁。 */
     it.each(['steer', 'approval'] as const)('waits for runtime readiness before %s and allows explicit retry after rejection', async (kind) => {
         const ready = createDeferred<boolean>();
-        const prepareForMutation = vi.fn().mockReturnValueOnce(ready.promise).mockResolvedValue(true);
+        const prepareForMutation = vi.fn().mockResolvedValue(true);
         mocks.action.mockResolvedValue({ ok: true, result: { status: 'accepted', turnId: 'turn' } });
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation }));
+        prepareForMutation.mockReturnValueOnce(ready.promise);
         const start = vi.fn(async () => 'accepted' as const);
         let operation!: Promise<unknown>;
         await act(async () => {
@@ -47,7 +48,9 @@ describe('desktop control lifecycle', () => {
     it('rejects a prepared mutation after its account changes', async () => {
         const ready = createDeferred<boolean>();
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
-        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation: () => ready.promise }));
+        const prepareForMutation = () => ready.promise;
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation }));
+        expect(mocks.read).not.toHaveBeenCalled();
         const start = vi.fn(async () => 'accepted' as const);
         let operation!: Promise<unknown>;
         await act(async () => { operation = hook.getCurrent().sendText('old account text', start); });
@@ -55,6 +58,7 @@ describe('desktop control lifecycle', () => {
         mocks.accountId = 'account-b';
         await hook.rerender();
         await act(async () => { ready.resolve(true); expect(await operation).toEqual({ outcome: 'rejected' }); });
+        expect(mocks.read).toHaveBeenCalledTimes(1);
         expect(mocks.action).not.toHaveBeenCalled();
         expect(start).not.toHaveBeenCalled();
         await hook.unmount();

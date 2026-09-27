@@ -643,12 +643,17 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       }) };
       await followLeaseManager.invalidateMismatchedTarget(followTarget);
       if (!isCurrentLifecycle(currentEpoch)) return { ok: false, error: 'source_unavailable', errorCode: 'source_unavailable' };
+      const followedLease = await followLeaseManager.waitForProviderControl(followTarget);
       /** provider 每次取控制连接时复核认证寿命；已撤销与从未获取必须区别处理。 */
       const getFollowLease = () => {
         // 失效身份必须终止；不能将撤销伪装成没有 lease 而触发 provider 新建控制连接。
         if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
-        return followLeaseManager.getFollowLease(followTarget);
+        const current = followLeaseManager.getFollowLease(followTarget);
+        if (followedLease && current !== followedLease) throw new Error('source_unavailable');
+        return current;
       };
+      // 水合等待新增了异步边界；进入任何 provider 分支前先复核原身份与 lease。
+      getFollowLease();
       submissionStarted = true;
       const result = await provider.send({ source: validatedSource.source, remoteSessionId: linked.session.remoteSessionId,
         text: parsed.data.text, localId: parsed.data.localId, meta: parsed.data.meta, accountId: identity.identity.accountId, getFollowLease });
@@ -686,11 +691,16 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       }) };
       await followLeaseManager.invalidateMismatchedTarget(followTarget);
       if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable');
+      const followedLease = await followLeaseManager.waitForProviderControl(followTarget);
       /** 只在原 RPC 寿命内选择同目标现有 lease，异步等待后不得借用新账号连接。 */
       const getFollowLease = () => {
         if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
-        return followLeaseManager.getFollowLease(followTarget);
+        const current = followLeaseManager.getFollowLease(followTarget);
+        if (followedLease && current !== followedLease) throw new Error('source_unavailable');
+        return current;
       };
+      // 审批保留自身的独立读取流程，也必须先通过等待后的寿命复核。
+      getFollowLease();
       const target = { source: source.source, remoteSessionId: linked.session.remoteSessionId, getFollowLease };
       if (action?.success) {
         if (!provider.control) return err('provider_unavailable');

@@ -356,11 +356,30 @@ describe('Desktop-owned session control', () => {
         expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
     });
 
-    it('leaves an already loaded task in place without launching its desktop URL', async () => {
+    it('opens the selected existing task when discovery succeeds before history is loaded', async () => {
         Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        let loaded = false;
+        const loadedHistory = onHistory;
+        onHistory = (request, socket) => loaded ? loadedHistory(request, socket) : missingOwner(request, socket);
+        onFollow = (request, socket) => {
+            if (request.params.following) respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+                sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: openId,
+                    change: { type: 'snapshot', revision: 1, conversationState: { ...idleControlState(), id: openId } } } });
+        };
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            loaded = true;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
         await startRouter();
-        await openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true });
-        expect(execFile).not.toHaveBeenCalled();
+        const target = { codexHome, remoteSessionId: openId, isCurrent: () => true };
+        await expect(getDesktopSessionControlSnapshot(target)).rejects.toThrow('owner_unavailable');
+        await openDesktopSession(target);
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(execFile).toHaveBeenCalledWith('/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${openId}?hostId=local`],
+            expect.objectContaining({ timeout: 2_000 }), expect.any(Function));
+        await expect(getDesktopSessionControlSnapshot(target)).resolves.toMatchObject({ state: 'completed', textSendMode: 'start', requests: [] });
     });
 
     it.each(['../new?prompt=unexpected', 'new', `${openId}?prompt=unexpected`])('rejects a non-task URL target before a launch (%s)', async (remoteSessionId) => {
@@ -400,7 +419,7 @@ describe('Desktop-owned session control', () => {
         const target = { codexHome, remoteSessionId: openId, isCurrent: () => true };
         await expect(openDesktopSession(target)).rejects.toThrow('owner_unavailable');
         expect(execFile).toHaveBeenCalledTimes(1);
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(3);
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(2);
         await expect(openDesktopSession(target)).rejects.toThrow('owner_unavailable');
         expect(execFile).toHaveBeenCalledTimes(2);
     });
@@ -447,7 +466,7 @@ describe('Desktop-owned session control', () => {
         await startRouter();
         await expect(openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true })).rejects.toThrow('desktop_open_failed');
         expect(execFile).toHaveBeenCalledTimes(1);
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(0);
     });
 
     it('never launches the desktop from ordinary status or control failures', async () => {

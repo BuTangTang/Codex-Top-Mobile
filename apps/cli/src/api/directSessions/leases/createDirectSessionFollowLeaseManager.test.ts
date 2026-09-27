@@ -3,6 +3,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDirectSessionFollowLeaseManager } from './createDirectSessionFollowLeaseManager';
 
 describe('createDirectSessionFollowLeaseManager', () => {
+  it.each(['expiry', 'replacement'] as const)('rejects a control baseline that finishes after viewer %s', async (revocation) => {
+    let nowMs = 0;
+    const manager = createDirectSessionFollowLeaseManager({ now: () => nowMs });
+    const target = { sessionId: 's', targetKey: 'original' };
+    let finish!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const baseline = new Promise<void>((resolve) => { finish = resolve; });
+    const lease = { release: () => {}, waitForProviderControl: () => { entered(); return baseline; } };
+    try {
+      await manager.attach({ ...target, leaseId: 'viewer', ttlMs: 1000, acquireFollowLease: async () => lease });
+      const control = manager.waitForProviderControl(target).then(() => 'ready', () => 'unavailable');
+      await waiting;
+      if (revocation === 'expiry') nowMs = 1001;
+      else {
+        await manager.invalidateMismatchedTarget({ ...target, targetKey: 'replacement' });
+        await manager.attach({ ...target, leaseId: 'viewer', ttlMs: 1000, acquireFollowLease: async () => lease });
+      }
+      finish();
+      expect(await control).toBe('unavailable');
+    } finally { finish(); await manager.dispose(); }
+  });
+
   it('exposes an attached viewer observation only for its target and unexpired lifetime', async () => {
     let nowMs = 0;
     const manager = createDirectSessionFollowLeaseManager({ now: () => nowMs });

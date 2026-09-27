@@ -515,7 +515,7 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
         return latest?.machineOnline === true && latest.runnerActive !== true;
     }, [refreshNow, targetKey, viewerActive]);
 
-    // 控制读取不以缓存在线状态为前提；实际操作先由原 runtime 确认连接与 runner 归属。
+    // 冷点击保持可进入；首次控制读取和实际操作均复用原 runtime 确认连接与 runner 归属。
     const control = useDirectSessionControl({
         sessionId: params.sessionId,
         machineId: directSessionLink?.machineId ?? null,

@@ -32,6 +32,8 @@ export type DirectSessionFollowLease = Readonly<{
   getObservation?: () => DirectSessionObservationV1;
   /** 仅原 provider 可识别的进程内活连接；不得序列化或作为通用状态解释。 */
   getProviderControl?: () => unknown;
+  /** 等待该 lease 已开始的控制水合，不创建连接或授予观察状态。 */
+  waitForProviderControl?: () => Promise<void>;
   getNotificationDelivery?: () => 'submitted' | 'not_submitted' | 'unknown' | undefined;
   subscribeToTranscriptUpdates?: (listener: DirectSessionTranscriptUpdateListener) => () => void;
 }>;
@@ -63,9 +65,16 @@ export async function createManagedDirectSessionFollowLease(params: Readonly<{
   let released = false;
   /** 每次从提供方取活控制对象；wrapper 开始释放后同步撤权。 */
   const getProviderControl = () => released ? null : acquiredLease.getProviderControl?.() ?? null;
+  /** 等待前后都复核 wrapper 寿命，释放中的旧基线不得恢复控制权。 */
+  const waitForProviderControl = async () => {
+    if (released) throw new Error('source_unavailable');
+    await acquiredLease.waitForProviderControl?.();
+    if (released) throw new Error('source_unavailable');
+  };
   if (!acquiredLease.subscribeToTranscriptUpdates) return {
     ...acquiredLease,
     getProviderControl,
+    waitForProviderControl,
     /** 无转录订阅的提供方也遵守先撤权、再释放底层连接。 */
     release: () => {
       if (released) return;
@@ -234,6 +243,7 @@ export async function createManagedDirectSessionFollowLease(params: Readonly<{
     },
     getTailCursor: acquiredLease.getTailCursor,
     getProviderControl,
+    waitForProviderControl,
     // 状态直接读取持续来源；通知 CAS 队列中的旧检查点不能覆盖当前断连或新轮事实。
     getObservation: () => released ? { v: 1, state: 'unknown', reason: 'connection_closed' }
       : acquiredLease.getObservation?.() ?? observation,

@@ -9,6 +9,7 @@ type ManagedFollowLeaseRecord = {
   release: (() => void | Promise<void>) | null;
   expiryTimer: ReturnType<typeof setTimeout> | null;
   lease?: DirectSessionFollowLease;
+  acquisition?: Promise<void>;
   targetKey?: string;
   expiresAtMs?: number;
   notificationGeneration?: string;
@@ -202,20 +203,24 @@ export function createDirectSessionFollowLeaseManager(params?: DirectSessionFoll
         scheduleExpiry(attached.leaseId, input.sessionId, attached.expiresAtMs);
         try {
           clearManagedTimer(existing?.expiryTimer ?? null, clearTimer);
-          if (existing?.release) await existing.release();
-          const background = backgroundFollowLeasesBySessionId.get(input.sessionId);
-          const followLease = background && background.targetKey === input.targetKey
-            ? null
-            : (await input.acquireFollowLease?.()) ?? null;
-          if (disposed || followLeasesById.get(attached.leaseId) !== record || (record.expiresAtMs ?? 0) <= now()) {
-            await followLease?.release();
-          } else if (backgroundFollowLeasesBySessionId.get(input.sessionId)?.targetKey === input.targetKey
-              && backgroundFollowLeasesBySessionId.has(input.sessionId)) {
-            await followLease?.release();
-          } else {
-            record.release = followLease?.release ?? null;
-            record.lease = followLease ?? undefined;
-          }
+          // 控制读取加入原 record 的获取过程，不能在 lease 发布前另开控制连接。
+          record.acquisition = (async () => {
+            if (existing?.release) await existing.release();
+            const background = backgroundFollowLeasesBySessionId.get(input.sessionId);
+            const followLease = background && background.targetKey === input.targetKey
+              ? null
+              : (await input.acquireFollowLease?.()) ?? null;
+            if (disposed || followLeasesById.get(attached.leaseId) !== record || (record.expiresAtMs ?? 0) <= now()) {
+              await followLease?.release();
+            } else if (backgroundFollowLeasesBySessionId.get(input.sessionId)?.targetKey === input.targetKey
+                && backgroundFollowLeasesBySessionId.has(input.sessionId)) {
+              await followLease?.release();
+            } else {
+              record.release = followLease?.release ?? null;
+              record.lease = followLease ?? undefined;
+            }
+          })();
+          await record.acquisition;
         } catch (error) {
           if (followLeasesById.get(attached.leaseId) === record) {
             viewerLeaseRegistry.detach({ sessionId: input.sessionId, leaseId: attached.leaseId });
@@ -296,6 +301,33 @@ export function createDirectSessionFollowLeaseManager(params?: DirectSessionFoll
       return backgroundFollowLeasesBySessionId.get(sessionId)?.lease;
     },
     getFollowLease,
+    /** 控制等待原租约获取和原生水合；撤销后不得转借新代次或另开短连接。 */
+    async waitForProviderControl(input: Readonly<{ sessionId: string; targetKey?: string }>): Promise<DirectSessionFollowLease | undefined> {
+      const backgroundAcquisition = backgroundAcquisitionsBySessionId.get(input.sessionId);
+      const backgroundConfig = backgroundFollowAcquireBySessionId.get(input.sessionId);
+      if (backgroundAcquisition && backgroundConfig?.targetKey === input.targetKey) {
+        await backgroundAcquisition;
+        if (disposed || backgroundFollowAcquireBySessionId.get(input.sessionId) !== backgroundConfig
+            || !backgroundFollowLeasesBySessionId.has(input.sessionId)) throw new Error('source_unavailable');
+      }
+      const background = backgroundFollowLeasesBySessionId.get(input.sessionId);
+      const selected = getFollowLease(input);
+      const record = background && background.targetKey === input.targetKey && selected === background.lease
+        ? background : [...followLeasesById.values()].find((candidate) => candidate.sessionId === input.sessionId
+          && candidate.targetKey === input.targetKey && (candidate.expiresAtMs ?? 0) > now()
+          && (!selected || candidate.lease === selected));
+      if (!record) return undefined;
+      /** 只验证捕获的 record；同 sessionId 的后继记录不继承旧等待者。 */
+      const isCurrent = () => !disposed && (record === background
+        ? backgroundFollowLeasesBySessionId.get(input.sessionId) === record
+        : [...followLeasesById.values()].includes(record) && (record.expiresAtMs ?? 0) > now());
+      await record.acquisition;
+      const lease = record.lease;
+      if (!isCurrent() || !lease || getFollowLease(input) !== lease) throw new Error('source_unavailable');
+      await lease.waitForProviderControl?.();
+      if (!isCurrent() || getFollowLease(input) !== lease) throw new Error('source_unavailable');
+      return lease;
+    },
     /** 同一认证目标的展示和控制沿用同一个 lease 选择。 */
     getObservation(input: Readonly<{ sessionId: string; targetKey?: string }>): DirectSessionObservationV1 {
       return getFollowLease(input)?.getObservation?.() ?? { v: 1, state: 'unknown', reason: 'not_observed' };

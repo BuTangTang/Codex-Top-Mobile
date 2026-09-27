@@ -37,16 +37,10 @@ async function launchTask(id: string): Promise<void> {
     });
 }
 
-/** 未加载时只打开一次并复用同一连接有限发现，原 CONTROL 仍自行关联快照 revision。 */
-async function openUnloadedTask(target: OpenTarget): Promise<void> {
+/** owner 可发现不代表任务已加载；明确打开时调用一次官方入口，原 CONTROL 仍自行关联快照 revision。 */
+async function openSelectedTask(target: OpenTarget): Promise<void> {
     const ipc = await DesktopIpc.open(target.codexHome);
     try {
-        try {
-            await ipc.discoverOwner(target.remoteSessionId);
-            return;
-        } catch (error) {
-            if (!(error instanceof DesktopIpcError) || !['owner_unavailable', 'timeout'].includes(error.reason)) throw error;
-        }
         await assertExistingTask(target);
         if (!target.isCurrent()) throw new DirectSessionsProviderUnavailableError('source_unavailable');
         await launchTask(target.remoteSessionId);
@@ -77,7 +71,7 @@ export async function openDesktopSession(params: OpenTarget): Promise<void> {
     const existing = pendingOpens.get(key);
     if (existing) return existing;
     // 并发点击共享同一稳定错误，不能让其中一个调用泄漏底层异常。
-    const pending = openUnloadedTask({ ...params, codexHome }).catch((error: unknown) => {
+    const pending = openSelectedTask({ ...params, codexHome }).catch((error: unknown) => {
         if (error instanceof DirectSessionsProviderUnavailableError) throw error;
         throw new DirectSessionsProviderUnavailableError(error instanceof DesktopIpcError ? error.reason : 'source_unavailable');
     });

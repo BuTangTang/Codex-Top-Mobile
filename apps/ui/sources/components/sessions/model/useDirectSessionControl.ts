@@ -75,6 +75,13 @@ export function useDirectSessionControl(params: Readonly<{
         const version = ++lifetime.readVersion;
         updateView({ loading: true });
         try {
+            // 冷入先复用原 ATTACH/STATUS；避免 viewer 尚未建立时另开完整历史读取。
+            const ready = await params.prepareForMutation();
+            if (!isCurrent() || lifetime.readVersion !== version) return null;
+            if (!ready) {
+                updateView({ snapshot: null, error: '暂时无法读取桌面状态' });
+                return null;
+            }
             const response = await machineDirectSessionControlRead({ machineId: params.machineId, sessionId: params.sessionId }, { serverId });
             if (!isCurrent() || lifetime.readVersion !== version) return null;
             if (response.ok) {
@@ -89,7 +96,7 @@ export function useDirectSessionControl(params: Readonly<{
             if (lifetime.readVersion === version) updateView({ loading: false });
         }
         return null;
-    }, [isCurrent, lifetime, params.machineId, params.sessionId, serverId, updateView]);
+    }, [isCurrent, lifetime, params.machineId, params.prepareForMutation, params.sessionId, serverId, updateView]);
 
     React.useEffect(() => {
         current.current = lifetime;
