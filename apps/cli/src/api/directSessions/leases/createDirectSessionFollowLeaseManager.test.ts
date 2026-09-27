@@ -7,12 +7,30 @@ describe('createDirectSessionFollowLeaseManager', () => {
     let nowMs = 0;
     const manager = createDirectSessionFollowLeaseManager({ now: () => nowMs });
     const observation = { v: 1 as const, source: 'desktop' as const, turnId: 'current', state: 'running' as const };
+    const lease = { release: () => {}, getObservation: () => observation };
     await manager.attach({ sessionId: 's', targetKey: 'target', ttlMs: 1000,
-      acquireFollowLease: async () => ({ release: () => {}, getObservation: () => observation }) });
+      acquireFollowLease: async () => lease });
     expect(manager.getObservation({ sessionId: 's', targetKey: 'target' })).toEqual(observation);
+    expect(manager.getFollowLease({ sessionId: 's', targetKey: 'target' })).toBe(lease);
     expect(manager.getObservation({ sessionId: 's', targetKey: 'other' })).toMatchObject({ state: 'unknown' });
+    expect(manager.getFollowLease({ sessionId: 's', targetKey: 'other' })).toBeUndefined();
     nowMs = 1001;
     expect(manager.getObservation({ sessionId: 's', targetKey: 'target' })).toMatchObject({ state: 'unknown' });
+    expect(manager.getFollowLease({ sessionId: 's', targetKey: 'target' })).toBeUndefined();
+    await manager.dispose();
+  });
+
+  it('revokes the selected live lease before an asynchronous target release completes', async () => {
+    const manager = createDirectSessionFollowLeaseManager();
+    const target = { sessionId: 's', targetKey: 'old-source' };
+    let finishRelease!: () => void;
+    const lease = { release: () => new Promise<void>((resolve) => { finishRelease = resolve; }) };
+    await manager.attach({ ...target, leaseId: 'viewer', ttlMs: 1000, acquireFollowLease: async () => lease });
+    expect(manager.getFollowLease(target)).toBe(lease);
+    const invalidating = manager.invalidateMismatchedTarget({ ...target, targetKey: 'new-source' });
+    expect(manager.getFollowLease(target)).toBeUndefined();
+    finishRelease();
+    await invalidating;
     await manager.dispose();
   });
 
@@ -62,13 +80,16 @@ describe('createDirectSessionFollowLeaseManager', () => {
       release: releaseBackground, getObservation: () => ({ v: 1, state: 'unknown', reason: 'not_observed' }),
     }) });
     expect(releaseViewer).toHaveBeenCalledTimes(1);
+    expect(manager.getFollowLease(target)?.release).toBe(releaseBackground);
     expect(manager.getObservation(target)).toMatchObject({ state: 'unknown' });
     await manager.setBackgroundFollowEnabled({ ...target, enabled: false });
     expect(releaseBackground).not.toHaveBeenCalled();
+    expect(manager.getFollowLease(target)?.release).toBe(releaseBackground);
     expect(manager.getObservation(target)).toMatchObject({ state: 'unknown' });
     await manager.detach({ sessionId: 's', leaseId: 'viewer' });
     expect(releaseBackground).toHaveBeenCalledTimes(1);
     expect(manager.getObservation(target)).toMatchObject({ state: 'unknown' });
+    expect(manager.getFollowLease(target)).toBeUndefined();
     await manager.dispose();
   });
   it('shares an in-flight background acquisition with a concurrent viewer expiry', async () => {

@@ -11,6 +11,7 @@ import { act } from 'react-test-renderer';
 import { flushHookEffects, renderHook } from '@/dev/testkit';
 import type { WebTranscriptScrollMetrics } from '@/components/sessions/transcript/webTranscriptScrollMetrics';
 import { useCommittedTranscriptRef } from '@/components/sessions/transcript/viewport/lifecycle/host/useCommittedTranscriptRef';
+import { storage } from '@/sync/domains/state/storage';
 
 import type { ScrollableChatListRef } from '../../transcriptScrollableListTypes';
 import { useTranscriptJumpHost } from './useTranscriptJumpHost';
@@ -150,6 +151,24 @@ function useJumpHostWithCommittedPinThreshold(deps: JumpHostDeps) {
 describe('useTranscriptJumpHost identity stability', () => {
     beforeEach(() => {
         loadTargetWindowMessagesMock.mockReset();
+        storage.setState({ sessionDeferredNewerMessages: {} });
+    });
+
+    // 已加载列表的物理底部也可能落后于源尾部，沿用下箭头入口且不虚构未读数量。
+    it('reveals the existing return-to-latest action for deferred content without moving the reader', async () => {
+        const members = createStableMembers();
+        const deps = buildDeps(members);
+        const hook = await renderHook(() => useTranscriptJumpHost(deps));
+        expect(hook.getCurrent().jumpToBottomAffordance.isVisible).toBe(false);
+        await act(async () => { storage.setState({ sessionDeferredNewerMessages: { 'other-session': true } }); });
+        expect(hook.getCurrent().jumpToBottomAffordance.isVisible).toBe(false);
+        await act(async () => { storage.setState({ sessionDeferredNewerMessages: { s1: true } }); });
+        expect(hook.getCurrent().jumpToBottomAffordance).toMatchObject({ isVisible: true, count: 0 });
+        expect(members.commitExplicitReturnToLiveTailState).not.toHaveBeenCalled();
+        await act(async () => { hook.getCurrent().jumpToBottom(); });
+        expect(members.commitExplicitReturnToLiveTailState).toHaveBeenCalledWith('jump-to-bottom');
+        await act(async () => { storage.setState({ sessionDeferredNewerMessages: {} }); });
+        expect(hook.getCurrent().jumpToBottomAffordance.isVisible).toBe(false);
     });
 
     it('settles a successful current route jump only after its explicit barrier closes', async () => {

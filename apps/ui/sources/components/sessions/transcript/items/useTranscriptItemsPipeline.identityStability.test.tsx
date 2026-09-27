@@ -13,6 +13,7 @@ import type { ChatTranscriptListItem } from '@/components/sessions/transcript/ch
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import type { ForkedTranscriptSnapshot } from '@/sync/domains/sessionFork/forkedTranscriptSnapshot';
 import { useChatListRootState } from '@/components/sessions/transcript/useChatListRootState';
+import { openTailDiscontinuityFromOpaqueSnapshot, applyTailDiscontinuityOpaqueForwardPage } from '@/sync/runtime/sessionMessagesTailDiscontinuity';
 
 import { useTranscriptItemsPipeline, useTranscriptToolAutoExpandEffect } from './useTranscriptItemsPipeline';
 
@@ -131,6 +132,43 @@ function buildDeps(members: ReturnType<typeof createStableMembers>): ItemsPipeli
 }
 
 describe('useTranscriptItemsPipeline identity stability', () => {
+    // 原始断点是隐藏工具时，新正文仍必须进入真实渲染窗口，旧前缀不能越过缺口。
+    it('renders new text beyond a hidden tool boundary without exposing the disconnected prefix', async () => {
+        const previous = { messages: rootPermissionState.messages, transcript: rootPermissionState.transcript };
+        const old: Message = { id: 'old-prefix', kind: 'agent-text', localId: null, createdAt: 1, text: 'synthetic old text' };
+        const tool = createToolCallMessageFixture({ id: 'hidden-boundary', createdAt: 2 });
+        const answer: Message = { id: 'new-answer', kind: 'agent-text', localId: null, createdAt: 3, text: 'synthetic new text' };
+        const gap = openTailDiscontinuityFromOpaqueSnapshot({ prev: null,
+            prefixMessageIds: ['raw-old'], prefixMaterializedMessageIds: [old.id],
+            snapshotMessageIds: ['raw-tool'], snapshotMaterializedMessageIds: [tool.id], nextCursor: 'older-cursor',
+        })!;
+        const boundary = { kind: 'messageIds' as const, messageIds: gap.boundaryMessageIds };
+        rootPermissionState.messages = { [old.id]: old, [tool.id]: tool };
+        rootPermissionState.transcript = { ids: [old.id, tool.id], isLoaded: true };
+        const session = createSessionFixture({ id: 'hidden-tool-gap', active: true });
+        const base = buildDeps(createStableMembers());
+        const hook = await renderHook(() => {
+            const root = useChatListRootState({ session, hideOrdinaryToolCalls: true });
+            return { root, pipeline: useTranscriptItemsPipeline({ ...base, ...root.internalProps,
+                platformOS: 'ios', tailContiguousBoundary: boundary,
+                getMessageById: (id) => rootPermissionState.messages[id] ?? null,
+            }) };
+        });
+        try {
+            expect(hook.getCurrent().pipeline.listData.map((item) => item.id)).toEqual(['transcript-window-gap:tail:older']);
+            expect(applyTailDiscontinuityOpaqueForwardPage({ prev: gap, pageMaterializedMessageIds: [answer.id] })).toBe(gap);
+            rootPermissionState.messages = { ...rootPermissionState.messages, [answer.id]: answer };
+            rootPermissionState.transcript = { ids: [old.id, tool.id, answer.id], isLoaded: true };
+            await hook.rerender();
+            expect(hook.getCurrent().root.boundary.eligibleMessageIdsInOrder).toEqual([old.id, answer.id]);
+            expect(hook.getCurrent().pipeline.listData.map((item) => item.id)).toEqual(['transcript-window-gap:tail:older', 'msg:new-answer']);
+            expect(rootPermissionState.messages[tool.id]).toBe(tool);
+        } finally {
+            await hook.unmount();
+            Object.assign(rootPermissionState, previous);
+        }
+    });
+
     // 复用真实根分组缓存，验证同一消息的审批状态变化仍会刷新可见工具行。
     it('refreshes compact permission visibility through the root when linear group items retain their identity', async () => {
         const ordinary = createToolCallMessageFixture({ id: 'ordinary', createdAt: 1 });

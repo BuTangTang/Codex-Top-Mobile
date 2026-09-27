@@ -93,6 +93,8 @@ export type SessionOpenLatchArmInput = Readonly<{
 }>;
 
 export type SessionOpenHostFacts = Readonly<{
+    /** 原生尾部缺口的可见投影；用于复用首屏有界补页，不代表网络状态。 */
+    tailGapState?: 'none' | 'content' | 'empty';
     contentHeight: number;
     hasEntrySliceWindow: boolean;
     isLoaded: boolean;

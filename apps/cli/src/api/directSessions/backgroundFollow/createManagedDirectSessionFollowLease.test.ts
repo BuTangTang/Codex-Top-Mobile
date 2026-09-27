@@ -24,6 +24,28 @@ const directMessage = {
 } satisfies DirectTranscriptRawMessageV1;
 
 describe('createManagedDirectSessionFollowLease', () => {
+  it.each([true, false])('revokes the live provider control before release completes (transcript subscription: %s)', async (subscribed) => {
+    let control: unknown = { owner: 'current' };
+    let finishRelease!: () => void;
+    const lease = await createManagedDirectSessionFollowLease({
+      sessionId: 's', reason: 'attached_view', shouldProcessBackgroundFollowEffects: () => false,
+      acquireProviderFollowLease: async () => ({
+        getProviderControl: () => control,
+        ...(subscribed ? { subscribeToTranscriptUpdates: () => () => {} } : {}),
+        release: () => new Promise<void>((resolve) => { finishRelease = resolve; }),
+      }),
+    });
+    expect(lease?.getProviderControl?.()).toBe(control);
+    control = null;
+    expect(lease?.getProviderControl?.()).toBeNull();
+    control = { owner: 'reconnected' };
+    expect(lease?.getProviderControl?.()).toBe(control);
+    const releasing = lease!.release();
+    expect(lease?.getProviderControl?.()).toBeNull();
+    finishRelease();
+    await releasing;
+  });
+
   it('reads current provider observation immediately without waiting for transcript processing', async () => {
     let observation: DirectSessionObservationV1 = { v: 1, source: 'desktop', turnId: 'current', state: 'running' };
     let finishRelease!: () => void;

@@ -126,9 +126,10 @@ export function useDirectBrowseCandidates(params: Readonly<{
     const generationRef = React.useRef(0);
     const observationSequenceRef = React.useRef(0);
     const appliedObservationScopeRef = React.useRef(params.observationScope);
-    const flightRef = React.useRef<{ promise: Promise<void> } | null>(null);
+    const appliedAutoRefreshEnabledRef = React.useRef(params.autoRefreshEnabled);
+    const flightRef = React.useRef<{ promise: Promise<void>; release: () => void } | null>(null);
 
-    /** 同一前台范围请求共享 Promise；身份切换、后台边界和成功删除作废旧回包。 */
+    /** 同一可用范围请求共享 Promise；身份、前台和连接范围失效时释放等待，删除仍只作废旧回包。 */
     const loadCandidates = React.useCallback((opts?: Readonly<{ append?: boolean; automatic?: boolean }>): Promise<void> => {
         const controls = controlsRef.current;
         if (!machineId || !providerId || !source || scopeRef.current !== scopeKey) return Promise.resolve();
@@ -142,7 +143,9 @@ export function useDirectBrowseCandidates(params: Readonly<{
         if (append && (!cursor || refreshRequiredRef.current)) return Promise.resolve();
         const generation = generationRef.current;
         const observationScope = controls.observationScope;
-        const flight = { promise: Promise.resolve() };
+        const flight = { promise: Promise.resolve(), release: () => {} };
+        // 只完成已经失效的界面等待；底层 RPC 继续收尾，其结果仍受代次和 flight 身份保护。
+        const superseded = new Promise<void>((resolve) => { flight.release = resolve; });
         flightRef.current = flight;
         if (append) setLoadingMore(true);
         else { setLoading(true); setError(null); }
@@ -289,16 +292,18 @@ export function useDirectBrowseCandidates(params: Readonly<{
                 }
             }
         };
-        flight.promise = run();
+        flight.promise = Promise.race([run(), superseded]);
         return flight.promise;
     }, [scopeKey]);
 
-    /** 范围改变才清空窗口；旧网络请求无法取消，但其回包和 finally 均不再生效。 */
+    /** 身份范围改变才清空窗口并释放旧刷新等待；底层旧回包和 finally 均不再生效。 */
     React.useEffect(() => {
         generationRef.current += 1;
+        flightRef.current?.release();
         flightRef.current = null;
         // 查询和前台范围同批改变时，这次初始加载已经使用新范围，不再被恢复 effect 重启。
         appliedObservationScopeRef.current = controlsRef.current.observationScope;
+        appliedAutoRefreshEnabledRef.current = controlsRef.current.autoRefreshEnabled;
         // 离线入口只派生已读正文的目录，不持久化 LIST 活动观测或赋予旧候选发送能力。
         const cached = providerId === 'codex' && machineId && source
             ? Object.values(loadDirectSessionTranscriptWarmCacheIndex(serverId, params.accountId)).flatMap((entry): DirectBrowseCandidate[] => {
@@ -325,23 +330,26 @@ export function useDirectBrowseCandidates(params: Readonly<{
         if (controlsRef.current.autoRefreshEnabled !== false) {
             void loadCandidates({ automatic: controlsRef.current.autoRefreshEnabled === true });
         }
-        return () => { generationRef.current += 1; flightRef.current = null; };
+        return () => { generationRef.current += 1; flightRef.current?.release(); flightRef.current = null; };
     }, [loadCandidates]);
 
-    /** Android 单调时钟可能不含深睡；切换前台范围时废弃观测和旧 flight，保留分页窗口。 */
+    /** 前台或连接可用边沿作废旧代次并释放刷新等待；恢复立即请求新事实，保留分页窗口。 */
     React.useEffect(() => {
-        if (appliedObservationScopeRef.current === params.observationScope) return;
+        if (appliedObservationScopeRef.current === params.observationScope
+            && appliedAutoRefreshEnabledRef.current === params.autoRefreshEnabled) return;
         appliedObservationScopeRef.current = params.observationScope;
+        appliedAutoRefreshEnabledRef.current = params.autoRefreshEnabled;
         generationRef.current += 1;
+        flightRef.current?.release();
         flightRef.current = null;
-        // 原行、页数和游标保持不变；原观测持有的范围已同步失效，无需重写时间或复制各页。
+        // 原行、页数和游标保持不变；保留页沿用原观测范围和时间，不能因连接恢复给旧事实续龄。
         setLoading(false);
         setLoadingMore(false);
         setSearchAugmenting(false);
         setSettledVersion((value) => value + 1);
-    }, [params.observationScope]);
+    }, [params.observationScope, params.autoRefreshEnabled]);
 
-    /** 前台、返回、重连共同形成一个可用边沿，进行中的请求直接复用。 */
+    /** 前台、返回、重连恢复后立即刷新，同一可用代次进行中的请求直接复用。 */
     React.useEffect(() => {
         if (params.autoRefreshEnabled) void loadCandidates({ automatic: true });
     }, [params.autoRefreshEnabled, params.observationScope, loadCandidates]);

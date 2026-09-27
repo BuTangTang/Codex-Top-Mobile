@@ -21,6 +21,12 @@ import type { SessionMessagesTailBoundary } from '@/sync/runtime/sessionMessages
  * session never shows a spinner.
  */
 export type TranscriptLoadingDomain = {
+    /** 原 sync 延迟向前加载集合的唯一可观察表示；不代表未读消息数量。 */
+    sessionDeferredNewerMessages: Record<string, true>;
+    /** 延迟或完成本会话的向前加载，不改动消息与阅读位置。 */
+    setSessionDeferredNewerMessages: (sessionId: string, deferred: boolean) => void;
+    /** 账号或服务器切换时清除上一来源的临时延迟状态。 */
+    clearSessionDeferredNewerMessages: () => void;
     /** Per-session ref-count of in-flight newer catch-up flows. */
     sessionCatchUpNewerInFlight: Record<string, number>;
     /**
@@ -52,6 +58,23 @@ export function createTranscriptLoadingDomain<S extends TranscriptLoadingDomain>
     get: StoreGet<S>;
 }): TranscriptLoadingDomain {
     return {
+        sessionDeferredNewerMessages: {},
+        /** 只在成员变化时通知订阅者，重复轮询不会重绘返回最新入口。 */
+        setSessionDeferredNewerMessages: (sessionId, deferred) => {
+            if (!sessionId) return;
+            set((state) => {
+                if ((state.sessionDeferredNewerMessages[sessionId] === true) === deferred) return state;
+                const next = { ...state.sessionDeferredNewerMessages };
+                if (deferred) next[sessionId] = true;
+                else delete next[sessionId];
+                return { ...state, sessionDeferredNewerMessages: next };
+            });
+        },
+        /** 切源时一次清空，已经为空则保留 store 身份。 */
+        clearSessionDeferredNewerMessages: () => {
+            set((state) => Object.keys(state.sessionDeferredNewerMessages).length === 0
+                ? state : { ...state, sessionDeferredNewerMessages: {} });
+        },
         sessionCatchUpNewerInFlight: {},
         sessionTailContiguousBoundary: {},
         isSessionCatchingUpNewer: (sessionId) => {

@@ -365,25 +365,52 @@ describe('direct browse discovery window', () => {
         expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['new-account']);
     });
 
-    it('starts only when eligible, coalesces activation while slow, and waits a full interval after completion', async () => {
+    /** 恢复只重启失效代次；原刷新等待及时结束，迟到结果不能覆盖新页或结束新请求的忙态。 */
+    it.each(['before-fresh', 'after-fresh'] as const)('refreshes immediately after eligibility returns and rejects an old flight arriving %s', async (arrival) => {
         vi.useFakeTimers();
-        const pending = deferred();
-        list.mockReturnValueOnce(pending.promise);
         const hook = await renderHook((enabled: boolean) => useDirectBrowseCandidates({ ...scope, autoRefreshEnabled: enabled }), { initialProps: false });
         expect(list).not.toHaveBeenCalled();
         await hook.rerender(true);
+        const old = deferred();
+        list.mockReturnValueOnce(old.promise);
+        let oldRefreshSettled = false;
+        await act(async () => { void hook.getCurrent().refresh().then(() => { oldRefreshSettled = true; }); });
+        expect(list).toHaveBeenCalledTimes(2);
         await hook.rerender(false);
+        expect(oldRefreshSettled).toBe(true);
+        expect(hook.getCurrent().loading).toBe(false);
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['initial']);
+        await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+        expect(list).toHaveBeenCalledTimes(2);
+
+        const fresh = deferred();
+        list.mockReturnValueOnce(fresh.promise);
         await hook.rerender(true);
-        await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
-        expect(list).toHaveBeenCalledTimes(1);
-        await act(async () => { pending.resolve(page(['slow'])); });
+        expect(list).toHaveBeenCalledTimes(3);
+        expect(hook.getCurrent().loading).toBe(true);
+        if (arrival === 'before-fresh') {
+            await act(async () => { old.resolve(page(['stale'])); });
+            expect(hook.getCurrent().loading).toBe(true);
+            expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['initial']);
+        }
+        // 同一恢复代次的刷新和翻页仍然共用唯一请求，慢请求也不被周期定时重启。
+        await act(async () => {
+            void hook.getCurrent().refresh();
+            void hook.getCurrent().loadMore();
+            await vi.advanceTimersByTimeAsync(90_000);
+        });
+        expect(list).toHaveBeenCalledTimes(3);
+        await act(async () => { fresh.resolve(page(['latest'])); });
+        if (arrival === 'after-fresh') await act(async () => { old.resolve(page(['stale'])); });
+        expect(hook.getCurrent().candidates.map((row) => row.remoteSessionId)).toEqual(['latest']);
+        expect(hook.getCurrent().loading).toBe(false);
         await act(async () => { await vi.advanceTimersByTimeAsync(29_999); });
-        expect(list).toHaveBeenCalledTimes(1);
+        expect(list).toHaveBeenCalledTimes(3);
         await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-        expect(list).toHaveBeenCalledTimes(2);
+        expect(list).toHaveBeenCalledTimes(4);
         await hook.rerender(false);
         await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
-        expect(list).toHaveBeenCalledTimes(2);
+        expect(list).toHaveBeenCalledTimes(4);
     });
 
     it('does not repeatedly scan history while searching', async () => {

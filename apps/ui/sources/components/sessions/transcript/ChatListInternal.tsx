@@ -1247,6 +1247,7 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
         listDataRef,
         listOrientation,
         messagesById: props.messagesById,
+        sourceMessageIdsOldestFirst: props.sourceMessageIdsOldestFirst,
         platformOS: Platform.OS,
         preDecompositionItemsRef,
         rendererKind: mainTranscriptRendererSelection.renderer.kind,

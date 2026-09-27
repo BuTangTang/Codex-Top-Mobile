@@ -93,6 +93,7 @@ export type TranscriptItemsPipelineDeps = Readonly<{
     listDataRef: Ref<readonly ChatTranscriptListItem[]>;
     listOrientation: TranscriptListOrientation;
     messagesById: Readonly<Record<string, Message>>;
+    sourceMessageIdsOldestFirst?: readonly string[];
     platformOS: string;
     preDecompositionItemsRef: Ref<ChatTranscriptListItem[]>;
     rendererKind: 'flashList' | 'legendList';
@@ -149,6 +150,7 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
         listDataRef,
         listOrientation,
         messagesById,
+        sourceMessageIdsOldestFirst,
         platformOS,
         preDecompositionItemsRef,
         rendererKind,
@@ -262,6 +264,7 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
             resolveSeq: jumpWindowFacts.resolveTargetWindowItemSeq,
             sessionId,
             tailContiguousBoundary: tailContiguousBoundary ?? null,
+            sourceMessageIdsOldestFirst,
             resolveMessageIds: collectTranscriptNavigationMessageIdsForItem,
             targetWindowState: targetWindowState ?? jumpWindowFacts.sessionTargetWindowState,
             transcriptNativeHotTailItemCount,
@@ -280,6 +283,7 @@ export function useTranscriptItemsPipeline(deps: TranscriptItemsPipelineDeps) {
         sessionId,
         tailContiguousBoundary,
         targetWindowState,
+        sourceMessageIdsOldestFirst,
         transcriptNativeHotTailItemCount,
         transcriptWebHotTailItemCount,
     ]);

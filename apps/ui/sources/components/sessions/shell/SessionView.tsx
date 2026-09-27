@@ -2334,6 +2334,7 @@ const SessionTranscriptAgentContentView = React.memo(function SessionTranscriptA
 type SessionTranscriptContentProps = Readonly<{
     sessionId: string;
     session: Session;
+    hideOrdinaryToolCalls: ChatListProps['hideOrdinaryToolCalls'];
     isEncryptedSessionLocked: boolean;
     isForkedSessionV1: boolean;
     isLocallyAttached: boolean;
@@ -2352,9 +2353,11 @@ type SessionTranscriptContentProps = Readonly<{
     routeHydrationPending: ChatListProps['routeHydrationPending'];
 }>;
 
+// 保持正文的既有挂载边界，并传递手机桌面对话的显示范围。
 const SessionTranscriptContent = React.memo(function SessionTranscriptContent({
     sessionId,
     session,
+    hideOrdinaryToolCalls,
     isEncryptedSessionLocked,
     isForkedSessionV1,
     isLocallyAttached,
@@ -2478,6 +2481,7 @@ const SessionTranscriptContent = React.memo(function SessionTranscriptContent({
             {shouldRenderChatTimeline ? (
                 <ChatList
                     session={session}
+                    hideOrdinaryToolCalls={hideOrdinaryToolCalls}
                     bottomNotice={bottomNotice}
                     controlledByUserOverride={controlledByUserOverride}
                     controlSwitchTo={controlSwitchTo}
@@ -5344,6 +5348,7 @@ function SessionViewLoaded({
         <SessionTranscriptContent
             sessionId={sessionId}
             session={session}
+            hideOrdinaryToolCalls={desktopStatusInHeader}
             isEncryptedSessionLocked={isEncryptedSessionLocked}
             isForkedSessionV1={isForkedSessionV1}
             isLocallyAttached={isLocallyAttached}

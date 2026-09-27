@@ -47,6 +47,21 @@ export function createDirectSessionFollowLeaseManager(params?: DirectSessionFoll
   const backgroundAcquisitionsBySessionId = new Map<string, Promise<boolean>>();
   let disposed = false;
 
+  /** 观察和控制共用唯一有效来源；不合并多个 lease，也不回退到过期已知状态。 */
+  const getFollowLease = (input: Readonly<{ sessionId: string; targetKey?: string }>): DirectSessionFollowLease | undefined => {
+    if (disposed) return undefined;
+    const background = backgroundFollowLeasesBySessionId.get(input.sessionId);
+    if (background && background.targetKey === input.targetKey
+        && (backgroundFollowEnabledBySessionId.get(input.sessionId) || viewerLeaseRegistry.countActiveLeases(input.sessionId) > 0)) {
+      return background.lease;
+    }
+    for (const record of followLeasesById.values()) {
+      if (record.sessionId === input.sessionId && record.targetKey === input.targetKey
+          && (record.expiresAtMs ?? 0) > now() && record.lease) return record.lease;
+    }
+    return undefined;
+  };
+
   /** 先移除 viewer 引用，再等待外部资源释放，撤销立即对状态查询生效。 */
   const releaseFollowLease = async (leaseId: string, sessionId: string): Promise<boolean> => {
     const record = followLeasesById.get(leaseId) ?? null;
@@ -280,20 +295,10 @@ export function createDirectSessionFollowLeaseManager(params?: DirectSessionFoll
     getBackgroundFollowLease(sessionId: string): DirectSessionFollowLease | undefined {
       return backgroundFollowLeasesBySessionId.get(sessionId)?.lease;
     },
-    /** 同一认证目标只读当前有效 lease；不合并多个来源，也不回退到过期的已知状态。 */
+    getFollowLease,
+    /** 同一认证目标的展示和控制沿用同一个 lease 选择。 */
     getObservation(input: Readonly<{ sessionId: string; targetKey?: string }>): DirectSessionObservationV1 {
-      const unknown: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
-      if (disposed) return unknown;
-      const background = backgroundFollowLeasesBySessionId.get(input.sessionId);
-      if (background && background.targetKey === input.targetKey
-          && (backgroundFollowEnabledBySessionId.get(input.sessionId) || viewerLeaseRegistry.countActiveLeases(input.sessionId) > 0)) {
-        return background.lease?.getObservation?.() ?? unknown;
-      }
-      for (const record of followLeasesById.values()) {
-        if (record.sessionId === input.sessionId && record.targetKey === input.targetKey
-            && (record.expiresAtMs ?? 0) > now() && record.lease) return record.lease.getObservation?.() ?? unknown;
-      }
-      return unknown;
+      return getFollowLease(input)?.getObservation?.() ?? { v: 1, state: 'unknown', reason: 'not_observed' };
     },
     invalidateSession,
     /** 已核验的关联身份改变时，撤销旧来源及其正在获取的连接，不创建替代连接。 */

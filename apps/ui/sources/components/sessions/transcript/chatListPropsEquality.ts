@@ -6,8 +6,10 @@ function areChatListSessionRelevantPropsEqual(left: Session, right: Session): bo
     return buildSessionTranscriptRenderSignature(left) === buildSessionTranscriptRenderSignature(right);
 }
 
+// 显示范围变化必须穿过 memo，恢复大屏时重新投影工具行。
 function areChatListNonSessionPropsEqual(left: ChatListProps, right: ChatListProps): boolean {
     return left.bottomNotice === right.bottomNotice
+        && left.hideOrdinaryToolCalls === right.hideOrdinaryToolCalls
         && left.controlledByUserOverride === right.controlledByUserOverride
         && left.controlSwitchTo === right.controlSwitchTo
         && left.onRequestSwitchToRemote === right.onRequestSwitchToRemote

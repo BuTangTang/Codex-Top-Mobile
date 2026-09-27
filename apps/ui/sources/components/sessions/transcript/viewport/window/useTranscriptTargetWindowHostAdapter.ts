@@ -83,6 +83,7 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
     isSeqRangeLoaded?: (fromInclusive: number, toInclusive: number) => boolean;
     resolveSeq?: (item: TItem) => number | null | undefined;
     tailContiguousBoundary?: SessionMessagesTailBoundary | null;
+    sourceMessageIdsOldestFirst?: readonly string[];
     resolveMessageIds?: (item: TItem) => readonly string[];
     windowState: TranscriptTargetWindowState;
 }>): TranscriptTargetWindowHostFacts<TItem> {
@@ -154,6 +155,7 @@ export function resolveTranscriptTargetWindowHostFacts<TItem extends TranscriptT
             items: params.items,
             resolveSeq: params.resolveSeq,
             tailContiguousBoundary: params.tailContiguousBoundary ?? null,
+            sourceMessageIdsOldestFirst: params.sourceMessageIdsOldestFirst,
             resolveMessageIds: params.resolveMessageIds,
         }),
         targetWindowActive: activeWindowState !== null,
@@ -180,6 +182,7 @@ function boundTailItemsToContiguousBoundary<TItem extends TranscriptTargetWindow
     items: readonly TItem[];
     resolveSeq?: (item: TItem) => number | null | undefined;
     tailContiguousBoundary: SessionMessagesTailBoundary | null;
+    sourceMessageIdsOldestFirst?: readonly string[];
     resolveMessageIds?: (item: TItem) => readonly string[];
 }>): readonly TItem[] {
     const boundary = params.tailContiguousBoundary;
@@ -190,6 +193,13 @@ function boundTailItemsToContiguousBoundary<TItem extends TranscriptTargetWindow
         return Math.trunc(rawSeq);
     };
     const boundaryIds = new Set(boundary.kind === 'messageIds' ? boundary.messageIds : []);
+    // 边界可能是被隐藏的工具；按同一完整消息序列定位，不凭可见行缺失清除 gap。
+    const sourceBoundaryIndex = boundary.kind === 'messageIds'
+        ? params.sourceMessageIdsOldestFirst?.findIndex((id) => boundaryIds.has(id)) ?? -1
+        : -1;
+    const sourceIndexById = sourceBoundaryIndex >= 0
+        ? new Map(params.sourceMessageIdsOldestFirst!.map((id, index) => [id, index]))
+        : null;
     const messageIdsForItem = (item: TItem) => params.resolveMessageIds?.(item) ?? [item.id];
     let islandStartIndex = params.items.length;
     for (let index = 0; index < params.items.length; index += 1) {
@@ -197,7 +207,8 @@ function boundTailItemsToContiguousBoundary<TItem extends TranscriptTargetWindow
         if (!item) continue;
         const startsIsland = boundary.kind === 'seq'
             ? (resolveItemSeq(item) ?? -1) >= boundary.seq
-            : messageIdsForItem(item).some((id) => boundaryIds.has(id));
+            : messageIdsForItem(item).some((id) => boundaryIds.has(id)
+                || (sourceIndexById !== null && (sourceIndexById.get(id) ?? -1) >= sourceBoundaryIndex));
         if (startsIsland) {
             islandStartIndex = index;
             break;
@@ -217,6 +228,7 @@ export function useTranscriptTargetWindowHostAdapter<TItem extends TranscriptTar
     isSeqRangeLoaded?: (fromInclusive: number, toInclusive: number) => boolean;
     resolveSeq?: (item: TItem) => number | null | undefined;
     tailContiguousBoundary?: SessionMessagesTailBoundary | null;
+    sourceMessageIdsOldestFirst?: readonly string[];
     resolveMessageIds?: (item: TItem) => readonly string[];
     windowState: TranscriptTargetWindowState;
 }>): TranscriptTargetWindowHostFacts<TItem> {
@@ -225,6 +237,7 @@ export function useTranscriptTargetWindowHostAdapter<TItem extends TranscriptTar
         params.isSeqRangeLoaded,
         params.resolveSeq,
         params.tailContiguousBoundary,
+        params.sourceMessageIdsOldestFirst,
         params.resolveMessageIds,
         params.windowState,
     ]);

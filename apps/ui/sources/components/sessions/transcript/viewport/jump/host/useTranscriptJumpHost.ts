@@ -790,10 +790,12 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         );
     }, [jumpRevealOffsetThresholdPx]);
 
+    // 同一 sync 延迟状态让旧列表底部也能回到真实尾部，不伪造消息计数或移动阅读锚点。
+    const hasDeferredNewerMessages = getStorage()((state) => state.sessionDeferredNewerMessages?.[sessionId] === true);
     const jumpToBottomAffordance = resolveJumpToBottomAffordanceState({
         distanceFromBottom: jumpToBottomDistanceFromBottom,
         enabled: jumpEnabled,
-        hasMoreNewerBeyondRenderedWindow: targetWindowHasNewerBeyondRenderedWindow,
+        hasMoreNewerBeyondRenderedWindow: targetWindowHasNewerBeyondRenderedWindow || hasDeferredNewerMessages,
         isPinned: scrollPin.isPinned,
         minNewActivityCount: jumpMinNewCount,
         newActivityCount: scrollPin.newActivityCount,

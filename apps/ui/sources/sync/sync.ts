@@ -1037,7 +1037,6 @@ class Sync {
        * skipping the unconditional durable live-tail delete.
        */
       private persistedSessionViewportIds = new Set<string>();
-      private deferredForwardLoadingSessions = new Set<string>();
       private explicitSessionTailProbeIds = new Set<string>();
       private sessionDataKeys = new Map<string, Uint8Array>(); // Store session data encryption keys internally
       private sessionDataKeyEnvelopes = new Map<string, string>(); // Track wrapped DEK envelopes so unchanged keys can be reused safely
@@ -2117,7 +2116,7 @@ class Sync {
         resetSocketSessionProjectionStateForServerScope();
         clearActiveViewingSessionsForServerScopeReset();
         clearMountedSessionRealtimeScmConsumerScopes();
-        this.deferredForwardLoadingSessions.clear();
+        storage.getState().clearSessionDeferredNewerMessages();
         this.explicitSessionTailProbeIds.clear();
         this.activeServerSessionIds.clear();
         this.hasFetchedSessionsSnapshotForActiveServer = false;
@@ -2736,7 +2735,7 @@ class Sync {
                         meta: content.meta ?? {},
                     }, {
                         serverId: externalTarget.serverId,
-                        timeoutMs: this.syncTuning.sessionRpcTimeoutMs,
+                        // Direct 包含桌面历史读取与发送，沿用机器 RPC 的完整预算。
                         onIssued: () => { issued = true; },
                     });
                 } catch (error) {
@@ -5624,10 +5623,10 @@ class Sync {
           const needsSnapshotLoad = replacesDirectTranscript || !hasLoadedMessages || (!hasMaterializedMessages && sessionSeqHint > 0);
           if (needsSnapshotLoad) {
               if (replacesDirectTranscript) {
-                  this.deferredForwardLoadingSessions.add(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   if (!this.isDirectSessionLiveTail(sessionId)) return;
               } else {
-                  this.deferredForwardLoadingSessions.delete(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, false);
               }
               // Stage a source handoff with separate dedupe receipts; the accepted rows,
               // cursors and gap remain authoritative until the replacement can commit.
@@ -5759,7 +5758,7 @@ class Sync {
                       shouldContinue: () => {
                           if (!shouldContinue()) return false;
                           const canRefresh = canRefreshLiveTail();
-                          if (!canRefresh) this.deferredForwardLoadingSessions.add(sessionId);
+                          if (!canRefresh) storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                           return canRefresh;
                       },
                       limit: this.getSessionMessagesPageSize(),
@@ -5790,11 +5789,7 @@ class Sync {
               markLoaded: () => { if (shouldContinue()) storage.getState().applyMessagesLoaded(sessionId); },
               setDeferredForwardLoading: (deferred) => {
                   if (!shouldContinue()) return;
-                  if (deferred) {
-                      this.deferredForwardLoadingSessions.add(sessionId);
-                  } else {
-                      this.deferredForwardLoadingSessions.delete(sessionId);
-                  }
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, deferred);
               },
           });
           await (isCatchUpWork
@@ -5983,7 +5978,7 @@ class Sync {
                   ?? this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)),
               requiresRefresh: true,
           });
-          this.deferredForwardLoadingSessions.add(sessionId);
+          storage.getState().setSessionDeferredNewerMessages(sessionId, true);
           this.queueDirectTranscriptWarmCache(sessionId, []);
       }
 
@@ -6242,7 +6237,7 @@ class Sync {
 
           // Keep the accepted transcript and cursors until every replacement read succeeds.
           if (options && !this.isDirectSessionLiveTail(sessionId)) {
-              this.deferredForwardLoadingSessions.add(sessionId);
+              storage.getState().setSessionDeferredNewerMessages(sessionId, true);
               return;
           }
           const normalizedMessages = normalizeDirectTranscriptMessages(page.items);
@@ -6274,7 +6269,7 @@ class Sync {
               lastSourceMessageIds: page.items.length > 0 ? page.items.map((item) => item.id) : acceptedWindow?.lastSourceMessageIds,
           });
           this.directSessionLatestSnapshotPendingBySessionId.delete(sessionId);
-          this.deferredForwardLoadingSessions.delete(sessionId);
+          storage.getState().setSessionDeferredNewerMessages(sessionId, false);
           storage.getState().applyMessagesLoaded(sessionId);
           if (directSessionLink.providerId === 'codex') {
               storage.getState().setDirectSessionHistoryAvailability(sessionId, page.historyAvailability);
@@ -6317,7 +6312,7 @@ class Sync {
           const probeAndApply = async (): Promise<number> => {
               if (this.getSessionTargetWindowState(sessionId).isWindowMode
                   || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true)) {
-                  this.deferredForwardLoadingSessions.add(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   return 0;
               }
               const replacesSource = !this.hasAcceptedDirectSessionSource(sessionId, directSessionLink);
@@ -6327,7 +6322,7 @@ class Sync {
               if (replacesSource || this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh === true
                   || needsHistoryRecovery
                   || (this.directSessionLatestSnapshotPendingBySessionId.has(sessionId) && this.isDirectSessionLiveTail(sessionId))) {
-                  this.deferredForwardLoadingSessions.add(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   if (this.isDirectSessionLiveTail(sessionId)) {
                       await this.withSessionCatchUpNewer(sessionId, () => this.fetchDirectSessionMessages(
                           sessionId, directSessionLink,
@@ -6361,7 +6356,7 @@ class Sync {
 
               const continuation = resolveDirectTranscriptContinuation(tail);
               if (continuation === 'source_discontinuity') {
-                  this.deferredForwardLoadingSessions.add(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   // Missing reasons retain the released conservative reset semantics.
                   this.requireDirectSessionTranscriptRefresh(sessionId);
                   if (this.isDirectSessionLiveTail(sessionId)) {
@@ -6379,11 +6374,11 @@ class Sync {
               }
               if (continuation === 'page_limit') {
                   this.directSessionLatestSnapshotPendingBySessionId.add(sessionId);
-                  this.deferredForwardLoadingSessions.add(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, true);
               }
               if (this.getSessionTargetWindowState(sessionId).isWindowMode
                   || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true)) {
-                  this.deferredForwardLoadingSessions.add(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   return 0;
               }
 
@@ -6394,7 +6389,7 @@ class Sync {
               this.setDirectSessionTailCursor(sessionId, tail.nextCursor ?? null);
               this.recordDirectSessionSourcePage(sessionId, tail.items);
               this.queueDirectTranscriptWarmCache(sessionId, tail.items);
-              if (continuation === 'complete') this.deferredForwardLoadingSessions.delete(sessionId);
+              if (continuation === 'complete') storage.getState().setSessionDeferredNewerMessages(sessionId, false);
               return normalizedMessages.length;
           };
 
@@ -6537,14 +6532,14 @@ class Sync {
               this.requireDirectSessionTranscriptRefresh(ephemeralUpdate.sessionId);
           }
           if (!this.isDirectSessionLiveTail(ephemeralUpdate.sessionId)) {
-              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              storage.getState().setSessionDeferredNewerMessages(ephemeralUpdate.sessionId, true);
               return;
           }
           if (continuation === 'source_discontinuity' || this.directSessionTailStateBySessionId.get(ephemeralUpdate.sessionId)?.requiresRefresh === true
               || ((storage.getState().sessionMessages[ephemeralUpdate.sessionId]?.isLoaded === true
                   || (storage.getState().sessionMessages[ephemeralUpdate.sessionId]?.reducerState.messageIds.size ?? 0) > 0)
                   && !this.hasAcceptedDirectSessionSource(ephemeralUpdate.sessionId, directSessionLink))) {
-              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              storage.getState().setSessionDeferredNewerMessages(ephemeralUpdate.sessionId, true);
               await this.fetchDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink, { mode: 'replace' });
               return;
           }
@@ -6556,7 +6551,7 @@ class Sync {
           const hasAnchoredFromCursor = typeof ephemeralUpdate.fromCursor === 'string'
               && ephemeralUpdate.fromCursor.trim().length > 0;
           if (hasAnchoredFromCursor && resolvedCursor === undefined) {
-              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              storage.getState().setSessionDeferredNewerMessages(ephemeralUpdate.sessionId, true);
               if (this.getDirectSessionTailCursor(ephemeralUpdate.sessionId) === null) {
                   await this.fetchDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink, { mode: 'replace' });
               } else {
@@ -6566,7 +6561,7 @@ class Sync {
           }
           if (continuation === 'page_limit') {
               this.directSessionLatestSnapshotPendingBySessionId.add(ephemeralUpdate.sessionId);
-              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              storage.getState().setSessionDeferredNewerMessages(ephemeralUpdate.sessionId, true);
               if (typeof resolvedCursor !== 'string') {
                   await this.catchUpDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
                   return;
@@ -6576,7 +6571,7 @@ class Sync {
               });
               return;
           }
-          if (this.deferredForwardLoadingSessions.has(ephemeralUpdate.sessionId)) {
+          if (this.hasDeferredNewerMessages(ephemeralUpdate.sessionId)) {
               await this.catchUpDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
               return;
           }
@@ -7250,7 +7245,7 @@ class Sync {
       public markSessionLiveTailIntent(sessionId: string): void {
           if (!sessionId) return;
           this.ensureSessionViewportHydrated();
-          const hadDeferredForwardLoading = this.deferredForwardLoadingSessions.has(sessionId);
+          const hadDeferredForwardLoading = this.hasDeferredNewerMessages(sessionId);
           this.sessionMessagesWindowStateBySessionId.set(
               sessionId,
               resetSessionMessagesWindowForLiveTail(this.getSessionTargetWindowState(sessionId)),
@@ -7417,8 +7412,9 @@ class Sync {
           return { messageId: realId ?? messageId, seq };
       }
 
+      // 与返回最新入口共用同一份临时状态，不维护不可观察的第二份集合。
       public hasDeferredNewerMessages(sessionId: string): boolean {
-          return this.deferredForwardLoadingSessions.has(sessionId);
+          return storage.getState().sessionDeferredNewerMessages[sessionId] === true;
       }
 
       /**
@@ -7464,7 +7460,7 @@ class Sync {
                   const loaded = await this.catchUpDirectSessionMessages(sessionId, directSessionLink, {
                       surfaceCatchUp: true, allowAdjacentPage: true,
                   });
-                  const hasMore = this.deferredForwardLoadingSessions.has(sessionId);
+                  const hasMore = this.hasDeferredNewerMessages(sessionId);
                   return { loaded, hasMore, status: hasMore ? 'loaded' : 'no_more' };
               } finally {
                   this.sessionMessagesLoadingNewerByKey.delete(pagingKey);
@@ -7516,13 +7512,13 @@ class Sync {
 
               if (!shouldContinue()) return { loaded: 0, hasMore: true, status: 'not_ready' };
               if (result.page.messages.length === 0) {
-                  this.deferredForwardLoadingSessions.delete(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, false);
                   return { loaded: 0, hasMore: false, status: 'no_more' };
               }
 
               const hasMore = Boolean(result.page.nextAfterSeq);
               if (!hasMore) {
-                  this.deferredForwardLoadingSessions.delete(sessionId);
+                  storage.getState().setSessionDeferredNewerMessages(sessionId, false);
                   return { loaded: result.applied, hasMore: false, status: 'no_more' };
               }
 
@@ -7701,7 +7697,7 @@ class Sync {
 
           this.sessionReceivedMessages.delete(sessionId);
           this.deleteSessionMessagesPaginationStateForSession(sessionId);
-          this.deferredForwardLoadingSessions.delete(sessionId);
+          storage.getState().setSessionDeferredNewerMessages(sessionId, false);
           this.explicitSessionTailProbeIds.delete(sessionId);
           this.deferredTranscriptState = clearDeferredTranscriptStateForSession(this.deferredTranscriptState, sessionId);
           this.sessionMessagesWindowStateBySessionId.set(

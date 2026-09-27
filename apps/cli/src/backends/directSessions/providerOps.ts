@@ -109,13 +109,16 @@ export type DirectSessionProviderOps = Readonly<{
     source: DirectSessionsSource;
     requestedSource: DirectSessionsSource;
     remoteSessionId: string;
+    getFollowLease?: () => DirectSessionFollowLease | undefined;
   }>) => Promise<DirectSessionExternalControl>;
   /** 只读原 owner 当前请求，关联与账号归属由机器 RPC 固定。 */
-  readControl?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string }>) => Promise<DesktopControlSnapshotV1>;
+  readControl?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string;
+    getFollowLease?: () => DirectSessionFollowLease | undefined }>) => Promise<DesktopControlSnapshotV1>;
   /** 浏览真实桌面项目配置，不承诺原生创建入口已经可用。 */
   listProjects?: (params: Readonly<{ source: DirectSessionsSource }>) => Promise<DesktopProjectV1[]>;
   /** 同原 owner 审批或忙时追加，未知结果不得自动重发。 */
-  control?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string; accountId: string; action: DirectSessionControlActionRequest }>) => Promise<DirectSessionControlResult>;
+  control?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string; accountId: string; action: DirectSessionControlActionRequest;
+    getFollowLease?: () => DirectSessionFollowLease | undefined }>) => Promise<DirectSessionControlResult>;
   /** 只向关联目标现有 owner 投递；禁止启动、恢复或接管执行器作为降级路径。 */
   send?: (params: Readonly<{
     /** 本次 RPC 已认证的账号快照，去重分区不得重新读取可变凭据。 */
@@ -125,6 +128,8 @@ export type DirectSessionProviderOps = Readonly<{
     text: string;
     localId: string;
     meta: Readonly<Record<string, unknown>>;
+    /** 每次使用时取当前认证目标的有效 lease，不能跨 await 保存旧所有权。 */
+    getFollowLease?: () => DirectSessionFollowLease | undefined;
   }>) => Promise<DirectSessionExternalSendResult>;
   pageTranscript?: (params: Readonly<{
     source: DirectSessionsSource;

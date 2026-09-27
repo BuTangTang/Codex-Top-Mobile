@@ -816,6 +816,22 @@ describe('transcript target-window host adapter', () => {
 });
 
 describe('tail contiguous floor (tail-reset discontinuity display)', () => {
+    // 源顺序只为已知断点补足显示定位；缺失断点不能使旧前缀意外可见。
+    it('locates a filtered opaque floor in source order while keeping unknown floors closed', () => {
+        const items = [{ id: 'old' }, { id: 'answer' }, { id: 'latest' }];
+        const project = (messageIds: string[]) => resolveTranscriptTargetWindowHostFacts({
+            items, sourceMessageIdsOldestFirst: ['old', 'hidden-tool', 'answer', 'hidden-tool-2', 'latest'],
+            tailContiguousBoundary: { kind: 'messageIds', messageIds }, windowState: inactiveState,
+        });
+        expect(project(['missing', 'hidden-tool-2', 'hidden-tool']).items.map((item) => item.id)).toEqual(['answer', 'latest']);
+        expect(project(['missing']).items).toEqual([]);
+        expect(project([]).items).toEqual([]);
+        expect(project(['hidden-tool']).gaps.older?.id).toBe('transcript-window-gap:tail:older');
+        expect(resolveTranscriptTargetWindowHostFacts({ items,
+            tailContiguousBoundary: { kind: 'messageIds', messageIds: ['hidden-tool'] }, windowState: inactiveState,
+        }).items).toEqual([]);
+    });
+
     it('keeps an unresolved opaque boundary explicit without treating seqless messages as chrome', () => {
         const items = [{ id: 'old' }, { id: 'chrome' }];
         const facts = resolveTranscriptTargetWindowHostFacts({

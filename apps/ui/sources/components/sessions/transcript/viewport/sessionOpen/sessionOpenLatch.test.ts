@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { createSessionOpenLatch } from './sessionOpenLatch';
-import type { SessionOpenEntryKind, SessionOpenLatchArmInput } from './types';
+import type { SessionOpenEntryKind, SessionOpenHostFacts, SessionOpenLatchArmInput } from './types';
 
 function armInput(overrides: Partial<SessionOpenLatchArmInput> = {}): SessionOpenLatchArmInput {
     const entryKind: SessionOpenEntryKind = overrides.entryKind ?? 'bottom';
@@ -25,6 +25,59 @@ type RendererOwnedInitialPositionArmInput = SessionOpenLatchArmInput & Readonly<
 }>;
 
 describe('session open latch', () => {
+    const warmBottomFacts: SessionOpenHostFacts = {
+        contentHeight: 1000,
+        hasEntrySliceWindow: false,
+        isLoaded: true,
+        isScrollable: true,
+        itemCount: 5,
+        layoutHeight: 600,
+        nowMs: 1_025,
+        sessionId: 'session-a',
+        tailGapState: 'none',
+        userWantsPinned: true,
+    };
+    const emptyTailFacts: SessionOpenHostFacts = {
+        ...warmBottomFacts,
+        contentHeight: 64,
+        isScrollable: false,
+        itemCount: 1,
+        tailGapState: 'empty',
+    };
+
+    it('uses one bounded fill for a newly empty native tail gap after a warm entry settled', () => {
+        const latch = createSessionOpenLatch();
+        latch.arm(armInput({ platform: 'native' }));
+        expect(latch.onHostFacts(warmBottomFacts).phase).toBe('done');
+        expect(latch.onHostFacts(emptyTailFacts).effects).toEqual([{ type: 'request-initial-fill' }]);
+        expect(latch.markInitialFillInProgress('session-a')).toBe(true);
+        latch.onInitialFillSettled({ sessionId: 'session-a', nowMs: 3_100 });
+
+        // A fill that exhausts its existing budget cannot restart as the same gap changes pages.
+        expect(latch.onHostFacts({ ...emptyTailFacts, nowMs: 4_000 }).effects).toEqual([]);
+        latch.onHostFacts({ ...warmBottomFacts, tailGapState: 'content' });
+        expect(latch.onHostFacts(emptyTailFacts).effects).toEqual([]);
+        expect(latch.initialFillStatus()).toBe('done');
+
+        // Only a closed gap followed by a new gap grants another fill.
+        latch.onHostFacts(warmBottomFacts);
+        expect(latch.onHostFacts(emptyTailFacts).effects).toEqual([{ type: 'request-initial-fill' }]);
+    });
+
+    it.each([
+        { label: 'web', arm: { platform: 'web' as const }, facts: {} },
+        { label: 'detached reader', arm: {}, facts: { userWantsPinned: false } },
+        { label: 'anchored entry', arm: { entryKind: 'anchored' as const }, facts: {} },
+        { label: 'entry slice', arm: {}, facts: { hasEntrySliceWindow: true } },
+        { label: 'route jump', arm: { entryKind: 'jump' as const }, facts: {} },
+    ])('does not re-open fill for an empty gap owned by $label', ({ arm, facts }) => {
+        const latch = createSessionOpenLatch();
+        latch.arm(armInput({ platform: 'native', ...arm }));
+        latch.onHostFacts(warmBottomFacts);
+        const next = latch.onHostFacts({ ...emptyTailFacts, ...facts });
+        expect(next.effects).not.toContainEqual({ type: 'request-initial-fill' });
+    });
+
     it('does not expire data readiness before a delayed initial page can start its fill', () => {
         const latch = createSessionOpenLatch();
         latch.arm(armInput({ initialBottomPositionOwner: 'renderer', webOpenPhaseDeadlineDelayMs: 10_000 }));

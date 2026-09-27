@@ -19,6 +19,7 @@ export async function createCodexDirectSessionFollowLease(params: {
   let baselineAttempts = 0;
   let baselineSelected = false;
   let baselineInvalidated = false;
+  let anchoredConnection: DesktopIpc | null = null;
   let observation: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
   let desktopObservation: DirectSessionObservationV1 = observation;
   const pending: DirectSessionObservationFact[] = [];
@@ -64,13 +65,20 @@ export async function createCodexDirectSessionFollowLease(params: {
         && next.turnId === observation.turnId && isTerminal(observation)) return;
     publish(next, continuity);
   };
-  /** 仅建立既有长订阅，重连和外部快照都不能再次触发历史水合请求。 */
+  /** 原连接失效先撤销控制锚；仅已成功的连接可在原 poller 上重新建立一次基线。 */
+  const observeConnection = (opened: DesktopIpc, next: DirectSessionObservationV1, continuity: DirectSessionObservationFact['continuity']) => {
+    if (released || ipc !== opened) return;
+    observeDesktop(next, continuity);
+    if (opened.isClosed()) {
+      ipc = null;
+      if (anchoredConnection === opened) {
+        anchoredConnection = null; baselineStarted = false; baselineAttempts = 0;
+      }
+    }
+  };
+  /** 无控制锚的旧 producer 继续使用原观察订阅，不将任意首快照升级为发送依据。 */
   const follow = (opened: DesktopIpc) => {
-    opened.followConversation(params.remoteSessionId, (next, continuity) => {
-      if (released || ipc !== opened) return;
-      observeDesktop(next, continuity);
-      if (opened.isClosed()) ipc = null;
-    });
+    opened.followConversation(params.remoteSessionId, (next, continuity) => observeConnection(opened, next, continuity));
   };
   /** 首次关联读取遇到暂时传输失败只恢复一次；每次先有文件边界，新事实仍优先于迟到基线。 */
   const initializeBaseline = async (opened: DesktopIpc) => {
@@ -79,9 +87,11 @@ export async function createCodexDirectSessionFollowLease(params: {
     baselineInvalidated = false;
     const before = observation;
     try {
-      const raw = await opened.readControlSnapshot(params.remoteSessionId);
+      const raw = await opened.readControlSnapshot(params.remoteSessionId,
+        (next, continuity) => observeConnection(opened, next, continuity),
+        (state) => { readDesktopControlSnapshot(state, params.remoteSessionId); });
       // 复用控制 owner 的 runtime/当前尾轮校验，再用唯一观察投影器生成状态。
-      readDesktopControlSnapshot(raw, params.remoteSessionId);
+      if (!released && ipc === opened) anchoredConnection = opened;
       const next = readDesktopConversationObservation(raw, params.remoteSessionId);
       if (!released && ipc === opened && !baselineInvalidated && before.state === 'unknown' && observation === before && next.state !== 'unknown') {
         publish(next, 'snapshot');
@@ -97,6 +107,8 @@ export async function createCodexDirectSessionFollowLease(params: {
       }
     }
     if (released || ipc !== opened) return;
+    // 有关联基线的连接已保留同一个订阅；重新 following 会丢失控制锚和连续修订。
+    if (opened.getControlSnapshot(params.remoteSessionId)) return;
     try {
       follow(opened);
     } catch {
@@ -104,7 +116,7 @@ export async function createCodexDirectSessionFollowLease(params: {
       if (observation.state === 'unknown' || observation.source !== 'rollout') markSourceUnavailable();
     }
   };
-  /** 一般重连只恢复订阅；首次基线恢复由原 poller 的有效来源边界放行。 */
+  /** 失效控制锚由原 poller 的有效来源边界恢复；旧 producer 或已耗尽恢复次数时仅恢复观察订阅。 */
   const connect = async () => {
     if (ipc || released || homes.length !== 1) return;
     let opened: DesktopIpc | null = null;
@@ -113,7 +125,7 @@ export async function createCodexDirectSessionFollowLease(params: {
       await opened.discoverOwner(params.remoteSessionId);
       if (released) { opened.close(); return; }
       ipc = opened;
-      // 初次或唯一恢复连接等待下方基线读取；成功基线之后的重连仍只订阅。
+      // 待恢复的控制连接等下方来源校验；普通观察重连不额外水合。
       if (baselineStarted) follow(opened);
     } catch {
       opened?.close(); ipc = null;
@@ -150,6 +162,8 @@ export async function createCodexDirectSessionFollowLease(params: {
     },
   });
   return { ...polling,
+    /** 只交回现有连续连接，通用 lease 层不读取 provider 私有状态。 */
+    getProviderControl: () => !released && ipc?.getControlSnapshot(params.remoteSessionId) ? ipc : null,
     /** 只返回当前已选择来源的事实，释放后的旧引用一律未知。 */
     getObservation: () => released ? { v: 1, state: 'unknown', reason: 'connection_closed' } : observation,
     /** 先撤销观察，再等待轮询释放，迟到回调不能恢复已释放的 lease。 */

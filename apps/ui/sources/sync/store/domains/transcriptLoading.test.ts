@@ -9,6 +9,23 @@ function createHarness() {
 }
 
 describe('transcriptLoading domain', () => {
+    // 延迟状态只有一个可观察 owner；重复 tick、无关会话和切源清理不能产生额外状态。
+    it('keeps deferred newer state isolated and suppresses unchanged polling updates', () => {
+        const { get, subscribe } = createHarness();
+        let notifications = 0;
+        subscribe(() => { notifications += 1; });
+        get().setSessionDeferredNewerMessages('s1', true);
+        const state = get();
+        get().setSessionDeferredNewerMessages('s1', true);
+        get().setSessionDeferredNewerMessages('s2', false);
+        expect(get()).toBe(state);
+        expect(get().sessionDeferredNewerMessages).toEqual({ s1: true });
+        get().clearSessionDeferredNewerMessages();
+        get().clearSessionDeferredNewerMessages();
+        expect(get().sessionDeferredNewerMessages).toEqual({});
+        expect(notifications).toBe(2);
+    });
+
     it('keeps one stable boundary projection for equivalent sequence and identity updates', () => {
         const { get, subscribe } = createHarness();
         let notifications = 0;

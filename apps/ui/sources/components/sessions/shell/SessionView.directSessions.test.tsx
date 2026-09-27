@@ -753,8 +753,8 @@ vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOrigin
 });
 
 describe('SessionView (direct sessions)', () => {
-  // 首次历史观察仍未知时，只由本次原桌面快照决定是否允许开始，不篡改观察状态。
-  it('sends an unknown desktop observation through a freshly confirmed start mode', async () => {
+  // 已确认的同寿命快照只选路；先投递，受理后异步回读，不篡改历史观察状态。
+  it('sends through its confirmed start mode before refreshing control history', async () => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true },
       observation: { v: 1, state: 'unknown', reason: 'not_observed' } });
@@ -765,8 +765,10 @@ describe('SessionView (direct sessions)', () => {
     await act(async () => { findAgentInput(screen).props.onChangeText('first desktop text'); });
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
-    expect(machineControlReadSpy.mock.calls.length).toBeGreaterThan(readsBeforeClick);
+    expect(machineControlReadSpy.mock.calls.length).toBe(readsBeforeClick + 1);
     expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+    expect(syncSubmitMessageSpy.mock.invocationCallOrder[0])
+      .toBeLessThan(machineControlReadSpy.mock.invocationCallOrder[readsBeforeClick]!);
     expect(syncSubmitMessageSpy).toHaveBeenCalledWith('s1', 'first desktop text', undefined, undefined,
       expect.objectContaining({ directSessionExternalControl: true }));
     expect(machineControlActionSpy).not.toHaveBeenCalled();
@@ -774,30 +776,40 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.value).toBe('');
   });
 
-  // 点击之前的缓存不可授权发送；读取失败时保留草稿并提供本地化确认按钮。
-  it('rejects a fresh desktop control read failure instead of using cached start authority', async () => {
+  // 已失败的刷新同步撤销旧快照；再次点击补读仍失败时保留草稿。
+  it('rejects a desktop control read failure after refresh has revoked the cached start mode', async () => {
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
     machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
     const screen = await renderSessionViewAndSettle();
     machineControlReadSpy.mockResolvedValue({ ok: false, error: 'unavailable', errorCode: 'provider_unavailable' });
+    await screen.pressByTestIdAsync('desktop-session-header-refresh');
+    await flushHookEffects();
+    const readsBeforeClick = machineControlReadSpy.mock.calls.length;
     await act(async () => { findAgentInput(screen).props.onChangeText('keep cold draft'); });
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
+    expect(machineControlReadSpy.mock.calls.length).toBe(readsBeforeClick + 1);
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
     expect(machineControlActionSpy).not.toHaveBeenCalled();
     expect(findAgentInput(screen).props.value).toBe('keep cold draft');
     expect(modalAlertSpy.mock.calls.at(-1)?.[2]).toEqual([{ text: 'common.ok' }]);
   });
 
-  // 页面点击只认新轮次；历史观察和缓存即使仍显示已结束，也不能派发普通 SEND。
-  it('steers the freshly running desktop turn instead of the cached start mode', async () => {
+  // 手动刷新发布新轮次后，点击使用该轮次选路，不借旧闭包派发普通 SEND。
+  it('steers the refreshed running desktop turn instead of the previous start mode', async () => {
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
     machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
     const screen = await renderSessionViewAndSettle();
     machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'new-turn', state: 'running', requests: [], textSendMode: 'steer' } });
     machineControlActionSpy.mockResolvedValue({ ok: true, result: { status: 'accepted', turnId: 'new-turn' } });
+    await screen.pressByTestIdAsync('desktop-session-header-refresh');
+    await flushHookEffects();
     await act(async () => { findAgentInput(screen).props.onChangeText('append new turn'); });
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
@@ -819,22 +831,21 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.value).toBe('older producer draft');
   });
 
-  // 连点在读取阶段即合并，等待期间新输入的草稿不被旧文本受理清除。
-  it('admits one desktop click and preserves newer draft text across its deferred read', async () => {
+  // 快路径仍从点击开始单飞，等待 ACK 期间的新草稿不能被旧文本受理清除。
+  it('admits one desktop click and preserves newer draft text across its deferred receipt', async () => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
     machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
-    syncSubmitMessageSpy.mockResolvedValue({ localId: 'desktop-start', persistence: 'provider_direct' });
+    const receipt = createDeferred<DirectMessageSubmitResult>();
+    syncSubmitMessageSpy.mockReturnValueOnce(receipt.promise);
     const screen = await renderSessionViewAndSettle();
-    const freshRead = createDeferred<any>();
-    machineControlReadSpy.mockReturnValueOnce(freshRead.promise);
     const readsBefore = machineControlReadSpy.mock.calls.length;
     await act(async () => { findAgentInput(screen).props.onChangeText('clicked text'); });
     await act(async () => { const send = findAgentInput(screen).props.onSend; send(); send(); });
     await act(async () => { findAgentInput(screen).props.onChangeText('newer draft'); });
-    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
-    expect(machineControlReadSpy.mock.calls.length).toBe(readsBefore + 1);
-    await act(async () => { freshRead.resolve({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } }); });
+    expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+    expect(machineControlReadSpy.mock.calls.length).toBe(readsBefore);
+    await act(async () => { receipt.resolve({ localId: 'desktop-start', persistence: 'provider_direct' }); });
     await flushHookEffects();
     expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
     expect(syncSubmitMessageSpy.mock.calls[0]?.[1]).toBe('clicked text');
@@ -867,20 +878,31 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.connectionStatus.text).toBe('directSessions.observation.unknown');
   });
 
-  // CLI 在开始前发现变忙必须明确拒绝，页面不得自动改成 steer 再投一次。
-  it('keeps a rejected desktop start draft without steering fallback', async () => {
+  // 旧快照只负责选路：CLI 拒绝变忙或换轮后，页面保稿、不改观察状态、不换路重投。
+  it.each(['start', 'steer'] as const)('keeps a rejected stale desktop %s draft without another route or optimistic state', async (mode) => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
-      activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
-    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
+      activity: 'idle', canForceStop: false, externalControl: { canSend: true },
+      observation: { v: 1, state: 'unknown', reason: 'not_observed' } });
+    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: mode === 'start' ? 'completed' : 'running', requests: [], textSendMode: mode } });
     syncSubmitMessageSpy.mockRejectedValue(new Error('desktop became busy'));
+    machineControlActionSpy.mockResolvedValue({ ok: true, result: { status: 'rejected', reason: 'turn_changed' } });
     const screen = await renderSessionViewAndSettle();
+    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'new-turn', state: 'running', requests: [], textSendMode: 'steer' } });
     await act(async () => { findAgentInput(screen).props.onChangeText('busy race draft'); });
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
-    expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
-    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    if (mode === 'start') {
+      expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+      expect(machineControlActionSpy).not.toHaveBeenCalled();
+      expect(modalAlertSpy).toHaveBeenCalledWith('common.error', 'desktop became busy', [{ text: 'common.ok' }]);
+    } else {
+      expect(machineControlActionSpy).toHaveBeenCalledTimes(1);
+      expect(machineControlActionSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'steer', expectedTurnId: 'old-turn', text: 'busy race draft' }), expect.anything());
+      expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    }
     expect(findAgentInput(screen).props.value).toBe('busy race draft');
-    expect(modalAlertSpy).toHaveBeenCalledWith('common.error', 'desktop became busy', [{ text: 'common.ok' }]);
+    expect(findAgentInput(screen).props.connectionStatus.text).toBe('directSessions.observation.unknown');
+    expect(screen.findByTestId('desktop-control-outcome')?.props.children).toBe('桌面未接受这次操作，请核对最新状态。');
   });
 
   it.each(['running', 'needs_input'] as const)('sends a %s desktop composer message to the current native turn without ordinary send fallback', async (state) => {
@@ -936,6 +958,7 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.showAbortButton).toBe(false);
     expect(screen.findByTestId('desktop-approval-panel')).toBeNull();
     expect(chatListPropsSpy.mock.calls.at(-1)?.[0].directControlFooter).toBeNull();
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].hideOrdinaryToolCalls).toBe(true);
     expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toContain('directSessions.observation.running');
     expect(screen.findByTestId('desktop-session-header-details')?.props.disabled).not.toBe(true);
     expect(screen.findByTestId('desktop-session-header-attention')).not.toBeNull();
@@ -962,6 +985,7 @@ describe('SessionView (direct sessions)', () => {
     });
     const screen = await renderSessionViewAndSettle();
     const notice = { title: 'session.machineOfflineNoticeTitle', body: 'session.machineOfflineNoticeBody' };
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].hideOrdinaryToolCalls).toBe(headerNotice);
     if (!headerNotice) {
       expect(chatListPropsSpy.mock.calls.at(-1)?.[0].bottomNotice).toEqual(notice);
       expect(screen.findByTestId('desktop-session-header-status')).toBeNull();
@@ -2564,6 +2588,8 @@ describe('SessionView (direct sessions)', () => {
 
   it('updates AgentInput runtime status from fresh heartbeat fields without replacing the shell session', async () => {
     // 这里验收现有 runner 状态，不使用外部桌面 Direct 生命周期。
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
     storageState.sessions.s1.metadata = { ...storageState.sessions.s1.metadata, directSessionV1: undefined };
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
@@ -2582,6 +2608,7 @@ describe('SessionView (direct sessions)', () => {
     const screen = await renderSessionViewAndSettle();
 
     expect(findAgentInput(screen).props.connectionStatus?.text).toBe('status.online');
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].hideOrdinaryToolCalls).toBe(false);
     expect(findAgentInput(screen).props.showAbortButton).toBe(false);
 
     storageState.sessions.s1 = {
@@ -4328,6 +4355,8 @@ describe('SessionView (direct sessions)', () => {
   // 桌面继续拥有会话，手机普通发送只使用本次探测的外部能力。
   it('keeps ordinary runner composer controls available', async () => {
     featureEnabledState['mcp.servers'] = true;
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
     mockActiveDirectRunner();
     const screen = await renderSessionView();
     const input = findAgentInput(screen);
@@ -4337,6 +4366,7 @@ describe('SessionView (direct sessions)', () => {
     expect(input.props.autocompleteKinds).toContain('file');
     expect((input.props.extraActionChips ?? []).map((chip: { key: string }) => chip.key)).toContain('new-session-mcp');
     expect((input.props.extraActionChips ?? []).map((chip: { key: string }) => chip.key)).toContain('project-file-link');
+    expect(chatListPropsSpy.mock.calls.at(-1)?.[0].hideOrdinaryToolCalls).toBe(false);
   });
 
   it('sends text to the external desktop owner without takeover and inherits desktop settings', async () => {

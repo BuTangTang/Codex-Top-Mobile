@@ -1534,6 +1534,47 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledTimes(1);
     });
 
+    // 新尾部提示由 sync 的原延迟状态驱动；历史锚点与游标只在用户回底后接纳增量。
+    it('exposes deferred direct updates while preserving the reading anchor until explicit return', async () => {
+        const sessionId = 'detached-direct-newer-signal';
+        storage.getState().applySessions([createDirectSession(sessionId)]);
+        const { sync } = await import('./sync');
+        const internals = sync as unknown as {
+            fetchMessages(id: string): Promise<void>;
+            getDirectSessionTailCursor(id: string): string | null;
+            handleDirectSessionTranscriptEphemeralUpdate(update: unknown): Promise<void>;
+        };
+        machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({
+            ok: true, historyAvailability: 'available',
+            items: [{ id: 'cached-anchor', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: 'synthetic cached history' } } }],
+            nextCursor: 'older', tailCursor: 'tail-1', hasMore: true,
+        });
+        await internals.fetchMessages(sessionId);
+        sync.onSessionViewportChange(sessionId, {
+            isPinned: false, offsetY: 8, shouldRestoreViewport: true,
+            anchor: { kind: 'message', messageId: 'cached-anchor', itemId: 'cached-anchor', itemOffsetPx: 8, capturedAtMs: 1 },
+        });
+        const viewport = sync.getSessionViewport(sessionId);
+        const accepted = storage.getState().sessionMessages[sessionId];
+        const items = [2, 3].map((time) => ({ id: `new-${time}`, createdAtMs: time,
+            raw: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: `synthetic update ${time}` } } } }));
+        await internals.handleDirectSessionTranscriptEphemeralUpdate({ sessionId, items, fromCursor: 'tail-1', nextCursor: 'tail-2', truncated: false });
+        expect(storage.getState().sessionMessages[sessionId]).toBe(accepted);
+        expect(sync.getSessionViewport(sessionId)).toBe(viewport);
+        expect(internals.getDirectSessionTailCursor(sessionId)).toBe('tail-1');
+        expect(storage.getState().sessionDeferredNewerMessages?.[sessionId]).toBe(true);
+        expect(storage.getState().sessionDeferredNewerMessages?.['other-session']).toBeUndefined();
+        machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({
+            ok: true, historyAvailability: 'available', items, nextCursor: 'tail-2', truncated: false,
+        });
+        sync.markSessionLiveTailIntent(sessionId);
+        await internals.fetchMessages(sessionId);
+        expect(internals.getDirectSessionTailCursor(sessionId)).toBe('tail-2');
+        expect(storage.getState().sessionMessages[sessionId]?.messageIdsOldestFirst).toHaveLength(3);
+        expect(sync.getSessionViewport(sessionId)?.isPinned).toBe(true);
+        expect(storage.getState().sessionDeferredNewerMessages?.[sessionId]).toBeUndefined();
+    });
+
     it.each(['pull', 'push'] as const)('replaces a hosted target window on live-tail handoff through %s even before the main transcript was loaded', async (entry) => {
         const sessionId = `cold_target_window_direct_handoff_${entry}`;
         const { sync } = await import('./sync');

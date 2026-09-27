@@ -20,11 +20,20 @@ import { getDesktopSessionControl, sendDesktopSessionUserMessage, getDesktopSess
 import { DirectSessionsProviderUnavailableError } from '@/backends/directSessions/providerOps';
 import { readDesktopProjects } from './desktop/readDesktopProjects';
 import { openDesktopSession } from './desktop/openDesktopSession';
+import { DesktopIpc } from './desktop/desktopIpc';
 
 // 这些字段只记录普通文本的 UI 来源和设置快照；实际运行设置仍继承 Desktop。
 const DESKTOP_TEXT_TRACKING_META_KEYS = new Set([
   'source', 'sentFrom', 'permissionMode', 'model', 'fallbackModel', 'displayText',
 ]);
+
+/** 通用链只传递当前 lease；私有连接类型与控制锚仅由 Codex provider 识别。 */
+function followedIpc(getFollowLease: Parameters<NonNullable<DirectSessionProviderOps['readControl']>>[0]['getFollowLease']) {
+  return () => {
+    const value = getFollowLease?.()?.getProviderControl?.();
+    return value instanceof DesktopIpc ? value : null;
+  };
+}
 
 export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
   /** 手机明确打开时复用唯一来源与原任务入口，已加载任务不切换桌面。 */
@@ -40,16 +49,16 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     return readDesktopProjects(homes[0]!.codexHome);
   },
   /** 沿规范来源找到唯一 Codex home；聚合来源不能作为控制目标。 */
-  readControl: async ({ source, remoteSessionId }) => {
+  readControl: async ({ source, remoteSessionId, getFollowLease }) => {
     const homes = await resolveCodexHomeEntriesForDirectSessionsSource({ source, activeServerDir: configuration.activeServerDir, env: process.env });
     if (homes.length !== 1) throw new DirectSessionsProviderUnavailableError('source_unavailable');
-    return getDesktopSessionControlSnapshot({ codexHome: homes[0]!.codexHome, remoteSessionId });
+    return getDesktopSessionControlSnapshot({ codexHome: homes[0]!.codexHome, remoteSessionId, getFollowedIpc: followedIpc(getFollowLease) });
   },
   /** 保留账号和原生任务身份，不通过 spawn 或 resume 降级执行。 */
-  control: async ({ source, remoteSessionId, accountId, action }) => {
+  control: async ({ source, remoteSessionId, accountId, action, getFollowLease }) => {
     const homes = await resolveCodexHomeEntriesForDirectSessionsSource({ source, activeServerDir: configuration.activeServerDir, env: process.env });
     if (homes.length !== 1) return { status: 'rejected', reason: 'source_unavailable' };
-    return performDesktopSessionControlAction({ codexHome: homes[0]!.codexHome, remoteSessionId, accountId, action });
+    return performDesktopSessionControlAction({ codexHome: homes[0]!.codexHome, remoteSessionId, accountId, action, getFollowedIpc: followedIpc(getFollowLease) });
   },
   listCandidates: async ({ source, cursor, limit, searchTerm, searchMode }) => {
     const res = await listCodexSessionCandidates({ source, activeServerDir: configuration.activeServerDir, serverScope: resolveServerHttpBaseUrl(), cursor, limit, searchTerm, searchMode });
@@ -63,7 +72,7 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     };
   },
   /** 用既有 home resolver 消除默认值与等价路径差异，只有同一精确目标才能展示能力。 */
-  getExternalControl: async ({ source, requestedSource, remoteSessionId }) => {
+  getExternalControl: async ({ source, requestedSource, remoteSessionId, getFollowLease }) => {
     const [linkedHomes, requestedHomes] = await Promise.all([source, requestedSource].map((candidate) =>
       resolveCodexHomeEntriesForDirectSessionsSource({ source: candidate, activeServerDir: configuration.activeServerDir, env: process.env })));
     if (linkedHomes.length !== 1 || requestedHomes.length !== 1) {
@@ -78,11 +87,11 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     if (!linkedPath || linkedPath !== requestedPath || identityKeys.some((key) => linked.source[key] !== requested.source[key])) {
       return { canSend: false, unavailableReason: 'source_mismatch' };
     }
-    const control = await getDesktopSessionControl({ codexHome: linked.codexHome, remoteSessionId });
+    const control = await getDesktopSessionControl({ codexHome: linked.codexHome, remoteSessionId, getFollowedIpc: followedIpc(getFollowLease) });
     return control.available ? { canSend: true } : { canSend: false, unavailableReason: control.reason };
   },
   /** 纯文本向现有 Desktop owner 投递；不支持的输入必须拒绝，不能静默丢弃。 */
-  send: async ({ source, remoteSessionId, text, localId, meta, accountId }) => {
+  send: async ({ source, remoteSessionId, text, localId, meta, accountId, getFollowLease }) => {
     if (Object.keys(meta).some((key) => !DESKTOP_TEXT_TRACKING_META_KEYS.has(key))) {
       return { status: 'rejected', reason: 'unsupported_input' };
     }
@@ -90,7 +99,7 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
       source, activeServerDir: configuration.activeServerDir, env: process.env,
     });
     if (homes.length !== 1) return { status: 'rejected', reason: 'source_unavailable' };
-    return sendDesktopSessionUserMessage({ codexHome: homes[0]!.codexHome, remoteSessionId, text, localId, accountId });
+    return sendDesktopSessionUserMessage({ codexHome: homes[0]!.codexHome, remoteSessionId, text, localId, accountId, getFollowedIpc: followedIpc(getFollowLease) });
   },
   pageTranscript: async ({ source, remoteSessionId, direction, cursor, maxBytes, maxItems }) => {
     const res = await pageCodexTranscript({

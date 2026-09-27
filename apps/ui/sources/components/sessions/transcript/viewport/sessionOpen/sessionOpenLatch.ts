@@ -62,6 +62,7 @@ export function createSessionOpenLatch(): SessionOpenLatch {
     let requestedInitialPin = false;
     let requestedInitialPositioning = false;
     let requestedInitialFill = false;
+    let emptyTailGapFillHandled = false;
 
     const decision = (effects: readonly SessionOpenLatchEffect[] = []): SessionOpenLatchDecision => ({
         effects,
@@ -88,6 +89,7 @@ export function createSessionOpenLatch(): SessionOpenLatch {
         requestedInitialPin = false;
         requestedInitialPositioning = false;
         requestedInitialFill = false;
+        emptyTailGapFillHandled = false;
     };
 
     const takeNextWebRetryEffect = (nowMs: number): SessionOpenLatchEffect | null => {
@@ -202,6 +204,19 @@ export function createSessionOpenLatch(): SessionOpenLatch {
         },
         onHostFacts(facts) {
             if (!armed || armed.sessionId !== facts.sessionId) return decision();
+            // 缓存已完成首屏后，新快照可能只留下隐藏工具的 gap；同一缺口只补一次。
+            if (!facts.tailGapState || facts.tailGapState === 'none') emptyTailGapFillHandled = false;
+            if (facts.tailGapState === 'empty' && !emptyTailGapFillHandled && phase !== 'disarmed') {
+                if (initialFillStatus !== 'done') {
+                    emptyTailGapFillHandled = true;
+                } else if (armed.platform === 'native' && armed.entryKind === 'bottom'
+                    && facts.userWantsPinned && !facts.hasEntrySliceWindow) {
+                    emptyTailGapFillHandled = true;
+                    initialFillStatus = 'idle';
+                    requestedInitialFill = false;
+                    phase = 'positioning';
+                }
+            }
             if (phase === 'disarmed' || phase === 'done') return decision();
             // Bound a started fill, not the preceding data load. Expiring an idle
             // fill fabricated readiness and prevented a delayed page from starting

@@ -90,6 +90,70 @@ describe('Desktop IPC frame buffering', () => {
             handledByClientId: 'owner-synthetic', result: { revision } }));
     }
 
+    it('keeps a correlated control subscription and advances its live proof without another history read', async () => {
+        await discover();
+        const observation = vi.fn();
+        const pending = ipc.readControlSnapshot('thread-synthetic', observation);
+        socket.emit('data', frame(snapshot(10)));
+        acknowledgeHistory(10);
+        await pending;
+        // 旧实现会在返回基线时发 following:false，随后的 patch 已无接收 owner。
+        expect(socket.lastRequest?.method).toBe('thread-follower-load-complete-history');
+        socket.emit('data', frame({ type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+            sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: 'thread-synthetic',
+                change: { type: 'patches', baseRevision: 10, revision: 11, patches: [
+                    { op: 'add', path: ['turns', 1], value: { turnId: 'next-turn', status: 'inProgress' } },
+                    { op: 'replace', path: ['threadRuntimeStatus', 'type'], value: 'active' },
+                ] } } }));
+        expect(ipc.getControlSnapshot('thread-synthetic')).toMatchObject({ ownerClientId: 'owner-synthetic', state: { turns: [{ turnId: 'turn-synthetic' }, { turnId: 'next-turn' }] } });
+        expect(observation).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'running', turnId: 'next-turn' }), 'event');
+        expect(ipc.getControlSnapshot('other-thread')).toBeNull();
+    });
+
+    it('keeps the same correlated stream through a native next-revision snapshot and its following patch', async () => {
+        await discover();
+        const observation = vi.fn();
+        const pending = ipc.readControlSnapshot('thread-synthetic', observation);
+        socket.emit('data', frame(snapshot(10))); acknowledgeHistory(10); await pending;
+        const next = snapshot(11) as { params: { change: { conversationState: { turns: unknown[]; threadRuntimeStatus: { type: string } } } } };
+        next.params.change.conversationState.turns.push({ turnId: 'next-turn', status: 'inProgress' });
+        next.params.change.conversationState.threadRuntimeStatus.type = 'active';
+        socket.emit('data', frame(next));
+        expect(ipc.getControlSnapshot('thread-synthetic')).toMatchObject({ state: { threadRuntimeStatus: { type: 'active' } } });
+        expect(observation).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'running', turnId: 'next-turn' }), 'snapshot');
+        socket.emit('data', frame({ type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+            sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: 'thread-synthetic',
+                change: { type: 'patches', baseRevision: 11, revision: 12, patches: [
+                    { op: 'replace', path: ['turns', 1, 'status'], value: 'completed' },
+                    { op: 'replace', path: ['threadRuntimeStatus', 'type'], value: 'idle' },
+                ] } } }));
+        expect(ipc.getControlSnapshot('thread-synthetic')).toMatchObject({ state: { threadRuntimeStatus: { type: 'idle' } } });
+        expect(observation).toHaveBeenLastCalledWith(expect.objectContaining({ state: 'completed', turnId: 'next-turn' }), 'event');
+    });
+
+    it.each(['disconnect', 'owner_changed', 'gap', 'unrelated_snapshot', 'regressed_snapshot', 'conflicting_snapshot', 'foreign_snapshot'] as const)(
+        'revokes retained control proof immediately on %s', async (failure) => {
+            await discover();
+            const pending = ipc.readControlSnapshot('thread-synthetic', () => {});
+            socket.emit('data', frame(snapshot(10))); acknowledgeHistory(10); await pending;
+            if (failure === 'disconnect') socket.destroy();
+            else if (failure === 'owner_changed') socket.emit('data', frame({ type: 'broadcast', method: 'client-status-changed',
+                params: { clientId: 'owner-synthetic', status: 'disconnected' } }));
+            else if (failure === 'unrelated_snapshot') socket.emit('data', frame(snapshot(50)));
+            else if (failure === 'regressed_snapshot') socket.emit('data', frame(snapshot(9)));
+            else if (failure === 'conflicting_snapshot') socket.emit('data', frame(snapshot(10, 'different-state')));
+            else if (failure === 'foreign_snapshot') {
+                const next = snapshot(11) as { params: { change: { conversationState: { id: string } } } };
+                next.params.change.conversationState.id = 'other-thread';
+                socket.emit('data', frame(next));
+            }
+            else socket.emit('data', frame({ type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+                sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: 'thread-synthetic',
+                    change: { type: 'patches', baseRevision: 12, revision: 13, patches: [] } } }));
+            expect(ipc.getControlSnapshot('thread-synthetic')).toBeNull();
+        },
+    );
+
     it('accounts received snapshot bytes without serializing the parsed full history again', async () => {
         await discover();
         const bytes = frame(snapshot(10));
@@ -101,13 +165,19 @@ describe('Desktop IPC frame buffering', () => {
         expect(stringify.mock.calls.filter(([value]) => value?.method === 'thread-stream-state-changed')).toHaveLength(0);
     });
 
-    it('allows the correlated read-only history response after five seconds without changing its wire timeout', async () => {
+    it('keeps the router history deadline open for a correlated response after five seconds', async () => {
         await discover();
         vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
         const outcome = ipc.readControlSnapshot('thread-synthetic').then((state) => ({ state }), (error: Error) => ({ error: error.message }));
-        expect(socket.lastRequest).toMatchObject({ method: 'thread-follower-load-complete-history', timeoutMs: 5000 });
+        const request = socket.lastRequest!;
+        // Desktop 26.917.71314 (10954) 的 router.forwardRequest 按线上 timeoutMs 截止；
+        // 到期后会回 request-timeout，不能用忽略该截止的直接 ACK 假装慢读取成功。
+        const routerDeadline = setTimeout(() => socket.emit('data', frame({
+            type: 'response', requestId: request.requestId, resultType: 'error', error: 'request-timeout',
+        })), request.timeoutMs ?? 10_000);
         socket.emit('data', frame(snapshot(10)));
         await vi.advanceTimersByTimeAsync(9440);
+        clearTimeout(routerDeadline);
         acknowledgeHistory(10);
         await expect(outcome).resolves.toMatchObject({ state: { id: 'thread-synthetic' } });
     });
@@ -124,12 +194,16 @@ describe('Desktop IPC frame buffering', () => {
         await expect(outcome).resolves.toBe('timeout');
     });
 
-    it('keeps ordinary owner discovery at five seconds', async () => {
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        const outcome = ipc.discoverOwner('thread-synthetic').catch((error: Error) => error.message);
-        await vi.advanceTimersByTimeAsync(5000);
-        await expect(outcome).resolves.toBe('timeout');
-    });
+    it.each(['thread-owner-discovery', 'thread-follower-start-turn', 'thread-follower-steer-turn',
+        'thread-follower-command-approval-decision'])(
+        'keeps the local and router deadline at five seconds for %s', async (method) => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+            const outcome = ipc.request(method, 1, {}).catch((error: Error) => error.message);
+            expect(socket.lastRequest).toMatchObject({ method, timeoutMs: 5000 });
+            await vi.advanceTimersByTimeAsync(5000);
+            await expect(outcome).resolves.toBe('timeout');
+        },
+    );
 
     it.each(['current', 'discarded_ack', 'discarded_conflict', 'patch_overflow'] as const)(
         'keeps a bounded snapshot window safe for %s using actual frame sizes', async (variant) => {

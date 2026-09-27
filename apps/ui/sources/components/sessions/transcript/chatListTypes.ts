@@ -61,6 +61,8 @@ export type PromotedJumpSeqViewportProtection = Readonly<{
 
 export type ChatListProps = Readonly<{
     session: Session;
+    /** 手机桌面对话只投影正文和仍需处理的工具审批。 */
+    hideOrdinaryToolCalls?: boolean;
     bottomNotice?: ChatListBottomNotice | null;
     controlledByUserOverride?: boolean;
     controlSwitchTo?: 'remote' | null;
@@ -89,6 +91,8 @@ export type ChatListInternalProps = Readonly<{
     messagePins: readonly PersistedSessionMessagePinV1[];
     onToggleMessagePin: (pin: PersistedSessionMessagePinV1) => void;
     messagesById: Readonly<Record<string, Message>>;
+    /** 隐藏工具时仍用完整的 materialized 消息顺序定位原同步边界。 */
+    sourceMessageIdsOldestFirst?: readonly string[];
     /** 手机折叠时仍应显示的审批行，由已有根消息订阅派生。 */
     compactPendingToolCallIds?: readonly string[];
     eventEmphasisByMessageId: TranscriptEventEmphasisByMessageId;

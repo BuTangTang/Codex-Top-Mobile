@@ -16,7 +16,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
 
 import { getDesktopSessionControl, getDesktopSessionControlSnapshot, sendDesktopSessionUserMessage, performDesktopSessionControlAction } from './desktopSessionControl';
 import { readDesktopControlSnapshot } from './desktopControlSnapshot';
-import { DesktopIpc } from './desktopIpc';
+import { DesktopIpc, DesktopIpcError } from './desktopIpc';
 import { openDesktopSession } from './openDesktopSession';
 
 type Request = {
@@ -175,6 +175,159 @@ describe('Desktop-owned session control', () => {
         for (const server of servers) await new Promise<void>((resolve) => server.close(() => resolve()));
         servers.clear();
         await removeTempDir(root);
+    });
+
+    it.each(['valid', 'revoked'] as const)('checks warm status against the %s current lease without cold discovery', async (mode) => {
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        await followed.readControlSnapshot(input.remoteSessionId, () => {});
+        let reads = 0;
+        const getFollowedIpc = () => mode === 'revoked' && ++reads > 1 ? null : followed;
+        try {
+            const result = await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, getFollowedIpc });
+            expect(result).toMatchObject(mode === 'valid' ? { available: true, ownerClientId: 'owner-synthetic' }
+                : { available: false, reason: 'owner_changed' });
+            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+            expect(followed.isClosed()).toBe(false);
+        } finally { followed.close(); }
+    });
+
+    it.each(['start', 'steer'] as const)('dispatches warm %s on the retained connection before any second history hydration', async (mode) => {
+        if (mode === 'steer') onFollow = (request, socket) => {
+            if (request.params.following) respond(socket, controlSnapshotFrame({ ...idleControlState(),
+                threadRuntimeStatus: { type: 'active' }, turns: [{ turnId: 'old-turn', status: 'inProgress', items: [] }] }));
+        };
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic', result: { result: { turnId: 'old-turn' } } });
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        await followed.readControlSnapshot(input.remoteSessionId, () => {});
+        const getFollowedIpc = () => followed;
+        // 后续历史永不回执；真正投递仍应使用原连续锚，不能等完整历史超时。
+        onHistory = () => {};
+        const result = mode === 'start' ? sendDesktopSessionUserMessage({ codexHome, ...input, getFollowedIpc })
+            : performDesktopSessionControlAction({ codexHome, ...input, getFollowedIpc, action: {
+                machineId: 'machine', sessionId: 'linked', kind: 'steer', operationId: input.localId,
+                expectedTurnId: 'old-turn', text: input.text,
+            } });
+        try {
+            await vi.waitFor(() => expect(requests.filter((request) => request.method === `thread-follower-${mode}-turn`)).toHaveLength(1), { timeout: 1000 });
+            await expect(result).resolves.toMatchObject({ status: 'accepted' });
+            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'initialize')).toHaveLength(1);
+            expect(followed.isClosed()).toBe(false);
+        } finally {
+            followed.close();
+            for (const socket of sockets) socket.destroy();
+            await result;
+        }
+    });
+
+    it.each(['start', 'steer'] as const)('keeps the real warm %s ACK when a native lifecycle snapshot arrives first', async (mode) => {
+        const initial = mode === 'start' ? idleControlState() : { ...idleControlState(),
+            threadRuntimeStatus: { type: 'active' }, turns: [{ turnId: 'old-turn', status: 'inProgress', items: [] }] };
+        onFollow = (request, socket) => {
+            if (request.params.following) respond(socket, controlSnapshotFrame(initial));
+        };
+        let releaseAck!: () => void;
+        const receive = (request: Request, socket: Socket) => {
+            // 原生 turn/started 与 turn/completed 会先广播完整 snapshot，再返回请求 ACK。
+            const message = controlSnapshotFrame({ ...initial, threadRuntimeStatus: { type: 'active' },
+                turns: mode === 'start' ? [...initial.turns as unknown[], { turnId: 'turn-synthetic', status: 'inProgress', items: [] }]
+                    : initial.turns });
+            (message.params as { change: { revision: number } }).change.revision = 2;
+            respond(socket, message);
+            releaseAck = () => mode === 'start' ? accepted(request, socket) : respond(socket, {
+                type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'success', handledByClientId: 'owner-synthetic', result: { result: { turnId: 'old-turn' } },
+            });
+        };
+        onStart = receive; onAction = receive;
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        const observation = vi.fn();
+        await followed.readControlSnapshot(input.remoteSessionId, observation);
+        let settled = false;
+        const result = (mode === 'start' ? sendDesktopSessionUserMessage({ codexHome, ...input, getFollowedIpc: () => followed })
+            : performDesktopSessionControlAction({ codexHome, ...input, getFollowedIpc: () => followed, action: {
+                machineId: 'machine', sessionId: 'linked', kind: 'steer', operationId: input.localId,
+                expectedTurnId: 'old-turn', text: input.text,
+            } })).finally(() => { settled = true; });
+        try {
+            await vi.waitFor(() => expect(observation).toHaveBeenCalled());
+            // 完整快照不是请求回执；必须继续等待原 requestId/owner 的真实 ACK。
+            expect(settled).toBe(false);
+            releaseAck();
+            await expect(result).resolves.toMatchObject({ status: 'accepted' });
+            expect(requests.filter((request) => request.method === `thread-follower-${mode}-turn`)).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+        } finally { followed.close(); await result; }
+    });
+
+    it('does not grant a new send from a contiguous native snapshot whose control state is unknown', async () => {
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        const observation = vi.fn();
+        await followed.readControlSnapshot(input.remoteSessionId, observation);
+        const state = idleControlState();
+        delete state.threadRuntimeStatus;
+        const message = controlSnapshotFrame(state);
+        (message.params as { change: { revision: number } }).change.revision = 2;
+        respond([...sockets][0]!, message);
+        try {
+            await vi.waitFor(() => expect(observation).toHaveBeenCalled());
+            const result = await sendDesktopSessionUserMessage({ codexHome, ...input, getFollowedIpc: () => followed });
+            expect(result).toMatchObject({ status: 'rejected' });
+            expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
+            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+            expect(followed.isClosed()).toBe(false);
+        } finally { followed.close(); }
+    });
+
+    it.each(['start', 'steer', 'revoked'] as const)('rejects a warm %s intent when its continuous proof no longer permits it', async (mode) => {
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        await followed.readControlSnapshot(input.remoteSessionId, () => {});
+        const socket = [...sockets][0]!;
+        respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
+            params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'patches', baseRevision: 1, revision: 2,
+                patches: [{ op: 'add', path: ['turns', 1], value: { turnId: 'new-turn', status: 'inProgress', items: [] } },
+                    { op: 'replace', path: ['threadRuntimeStatus', 'type'], value: 'active' }] } } });
+        await vi.waitFor(() => expect(followed.getControlSnapshot(input.remoteSessionId)?.state).toMatchObject({ turns: [expect.anything(), { turnId: 'new-turn' }] }));
+        let reads = 0;
+        const getFollowedIpc = () => mode === 'revoked' && ++reads > 1 ? null : followed;
+        const result = mode !== 'steer' ? await sendDesktopSessionUserMessage({ codexHome, ...input, getFollowedIpc })
+            : await performDesktopSessionControlAction({ codexHome, ...input, getFollowedIpc, action: {
+                machineId: 'machine', sessionId: 'linked', kind: 'steer', operationId: input.localId,
+                expectedTurnId: 'old-turn', text: input.text,
+            } });
+        expect(result).toMatchObject({ status: 'rejected', reason: mode === 'start' ? 'turn_not_idle' : mode === 'steer' ? 'turn_changed' : 'owner_changed' });
+        expect(requests.filter((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toHaveLength(0);
+        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+        followed.close();
+    });
+
+    it('rejects a cold send whose caller is revoked while complete history is pending', async () => {
+        let history: { request: Request; socket: Socket } | undefined;
+        onHistory = (request, socket) => { history = { request, socket }; };
+        await startRouter();
+        let revoked = false;
+        const result = sendDesktopSessionUserMessage({ codexHome, ...input, getFollowedIpc: () => {
+            if (revoked) throw new DesktopIpcError('owner_changed');
+            return null;
+        } });
+        await vi.waitFor(() => expect(history).toBeDefined());
+        revoked = true;
+        respond(history!.socket, { type: 'response', requestId: history!.request.requestId,
+            method: history!.request.method, resultType: 'success', handledByClientId: 'owner-synthetic', result: { revision: 1 } });
+        await expect(result).resolves.toMatchObject({ status: 'rejected', reason: 'owner_changed' });
+        expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
     });
 
     it('opens an unloaded existing task once and then uses the original correlated control path', async () => {

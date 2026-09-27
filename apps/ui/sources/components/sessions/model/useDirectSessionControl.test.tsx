@@ -17,11 +17,91 @@ function resetControlMocks() {
 }
 describe('desktop control lifecycle', () => {
     beforeEach(resetControlMocks);
-    /** 每次点击直接消费本次读取值：缓存运行态不能把新终态错当追加。 */
-    it('chooses a fresh start snapshot rather than the cached running snapshot', async () => {
+    /** 已发布的同寿命快照只负责选路，下一次慢水合不能延迟真实投递。 */
+    it.each(['start', 'steer'] as const)('dispatches %s from the current snapshot without waiting for another history read', async (mode) => {
+        mocks.read.mockResolvedValue({ ok: true, snapshot: mode === 'start'
+            ? { ...snapshot, state: 'completed', textSendMode: 'start', requests: [] } : snapshot });
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
-        mocks.read.mockResolvedValueOnce({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+        const history = createDeferred<unknown>();
+        const receipt = createDeferred<'accepted'>();
+        mocks.read.mockReturnValue(history.promise);
+        mocks.action.mockImplementation(async () => ({ ok: true, result: { status: await receipt.promise, turnId: 'turn' } }));
+        const start = vi.fn(() => receipt.promise);
+        const readsBefore = mocks.read.mock.calls.length;
+        await act(async () => { void hook.getCurrent().sendText('synthetic text', start); });
+        expect(mode === 'start' ? start : mocks.action).toHaveBeenCalledTimes(1);
+        expect(mocks.read).toHaveBeenCalledTimes(readsBefore);
+        expect(hook.getCurrent().busy).toBe(true);
+        await act(async () => { receipt.resolve('accepted'); history.resolve({ ok: true, snapshot }); });
+    });
+
+    /** 受理回执是输入忙态的终点，后续完整历史回读独立更新真实快照。 */
+    it('releases an accepted steer while the post-ACK history read is still pending', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        const receipt = createDeferred<unknown>();
+        const history = createDeferred<unknown>();
+        mocks.action.mockReturnValue(receipt.promise);
+        let settled = false;
+        await act(async () => { void hook.getCurrent().steer('synthetic text').then(() => { settled = true; }); });
+        expect(mocks.action).toHaveBeenCalledTimes(1);
+        mocks.read.mockReturnValue(history.promise);
+        await act(async () => { receipt.resolve({ ok: true, result: { status: 'accepted', turnId: 'turn' } }); });
+        expect(settled).toBe(true);
+        expect(hook.getCurrent().busy).toBe(false);
+        expect(hook.getCurrent().loading).toBe(true);
+        expect(hook.getCurrent().outcome).toBe('accepted');
+        await act(async () => { history.resolve({ ok: true, snapshot: { ...snapshot, state: 'completed' } }); });
+        expect(hook.getCurrent().outcome).toBeNull();
+    });
+
+    /** 新轮受理后马上回读真实状态；慢回读不占输入锁，也不等下一次观察轮询。 */
+    it('refreshes after an accepted start without delaying its receipt', async () => {
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start', requests: [] } });
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        const history = createDeferred<unknown>();
+        const readsBefore = mocks.read.mock.calls.length;
+        mocks.read.mockReturnValue(history.promise);
+        await act(async () => {
+            expect(await hook.getCurrent().sendText('new turn', async () => 'accepted'))
+                .toEqual({ outcome: 'accepted', mode: 'start' });
+        });
+        expect(mocks.read).toHaveBeenCalledTimes(readsBefore + 1);
+        expect(hook.getCurrent().busy).toBe(false);
+        expect(hook.getCurrent().loading).toBe(true);
+        expect(hook.getCurrent().snapshot?.state).toBe('completed');
+        await act(async () => { history.resolve({ ok: true, snapshot: { ...snapshot, turnId: 'new-turn' } }); });
+        expect(hook.getCurrent().snapshot?.state).toBe('running');
+        expect(hook.getCurrent().outcome).toBeNull();
+        await hook.unmount();
+    });
+
+    /** 失败已发生但 React 尚未提交时，旧点击闭包也不能借上一份快照跳过补读。 */
+    it('revokes the current snapshot synchronously after a failed refresh', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        const oldClick = hook.getCurrent().sendText;
+        const start = vi.fn(async () => 'accepted' as const);
+        mocks.read.mockRejectedValue(new Error('offline'));
+        const readsBefore = mocks.read.mock.calls.length;
+        await act(async () => {
+            await hook.getCurrent().refresh();
+            expect((await oldClick('keep draft', start)).outcome).toBe('rejected');
+        });
+        expect(mocks.read).toHaveBeenCalledTimes(readsBefore + 2);
+        expect(mocks.action).not.toHaveBeenCalled();
+        expect(start).not.toHaveBeenCalled();
+        expect(hook.getCurrent().snapshot).toBeNull();
+    });
+
+    /** 新控制快照发布后替换选路依据，旧运行快照不能继续指向追加。 */
+    it('chooses the newly published start snapshot rather than the earlier running snapshot', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
         const start = vi.fn(async (isCurrent: () => boolean) => { expect(isCurrent()).toBe(true); return 'accepted' as const; });
         await act(async () => { expect(await hook.getCurrent().sendText('new turn', start)).toEqual({ outcome: 'accepted', mode: 'start' }); });
         expect(start).toHaveBeenCalledTimes(1);
@@ -33,6 +113,7 @@ describe('desktop control lifecycle', () => {
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
         await act(async () => { expect(await hook.getCurrent().steer('append only')).toBe(false); });
         expect(mocks.action).not.toHaveBeenCalled();
     });
@@ -46,6 +127,7 @@ describe('desktop control lifecycle', () => {
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         mocks.read.mockResolvedValueOnce({ ok: true, snapshot: { ...snapshot, ...authority } });
+        await act(async () => { await hook.getCurrent().refresh(); });
         const start = vi.fn(async () => 'accepted' as const);
         await act(async () => { expect((await hook.getCurrent().sendText('keep draft', start)).outcome).toBe('rejected'); });
         expect(start).not.toHaveBeenCalled(); expect(mocks.action).not.toHaveBeenCalled();
@@ -53,6 +135,7 @@ describe('desktop control lifecycle', () => {
 
     /** 单飞锁从读取开始持有，快速双击不会启动第二个读取或第二次投递。 */
     it('holds the click flight across the read and one start dispatch', async () => {
+        mocks.read.mockRejectedValueOnce(new Error('initially offline'));
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         const pending = createDeferred<unknown>();
@@ -69,6 +152,7 @@ describe('desktop control lifecycle', () => {
 
     /** 换号后再返回同账号也属于新寿命，旧读取不可授权发送。 */
     it('discards an old click read after an account A to B to A cycle', async () => {
+        mocks.read.mockRejectedValueOnce(new Error('initially offline'));
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         const pending = createDeferred<unknown>();
@@ -84,6 +168,7 @@ describe('desktop control lifecycle', () => {
 
     /** 读取被更新请求替代时，不拿较早返回的同目标快照放行。 */
     it('rejects a click read superseded by a newer refresh', async () => {
+        mocks.read.mockRejectedValueOnce(new Error('initially offline'));
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         const pending = createDeferred<unknown>();
@@ -102,6 +187,7 @@ describe('desktop control lifecycle', () => {
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, turnId: 'new-running' } });
+        await act(async () => { await hook.getCurrent().refresh(); });
         mocks.action.mockResolvedValue({ ok: true, result: { status: 'unknown', reason: 'delivery_outcome_unknown' } });
         const start = vi.fn(async () => 'accepted' as const);
         await act(async () => { expect(await hook.getCurrent().sendText('append', start)).toEqual({ outcome: 'unknown', mode: 'steer' }); });
@@ -205,6 +291,7 @@ describe('desktop control lifecycle', () => {
         await act(async () => { await hook.getCurrent().refresh(); });
         expect(hook.getCurrent().outcome).toBe('unknown');
         mocks.read.mockResolvedValue({ ok: true, snapshot });
+        await act(async () => { await hook.getCurrent().refresh(); });
         await act(async () => { await hook.getCurrent().steer('append text'); });
         expect(mocks.action).toHaveBeenCalledTimes(1);
         expect(hook.getCurrent().outcome).toBe('unknown');

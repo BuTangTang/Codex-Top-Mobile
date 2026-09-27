@@ -616,6 +616,7 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
 
   // 新发送入口只接受 Happier 关联 ID；原生 ID 与来源必须从当前账号的关联读取。
   registerHandler(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND, async (raw: unknown): Promise<SessionUserMessageSendResponse> => {
+    const currentEpoch = epoch;
     const parsed = DirectSessionSendRequestSchema.safeParse(raw);
     if (!parsed.success) return { ok: false, error: 'invalid_request', errorCode: 'invalid_request' };
     let submissionStarted = false;
@@ -636,9 +637,21 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       if (!validatedSource.ok) return { ok: false, error: 'invalid_request', errorCode: 'invalid_request' };
       const provider = await getDirectSessionProviderOps(linked.session.providerId);
       if (!provider.send) return { ok: false, error: 'provider_unavailable', errorCode: 'provider_unavailable' };
+      if (!isCurrentLifecycle(currentEpoch)) return { ok: false, error: 'source_unavailable', errorCode: 'source_unavailable' };
+      const followTarget = { sessionId: parsed.data.sessionId, targetKey: directSessionNotificationIdentity({
+        metadata: linked.session.metadata, ...identity.identity, sessionId: parsed.data.sessionId,
+      }) };
+      await followLeaseManager.invalidateMismatchedTarget(followTarget);
+      if (!isCurrentLifecycle(currentEpoch)) return { ok: false, error: 'source_unavailable', errorCode: 'source_unavailable' };
+      /** provider 每次取控制连接时复核认证寿命；已撤销与从未获取必须区别处理。 */
+      const getFollowLease = () => {
+        // 失效身份必须终止；不能将撤销伪装成没有 lease 而触发 provider 新建控制连接。
+        if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
+        return followLeaseManager.getFollowLease(followTarget);
+      };
       submissionStarted = true;
       const result = await provider.send({ source: validatedSource.source, remoteSessionId: linked.session.remoteSessionId,
-        text: parsed.data.text, localId: parsed.data.localId, meta: parsed.data.meta, accountId: identity.identity.accountId });
+        text: parsed.data.text, localId: parsed.data.localId, meta: parsed.data.meta, accountId: identity.identity.accountId, getFollowLease });
       if (result.status === 'accepted') return { ok: true };
       const reason = result.status === 'unknown' ? 'delivery_outcome_unknown' : result.reason;
       return { ok: false, error: reason, errorCode: reason };
@@ -651,6 +664,7 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
 
   /** 读取和决定沿同一认证关联定位，不接受手机提供的原生任务或来源覆盖。 */
   const handleDesktopControl = async (raw: unknown, actionRequested: boolean): Promise<unknown> => {
+    const currentEpoch = epoch;
     // 保留动作 schema 的成功结果，后续不能只凭公共目标上的 kind 属性推断已验证的动作。
     const action = actionRequested ? DirectSessionControlActionRequestSchema.safeParse(raw) : null;
     const parsed = action ?? DirectSessionControlReadRequestSchema.safeParse(raw);
@@ -666,7 +680,18 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       const source = validateDirectMachineSource({ providerId: linked.session.providerId, source: linked.session.source, env: process.env });
       if (!source.ok) return err('invalid_request');
       const provider = await getDirectSessionProviderOps(linked.session.providerId);
-      const target = { source: source.source, remoteSessionId: linked.session.remoteSessionId };
+      if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable');
+      const followTarget = { sessionId: parsed.data.sessionId, targetKey: directSessionNotificationIdentity({
+        metadata: linked.session.metadata, ...identity.identity, sessionId: parsed.data.sessionId,
+      }) };
+      await followLeaseManager.invalidateMismatchedTarget(followTarget);
+      if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable');
+      /** 只在原 RPC 寿命内选择同目标现有 lease，异步等待后不得借用新账号连接。 */
+      const getFollowLease = () => {
+        if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
+        return followLeaseManager.getFollowLease(followTarget);
+      };
+      const target = { source: source.source, remoteSessionId: linked.session.remoteSessionId, getFollowLease };
       if (action?.success) {
         if (!provider.control) return err('provider_unavailable');
         submissionStarted = true;
@@ -783,7 +808,11 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
                     if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable');
                     try {
                       externalControl = await provider.getExternalControl({ source: linkedSource.source,
-                        requestedSource: validatedSource.source, remoteSessionId: linked.session.remoteSessionId });
+                        requestedSource: validatedSource.source, remoteSessionId: linked.session.remoteSessionId,
+                        getFollowLease: () => {
+                          if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
+                          return followLeaseManager.getFollowLease(target);
+                        } });
                     } catch { /* 能力探测失败不覆盖另一条仍有效的只读观察。 */ }
                     if (isCurrentLifecycle(currentEpoch)
                         && externalControl.unavailableReason !== 'source_mismatch' && externalControl.unavailableReason !== 'source_unavailable') {

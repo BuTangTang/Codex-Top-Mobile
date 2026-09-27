@@ -26,6 +26,16 @@ const fetchSessionsPageMock = vi.fn();
 const getOrCreateSessionByTagMock = vi.fn();
 const commitSessionStoredMessageMock = vi.fn();
 const updateSessionMetadataWithRetryMock = vi.fn();
+const fileBoundary = vi.hoisted(() => ({ beforeRealpath: null as ((path: unknown) => Promise<void>) | null }));
+
+// 仅暂停 OS 路径解析边界；provider、lease 选择、身份门禁及 Desktop IPC 保持真实。
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, realpath: async (...args: Parameters<typeof actual.realpath>) => {
+    await fileBoundary.beforeRealpath?.(args[0]);
+    return actual.realpath(...args);
+  } };
+});
 
 // 配置边界使用独立日志目录，避免真实 Logger 的保留策略清理无关 /tmp 日志。
 vi.mock('@/configuration', async () => {
@@ -96,8 +106,9 @@ async function withDesktopRpcFixture(
     stopSession: ReturnType<typeof vi.fn>;
     credentials: Credentials;
     invokeTransport: (method: string, payload: Record<string, unknown>) => Promise<unknown>;
-    publishSnapshot: (revision: number, turns: Array<{ turnId: string; status: string }>) => void;
+    publishTurnsPatch: (revision: number, turns: Array<{ turnId: string; status: string }>) => void;
     setOwnerAvailable: (available: boolean) => void;
+    getActiveFollowerCount: () => number;
     lifecycle: ReturnType<typeof registerMachineDirectSessionsRpcHandlers>;
   }) => Promise<void>,
   options: { daemonMachineId?: string; identityAvailable?: boolean; initialRuntime?: 'idle' | 'active' | 'missing' } = {},
@@ -171,11 +182,14 @@ async function withDesktopRpcFixture(
           else if (outcome === 'rejected') respond(socket, { type: 'response', requestId: request.requestId, resultType: 'error', error: 'no-client-found' });
           else respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
             resultType: 'success', handledByClientId: 'original-desktop-owner', result: { result: { turn: { id: 'accepted-native-turn' } } } });
+        } else if (request.method === 'thread-follower-steer-turn') {
+          respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+            resultType: 'success', handledByClientId: 'original-desktop-owner', result: { result: { turnId: 'observed-active-turn' } } });
         } else if (request.method === 'thread-stream-following-changed' && request.params.following === true) {
           followers.add(socket);
           respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'original-desktop-owner',
             params: { hostId: 'local', conversationId: request.params.conversationId, change: { type: 'snapshot', revision: 1,
-              conversationState: { id: request.params.conversationId, requests: [],
+              conversationState: { id: request.params.conversationId, cwd: root, requests: [],
                 ...(options.initialRuntime === 'missing' ? {} : { threadRuntimeStatus: { type: options.initialRuntime ?? 'idle' } }),
                 turns: [{ turnId: 'observed-active-turn', status: options.initialRuntime === 'active' ? 'inProgress' : 'completed', items: [] }] } } } });
         }
@@ -212,13 +226,15 @@ async function withDesktopRpcFixture(
   try {
     await run({ handlers, requests, rawSession, source, spawnSession, stopSession, credentials, invokeTransport, lifecycle,
       setOwnerAvailable: (available) => { ownerAvailable = available; },
-      /** 让发布的观察事件携带与最新轮次一致的原生 runtime，不靠缺字段规避控制门禁。 */
-      publishSnapshot: (revision, turns) => {
+      getActiveFollowerCount: () => followers.size,
+      /** 换轮沿已关联基线的连续补丁发布，runtime 同步更新；无关联完整快照另有 IPC 撤权测试。 */
+      publishTurnsPatch: (revision, turns) => {
         for (const socket of followers) respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
           sourceClientId: 'original-desktop-owner', params: { hostId: 'local', conversationId: 'native-linked-thread',
-            change: { type: 'snapshot', revision, conversationState: { id: 'native-linked-thread', requests: [],
-              threadRuntimeStatus: { type: turns.at(-1)?.status === 'inProgress' ? 'active' : 'idle' },
-              turns: turns.map((turn) => ({ ...turn, items: [] })) } } } });
+            change: { type: 'patches', revision, baseRevision: revision - 1, patches: [
+              { op: 'replace', path: ['turns'], value: turns.map((turn) => ({ ...turn, items: [] })) },
+              { op: 'replace', path: ['threadRuntimeStatus', 'type'], value: turns.at(-1)?.status === 'inProgress' ? 'active' : 'idle' },
+            ] } } });
       },
       request: { machineId: 'machine-a', sessionId: rawSession.id, text: 'synthetic mobile message', localId: 'mobile-id',
         meta: { sentFrom: 'test', permissionMode: 'default', model: 'tracking-only-model' } } });
@@ -238,6 +254,165 @@ async function withDesktopRpcFixture(
 }
 
 describe('registerMachineDirectSessionsRpcHandlers', () => {
+  it('reuses the authenticated live viewer owner for status without cold rediscovery', async () => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
+      const status = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!;
+      await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, leaseId: 'viewer', ttlMs: 45_000 }))
+        .resolves.toMatchObject({ ok: true });
+      await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'completed' } }));
+      const discoveries = requests.filter((entry) => entry.method === 'thread-owner-discovery').length;
+      await expect(status(target)).resolves.toMatchObject({ ok: true, externalControl: { canSend: true },
+        observation: { state: 'completed' } });
+      // 状态刷新已有连续控制锚；点击前不应再等待另一条 owner 发现连接。
+      expect(requests.filter((entry) => entry.method === 'thread-owner-discovery')).toHaveLength(discoveries);
+      expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+      const otherHome = `${source.homePath}-other`;
+      await mkdir(join(otherHome, 'sessions'), { recursive: true });
+      await writeFile(join(otherHome, 'sessions', 'rollout-2026-09-23-native-linked-thread.jsonl'), jsonlLine({ type: 'session_meta' }));
+      // 同 remoteSessionId 的另一来源不能借用已经热起来的认证 owner。
+      await expect(status({ ...target, source: { ...source, homePath: otherHome } })).resolves.toMatchObject({
+        externalControl: { canSend: false, unavailableReason: 'source_mismatch' }, observation: { state: 'unknown' },
+      });
+      expect(requests.filter((entry) => entry.method === 'thread-owner-discovery')).toHaveLength(discoveries);
+    });
+  });
+
+  it.each(['detached', 'relinked', 'revision_gap'] as const)('falls back to owner discovery for status after the viewer is %s', async (change) => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishTurnsPatch, getActiveFollowerCount }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
+      const status = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!;
+      await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, leaseId: 'viewer', ttlMs: 45_000 });
+      await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'completed' } }));
+      const discoveries = requests.filter((entry) => entry.method === 'thread-owner-discovery').length;
+      if (change === 'detached') {
+        await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_DETACH)!({ ...target, leaseId: 'viewer' });
+      } else if (change === 'relinked') {
+        const metadata = JSON.parse(rawSession.metadata);
+        metadata.directSessionV1.linkedAtMs += 1;
+        rawSession.metadata = JSON.stringify(metadata);
+      } else {
+        publishTurnsPatch(3, [{ turnId: 'new-turn', status: 'inProgress' }]);
+        await vi.waitFor(() => expect(getActiveFollowerCount()).toBe(0));
+      }
+      await expect(status(target)).resolves.toMatchObject({ ok: true, externalControl: { canSend: true },
+        observation: { state: 'unknown' } });
+      expect(requests.filter((entry) => entry.method === 'thread-owner-discovery')).toHaveLength(discoveries + 1);
+      expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+    });
+  });
+
+  it('does not discover another status owner after suspension during provider path resolution', async () => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, lifecycle }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
+      const status = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!;
+      await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, leaseId: 'viewer', ttlMs: 45_000 });
+      await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'completed' } }));
+      const discoveries = requests.filter((entry) => entry.method === 'thread-owner-discovery').length;
+      let resume!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>((resolve) => { entered = resolve; });
+      const continued = new Promise<void>((resolve) => { resume = resolve; });
+      // 在关联 HTTP 已验证之后暂停 OS 解析，覆盖 capability 使用前的生命周期撤销。
+      fetchSessionByIdMock.mockImplementationOnce(async () => {
+        fileBoundary.beforeRealpath = async (path) => {
+          if (path !== source.homePath) return;
+          fileBoundary.beforeRealpath = null;
+          entered();
+          await continued;
+        };
+        return rawSession;
+      });
+      try {
+        const pending = status(target);
+        await paused;
+        await lifecycle.suspend();
+        resume();
+        await expect(pending).resolves.toMatchObject({ ok: false });
+        expect(requests.filter((entry) => entry.method === 'thread-owner-discovery')).toHaveLength(discoveries);
+      } finally {
+        fileBoundary.beforeRealpath = null;
+        resume();
+      }
+    });
+  });
+
+  it.each(['read', 'start', 'steer'] as const)('uses the authenticated live viewer for %s without another full-history request', async (operation) => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, invokeTransport, request, source, requests }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId };
+      await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source, leaseId: 'viewer', ttlMs: 45_000,
+      })).resolves.toMatchObject({ ok: true });
+      await vi.waitFor(() => expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1));
+      await vi.waitFor(async () => expect(await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!({ ...target,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source,
+      })).toMatchObject({ observation: { state: operation === 'steer' ? 'running' : 'completed' } }));
+      const result = operation === 'start'
+        ? await invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND, request)
+        : operation === 'steer'
+          ? await invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_ACTION, { ...target, kind: 'steer',
+            operationId: 'steer-live', expectedTurnId: 'observed-active-turn', text: request.text })
+          : await invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ, target);
+      expect(result).toMatchObject(operation === 'read' ? { ok: true, snapshot: { textSendMode: 'start' } }
+        : operation === 'steer' ? { ok: true, result: { status: 'accepted' } } : { ok: true });
+      // 性能契约：已有连续控制锚不能在点击路径重读完整历史。
+      expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+    }, { initialRuntime: operation === 'steer' ? 'active' : 'idle' });
+  });
+
+  it('discards the old viewer control when the authenticated link is replaced', async () => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, invokeTransport, request, source, requests, rawSession, getActiveFollowerCount }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId };
+      await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source, leaseId: 'viewer', ttlMs: 45_000,
+      })).resolves.toMatchObject({ ok: true });
+      await vi.waitFor(() => expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1));
+      const metadata = JSON.parse(rawSession.metadata);
+      metadata.directSessionV1.linkedAtMs += 1;
+      rawSession.metadata = JSON.stringify(metadata);
+      expect(await invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ, target))
+        .toMatchObject({ ok: true, snapshot: { textSendMode: 'start' } });
+      expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(2);
+      await vi.waitFor(() => expect(getActiveFollowerCount()).toBe(0));
+    });
+  });
+
+  it('does not open a replacement control connection after suspension during provider path resolution', async () => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, lifecycle }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId,
+        providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
+      await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, leaseId: 'viewer', ttlMs: 45_000 }))
+        .resolves.toMatchObject({ ok: true });
+      await vi.waitFor(async () => expect(await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!(target))
+        .toMatchObject({ observation: { state: 'completed' } }));
+      let resume!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>((resolve) => { entered = resolve; });
+      const continued = new Promise<void>((resolve) => { resume = resolve; });
+      fileBoundary.beforeRealpath = async (path) => {
+        if (path !== source.homePath) return;
+        fileBoundary.beforeRealpath = null;
+        entered();
+        await continued;
+      };
+      try {
+        const pending = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND)!(request);
+        await paused;
+        await lifecycle.suspend();
+        resume();
+        await expect(pending).resolves.toMatchObject({ ok: false });
+        expect(requests.some((entry) => entry.method === 'thread-follower-start-turn')).toBe(false);
+        expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+      } finally {
+        fileBoundary.beforeRealpath = null;
+        resume();
+      }
+    });
+  });
+
   it('lists genuine projects on the selected machine without offering runner-backed creation', async () => {
     await withDesktopRpcFixture('accepted', async ({ handlers, source, request, spawnSession }) => {
       await writeFile(join(source.homePath, '.codex-global-state.json'), JSON.stringify({
@@ -509,8 +684,8 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       });
     });
 
-    it.each(['status', 'attach'] as const)('rejects a late %s read after suspension without invalidating the new viewer', async (operation) => {
-      await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishSnapshot, lifecycle }) => {
+    it.each(['status', 'attach', 'control_read', 'send', 'steer'] as const)('rejects a late %s read after suspension without invalidating the new viewer', async (operation) => {
+      await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishTurnsPatch, lifecycle }) => {
         const target = { machineId: request.machineId, sessionId: request.sessionId, providerId: 'codex',
           remoteSessionId: 'native-linked-thread', source };
         const attach = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!;
@@ -521,7 +696,12 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
         const entered = new Promise<void>((resolve) => {
           fetchSessionByIdMock.mockImplementationOnce(() => { resolve(); return response; });
         });
-        const late = operation === 'status' ? status(target) : attach({ ...target, leaseId: 'old-viewer', ttlMs: 45_000 });
+        const late = operation === 'status' ? status(target)
+          : operation === 'attach' ? attach({ ...target, leaseId: 'old-viewer', ttlMs: 45_000 })
+            : operation === 'control_read' ? handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ)!({ machineId: target.machineId, sessionId: target.sessionId })
+              : operation === 'send' ? handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND)!(request)
+                : handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_ACTION)!({ machineId: target.machineId, sessionId: target.sessionId, kind: 'steer',
+                  operationId: 'late-steer', expectedTurnId: 'observed-active-turn', text: request.text });
         await entered;
         await lifecycle.suspend();
         const metadata = JSON.parse(rawSession.metadata);
@@ -529,16 +709,18 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
         rawSession.metadata = JSON.stringify(metadata);
         await attach({ ...target, leaseId: 'new-viewer', ttlMs: 45_000 });
         await vi.waitFor(() => expect(requests.some((entry) => entry.method === 'thread-stream-following-changed')).toBe(true));
-        publishSnapshot(2, [{ turnId: 'observed-active-turn', status: 'completed' }, { turnId: 'current', status: 'inProgress' }]);
+        await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'running', turnId: 'observed-active-turn' } }));
+        publishTurnsPatch(2, [{ turnId: 'observed-active-turn', status: 'completed' }, { turnId: 'current', status: 'inProgress' }]);
         await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'running', turnId: 'current' } }));
         finishRead(previousSession);
         await expect(late).resolves.toMatchObject({ ok: false, error: 'source_unavailable' });
         await expect(status(target)).resolves.toMatchObject({ observation: { state: 'running', turnId: 'current' } });
+        expect(requests.some((entry) => entry.method === 'thread-follower-start-turn' || entry.method === 'thread-follower-steer-turn')).toBe(false);
       }, { initialRuntime: 'active' });
     });
 
     it('reads an un-followed viewer lease, separates sending capability, and invalidates on source change and detach', async () => {
-      await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishSnapshot, setOwnerAvailable }) => {
+      await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishTurnsPatch, setOwnerAvailable }) => {
         const target = { machineId: request.machineId, sessionId: request.sessionId, providerId: 'codex',
           remoteSessionId: 'native-linked-thread', source };
         const attach = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!;
@@ -550,14 +732,15 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
         await vi.waitFor(() => expect(requests.some((entry) => entry.method === 'thread-stream-following-changed')).toBe(true));
         // 新租约的一次关联快照已证明当前运行轮；未关联/未订阅时仍由上方断言保持未知。
         await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'running', turnId: 'observed-active-turn' } }));
-        publishSnapshot(2, [{ turnId: 'observed-active-turn', status: 'completed' }, { turnId: 'current', status: 'inProgress' }]);
+        publishTurnsPatch(2, [{ turnId: 'observed-active-turn', status: 'completed' }, { turnId: 'current', status: 'inProgress' }]);
         await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'running', turnId: 'current' }, externalControl: { canSend: true } }));
         setOwnerAvailable(false);
-        await expect(status(target)).resolves.toMatchObject({ observation: { state: 'running', turnId: 'current' }, externalControl: { canSend: false } });
+        // 仅冷发现不再响应不等于连续连接失效；有效 viewer 仍提供当前 owner 证明。
+        await expect(status(target)).resolves.toMatchObject({ observation: { state: 'running', turnId: 'current' }, externalControl: { canSend: true } });
         const metadata = JSON.parse(rawSession.metadata);
         metadata.directSessionV1.linkedAtMs += 1;
         rawSession.metadata = JSON.stringify(metadata);
-        await expect(status(target)).resolves.toMatchObject({ observation: { state: 'unknown' } });
+        await expect(status(target)).resolves.toMatchObject({ observation: { state: 'unknown' }, externalControl: { canSend: false } });
         await detach({ machineId: target.machineId, sessionId: target.sessionId, leaseId: 'viewer-1' });
         await expect(status(target)).resolves.toMatchObject({ observation: { state: 'unknown' } });
       }, { initialRuntime: 'active' });

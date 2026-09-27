@@ -273,15 +273,18 @@ it('uses one cold baseline for a static completed task without emitting a histor
   } finally { await harness.close(); }
 });
 
-/** 不同 scope 的 confirmed 不够；仅 canonical 尾岛明确包含基线且新轮在后时才接替。 */
+/** 连续补丁也必须证明新轮在基线之后；移除基线不能凭当前尾项推断顺序。 */
 it.each([true, false])('adopts a later Desktop turn only with cold baseline ordering proof: %s', async (ordered) => {
   const harness = await createFallbackHarness({ baseline: { turnId: 'historical', status: 'completed' } });
   try {
     await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', turnId: 'historical' }));
     await harness.roundTrip();
-    harness.snapshot(harness.followers[0]!, 2, 'next', 'inProgress', [], [
-      { turnId: 'base', status: 'completed' }, ...(ordered ? [{ turnId: 'historical', status: 'completed' }] : []),
-    ]);
+    harness.send(harness.followers[0]!, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner',
+      params: { hostId: 'local', conversationId: harness.remoteSessionId, change: { type: 'patches', baseRevision: 7, revision: 8,
+        patches: [{ op: 'replace', path: ['turns'], value: [
+          { turnId: 'base', status: 'completed', items: [] }, ...(ordered ? [{ turnId: 'historical', status: 'completed', items: [] }] : []),
+          { turnId: 'next', status: 'inProgress', items: [] },
+        ] }, { op: 'replace', path: ['threadRuntimeStatus', 'type'], value: 'active' }] } } });
     await harness.roundTrip();
     expect(harness.lease.getObservation?.()).toMatchObject(ordered
       ? { state: 'running', turnId: 'next' }
@@ -403,20 +406,49 @@ it.each([
   } finally { await harness.close(); }
 });
 
-/** 一次基线不意味着连接永远健康；断代重连只订阅，不触发下一次广播水合。 */
-it('invalidates a cold baseline on a real revision gap without loading history again on reconnect', async () => {
-  const harness = await createFallbackHarness({ baseline: { turnId: 'historical', status: 'completed' } });
+/** 曾成功的连续控制连接失效后，原 poller 恢复一次关联基线，不等新正文才知道休眠期间完成。 */
+it.each(['gap', 'disconnect', 'owner_changed'] as const)('revokes control on %s and restores a completed baseline on the next connection', async (failure) => {
+  const options = { baseline: { turnId: 'current', status: 'inProgress' }, holdBaseline: false };
+  const harness = await createFallbackHarness(options);
   try {
-    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed' }));
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'running', turnId: 'current' }));
+    expect(harness.lease.getProviderControl?.()).toBeTruthy();
     await harness.append('agent_message');
-    harness.send(harness.followers[0]!, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner',
+    options.holdBaseline = true;
+    if (failure === 'disconnect') harness.followers[0]!.destroy();
+    else if (failure === 'owner_changed') harness.send(harness.followers[0]!, { type: 'broadcast', method: 'client-status-changed',
+      params: { clientId: 'owner', status: 'disconnected' } });
+    else harness.send(harness.followers[0]!, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner',
       params: { hostId: 'local', conversationId: harness.remoteSessionId, change: { type: 'patches', baseRevision: 55, revision: 56, patches: [] } } });
-    await vi.waitFor(() => expect(harness.followers).toHaveLength(2));
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    expect(harness.lease.getProviderControl?.()).toBeNull();
+    harness.replyBaseline({ turnId: 'current', status: 'completed' });
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', turnId: 'current' }));
+    expect(harness.lease.getProviderControl?.()).toBeTruthy();
     await harness.append('agent_message');
-    expect(harness.historyRequests).toHaveLength(1);
-    await harness.append('task_started', 'new');
-    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'running', turnId: 'new' });
+    expect(harness.historyRequests).toHaveLength(2);
+  } finally { await harness.close(); }
+});
+
+/** 恢复成功连接也只有原有的一次补试，不因快路径增加失败水合循环。 */
+it('keeps reconnect hydration recovery bounded after an established control connection fails', async () => {
+  const options = { baseline: { turnId: 'current', status: 'completed' }, holdBaseline: false };
+  const harness = await createFallbackHarness(options);
+  try {
+    await vi.waitFor(() => expect(harness.lease.getProviderControl?.()).toBeTruthy());
+    options.holdBaseline = true;
+    harness.followers[0]!.destroy();
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(3));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.followers).toHaveLength(4));
+    await harness.append('agent_message');
+    await harness.roundTrip();
+    expect(harness.historyRequests).toHaveLength(3);
+    expect(harness.lease.getProviderControl?.()).toBeNull();
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
   } finally { await harness.close(); }
 });
 

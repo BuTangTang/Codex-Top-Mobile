@@ -93,15 +93,19 @@ function createFillHarness(params: Readonly<{
     });
 
     const items: readonly ChatTranscriptListItem[] = [];
-    const renderWindowProjection = resolveTranscriptRenderWindowProjection<ChatTranscriptListItem>({
+    const project = (hasTailGap = false, sourceItems: readonly ChatTranscriptListItem[] = items, hotTail = false) => resolveTranscriptRenderWindowProjection<ChatTranscriptListItem>({
         activeThinkingMessageId: null,
         createWindowGapItem: createTranscriptWindowGapItem,
         entrySliceWindow: null,
         expandedToolCallsAnchorMessageIds: new Set<string>(),
-        items,
+        items: sourceItems,
+        tailContiguousBoundary: hasTailGap ? { kind: 'messageIds', messageIds: ['hidden-tool'] } : null,
+        sourceMessageIdsOldestFirst: ['hidden-tool', 'filled-answer'],
+        resolveMessageIds: (item) => item.kind === 'message' ? [item.messageId] : [],
         listOrientation: 'standard',
         platformOS: 'ios',
-        rendererKind: 'legendList',
+        rendererKind: hotTail ? 'flashList' : 'legendList',
+        liveTailAnchorMessageId: hotTail ? 'filled-answer' : null,
         sessionId: 's1',
         targetWindowState: {
             isWindowMode: false,
@@ -115,7 +119,7 @@ function createFillHarness(params: Readonly<{
             hasMoreNewer: null,
             activatedAtMs: null,
         },
-        transcriptNativeHotTailItemCount: 0,
+        transcriptNativeHotTailItemCount: hotTail ? 1 : 0,
         transcriptWebHotTailItemCount: 0,
     });
 
@@ -174,7 +178,7 @@ function createFillHarness(params: Readonly<{
         recordEntryOwnerOutcome: vi.fn(),
         recordViewportTelemetryEvent: vi.fn(),
         rendererKind: 'flashList',
-        renderWindowProjection,
+        renderWindowProjection: project(),
         requestBottomFollowScheduledWriteRef: { current: () => {} },
         resolveEntryRestoreOwnerAnchor: vi.fn<EntryHostDeps['resolveEntryRestoreOwnerAnchor']>(() => null),
         resolveNearestSurvivingViewportAnchorIndex: vi.fn<EntryHostDeps['resolveNearestSurvivingViewportAnchorIndex']>(() => null),
@@ -207,7 +211,7 @@ function createFillHarness(params: Readonly<{
         wantsPinnedRef: { current: true },
     };
 
-    return { deps, isScrollable, listContentHeightRef, loadOlder, sessionOpenLatch };
+    return { deps, isScrollable, listContentHeightRef, loadOlder, sessionOpenLatch, project };
 }
 
 describe('useTranscriptEntryHost initial fill sufficiency (S-L/S-M)', () => {
@@ -219,6 +223,101 @@ describe('useTranscriptEntryHost initial fill sufficiency (S-L/S-M)', () => {
             Object.defineProperty(Platform, 'OS', { value: originalPlatformOS, configurable: true });
             vi.restoreAllMocks();
         };
+    });
+
+    // 缓存正文先完成首屏后，真实尾部快照可能只含隐藏工具；原有补页仍须处理这次空缺口。
+    it.each([64, 1000])('fills a newly empty tail gap after a warm transcript settled with height %s, once per gap', async (gapHeight) => {
+        const harness = createFillHarness({ layoutHeightPx: 600, initialContentHeightPx: 1000,
+            contentGrowthPerLoadPx: [0, 700], loadDurationMs: 10 });
+        const warmItem: ChatTranscriptListItem = { kind: 'message', id: 'msg:warm', messageId: 'warm', createdAt: 1, seq: null };
+        const warmDeps = { ...harness.deps, renderWindowProjection: harness.project(false, [warmItem]) };
+        harness.deps.listDataRef.current = [warmItem];
+        const load = harness.loadOlder.getMockImplementation()!;
+        harness.loadOlder.mockImplementation(async (options) => {
+            const result = await load(options);
+            if (harness.loadOlder.mock.calls.length === 2) {
+                harness.deps.listDataRef.current = harness.project(true, [
+                    { kind: 'message', id: 'msg:filled-answer', messageId: 'filled-answer', createdAt: 2, seq: null },
+                ]).listData;
+            }
+            return result;
+        });
+        const hook = await renderHook((deps: EntryHostDeps) => useTranscriptEntryHost(deps), { initialProps: warmDeps });
+        expect(harness.sessionOpenLatch.initialFillStatus()).toBe('done');
+        expect(harness.loadOlder).not.toHaveBeenCalled();
+        harness.listContentHeightRef.current = gapHeight;
+        const gapProjection = harness.project(true);
+        harness.deps.listDataRef.current = gapProjection.listData;
+        const gapDeps = { ...harness.deps, listContentHeight: gapHeight,
+            displayItemsLength: gapProjection.displayItems.length,
+            listDataLength: gapProjection.listData.length,
+            renderWindowProjection: gapProjection,
+        };
+        await hook.rerender(gapDeps);
+        await vi.waitFor(() => expect(harness.deps.listDataRef.current.map((item) => item.id)).toContain('msg:filled-answer'));
+        expect(harness.isScrollable()).toBe(true);
+        expect(harness.loadOlder).toHaveBeenCalledTimes(2);
+        expect(harness.deps.listDataRef.current.map((item) => item.id)).toContain('msg:filled-answer');
+        expect(harness.sessionOpenLatch.initialFillStatus()).toBe('done');
+        harness.listContentHeightRef.current = 64;
+        harness.deps.listDataRef.current = gapProjection.listData;
+        await hook.rerender({ ...gapDeps });
+        expect(harness.loadOlder).toHaveBeenCalledTimes(2);
+        await hook.unmount();
+    });
+
+    it('keeps an active fill working when its visible tail becomes a gap before a page settles', async () => {
+        const harness = createFillHarness({ layoutHeightPx: 600, initialContentHeightPx: 64,
+            contentGrowthPerLoadPx: [1000, 0], loadDurationMs: 10 });
+        let releaseFirstPage!: () => void;
+        const firstPage = new Promise<void>((resolve) => { releaseFirstPage = resolve; });
+        const load = harness.loadOlder.getMockImplementation()!;
+        harness.loadOlder.mockImplementation(async (options) => {
+            if (harness.loadOlder.mock.calls.length === 1) await firstPage;
+            const result = await load(options);
+            if (harness.loadOlder.mock.calls.length === 2) {
+                harness.deps.listDataRef.current = harness.project(true, [
+                    { kind: 'message', id: 'msg:filled-answer', messageId: 'filled-answer', createdAt: 2, seq: null },
+                ]).listData;
+            }
+            return result;
+        });
+        const hook = await renderHook((deps: EntryHostDeps) => useTranscriptEntryHost(deps), { initialProps: harness.deps });
+        expect(harness.loadOlder).toHaveBeenCalledTimes(1);
+        expect(harness.sessionOpenLatch.initialFillStatus()).toBe('in_progress');
+        const gapProjection = harness.project(true);
+        harness.deps.listDataRef.current = gapProjection.listData;
+        await hook.rerender({ ...harness.deps, renderWindowProjection: gapProjection });
+        releaseFirstPage();
+        await vi.waitFor(() => expect(harness.sessionOpenLatch.initialFillStatus()).toBe('done'));
+        expect(harness.loadOlder).toHaveBeenCalledTimes(2);
+        expect(harness.deps.listDataRef.current.map((item) => item.id)).toContain('msg:filled-answer');
+        await hook.unmount();
+    });
+
+    it('settles when a filled gap closes and FlashList renders the answer in its existing edge slot', async () => {
+        const harness = createFillHarness({ layoutHeightPx: 600, initialContentHeightPx: 64,
+            contentGrowthPerLoadPx: [1000], loadDurationMs: 10 });
+        const gapProjection = harness.project(true);
+        const filledProjection = harness.project(false, [
+            { kind: 'message', id: 'msg:older-answer', messageId: 'older-answer', createdAt: 1, seq: null },
+            { kind: 'message', id: 'msg:filled-answer', messageId: 'filled-answer', createdAt: 2, seq: null },
+        ], true);
+        expect(filledProjection.listData.map((item) => item.id)).toEqual(['msg:older-answer']);
+        expect(filledProjection.hotCold.nativeEdgeSlotItems.map((item) => item.id)).toEqual(['msg:filled-answer']);
+        harness.deps.listDataRef.current = gapProjection.listData;
+        const load = harness.loadOlder.getMockImplementation()!;
+        harness.loadOlder.mockImplementation(async (options) => {
+            const result = await load(options);
+            harness.deps.listDataRef.current = filledProjection.listData;
+            return result;
+        });
+        const hook = await renderHook((deps: EntryHostDeps) => useTranscriptEntryHost(deps), {
+            initialProps: { ...harness.deps, renderWindowProjection: gapProjection },
+        });
+        await vi.waitFor(() => expect(harness.sessionOpenLatch.initialFillStatus()).toBe('done'));
+        expect(harness.loadOlder).toHaveBeenCalledTimes(1);
+        await hook.unmount();
     });
 
     /**

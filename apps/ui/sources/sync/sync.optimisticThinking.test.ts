@@ -4,6 +4,7 @@ import { renderHook, resetBrowserSessionDraftPersistenceForTest, standardCleanup
 import { scopedSessionLocalStateKey } from '@/sync/domains/state/sessionLocalStateKeys';
 import type { ManagedEndpointSupervisor } from '@happier-dev/connection-supervisor';
 import { createSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
+import { t } from '@/text';
 
 type EndpointSupervisorLookup = typeof import('@/sync/runtime/connectivity/endpointSupervisorPool').getEndpointSupervisorForServer;
 type EndpointSupervisorAcquire = typeof import('@/sync/runtime/connectivity/endpointSupervisorPool').acquireEndpointSupervisor;
@@ -576,7 +577,8 @@ describe('sync.sendMessage optimistic thinking', () => {
             deliveryIntent: 'steer_now',
         })).rejects.toMatchObject({
             code: 'action-conflict',
-            message: expect.stringContaining('changed'),
+            // 校验实际冲突文案，不把测试进程的语言固定为英文。
+            message: t('session.pendingMessages.errors.actionConflict'),
         });
 
         expect(requests).toEqual([
@@ -1331,6 +1333,30 @@ describe('sync.sendMessage optimistic thinking', () => {
         expect(emitWithAck).not.toHaveBeenCalled();
         expect(send).not.toHaveBeenCalled();
         expect(ensureSessionRuntimeForPendingInputMock).not.toHaveBeenCalled();
+    });
+
+    // Direct 沿用机器请求预算，合法的桌面历史读取不能被普通会话的 7.5 秒预算截断。
+    it('accepts external desktop delivery beyond the ordinary session RPC deadline', async () => {
+        const sessionId = 'external-desktop-machine-budget';
+        const { sync, machineRpc, sessionRpc } = await prepareExternalDirectSend(sessionId);
+        vi.useFakeTimers();
+        try {
+            machineRpc.mockImplementationOnce(async (_machineId, _method, _payload, options) => {
+                options?.onIssued?.();
+                await new Promise((resolve) => setTimeout(resolve, 10_000));
+                return { ok: true } as never;
+            });
+            const sent = sync.sendMessage(sessionId, 'synthetic delayed acceptance', undefined, undefined, {
+                localId: 'machine-budget-message', directSessionExternalControl: true,
+            });
+            await vi.advanceTimersByTimeAsync(10_001);
+            await expect(sent).resolves.toMatchObject({ persistence: 'provider_direct' });
+            expect(storage.getState().sessionPending[sessionId]?.messages)
+                .toEqual([expect.objectContaining({ deliveryStatus: 'accepted' })]);
+            expect(sessionRpc).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     // 沿用真实 RPC 解析、归一化及 store；旧 offset 不能靠同文案清除本地发送。

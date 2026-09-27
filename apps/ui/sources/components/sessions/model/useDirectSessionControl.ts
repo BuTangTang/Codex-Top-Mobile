@@ -35,6 +35,7 @@ export function useDirectSessionControl(params: Readonly<{
     // A→B→A 与暂时停用也开启新寿命，旧回包和 finally 不能写入新锁。
     const lifetime = React.useMemo(() => ({
         readVersion: 0,
+        snapshot: null as DesktopControlSnapshotV1 | null,
         flight: null as object | null,
         issued: new Set<string>(),
         uncertainTextSendKey: null as string | null,
@@ -51,6 +52,8 @@ export function useDirectSessionControl(params: Readonly<{
     /** 只更新当前寿命的界面，不把旧账号结果短暂显示在新账号中。 */
     const updateView = React.useCallback((patch: Partial<ControlViewState>) => {
         if (!isCurrent()) return;
+        // 点击可能早于 React 提交；读取失败也须同步撤销同寿命快照，不能借旧闭包选路。
+        if (patch.snapshot !== undefined) lifetime.snapshot = patch.snapshot;
         setViewState((previous) => {
             if (!isCurrent()) return previous;
             const next = { ...(previous.lifetime === lifetime ? previous : EMPTY_CONTROL_VIEW), ...patch, lifetime };
@@ -124,7 +127,8 @@ export function useDirectSessionControl(params: Readonly<{
             const accepted = action.kind === 'steer' && response.ok && response.result.status === 'accepted' && response.result.turnId === action.expectedTurnId;
             const result = accepted ? 'accepted' : response.ok && response.result.status !== 'rejected' ? 'unknown' : 'rejected';
             updateView({ outcome: result, ...(!response.ok ? { error: response.error } : {}) });
-            await refresh();
+            // 回执已给出本次结果，回读仍刷新真实状态，但不再占住发送和审批的忙态。
+            void refresh();
             return isFlightCurrent() ? result : 'unknown';
         } catch {
             // 目标解析等发出前失败可重试；传输已接收后的断线必须保留未知并锁住原操作。
@@ -155,7 +159,7 @@ export function useDirectSessionControl(params: Readonly<{
         }
     }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.sessionId, releaseFlight, snapshot, updateView]);
 
-    /** 原桌面新快照是文本选路的唯一依据；不从历史观察状态推断发送能力。 */
+    /** 同寿命控制快照只用于文本选路；缺失时补读，CLI 投递前仍复核原 owner 和轮次。 */
     const sendTextWithMode = React.useCallback(async (
         text: string,
         start: StartTextSend,
@@ -167,7 +171,7 @@ export function useDirectSessionControl(params: Readonly<{
         if (!flight) return { outcome: 'unknown' };
         const isFlightCurrent = () => isCurrent() && lifetime.flight === flight;
         try {
-            const fresh = await refresh();
+            const fresh = lifetime.snapshot ?? await refresh();
             const mode = fresh?.textSendMode;
             if (!isFlightCurrent() || !fresh || !fresh.turnId.trim()
                 || (mode !== 'start' && mode !== 'steer')
@@ -199,6 +203,8 @@ export function useDirectSessionControl(params: Readonly<{
             if (result !== 'unknown') lifetime.uncertainTextSendKey = null;
             // 观察可能先于 ACK 到达；用同一上下文合并，避免迟到受理重新挂回旧文案。
             updateView({ outcome: result, outcomeContext });
+            // start 走既有 SEND 而非 dispatch；同样及时回读，不等下一次观察也不延长输入忙态。
+            if (mode === 'start') void refresh();
             return { outcome: result, mode };
         } finally {
             releaseFlight(flight);

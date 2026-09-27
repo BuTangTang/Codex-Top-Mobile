@@ -274,6 +274,11 @@ const WEB_FILL_TRANSIENT_RETRY_MS = 25;
 const WEB_FILL_MAX_TRANSIENT_RETRIES = 6;
 
 export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): TranscriptEntryHost {
+    const tailGapState = Platform.OS !== 'web'
+        && !deps.renderWindowProjection.targetWindow.targetWindowActive
+        && deps.renderWindowProjection.targetWindow.gaps.older
+        ? (deps.renderWindowProjection.targetWindow.items.length === 0 ? 'empty' : 'content')
+        : 'none';
     const requestSessionOpenInitialFillRef = React.useRef<() => void>(() => {});
     const [materializationCommit, requestMaterializationCommit] = React.useReducer((value: number) => value + 1, 0);
     const hasObservedScrollSinceSessionEntry = React.useCallback((): boolean => {
@@ -1240,6 +1245,15 @@ export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): Transcrip
         if (deps.listLayoutHeight <= 0) return;
         if (!deps.sessionOpenLatch.markInitialFillInProgress(deps.sessionId)) return;
         const entersAtBottom = deps.sessionEntryViewportRef.current?.shouldFollowBottom !== false;
+        // 空 gap 的旧缓存计数和上一帧高度不能证明已有正文；读取原列表实时投影。
+        const hasEnoughDisplayedContent = () => {
+            if (!deps.isScrollable()) return false;
+            const items = deps.listDataRef.current;
+            const hasGap = Platform.OS !== 'web' && items.some((item) => item.kind === 'transcript-window-gap');
+            return hasGap
+                ? items.some((item) => item.kind !== 'transcript-window-gap')
+                : deps.committedMessagesCount > 0;
+        };
         if (Platform.OS === 'web') {
             // Web can paint the newest transcript immediately: keeping historical loads
             // inside the session-open latch serialized network, decrypt, and render work
@@ -1294,7 +1308,7 @@ export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): Transcrip
                 let transientRetries = 0;
                 let contentHeightBaselinePx = deps.listContentHeightRef.current;
                 while (!webFillSignal.aborted) {
-                    if (deps.isScrollable() && deps.committedMessagesCount > 0) break;
+                    if (hasEnoughDisplayedContent()) break;
                     if (loadsWithoutProgress >= maxNoProgressLoads) break;
                     if (Date.now() >= absoluteFillDeadlineMs) break;
                     const result = await deps.loadOlder({ preservePrependViewport: true, showLoadingIndicator: false });
@@ -1368,7 +1382,7 @@ export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): Transcrip
             try {
                 while (true) {
                     if (signal.aborted) return;
-                    if (deps.isScrollable() && deps.committedMessagesCount > 0) break;
+                    if (hasEnoughDisplayedContent()) break;
                     if (deps.entrySliceWindowRef.current?.sessionId === deps.sessionId) break;
                     if (Date.now() - lastDisplayableProgressAtMs >= budgetMs) break;
                     if (Date.now() >= absoluteFillDeadlineMs) break;
@@ -1405,6 +1419,7 @@ export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): Transcrip
     }, [
         applySessionOpenLatchEffects,
         deps.committedMessagesCount,
+        deps.listDataRef,
         deps.entrySliceWindowRef,
         deps.initialFillAbortRef,
         deps.initialBottomPositionOwner,
@@ -1436,7 +1451,8 @@ export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): Transcrip
             contentHeight: deps.listContentHeight,
             hasEntrySliceWindow: deps.entrySliceWindowRef.current?.sessionId === deps.sessionId,
             isLoaded: deps.isLoaded,
-            isScrollable: deps.isScrollable(),
+            isScrollable: tailGapState !== 'empty' && deps.isScrollable(),
+            tailGapState,
             itemCount: deps.displayItemsLength,
             layoutHeight: deps.listLayoutHeight,
             nowMs: Date.now(),
@@ -1447,6 +1463,7 @@ export function useTranscriptEntryHost(deps: TranscriptEntryHostDeps): Transcrip
     }, [
         applySessionOpenLatchEffects,
         deps.displayItemsLength,
+        tailGapState,
         deps.entrySliceWindowRef,
         deps.isLoaded,
         deps.isScrollable,

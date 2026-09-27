@@ -47,13 +47,14 @@ export function resolveLatestCommittedActivityKey(params: Readonly<{
     return null;
 }
 
+// 从同一份消息来源派生显示 ID；手机工具过滤不修改历史和独立输入请求。
 export function useChatListRootState(props: ChatListProps) {
     const {
         fork,
         forkAwareMessageDescriptors,
         forkedTranscriptEnabled,
         isLoaded,
-        messageIdsOldestFirst,
+        messageIdsOldestFirst: sourceMessageIdsOldestFirst,
         messagesById,
     } = useTranscriptRootMessages(props.session.id);
     const { messages: pendingMessages, discarded: discardedPendingMessages } = useSessionPendingMessages(props.session.id);
@@ -63,6 +64,23 @@ export function useChatListRootState(props: ChatListProps) {
     const transcriptTurnToolCallsGroupStrategy = useSetting('transcriptTurnToolCallsGroupStrategy');
     const transcriptSessionCommon = useTranscriptSessionCommon(props.session.id);
     const toolViewTimelineChromeMode = transcriptSessionCommon.toolChrome.toolViewTimelineChromeMode;
+    const interaction = React.useMemo(() => {
+        return deriveTranscriptInteractionFromSession({
+            accessLevel: props.session.accessLevel,
+            canApprovePermissions: props.session.canApprovePermissions,
+            active: props.session.active,
+            presence: props.session.presence,
+        });
+    }, [props.session.accessLevel, props.session.canApprovePermissions, props.session.active, props.session.presence]);
+    // 在分组前排除普通工具，避免仅隐藏组件却仍挂载整段过程；审批沿用既有可操作判断。
+    const visibleMessageIds = props.hideOrdinaryToolCalls
+        ? sourceMessageIdsOldestFirst.filter((id) => messagesById[id]?.kind !== 'tool-call' || shouldKeepPendingToolCallVisible(
+            messagesById[id] ?? null,
+            deriveReadOnlyTranscriptInteraction(interaction, forkAwareMessageDescriptors?.metadataByMessageId[id]?.isReadOnlyContext === true),
+        ))
+        : sourceMessageIdsOldestFirst;
+    const stableVisibleMessageIds = useStableValueBySignature(visibleMessageIds, props.hideOrdinaryToolCalls ? JSON.stringify(visibleMessageIds) : '');
+    const messageIdsOldestFirst = props.hideOrdinaryToolCalls ? stableVisibleMessageIds : sourceMessageIdsOldestFirst;
 
     const activeServerAccountScope = useActiveServerAccountScope();
     const {
@@ -77,7 +95,7 @@ export function useChatListRootState(props: ChatListProps) {
         sessionId: props.session.id,
     });
     const pendingUserActionRequests = useTranscriptRootPendingRequests({
-        messageIdsOldestFirst,
+        messageIdsOldestFirst: sourceMessageIdsOldestFirst,
         messagesById,
         session: props.session,
     });
@@ -134,14 +152,6 @@ export function useChatListRootState(props: ChatListProps) {
         })
     ), [messageIdsOldestFirst, messagesById, props.session.active]);
 
-    const interaction = React.useMemo(() => {
-        return deriveTranscriptInteractionFromSession({
-            accessLevel: props.session.accessLevel,
-            canApprovePermissions: props.session.canApprovePermissions,
-            active: props.session.active,
-            presence: props.session.presence,
-        });
-    }, [props.session.accessLevel, props.session.canApprovePermissions, props.session.active, props.session.presence]);
     // 复用根消息订阅；原地更新也重新判断，只有可见审批 ID 改变才更新下游投影。
     const pendingToolCallIds = transcriptSessionCommon.toolChrome.compactToolCalls
         ? messageIdsOldestFirst.filter((id) => shouldKeepPendingToolCallVisible(
@@ -172,6 +182,7 @@ export function useChatListRootState(props: ChatListProps) {
             messagePins: sessionMessagePins,
             onToggleMessagePin: togglePersistedSessionMessagePin,
             messagesById: internalMessagesById,
+            sourceMessageIdsOldestFirst: props.hideOrdinaryToolCalls ? sourceMessageIdsOldestFirst : undefined,
             compactPendingToolCallIds,
             eventEmphasisByMessageId,
             forkMessageMetadataById: forkAwareMessageDescriptors?.metadataByMessageId ?? null,

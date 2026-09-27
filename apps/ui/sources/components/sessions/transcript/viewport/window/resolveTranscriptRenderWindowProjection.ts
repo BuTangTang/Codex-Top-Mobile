@@ -95,6 +95,7 @@ export function resolveTranscriptRenderWindowProjection<TItem extends RenderWind
     resolveLiveTailAnchor?: (items: readonly TItem[]) => Readonly<{ messageId: string; reason?: TranscriptLiveTailAnchorReason | null }> | null;
     sessionId: string;
     tailContiguousBoundary?: SessionMessagesTailBoundary | null;
+    sourceMessageIdsOldestFirst?: readonly string[];
     resolveMessageIds?: (item: TItem) => readonly string[];
     targetWindowState: TranscriptTargetWindowState;
     transcriptNativeHotTailItemCount: number;
@@ -120,6 +121,7 @@ export function resolveTranscriptRenderWindowProjection<TItem extends RenderWind
         isSeqRangeLoaded: params.isSeqRangeLoaded,
         resolveSeq: params.resolveSeq,
         tailContiguousBoundary: params.tailContiguousBoundary ?? null,
+        sourceMessageIdsOldestFirst: params.sourceMessageIdsOldestFirst,
         resolveMessageIds: params.resolveMessageIds,
         windowState: params.targetWindowState,
     });

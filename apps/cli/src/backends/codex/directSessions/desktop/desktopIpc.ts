@@ -16,7 +16,7 @@ enablePatches();
 // 同类协议参考：Emanuele-web04/remodex@e0e342dac5cddd40db661bfcf76e5ab0e3913ef8。
 // 这里独立实现协议边界，没有复制 Remodex 实现。
 const REQUEST_TIMEOUT_MS = 5_000;
-// 真实长会话的关联回执在 9.4 秒到达；仅本地只读水合等待 15 秒，线上请求仍为 5 秒。
+// 真实长会话的关联回执在 9.4 秒到达；只读水合的本地与 router 等待均为 15 秒，其余请求仍为 5 秒。
 const CONTROL_READ_TIMEOUT_MS = 15_000;
 const MAX_FRAME_BYTES = 268_435_456;
 
@@ -208,13 +208,24 @@ export class DesktopIpc {
         return followsObservedTurn(followed.state, previousTurnId, next.turnId);
     }
 
-    /** 返回本次订阅已应用的最新原 owner 状态；失联、并发替换或目标变化均不留下控制证明。 */
-    async readControlSnapshot(conversationId: string): Promise<unknown> {
+    /** 返回同连接、同 owner 且连续修订的控制基线；未关联或已失效的订阅不提供证明。 */
+    getControlSnapshot(conversationId: string): Readonly<{ state: unknown; ownerClientId: string }> | null {
+        const followed = this.observation;
+        if (this.failure || this.socket.destroyed || !this.socket.writable || !this.ownerClientId
+            || !this.controlSnapshotAnchored || this.snapshotAnchor || followed?.conversationId !== conversationId
+            || followed.revision === null || !ipcRecord(followed.state)) return null;
+        return { state: followed.state, ownerClientId: this.ownerClientId };
+    }
+
+    /** 关联当前完整历史；提供 listener 时让既有 lease 保留同一个连续订阅，不再另起基线。 */
+    async readControlSnapshot(conversationId: string, listener?: NonNullable<DesktopIpc['observation']>['listener'],
+        validateRetainedSnapshot?: (state: unknown) => void): Promise<unknown> {
         // 先拒绝并发读取，避免失败的新调用覆盖或清理仍在等待的原 listener。
         const existingSubscription = this.observation;
         if (this.controlSnapshotListener || existingSubscription) throw new DesktopIpcError('owner_unavailable');
         let stop: (() => void) | undefined;
         let timer: ReturnType<typeof setTimeout> | undefined;
+        let retained = false;
         try {
             const ready = new Promise<void>((resolve, reject) => {
                 timer = setTimeout(() => reject(new DesktopIpcError('timeout')), CONTROL_READ_TIMEOUT_MS);
@@ -231,13 +242,20 @@ export class DesktopIpc {
             if (this.failure) throw this.failure;
             if (!this.controlSnapshotAnchored || this.snapshotAnchor || !subscribed || this.observation !== subscribed || subscribed.conversationId !== conversationId
                 || !ipcRecord(subscribed.state)) throw new DesktopIpcError('invalid_snapshot');
+            if (listener) {
+                // 旧 producer 的控制投影若不完整，调用方仍可退回原观察订阅，不保留控制锚。
+                validateRetainedSnapshot?.(subscribed.state);
+                subscribed.listener = listener; retained = true;
+            }
             return subscribed.state;
         } finally {
             if (timer) clearTimeout(timer);
             this.controlSnapshotListener = null;
             this.controlSnapshotReject = null;
-            this.controlSnapshotAnchored = false;
-            stop?.();
+            if (!retained) {
+                this.controlSnapshotAnchored = false;
+                stop?.();
+            }
         }
     }
 
@@ -326,7 +344,7 @@ export class DesktopIpc {
         }
     }
 
-    /** 仅控制读取关联快照；长订阅保留原行为，控制遇未关联完整快照即拒绝且不重请求。 */
+    /** 冷读取仍关联回执；保留订阅只接纳原 owner 紧邻下一修订的完整状态。 */
     private receiveObservation(message: Record<string, unknown>, encodedBodyBytes?: number): void {
         const followed = this.observation;
         const params = ipcRecord(message.params);
@@ -335,11 +353,17 @@ export class DesktopIpc {
         if (message.version !== 11) { this.fail('incompatible_protocol'); return; }
         const change = ipcRecord(params.change);
         if (!change || !Number.isSafeInteger(change.revision) || Number(change.revision) < 0) { this.fail('invalid_snapshot'); return; }
-        if (!this.snapshotAnchor && this.controlSnapshotListener && change.type === 'snapshot') {
-            if (change.revision !== followed.revision || !isDeepStrictEqual(change.conversationState, followed.state)) {
-                this.controlSnapshotAnchored = false;
-                this.fail('invalid_snapshot');
+        if (!this.snapshotAnchor && (this.controlSnapshotListener || this.controlSnapshotAnchored) && change.type === 'snapshot') {
+            if (change.revision === followed.revision && isDeepStrictEqual(change.conversationState, followed.state)) return;
+            // 原生 turn/started、turn/completed 会广播完整状态；与 patches 共用同一个 +1 计数器。
+            // 只延续已关联的原流，不能把更大 revision 或别的完整快照当作新的控制基线。
+            if (!this.controlSnapshotListener && followed.revision !== null && change.revision === followed.revision + 1
+                && ipcRecord(change.conversationState)?.id === followed.conversationId) {
+                this.applyObservation(message);
+                return;
             }
+            this.controlSnapshotAnchored = false;
+            this.fail('invalid_snapshot');
             return;
         }
         const anchor = this.snapshotAnchor;
@@ -451,16 +475,18 @@ export class DesktopIpc {
         requestId: string = randomUUID(), targetClientId?: string): Promise<DesktopIpcResponse> {
         if (this.failure) throw this.failure;
         if (this.socket.destroyed || !this.socket.writable) throw new DesktopIpcError('connection_closed');
+        // router 会按线上期限主动回 request-timeout，必须与本地同属这次请求的等待期限。
+        const timeoutMs = method === 'thread-follower-load-complete-history' ? CONTROL_READ_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(requestId);
                 reject(new DesktopIpcError('timeout'));
-            }, method === 'thread-follower-load-complete-history' ? CONTROL_READ_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
+            }, timeoutMs);
             this.pending.set(requestId, { resolve, reject, timer });
             try {
                 // 本地请求必须省略顶层 hostId；否则 Desktop 使用另一方法版本。
                 this.write({ type: 'request', requestId, sourceClientId: this.clientId, method, version,
-                    params, ...(targetClientId ? { targetClientId } : {}), timeoutMs: REQUEST_TIMEOUT_MS });
+                    params, ...(targetClientId ? { targetClientId } : {}), timeoutMs });
             } catch {
                 this.fail('connection_closed');
             }
