@@ -369,6 +369,18 @@ installSessionShellCommonModuleMocks({
     };
 
     const testStorage = createStorageStoreMock(storageState as any);
+    const { createPendingDomain } = await import('@/sync/store/domains/pending');
+    Object.assign(testStorage.getState(), createPendingDomain({
+      get: () => testStorage.getState(),
+      set: (update: any) => {
+        const next = typeof update === 'function' ? update(testStorage.getState()) : update;
+        if (next.sessionPending !== storageState.sessionPending) {
+          for (const key of Object.keys(storageState.sessionPending)) delete storageState.sessionPending[key];
+          Object.assign(storageState.sessionPending, next.sessionPending);
+        }
+        Object.assign(testStorage.getState(), next, { sessionPending: storageState.sessionPending });
+      },
+    }), { sessionPending: storageState.sessionPending });
     return createStorageModuleMock({
       importOriginal,
       overrides: {
@@ -381,7 +393,7 @@ installSessionShellCommonModuleMocks({
         useRealtimeStatus: () => 'connected',
         useSessionMessages: () => ({ messages: sessionMessagesState.current, isLoaded: true }),
         useSessionTranscriptIds: () => ({ ids: ['m1'], isLoaded: true, hasRetainedContent: false }),
-        useSessionPendingMessages: () => ({ messages: [], discarded: [], isLoaded: true }),
+        useSessionPendingMessages: () => testStorage.getState().sessionPending.s1 ?? { messages: [], discarded: [], isLoaded: true },
         useWorkspaceReviewCommentsDrafts: () => reviewCommentDraftsState.current,
         useSessionReviewCommentsDrafts: () => reviewCommentDraftsState.current,
         useSessionUsage: () => null,
@@ -624,8 +636,11 @@ vi.mock('@/voice/session/voiceSession', () => ({
   voiceSessionManager: {},
 }));
 
-vi.mock('@/sync/sync', () => ({
+vi.mock('@/sync/sync', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/sync/sync')>();
+  return {
   sync: {
+    sendDirectSessionTextMessage: actual.sync.sendDirectSessionTextMessage.bind(actual.sync),
     markSessionViewed: async () => {},
     fetchPendingMessages: async () => {},
     publishSessionPermissionModeToMetadata: async () => {},
@@ -644,7 +659,8 @@ vi.mock('@/sync/sync', () => ({
     encryption: { getMachineEncryption: () => null },
     onSessionViewportChange: () => {},
   },
-}));
+  };
+});
 vi.mock('@/sync/ops', async (importOriginal) => {
   const actual = await importOriginal<any>();
   return {
@@ -753,6 +769,71 @@ vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOrigin
 });
 
 describe('SessionView (direct sessions)', () => {
+  it.each(['cancel', 'send', 'echo_before_send'] as const)('restores a failed desktop message for %s while preserving the next draft', async (action) => {
+    machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
+      activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
+    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
+    const screen = await renderSessionViewAndSettle();
+    const { storage } = await import('@/sync/domains/state/storage');
+    const failed = { id: 'failed-desktop', localId: 'failed-desktop', source: 'local_outbound' as const,
+      directSessionExternalControl: true as const, sendState: 'failed' as const, deliveryStatus: 'queued' as const,
+      text: 'earlier rejected text', createdAt: 1, updatedAt: 1, rawRecord: {} };
+    storage.getState().upsertPendingMessage('s1', failed);
+    await act(async () => { findAgentInput(screen).props.onChangeText('next draft to preserve'); });
+    await act(async () => { chatListPropsSpy.mock.calls.at(-1)?.[0].onEditPendingMessage({
+      id: failed.id, text: failed.text, message: failed,
+    }); });
+    expect(findAgentInput(screen).props.value).toBe('earlier rejected text');
+    if (action === 'cancel') {
+      await act(async () => {
+        findAgentInput(screen).props.statusBadges.find((badge: { key: string }) => badge.key === 'pending-message-edit').onPress();
+      });
+      expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+      expect(storage.getState().sessionPending.s1?.messages).toEqual([failed]);
+      expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+      return;
+    }
+    if (action === 'echo_before_send') storage.getState().removePendingMessage('s1', failed.id);
+    await act(async () => { findAgentInput(screen).props.onChangeText('edited explicit send'); });
+    const reply = createDeferred<any>();
+    syncSubmitMessageSpy.mockReturnValue(reply.promise);
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    await flushHookEffects();
+    expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+    const rows = storage.getState().sessionPending.s1?.messages ?? [];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ text: 'edited explicit send', directSessionExternalControl: true });
+    expect(rows[0].id).not.toBe(failed.id);
+    expect(syncSubmitMessageSpy).toHaveBeenCalledWith('s1', 'edited explicit send', undefined, undefined,
+      expect.objectContaining({ localId: rows[0].localId, directSessionExternalControl: true }));
+    await act(async () => { reply.resolve({ localId: rows[0].localId, persistence: 'provider_direct' }); });
+    await flushHookEffects();
+    expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+    expect(modalAlertSpy).not.toHaveBeenCalled();
+  });
+  it('hands off desktop text before CONTROL resolves and never clears the next draft on ACK', async () => {
+    machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
+      activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
+    machineControlReadSpy.mockResolvedValue({ ok: false, error: 'unavailable', errorCode: 'provider_unavailable' });
+    const screen = await renderSessionViewAndSettle();
+    const control = createDeferred<any>();
+    machineControlReadSpy.mockReturnValue(control.promise);
+    syncSubmitMessageSpy.mockResolvedValue({ localId: 'ignored-by-test', persistence: 'provider_direct' });
+    await act(async () => { findAgentInput(screen).props.onChangeText('desktop first draft'); });
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    const { storage } = await import('@/sync/domains/state/storage');
+    const pending = storage.getState().sessionPending.s1?.messages ?? [];
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ text: 'desktop first draft', directSessionExternalControl: true });
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    await act(async () => { findAgentInput(screen).props.onChangeText('desktop next draft'); });
+    await act(async () => { control.resolve({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } }); });
+    await flushHookEffects();
+    expect(syncSubmitMessageSpy).toHaveBeenCalledWith('s1', 'desktop first draft', undefined, undefined,
+      expect.objectContaining({ localId: pending[0].localId, directSessionExternalControl: true }));
+    expect(findAgentInput(screen).props.value).toBe('desktop next draft');
+  });
   // 已确认的同寿命快照只选路；先投递，受理后异步回读，不篡改历史观察状态。
   it('sends through its confirmed start mode before refreshing control history', async () => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
@@ -776,7 +857,7 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.value).toBe('');
   });
 
-  // 已失败的刷新同步撤销旧快照；再次点击补读仍失败时保留草稿。
+  // 已失败的刷新同步撤销旧快照；再次点击补读仍失败时保留本地正文。
   it('rejects a desktop control read failure after refresh has revoked the cached start mode', async () => {
     responsiveHarnessState.platformOs = 'android';
     responsiveHarnessState.deviceType = 'phone';
@@ -794,8 +875,9 @@ describe('SessionView (direct sessions)', () => {
     expect(machineControlReadSpy.mock.calls.length).toBe(readsBeforeClick + 1);
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
     expect(machineControlActionSpy).not.toHaveBeenCalled();
-    expect(findAgentInput(screen).props.value).toBe('keep cold draft');
-    expect(modalAlertSpy.mock.calls.at(-1)?.[2]).toEqual([{ text: 'common.ok' }]);
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'keep cold draft', directSessionExternalControl: true })]);
+    expect(modalAlertSpy).not.toHaveBeenCalled();
   });
 
   // 手动刷新发布新轮次后，点击使用该轮次选路，不借旧闭包派发普通 SEND。
@@ -828,7 +910,8 @@ describe('SessionView (direct sessions)', () => {
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled(); expect(machineControlActionSpy).not.toHaveBeenCalled();
-    expect(findAgentInput(screen).props.value).toBe('older producer draft');
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'older producer draft', directSessionExternalControl: true })]);
   });
 
   // 快路径仍从点击开始单飞，等待 ACK 期间的新草稿不能被旧文本受理清除。
@@ -844,17 +927,21 @@ describe('SessionView (direct sessions)', () => {
     await act(async () => { const send = findAgentInput(screen).props.onSend; send(); send(); });
     await act(async () => { findAgentInput(screen).props.onChangeText('newer draft'); });
     expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([
+      expect.objectContaining({ text: 'clicked text', directSessionExternalControl: true }),
+    ]);
     expect(machineControlReadSpy.mock.calls.length).toBe(readsBefore);
     await act(async () => { receipt.resolve({ localId: 'desktop-start', persistence: 'provider_direct' }); });
     await flushHookEffects();
     expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
     expect(syncSubmitMessageSpy.mock.calls[0]?.[1]).toBe('clicked text');
     expect(findAgentInput(screen).props.value).toBe('newer draft');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toHaveLength(1);
     expect(modalAlertSpy).not.toHaveBeenCalled();
   });
 
-  // 本地 pending 与等待 provider 的受理均不足以清稿；刷新或再次点击不会重投同一未确认操作。
-  it.each(['pending', 'provider_pending'] as const)('retains the desktop draft and unknown outcome for %s custody', async (custody) => {
+  // 本地交接先清本次草稿；等待 provider 的结果仍保留未知状态，刷新或再次点击不会重投。
+  it.each(['pending', 'provider_pending'] as const)('retains the desktop message and unknown outcome for %s custody', async (custody) => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true },
       observation: { v: 1, state: 'unknown', reason: 'not_observed' } });
@@ -868,18 +955,20 @@ describe('SessionView (direct sessions)', () => {
     await act(async () => { findAgentInput(screen).props.onChangeText('keep unconfirmed text'); });
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
-    expect(findAgentInput(screen).props.value).toBe('keep unconfirmed text');
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'keep unconfirmed text', directSessionExternalControl: true })]);
     await act(async () => { reply.resolve({ localId: 'unconfirmed', persistence: custody === 'pending' ? 'pending' : 'provider_direct', ...(custody === 'provider_pending' ? { providerAcceptancePending: true } : {}) }); });
     await flushHookEffects();
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
     expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
-    expect(findAgentInput(screen).props.value).toBe('keep unconfirmed text');
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'keep unconfirmed text', directSessionExternalControl: true })]);
     expect(findAgentInput(screen).props.connectionStatus.text).toBe('directSessions.observation.unknown');
   });
 
-  // 旧快照只负责选路：CLI 拒绝变忙或换轮后，页面保稿、不改观察状态、不换路重投。
-  it.each(['start', 'steer'] as const)('keeps a rejected stale desktop %s draft without another route or optimistic state', async (mode) => {
+  // 旧快照只负责选路：CLI 拒绝变忙或换轮后，页面保留失败正文、不改观察状态、不换路重投。
+  it.each(['start', 'steer'] as const)('retains a rejected stale desktop %s message without another route', async (mode) => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true },
       observation: { v: 1, state: 'unknown', reason: 'not_observed' } });
@@ -894,13 +983,14 @@ describe('SessionView (direct sessions)', () => {
     if (mode === 'start') {
       expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
       expect(machineControlActionSpy).not.toHaveBeenCalled();
-      expect(modalAlertSpy).toHaveBeenCalledWith('common.error', 'desktop became busy', [{ text: 'common.ok' }]);
+      expect(modalAlertSpy).not.toHaveBeenCalled();
     } else {
       expect(machineControlActionSpy).toHaveBeenCalledTimes(1);
       expect(machineControlActionSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'steer', expectedTurnId: 'old-turn', text: 'busy race draft' }), expect.anything());
       expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
     }
-    expect(findAgentInput(screen).props.value).toBe('busy race draft');
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'busy race draft', directSessionExternalControl: true })]);
     expect(findAgentInput(screen).props.connectionStatus.text).toBe('directSessions.observation.unknown');
     expect(screen.findByTestId('desktop-control-outcome')?.props.children).toBe('桌面未接受这次操作，请核对最新状态。');
   });
@@ -914,6 +1004,9 @@ describe('SessionView (direct sessions)', () => {
     await act(async () => { findAgentInput(screen).props.onSend(); });
     await flushHookEffects();
     expect(machineControlActionSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'steer', sessionId: 's1', expectedTurnId: 'turn-1', text: '追加说明' }), { serverId: 'server-1', onIssued: expect.any(Function) });
+    const row = (await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages[0];
+    expect(row).toMatchObject({ text: '追加说明', deliveryStatus: 'accepted', directSessionExternalControl: true });
+    expect(machineControlActionSpy.mock.calls[0]?.[0].operationId).toBe(row?.localId);
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
   });
 
@@ -925,7 +1018,8 @@ describe('SessionView (direct sessions)', () => {
     await flushHookEffects();
     expect(machineControlActionSpy).not.toHaveBeenCalled();
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
-    expect(findAgentInput(screen).props.value).toBe('保留追加说明');
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: '保留追加说明', directSessionExternalControl: true })]);
   });
 
   // 只把已声明的生命周期显示在状态区，不制造原生审批或中断能力。
@@ -4433,9 +4527,9 @@ describe('SessionView (direct sessions)', () => {
     }
   });
 
-  // 拒绝与刷新失败都要让用户看到原因；失败不能清稿、接管或把缓存继续显示成可发送。
+  // 拒绝与刷新失败保留失败正文；不接管或把缓存继续显示成可发送。
   it.each(['revoked', 'transport_error', 'unavailable_response'] as const)(
-    'explains fresh external desktop failure %s while preserving the draft', async (failure) => {
+    'retains fresh external desktop failure %s in its local message', async (failure) => {
     machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } });
     machineDirectSessionStatusGetSpy.mockResolvedValue({
       ok: true, machineOnline: true, runnerActive: false, activity: 'idle',
@@ -4461,14 +4555,9 @@ describe('SessionView (direct sessions)', () => {
     expect(showDirectSessionTakeoverDialogSpy).not.toHaveBeenCalled();
     expect(machineDirectSessionTakeoverSpy).not.toHaveBeenCalled();
     expect(machineDirectSessionTakeoverPersistSpy).not.toHaveBeenCalled();
-    expect(findAgentInput(screen).props.value).toBe('keep my draft');
-    expect(modalAlertSpy).toHaveBeenCalledWith(
-      'errors.failedToSendMessage',
-      expect.stringContaining(failure === 'revoked'
-        ? 'chatFooter.directSessionDesktopDisconnected'
-        : 'chatFooter.directSessionDesktopUnknown'),
-    );
-    expect(modalAlertSpy.mock.calls.at(-1)?.[1]).toContain('chatFooter.directSessionDraftKept');
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'keep my draft', directSessionExternalControl: true })]);
+    expect(modalAlertSpy).not.toHaveBeenCalled();
     expect(chatListPropsSpy.mock.calls.at(-1)?.[0].directControlFooter.externalControl?.canSend).not.toBe(true);
   });
 
@@ -4533,7 +4622,7 @@ describe('SessionView (direct sessions)', () => {
 
   });
 
-  it('keeps the composer text without takeover when the external capability is absent', async () => {
+  it('retains a local message without takeover when the external capability is absent', async () => {
     const screen = await renderSessionView();
 
     let agentInput = findAgentInput(screen);
@@ -4551,11 +4640,12 @@ describe('SessionView (direct sessions)', () => {
     expect(showDirectSessionTakeoverDialogSpy).not.toHaveBeenCalled();
 
     agentInput = findAgentInput(screen);
-    expect(agentInput.props.value).toBe('draft stays here');
+    expect(agentInput.props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'draft stays here', directSessionExternalControl: true })]);
 
   });
 
-  it('keeps the composer text visible while fresh desktop capability is pending', async () => {
+  it('hands off the composer text while fresh desktop capability is pending', async () => {
     const screen = await renderSessionView();
     const status = createDeferred<any>();
     machineDirectSessionStatusGetSpy.mockReturnValueOnce(status.promise);
@@ -4570,7 +4660,8 @@ describe('SessionView (direct sessions)', () => {
     });
 
     agentInput = findAgentInput(screen);
-    expect(agentInput.props.value).toBe('clear me immediately');
+    expect(agentInput.props.value).toBe('');
+    expect((await import('@/sync/domains/state/storage')).storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ text: 'clear me immediately', directSessionExternalControl: true })]);
     expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
     await act(async () => {
       status.resolve({ ok: false, errorCode: 'provider_unavailable', error: 'unavailable' });

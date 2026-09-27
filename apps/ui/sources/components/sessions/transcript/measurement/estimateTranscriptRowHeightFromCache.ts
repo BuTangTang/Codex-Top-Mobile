@@ -1,5 +1,6 @@
 import {
     getPendingMessageVisualState,
+    isDirectSessionPendingBlock,
     isPendingMessageProviderEffectPossible,
     paintsPendingMessageActionRow,
     resolvePendingMessageHeightBearingChrome,
@@ -431,7 +432,8 @@ function estimatePendingQueueRowPx(
                 + (discardedMessage.discardedReason ? PENDING_QUEUE_DISCARDED_REASON_PX : 0);
         }
     }
-    const headerPx = item.pendingMessages.length > 0 && item.discardedMessages.length > 0
+    const headerPx = isDirectSessionPendingBlock(item.pendingMessages, item.discardedMessages.length) ? 0
+        : item.pendingMessages.length > 0 && item.discardedMessages.length > 0
         ? PENDING_QUEUE_HEADER_WITH_SUBTITLE_PX
         : PENDING_QUEUE_HEADER_ROW_PX;
     // NOT a ceiling on a position-bearing value (see C-1 above): this is the block's OWN painted

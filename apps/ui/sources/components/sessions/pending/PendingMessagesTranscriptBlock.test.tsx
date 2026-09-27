@@ -527,6 +527,40 @@ describe('PendingMessagesTranscriptBlock', () => {
         expect(modalPrompt).not.toHaveBeenCalled();
     });
 
+    it.each(['sending', 'accepted', 'failed', 'unknown'] as const)('renders desktop %s locally without server queue actions', async (outcome) => {
+        const PendingMessagesTranscriptBlock = await loadPendingMessagesTranscriptBlock();
+        const onEditPendingMessage = vi.fn();
+        const message: PendingMessage = {
+            id: 'desktop', localId: 'desktop', text: 'desktop text', createdAt: 0, updatedAt: 0, rawRecord: {},
+            source: 'local_outbound', directSessionExternalControl: true,
+            deliveryStatus: outcome === 'accepted' ? 'accepted' : 'queued',
+            sendState: outcome === 'failed' ? 'failed' : outcome === 'unknown' ? 'unconfirmed' : undefined,
+        };
+        const screen = await renderScreen(React.createElement(PendingMessagesTranscriptBlock, {
+            sessionId: 's1', pendingMessages: [message], discardedMessages: [], onEditPendingMessage,
+        }));
+        await hoverPendingMessageRow(screen, 'desktop');
+        expect(screen.findByTestId('pendingMessages.headerLabel')).toBeNull();
+        for (const action of ['retrySend', 'sendNow', 'steerNow', 'sendDeliveryAsNew', 'markDeliveryHandled', 'remove']) {
+            expect(screen.findByTestId(`pendingMessages.${action}:desktop`)).toBeNull();
+        }
+        if (outcome === 'accepted') {
+            expect(screen.findByTestId('pendingMessages.pendingAffordance:desktop')).toBeNull();
+        } else {
+            expect(screen.findByTestId('pendingMessages.pendingAffordanceLabel:desktop')?.props.children).toBe(t(
+                outcome === 'failed' ? 'session.pendingMessages.deliveryStatus.sendFailed'
+                    : outcome === 'unknown' ? 'session.pendingMessages.deliveryStatus.deliveryUncertain'
+                    : 'session.pendingMessages.deliveryStatus.sending',
+            ));
+        }
+        if (outcome === 'failed') {
+            await screen.pressByTestIdAsync('pendingMessages.restoreEdit:desktop');
+            expect(onEditPendingMessage).toHaveBeenCalledWith(expect.objectContaining({ message }));
+        }
+        expect(sendPendingMessageNow).not.toHaveBeenCalled();
+        expect(sendPendingDeliveryAsNew).not.toHaveBeenCalled();
+    });
+
     it('renders a per-message pending affordance label', async () => {
         const PendingMessagesTranscriptBlock = await loadPendingMessagesTranscriptBlock();
         const screen = await renderScreen(React.createElement(PendingMessagesTranscriptBlock, {

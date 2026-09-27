@@ -183,6 +183,41 @@ describe('readCodexCandidateLifecycle', () => {
     return row('response_item', { type: 'message', role: 'assistant', content: 'x'.repeat(bytes) });
   }
 
+  /** 只计量真实文件边界，投影与恢复仍运行正式 owner。 */
+  async function createMeteredReader() {
+    let readBytes = 0;
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>();
+      return { ...actual, open: async (...args: Parameters<typeof actual.open>) => {
+        const file = await actual.open(...args);
+        return new Proxy(file, { get(target, property) {
+          if (property === 'read') return async (...readArgs: unknown[]) => {
+            const result = await Reflect.apply(target.read, target, readArgs);
+            readBytes += result.bytesRead;
+            return result;
+          };
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      } };
+    });
+    vi.resetModules();
+    const { readCodexCandidateLifecycle: meteredRead } = await import('./readCodexCandidateLifecycle');
+    return async () => {
+      readBytes = 0;
+      const lifecycle = await meteredRead({ filePath, remoteSessionId: 'root', checkedAtMs });
+      expect(readBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+      return { lifecycle, readBytes };
+    };
+  }
+
+  /** 分块写合成记录；普通回归只超过原 32 MiB 搜索范围，不复制大正文数组。 */
+  async function writeRecoveryFixture(prefix: string, blocks = 33) {
+    await fs.writeFile(filePath, row('session_meta', { id: 'root' }) + prefix);
+    const chunk = filler(16_000).repeat(66);
+    for (let block = 0; block < blocks; block++) await fs.appendFile(filePath, chunk);
+  }
+
   /** 用有界的多次列表刷新推进冷恢复，不从正文或次数猜状态。 */
   async function recover(maxCalls = 20): Promise<Awaited<ReturnType<typeof readCodexCandidateLifecycle>>> {
     let result = await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs });
@@ -303,43 +338,110 @@ describe('readCodexCandidateLifecycle', () => {
   /** 用真实文件读取计量总预算，并验证冷恢复完成后的普通刷新只读取校验边界。 */
   it('enforces 64 MiB total IO and keeps routine validation below 96 KiB', async () => {
     await fs.writeFile(filePath, row('session_meta', { id: 'root' }) + filler().repeat(150) + start + filler().repeat(450));
-    let readBytes = 0;
-    vi.doMock('node:fs/promises', async (importOriginal) => {
-      const actual = await importOriginal<typeof import('node:fs/promises')>();
-      return { ...actual, open: async (...args: Parameters<typeof actual.open>) => {
-        const file = await actual.open(...args);
-        return new Proxy(file, { get(target, property) {
-          if (property === 'read') return async (...readArgs: unknown[]) => {
-            const result = await Reflect.apply(target.read, target, readArgs);
-            readBytes += result.bytesRead;
-            return result;
-          };
-          const value = Reflect.get(target, property);
-          return typeof value === 'function' ? value.bind(target) : value;
-        } });
-      } };
-    });
-    const { readCodexCandidateLifecycle: meteredRead } = await import('./readCodexCandidateLifecycle');
-    let state = 'unknown';
-    for (let call = 0; state === 'unknown' && call < 40; call++) {
-      readBytes = 0;
-      state = (await meteredRead({ filePath, remoteSessionId: 'root', checkedAtMs })).state;
-      expect(readBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
-    }
-    expect(state).toBe('running');
-    readBytes = 0;
-    expect((await meteredRead({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('running');
-    expect(readBytes).toBeLessThanOrEqual(96 * 1024);
-    // 冷恢复累计只搜索最近 32 MiB；预算外的旧开始不触发整文件遍历，新终止仍可由尾窗恢复。
-    await fs.writeFile(filePath, row('session_meta', { id: 'root' }) + start + filler().repeat(4400));
-    for (let call = 0; call < 24; call++) {
-      readBytes = 0;
-      expect((await meteredRead({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('unknown');
-      expect(readBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
-    }
-    expect(readBytes).toBeLessThanOrEqual(96 * 1024);
+    const sample = await createMeteredReader();
+    expect((await sample()).lifecycle.state).toBe('running');
+    const steady = await sample();
+    expect(steady.lifecycle.state).toBe('running');
+    expect(steady.readBytes).toBeLessThanOrEqual(96 * 1024);
+    // 单次仍不越过搜索跨度；下一次沿已存游标继续，不永久放弃尾窗之外的明确开始。
+    await writeRecoveryFixture(start);
+    expect((await sample()).lifecycle.state).toBe('unknown');
+    expect((await sample()).lifecycle).toEqual({ v: 1, state: 'running', eventAtMs: at, checkedAtMs });
+    expect((await sample()).readBytes).toBeLessThanOrEqual(96 * 1024);
     await fs.appendFile(filePath, complete);
-    expect((await meteredRead({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('completed');
+    expect((await sample()).lifecycle.state).toBe('completed');
+  });
+
+  describe('progressive cold recovery', () => {
+    it('preserves a normal start line cut by the per-call reverse window floor', async () => {
+      const meta = row('session_meta', { id: 'root' });
+      const empty = filler(0);
+      const exact = (bytes: number) => filler(bytes - Buffer.byteLength(empty));
+      const block = exact(1024).repeat(1024);
+      const appendBytes = async (bytes: number) => {
+        while (bytes > block.length + 1024) {
+          await fs.appendFile(filePath, block);
+          bytes -= block.length;
+        }
+        while (bytes > 2048) {
+          await fs.appendFile(filePath, exact(1024));
+          bytes -= 1024;
+        }
+        if (bytes > 0) await fs.appendFile(filePath, exact(bytes));
+      };
+      // Cold tail begins at searchEnd; its reverse floor bisects this ordinary start.
+      const searchEnd = Buffer.byteLength(meta) + 50 + 32 * 1024 * 1024;
+      await fs.writeFile(filePath, meta + start);
+      await appendBytes(searchEnd - Buffer.byteLength(meta + start));
+      await appendBytes(64 * 1024 - 100);
+      const sample = await createMeteredReader();
+      expect((await sample()).lifecycle.state).toBe('unknown');
+      expect((await sample()).lifecycle).toEqual({ v: 1, state: 'running', eventAtMs: at, checkedAtMs });
+    });
+
+    it('retains reverse and replay progress across appends without publishing an incomplete tail', async () => {
+      // 唯一跨两次逆查及一次前向预算的长样例；其余只越过原 32 MiB 边界。
+      await writeRecoveryFixture(start, 65);
+      const sample = await createMeteredReader();
+      for (let call = 0; call < 3; call++) {
+        expect((await sample()).lifecycle.state).toBe('unknown');
+        await fs.appendFile(filePath, filler());
+      }
+      expect((await sample()).lifecycle).toEqual({ v: 1, state: 'running', eventAtMs: at, checkedAtMs });
+      // 同一长样例模拟冷缓存重建，再在未完成的 replay 中替换来源；不得发布旧运行。
+      const restarted = await createMeteredReader();
+      for (let call = 0; call < 3; call++) expect((await restarted()).lifecycle.state).toBe('unknown');
+      await fs.rename(filePath, filePath + '.old');
+      await fs.writeFile(filePath, row('session_meta', { id: 'root' }));
+      expect((await restarted()).lifecycle.state).toBe('unknown');
+    });
+
+    it('keeps a no-start search exhausted across ordinary appends and accepts a later explicit start', async () => {
+      await writeRecoveryFixture('');
+      const sample = await createMeteredReader();
+      expect((await sample()).lifecycle.state).toBe('unknown');
+      expect((await sample()).lifecycle.state).toBe('unknown');
+      expect((await sample()).readBytes).toBeLessThanOrEqual(96 * 1024);
+      await fs.appendFile(filePath, filler());
+      const appended = await sample();
+      expect(appended.lifecycle.state).toBe('unknown');
+      expect(appended.readBytes).toBeLessThanOrEqual(96 * 1024);
+      await fs.appendFile(filePath, start);
+      expect((await sample()).lifecycle).toEqual({ v: 1, state: 'running', eventAtMs: at, checkedAtMs });
+    });
+
+    it('replays a new start appended while the older search was still in progress', async () => {
+      await writeRecoveryFixture('');
+      const sample = await createMeteredReader();
+      expect((await sample()).lifecycle.state).toBe('unknown');
+      await fs.appendFile(filePath, start);
+      expect((await sample()).lifecycle).toEqual({ v: 1, state: 'running', eventAtMs: at, checkedAtMs });
+    });
+
+    it.each(['replace', 'rewrite', 'truncate'] as const)('discards partial search after source %s', async (change) => {
+      await writeRecoveryFixture(start);
+      const sample = await createMeteredReader();
+      expect((await sample()).lifecycle.state).toBe('unknown');
+      if (change === 'replace') {
+        await fs.rename(filePath, filePath + '.old');
+        await fs.writeFile(filePath, row('session_meta', { id: 'root' }));
+      } else if (change === 'truncate') {
+        await fs.truncate(filePath, Buffer.byteLength(row('session_meta', { id: 'root' })));
+      } else {
+        const handle = await fs.open(filePath, 'r+');
+        try { await handle.write(event('task_started', { turn_id: 'turn' }, '2027-09-24T08:00:00.000Z'),
+          Buffer.byteLength(row('session_meta', { id: 'root' })), 'utf8'); }
+        finally { await handle.close(); }
+      }
+      expect((await sample()).lifecycle.state).toBe('unknown');
+      expect((await sample()).lifecycle.state).toBe('unknown');
+    });
+
+    it('does not skip the nearest start with an invalid time to borrow an older valid start', async () => {
+      await writeRecoveryFixture(start + event('task_started', { turn_id: 'new' }, 'bad-time'));
+      const sample = await createMeteredReader();
+      for (let call = 0; call < 4; call++) expect((await sample()).lifecycle.state).toBe('unknown');
+    });
   });
 
   /** 缓存达到上限时淘汰最久未用来源；被淘汰的大历史再次读取必须重新证明运行。 */

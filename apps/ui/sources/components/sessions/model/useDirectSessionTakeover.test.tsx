@@ -73,6 +73,19 @@ async function renderHarness(
 }
 
 describe('useDirectSessionTakeover', () => {
+  it.each([false, true])('preserves readiness checks and only suppresses failure UI when requested: %s', async (suppressFailureAlert) => {
+    const refreshNow = vi.fn(async () => null);
+    const harness = await renderHarness({ directSessionLink, status, refreshNow });
+    await act(async () => {
+      expect(await harness.getCurrent().ensureReadyForSend({ intent: 'text',
+        ...(suppressFailureAlert ? { suppressFailureAlert: true } : {}),
+      })).toBe(false);
+    });
+    expect(refreshNow).toHaveBeenCalledTimes(1);
+    expect(modalAlertSpy).toHaveBeenCalledTimes(suppressFailureAlert ? 0 : 1);
+    expect(machineDirectSessionTakeoverSpy).not.toHaveBeenCalled();
+    await harness.unmount();
+  });
   const directSessionLink: NonNullable<UseDirectSessionRuntimeResult['directSessionLink']> = {
     v: 1,
     providerId: 'codex',

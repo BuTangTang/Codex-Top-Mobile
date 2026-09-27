@@ -21,7 +21,7 @@ type UseDirectSessionTakeoverParams = Readonly<{
 type UseDirectSessionTakeoverResult = Readonly<{
     takeoverInFlight: DirectTakeoverMode | null;
     requestTakeover: (mode: DirectTakeoverMode, options?: Readonly<{ forceStop?: boolean; promptForForceStop?: boolean }>) => Promise<boolean>;
-    ensureReadyForSend: (options?: Readonly<{ intent: 'text' }>) => Promise<boolean | 'external'>;
+    ensureReadyForSend: (options?: Readonly<{ intent: 'text'; suppressFailureAlert?: boolean }>) => Promise<boolean | 'external'>;
 }>;
 
 function resolveServerId(sessionId: string): string | undefined {
@@ -117,7 +117,7 @@ export function useDirectSessionTakeover(params: UseDirectSessionTakeoverParams)
 
     // 返回本次探测选择的路径，调用者无需再读取可能陈旧的 React 状态决定发送方式。
     const ensureReadyForSend = React.useCallback(async (
-        options?: Readonly<{ intent: 'text' }>,
+        options?: Readonly<{ intent: 'text'; suppressFailureAlert?: boolean }>,
     ): Promise<boolean | 'external'> => {
         const directSessionLink = params.directSessionRuntime.directSessionLink;
         if (!directSessionLink) {
@@ -126,14 +126,14 @@ export function useDirectSessionTakeover(params: UseDirectSessionTakeoverParams)
 
         const isTextIntent = options?.intent === 'text';
         if (isTextIntent && !params.hasWriteAccess) {
-            Modal.alert(t('common.error'), t('session.sharing.noEditPermission'));
+            if (!options?.suppressFailureAlert) Modal.alert(t('common.error'), t('session.sharing.noEditPermission'));
             return false;
         }
 
         const latestStatus = await readLatestStatus();
         if (!latestStatus) {
             // 探测未成功时说明本次没有发送，保留原草稿，不用缓存解释拒绝原因。
-            if (isTextIntent) {
+            if (isTextIntent && !options?.suppressFailureAlert) {
                 Modal.alert(t('errors.failedToSendMessage'), `${resolveDirectSessionControlNotice(null, params.inheritsDesktopSettings === true)}\n\n${t('chatFooter.directSessionDraftKept')}`);
             }
             return !isTextIntent;
@@ -142,14 +142,14 @@ export function useDirectSessionTakeover(params: UseDirectSessionTakeoverParams)
             return true;
         }
         if (!latestStatus.machineOnline) {
-            Modal.alert(t('common.error'), t('chatFooter.directSessionMachineOffline'));
+            if (!options?.suppressFailureAlert) Modal.alert(t('common.error'), t('chatFooter.directSessionMachineOffline'));
             return false;
         }
 
         if (isTextIntent) {
             if (latestStatus.externalControl?.canSend === true) return 'external';
             // 能力撤回或缺失必须可见，且不能通过接管改变用户原本的发送意图。
-            Modal.alert(t('errors.failedToSendMessage'), `${resolveDirectSessionControlNotice(latestStatus, params.inheritsDesktopSettings === true)}\n\n${t('chatFooter.directSessionDraftKept')}`);
+            if (!options?.suppressFailureAlert) Modal.alert(t('errors.failedToSendMessage'), `${resolveDirectSessionControlNotice(latestStatus, params.inheritsDesktopSettings === true)}\n\n${t('chatFooter.directSessionDraftKept')}`);
             return false;
         }
 

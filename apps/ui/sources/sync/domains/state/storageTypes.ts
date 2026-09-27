@@ -527,6 +527,8 @@ export interface PendingMessage {
     createdAt: number;
     updatedAt: number;
     source?: 'local_outbound' | 'server_pending';
+    /** 本机桌面发送投影；由原 Direct 控制操作结算，不进入服务器 Pending 重试。 */
+    directSessionExternalControl?: true;
     deliveryStatus?: 'queued' | 'accepted';
     /** Exact durable-outbox authority for local outbound rows; never inferred from the active server. */
     pendingOutboxScope?: import('@/sync/domains/scope/serverAccountScope').ServerAccountScope;

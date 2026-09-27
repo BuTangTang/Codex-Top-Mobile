@@ -1,4 +1,7 @@
 import * as React from 'react';
+import Color from 'color';
+import { useDeviceType } from '@/utils/platform/responsive';
+import { isDirectSessionPendingBlock } from './pendingMessageVisualState';
 import { Platform, Pressable, ScrollView, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { Typography } from '@/constants/Typography';
@@ -205,6 +208,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
     onPaintedUtteranceBubbleMeasured?: (measurement: Readonly<{ localId: string; bubbleHeightPx: number }>) => void;
 }>) {
     const { theme } = useUnistyles();
+    const isPhone = useDeviceType() === 'phone' && Platform.OS !== 'web';
     const contentMaxWidth = useLayoutMaxWidth();
     const session = useSession(props.sessionId);
     const pendingInputServerId = session?.serverId ?? resolvePreferredServerIdForSessionId(props.sessionId);
@@ -729,7 +733,8 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
             sessionRuntime: sessionRuntimeInput,
         });
         const deliveryActionBusy = materializingLocalIds.has(getPendingMaterializingKey(message));
-        const usesDeliveryResolutionActions = hasPendingDeliveryResolutionState(deliveryVisualState);
+        const isDesktopSubmission = message.directSessionExternalControl === true;
+        const usesDeliveryResolutionActions = !isDesktopSubmission && hasPendingDeliveryResolutionState(deliveryVisualState);
         const providerEffectPossible = isPendingMessageProviderEffectPossible(message);
         const isUncertainDelivery = deliveryVisualState.kind === 'delivery_uncertain';
         const isServerDeliveryInProgress = message.pendingDeliveryStatus === 'server_delivering'
@@ -749,7 +754,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
             && typeof deliveryVisualState.queuedBehindTurn?.turnStartedAtMs === 'number'
                 ? Math.max(0, Math.floor((Date.now() - deliveryVisualState.queuedBehindTurn.turnStartedAtMs) / 60_000))
                 : 0;
-        const canUsePendingQueueActions = !hasDurableOutboxOperation && !isAcceptedLocalPendingProjection(message);
+        const canUsePendingQueueActions = !isDesktopSubmission && !hasDurableOutboxOperation && !isAcceptedLocalPendingProjection(message);
         const deliveryBlockedPresentation = deliveryVisualState.deliveryBlockedPresentation ?? null;
         const providerDeliveryLabelKey = session && deliveryVisualState.kind === 'delivering'
             ? resolvePendingDeliveryLabelKeyForSession({
@@ -758,7 +763,8 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                 detail: message.pendingDeliveryDetail,
             })
             : null;
-        const deliveryStateLabel = getPendingDeliveryStateLabel(
+        const deliveryStateLabel = isDesktopSubmission && deliveryVisualState.kind === 'saving'
+            ? t('session.pendingMessages.deliveryStatus.sending') : getPendingDeliveryStateLabel(
             deliveryVisualState,
             providerDeliveryLabelKey ? t(providerDeliveryLabelKey) : null,
         );
@@ -787,7 +793,9 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                     icon: <Icon name="copy" size={16} color={theme.colors.text.secondary} />,
                 });
             }
-            if (isCancellationState) {
+            if (isDesktopSubmission) {
+                if (isSendFailed) items.push({ id: 'edit', title: t('session.pendingMessages.actions.edit'), icon: <Icon name="pencil" size={16} color={theme.colors.text.secondary} /> });
+            } else if (isCancellationState) {
                 items.push({ id: 'remove', title: t('common.remove'), icon: <Icon name="trash" size={16} color={theme.colors.text.secondary} />, disabled: deliveryActionBusy });
             } else if (isSendFailed) {
                 items.push({ id: 'retrySend', title: t('session.pendingMessages.actions.retrySend'), icon: <Icon name="arrow-clockwise" size={16} color={theme.colors.text.secondary} />, disabled: deliveryActionBusy });
@@ -894,6 +902,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                         testID={`pendingMessages.row:${message.id}`}
                         style={[
                             styles.userMessageWrapper,
+                            isPhone && isDesktopSubmission ? { maxWidth: '88%' } : null,
                             { paddingBottom: messageGapPx },
                             isWeb && (hoveredMessageId === message.id || menuOpen) ? styles.userMessageWrapperHovered : null,
                         ]}
@@ -936,6 +945,10 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                                 // which reads as the message popping rather than settling. The
                                 // delivery state is carried by the status chip, not by the ink.
                                 { backgroundColor: theme.colors.message.user.background, opacity: pressed ? 0.82 : 1 },
+                                isPhone && isDesktopSubmission ? {
+                                    backgroundColor: Color(theme.colors.accent.blue).alpha(theme.dark ? 0.24 : 0.14).rgb().string(),
+                                    borderRadius: 8, paddingHorizontal: 10,
+                                } : null,
                             ])}
                         >
                             {isExpanded ? (
@@ -969,7 +982,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                             ) : null}
                         </Pressable>
 
-                        <View
+                        {!(isDesktopSubmission && message.deliveryStatus === 'accepted') ? <View
                             testID={`pendingMessages.pendingAffordance:${message.id}`}
                             pointerEvents="none"
                             style={[
@@ -992,7 +1005,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                             >
                                 {deliveryStateLabel}
                             </Text>
-                        </View>
+                        </View> : null}
 
                         {heightBearingChrome === 'blocked-notice' && blockedDeliveryLabel ? (
                             <View
@@ -1028,15 +1041,15 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                             >
                                 <Icon name="warning-circle" size={14} color={theme.colors.state.danger.foreground} />
                                 <Text style={[styles.blockedDeliveryNoticeText, { color: theme.colors.text.secondary }]}>
-                                    {t('session.pendingMessages.sendFailedNotice')}
+                                    {t(isDesktopSubmission ? 'session.pendingMessages.deliveryStatus.sendFailed' : 'session.pendingMessages.sendFailedNotice')}
                                 </Text>
                                 <Pressable
-                                    testID={`pendingMessages.sendFailedRetry:${message.id}`}
+                                    testID={`pendingMessages.${isDesktopSubmission ? 'restoreEdit' : 'sendFailedRetry'}:${message.id}`}
                                     accessibilityRole="button"
-                                    accessibilityLabel={t('session.pendingMessages.actions.retrySend')}
+                                    accessibilityLabel={t(isDesktopSubmission ? 'session.pendingMessages.actions.edit' : 'session.pendingMessages.actions.retrySend')}
                                     accessibilityState={{ disabled: deliveryActionBusy, busy: deliveryActionBusy }}
                                     disabled={deliveryActionBusy}
-                                    onPress={() => { void handleRetrySend(message); }}
+                                    onPress={() => { if (isDesktopSubmission) void handleEdit(message); else void handleRetrySend(message); }}
                                     style={({ pressed }) => ([
                                         styles.nonSteerableNoticeAction,
                                         {
@@ -1046,9 +1059,9 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                                         },
                                     ])}
                                 >
-                                    <Icon name="arrow-clockwise" size={14} color={theme.colors.text.secondary} />
+                                    <Icon name={isDesktopSubmission ? 'pencil' : 'arrow-clockwise'} size={14} color={theme.colors.text.secondary} />
                                     <Text style={[styles.nonSteerableNoticeActionText, { color: theme.colors.text.secondary }]}>
-                                        {t('session.pendingMessages.actions.retrySend')}
+                                        {t(isDesktopSubmission ? 'session.pendingMessages.actions.edit' : 'session.pendingMessages.actions.retrySend')}
                                     </Text>
                                 </Pressable>
                             </View>
@@ -1089,7 +1102,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                                         accessibilityLabel: t('common.reorder'),
                                     })
                                 ) : null}
-                                {isSendFailed ? (
+                                {isSendFailed && !isDesktopSubmission ? (
                                     <IconAction
                                         testID={`pendingMessages.retrySend:${message.id}`}
                                         accessibilityLabel={t('session.pendingMessages.actions.retrySend')}
@@ -1190,6 +1203,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
     }, [
         canSteerNow,
         canReorderPendingMessages,
+        isPhone,
         paintsMessageActionRow,
         discardedCount,
         pendingCount,
@@ -1434,7 +1448,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
             <View style={[styles.messageContent, { maxWidth: contentMaxWidth }]}>
                 <View style={styles.userMessageContainer}>
                     <View style={{ width: '100%', maxWidth: contentMaxWidth }}>
-                        <View style={styles.sectionHeader}>
+                        {!isDirectSessionPendingBlock(props.pendingMessages, discardedCount) ? <View style={styles.sectionHeader}>
                             <TranscriptSeparatorRow
                                 iconName="clock"
                                 title={headerLabel}
@@ -1453,7 +1467,7 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                                 padding="none"
                                 chipChrome="minimal"
                             />
-                        </View>
+                        </View> : null}
 
                         {showNonSteerableNotice ? (
                             <View

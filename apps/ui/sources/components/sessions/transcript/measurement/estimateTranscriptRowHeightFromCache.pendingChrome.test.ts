@@ -84,6 +84,13 @@ function estimatePendingQueue(
  * so it undershot the one shape that was measured live and overshot everything else without bound.
  */
 describe('pending-queue estimate is chrome-aware', () => {
+    it('omits queue header space for direct conversation messages before and after acknowledgement', () => {
+        for (const deliveryStatus of ['queued', 'accepted'] as const) {
+            expect(estimatePendingQueue([pendingMessage({ directSessionExternalControl: true, deliveryStatus })]))
+                .toBeCloseTo(ONE_SHORT_PENDING_MESSAGE_NATIVE_PX - PENDING_QUEUE_HEADER_PX, 1);
+        }
+    });
+
     it('matches the measured painted height of a single short queued message on native', () => {
         expect(estimatePendingQueue([pendingMessage({ text: 'ok' })]))
             .toBeCloseTo(ONE_SHORT_PENDING_MESSAGE_NATIVE_PX, 1);

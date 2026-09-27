@@ -47,7 +47,6 @@ type LifecycleCache = {
   mode: 'tracking' | 'search' | 'replay' | 'unavailable';
   cursor: number;
   searchEnd: number;
-  searchFloor: number;
   skippingReverseLine: boolean;
 };
 const lifecycleCache = new Map<string, LifecycleCache>();
@@ -268,11 +267,12 @@ function isMainStart(value: unknown, remoteSessionId: string): boolean {
     && !id(payload.sidechainId) && !id(payload.sidechain_id);
 }
 
-/** 逆向只定位最近 32 MiB 内的开始；跨块长行不存正文，随后前向重放严格验证整条记录。 */
+/** 每次沿已存游标逆查最多 32 MiB 范围；跨块长行不存正文，找到开始后仍须前向重放。 */
 async function recoverAnchor(file: FileHandle, entry: LifecycleCache, remoteSessionId: string, budget: { remaining: number }): Promise<void> {
+  const searchFloor = Math.max(0, entry.searchEnd - RECOVERY_SPAN_BYTES);
   // 保留最终来源边界校验的预算；搜索进度可在后续请求继续。
-  while (entry.searchEnd > entry.searchFloor && budget.remaining >= READ_BYTES + 3 * FINGERPRINT_BYTES) {
-    const length = Math.min(READ_BYTES, entry.searchEnd - entry.searchFloor);
+  while (entry.searchEnd > searchFloor && budget.remaining >= READ_BYTES + 3 * FINGERPRINT_BYTES) {
+    const length = Math.min(READ_BYTES, entry.searchEnd - searchFloor);
     const base = entry.searchEnd - length;
     const bytes = await readRange(file, base, length, budget);
     let end = bytes.length;
@@ -294,12 +294,14 @@ async function recoverAnchor(file: FileHandle, entry: LifecycleCache, remoteSess
       end = start;
     }
     if (end === bytes.length) {
+      // 搜索跨度只剩短片段时，保留完整行末尾供下次回读；不是跨块长行。
+      if (length < READ_BYTES && base > 0) break;
       // 整块属于一条长记录；只继续找其前方的边界，不从片段猜 JSON 字段。
       entry.searchEnd = base; entry.skippingReverseLine = true;
     } else entry.searchEnd = base + end;
     if (base === 0 && end === 0) break;
   }
-  if (entry.searchEnd <= entry.searchFloor) entry.mode = 'unavailable';
+  if (entry.searchEnd === 0) entry.mode = 'unavailable';
 }
 
 /** 从完整行游标增量重放；读到预算边界的半行留到下次，未追到 EOF 绝不发布旧完成。 */
@@ -345,7 +347,6 @@ async function readLifecycle(params: Readonly<{ filePath: string; remoteSessionI
       const cached = lifecycleCache.get(key);
       let validCache = cached && before.dev === cached.source.dev && before.ino === cached.source.ino && before.size >= cached.source.size
         && (before.size > cached.source.size || (before.mtimeMs === cached.source.mtimeMs && before.ctimeMs === cached.source.ctimeMs));
-      if (cached?.mode === 'unavailable' && before.size > cached.source.size) validCache = false;
       if (validCache && cached) {
         const boundary = await readRange(file, Math.max(0, cached.source.size - FINGERPRINT_BYTES), Math.min(FINGERPRINT_BYTES, cached.source.size), budget);
         validCache = fingerprint(head.subarray(0, Math.min(FINGERPRINT_BYTES, cached.source.size))) === cached.headHash
@@ -373,10 +374,12 @@ async function readLifecycle(params: Readonly<{ filePath: string; remoteSessionI
         if (projection.invalid) break;
         entry = { source: before, headHash: '', tailHash: '', anchorHash: '', terminalHash: '', projection, mode: projection.turnId ? 'tracking' : 'search',
           cursor: before.size, searchEnd: parsed.lines[0]?.startOffsetBytes ?? offset,
-          searchFloor: Math.max(0, before.size - RECOVERY_SPAN_BYTES), skippingReverseLine: false };
+          skippingReverseLine: false };
         if (entry.searchEnd === 0 && entry.mode === 'search') entry.mode = 'unavailable';
       }
       if (entry.mode === 'search') await recoverAnchor(file, entry, params.remoteSessionId, budget);
+      // 旧范围无开始也保留完整行游标；搜索期间或之后的新追加仍可建立明确轮锚。
+      if (entry.mode === 'unavailable' && entry.cursor < before.size) entry.mode = 'replay';
       // 正常含截图的长轮在同次调用内追平；不把每块读取量变成额外的手机刷新轮次。
       while ((entry.mode === 'replay' || entry.mode === 'tracking') && entry.cursor < before.size && budget.remaining > 3 * FINGERPRINT_BYTES) {
         const previousCursor = entry.cursor;

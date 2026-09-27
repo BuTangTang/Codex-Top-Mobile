@@ -18,6 +18,7 @@ export type PendingMessageComposerSemanticDraftSnapshot = Readonly<{
 
 export type PendingMessageComposerEditState = Readonly<{
     pendingId: string;
+    directSessionExternalControl?: true;
     previousDraftText: string;
     previousAttachmentDrafts: readonly AttachmentDraft[];
     previousSemanticDraftSnapshot: PendingMessageComposerSemanticDraftSnapshot;

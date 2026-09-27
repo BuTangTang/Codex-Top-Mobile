@@ -164,6 +164,7 @@ export function useDirectSessionControl(params: Readonly<{
         text: string,
         start: StartTextSend,
         requiredMode?: 'steer',
+        localId?: string,
     ): Promise<TextSendResult> => {
         if (!isCurrent()) return { outcome: 'unknown' };
         if (!params.machineId || !text.trim()) return { outcome: 'rejected' };
@@ -193,7 +194,7 @@ export function useDirectSessionControl(params: Readonly<{
             let result: ControlOutcome;
             try {
                 result = mode === 'steer'
-                    ? await dispatch({ machineId: params.machineId, sessionId: params.sessionId, kind: 'steer', operationId: randomUUID(), expectedTurnId: fresh.turnId, text }, isFlightCurrent)
+                    ? await dispatch({ machineId: params.machineId, sessionId: params.sessionId, kind: 'steer', operationId: localId ?? randomUUID(), expectedTurnId: fresh.turnId, text }, isFlightCurrent)
                     : await start(isFlightCurrent);
             } catch {
                 // start 的既有发送 owner 未给明确拒绝时，不假定消息没有发出。
@@ -212,7 +213,7 @@ export function useDirectSessionControl(params: Readonly<{
     }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.sessionId, refresh, releaseFlight, updateView]);
 
     /** 普通文本允许明确的 start 或 steer，实际开始仍交给既有 SEND owner。 */
-    const sendText = React.useCallback((text: string, start: StartTextSend) => sendTextWithMode(text, start), [sendTextWithMode]);
+    const sendText = React.useCallback((text: string, start: StartTextSend, localId?: string) => sendTextWithMode(text, start, undefined, localId), [sendTextWithMode]);
     /** 兼容原追加入口但不扩大意图：最新快照只允许 start 时仍拒绝追加调用。 */
     const steer = React.useCallback(async (text: string): Promise<boolean> => {
         const result = await sendTextWithMode(text, async () => 'rejected', 'steer');
@@ -222,6 +223,7 @@ export function useDirectSessionControl(params: Readonly<{
     const isRequestLocked = React.useCallback((request: DesktopApprovalV1) =>
         lifetime.issued.has(JSON.stringify([snapshot?.turnId, request.requestId, request.revision])), [lifetime, snapshot?.turnId]);
     const outcomeKind = view.outcomeContext?.kind ?? null;
-    return React.useMemo(() => ({ snapshot: enabled ? snapshot : null, error, busy, loading, outcome, outcomeKind, refresh, decide, sendText, steer, isRequestLocked }),
-        [enabled, snapshot, error, busy, loading, outcome, outcomeKind, refresh, decide, sendText, steer, isRequestLocked]);
+    // 本地消息创建早于 React 提交；busy 读取同一把控制锁，状态更新仍负责触发重渲染。
+    return React.useMemo(() => ({ snapshot: enabled ? snapshot : null, error, get busy() { return lifetime.flight !== null; }, loading, outcome, outcomeKind, refresh, decide, sendText, steer, isRequestLocked }),
+        [enabled, snapshot, error, busy, lifetime, loading, outcome, outcomeKind, refresh, decide, sendText, steer, isRequestLocked]);
 }

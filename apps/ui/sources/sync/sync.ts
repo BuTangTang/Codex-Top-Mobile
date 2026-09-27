@@ -102,7 +102,7 @@ import { ActivityUpdateAccumulator, type ActivityUpdateAccumulatorFlushOptions }
 import { MachineActivityAccumulator, type MachineActivityUpdate } from './reducer/machineActivityAccumulator';
 import { randomUUID } from '@/platform/randomUUID';
 import { Platform, AppState } from 'react-native';
-import { buildOutgoingUserTextRecord } from './domains/messages/outgoingUserMessage';
+import { buildLocalOutboundPendingUserMessage, buildOutgoingUserTextRecord } from './domains/messages/outgoingUserMessage';
 import { resolveSentFrom } from './domains/messages/sentFrom';
 import { NormalizedMessage, normalizeRawMessage, RawRecord, RawRecordSchema } from './typesRaw';
 import { applySettings, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './domains/settings/settings';
@@ -2551,7 +2551,49 @@ class Sync {
         }
     }
 
-    // 外部桌面发送复用现有投影；一旦发出，结果不明也不能进入普通消息的回退重投。
+    /** 先交接到既有本地消息投影，再等待原 Desktop 控制操作；不排队或重发。 */
+    async sendDirectSessionTextMessage(
+        sessionId: string,
+        text: string,
+        displayText: string | undefined,
+        metaOverrides: Record<string, unknown> | undefined,
+        options: Readonly<{
+            submit: (localId: string) => Promise<'accepted' | 'rejected' | 'unknown'>;
+            onLocalPendingProjectionCreated?: (event: Readonly<{ localId: string }>) => void;
+        }>,
+    ): Promise<Readonly<{ localId: string; outcome: 'accepted' | 'rejected' | 'unknown' }>> {
+        const session = storage.getState().sessions[sessionId];
+        if (!session || !readDirectSessionLink(session.metadata) || !this.getDirectSessionServerScope(sessionId)) {
+            throw new Error('Direct session target is unavailable');
+        }
+        const localId = randomUUID();
+        const rawRecord = buildOutgoingUserTextRecord({
+            text, displayText, metaOverrides, sentFrom: resolveSentFrom(), agentId: null,
+            permissionMode: session.permissionMode || 'default', settings: storage.getState().settings, session,
+        });
+        storage.getState().upsertPendingMessage(sessionId, {
+            ...buildLocalOutboundPendingUserMessage({ localId, text, displayText, rawRecord }),
+            directSessionExternalControl: true,
+        });
+        options.onLocalPendingProjectionCreated?.({ localId });
+        let outcome: 'accepted' | 'rejected' | 'unknown';
+        try {
+            outcome = await options.submit(localId);
+        } catch {
+            outcome = 'unknown';
+        }
+        // echo 可以先于 ACK 退休本地行；迟到结果不能重新创建已经交接的正文。
+        const current = storage.getState().sessionPending[sessionId]?.messages.find((message) => message.id === localId);
+        if (current?.directSessionExternalControl) {
+            storage.getState().upsertPendingMessage(sessionId, {
+                ...current, updatedAt: nowServerMs(),
+                deliveryStatus: outcome === 'accepted' ? 'accepted' : 'queued',
+                sendState: outcome === 'accepted' ? undefined : outcome === 'rejected' ? 'failed' : 'unconfirmed',
+            });
+        }
+        return { localId, outcome };
+    }
+
     async sendMessage(
         sessionId: string,
         text: string,
@@ -2694,13 +2736,15 @@ class Sync {
             // Track this outbound user message in the local pending queue until it is committed.
             // This prevents “ghost” optimistic transcript items when the send fails, and it lets the UI
             // show a pending bubble while we await ACK / catch-up.
-            const createdAt = nowServerMs();
+            const createdAt = externalTarget && pendingMessageBeforeSend?.directSessionExternalControl
+                ? pendingMessageBeforeSend.createdAt : nowServerMs();
             storage.getState().upsertPendingMessage(sessionId, {
                 id: localId,
                 localId,
                 createdAt,
                 updatedAt: createdAt,
                 source: 'local_outbound',
+                ...(externalTarget ? { directSessionExternalControl: true as const } : {}),
                 text,
                 displayText,
                 rawRecord: content,
@@ -2709,15 +2753,16 @@ class Sync {
 
             if (externalTarget) {
                 // 未确认沿用同一 localId 和既有 pending 展示，不创建自动重试或新的投递记录。
-                const retainUnconfirmedExternalMessage = () => {
+                const retainExternalMessage = (sendState: 'unconfirmed' | 'failed') => {
                     storage.getState().upsertPendingMessage(sessionId, {
                         id: localId,
                         localId,
                         createdAt,
                         updatedAt: nowServerMs(),
                         source: 'local_outbound',
+                        directSessionExternalControl: true,
                         deliveryStatus: 'queued',
-                        sendState: 'unconfirmed',
+                        sendState,
                         text,
                         displayText,
                         rawRecord: content,
@@ -2739,14 +2784,14 @@ class Sync {
                         onIssued: () => { issued = true; },
                     });
                 } catch (error) {
-                    if (issued) return retainUnconfirmedExternalMessage();
-                    removePendingMessageCreatedForSend();
+                    if (issued) return retainExternalMessage('unconfirmed');
+                    retainExternalMessage('failed');
                     throw error;
                 }
 
                 if (!ack.ok) {
-                    if (ack.errorCode === 'delivery_outcome_unknown') return retainUnconfirmedExternalMessage();
-                    removePendingMessageCreatedForSend();
+                    if (ack.errorCode === 'delivery_outcome_unknown') return retainExternalMessage('unconfirmed');
+                    retainExternalMessage('failed');
                     throw new Error(ack.error);
                 }
 
@@ -2756,7 +2801,9 @@ class Sync {
                     createdAt,
                     updatedAt: nowServerMs(),
                     source: 'local_outbound',
-                    deliveryStatus: 'accepted',
+                    directSessionExternalControl: true,
+                    deliveryStatus: ack.providerAcceptancePending === true ? 'queued' : 'accepted',
+                    sendState: ack.providerAcceptancePending === true ? 'unconfirmed' : undefined,
                     text,
                     displayText,
                     rawRecord: content,

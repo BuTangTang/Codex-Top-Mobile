@@ -1,5 +1,10 @@
 import type { PendingMessage } from '@/sync/domains/state/storageTypes';
 import type { TranslationKeyNoParams } from '@/text';
+
+/** Direct 文本沿普通对话呈现，不绘制服务器待发队列的分区标题。 */
+export function isDirectSessionPendingBlock(messages: readonly PendingMessage[], discardedCount: number): boolean {
+    return discardedCount === 0 && messages.length > 0 && messages.every(message => message.directSessionExternalControl === true);
+}
 import {
     isPendingDeliveryProviderEffectPossibleV1,
     parsePendingDeliveryStatusV1,
@@ -146,6 +151,8 @@ export function isPendingMessageProviderDeliveryInFlight(message: PendingMessage
  * handle is one of the two branches of {@link paintsPendingMessageActionRow}, which is height-bearing.
  */
 export function isPendingMessageProviderEffectPossible(message: PendingMessage): boolean {
+    // 桌面投影属于已经点击提交的独立操作，没有可重排的服务器队列顺序。
+    if (message.directSessionExternalControl) return true;
     const status = parsePendingDeliveryStatusV1({
         status: message.pendingDeliveryStatus === 'server_delivering'
             ? 'delivering'
@@ -180,6 +187,18 @@ export function getPendingMessageVisualState(
         sessionRuntime?: PendingMessageSessionRuntimeInput;
     }>,
 ): PendingMessageVisualState {
+    if (message.directSessionExternalControl) {
+        if (message.deliveryStatus === 'accepted') {
+            return { kind: 'materializing', showSpinner: false, iconName: 'navigation-arrow' };
+        }
+        if (message.sendState === 'failed') {
+            return { kind: 'send_failed', showSpinner: false, iconName: 'warning-circle' };
+        }
+        if (message.sendState === 'unconfirmed') {
+            return { kind: 'delivery_uncertain', showSpinner: false, iconName: 'warning-circle' };
+        }
+        return { kind: 'saving', showSpinner: true, iconName: 'cloud-arrow-up' };
+    }
     const localId = typeof message.localId === 'string' ? message.localId : message.id;
     if (options?.materializingLocalIds?.has(localId)) {
         return {

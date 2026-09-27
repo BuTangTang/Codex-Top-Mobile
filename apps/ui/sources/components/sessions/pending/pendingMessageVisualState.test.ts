@@ -23,6 +23,12 @@ function pendingMessage(overrides: Partial<PendingMessage> = {}): PendingMessage
 }
 
 describe('getPendingMessageVisualState', () => {
+    it('keeps an uncertain desktop submission truthful without an endless sending spinner', () => {
+        expect(getPendingMessageVisualState(pendingMessage({
+            source: 'local_outbound', directSessionExternalControl: true,
+            deliveryStatus: 'queued', sendState: 'unconfirmed',
+        }))).toMatchObject({ kind: 'delivery_uncertain', showSpinner: false });
+    });
     it('treats server accepted rows as queued, not actively processing', () => {
         expect(getPendingMessageVisualState(pendingMessage({
             source: 'server_pending',

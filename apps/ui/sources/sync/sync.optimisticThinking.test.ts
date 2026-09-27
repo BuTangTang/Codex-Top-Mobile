@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react-test-renderer';
-import { renderHook, resetBrowserSessionDraftPersistenceForTest, standardCleanup } from '@/dev/testkit';
+import { createDeferred, renderHook, resetBrowserSessionDraftPersistenceForTest, standardCleanup } from '@/dev/testkit';
 import { scopedSessionLocalStateKey } from '@/sync/domains/state/sessionLocalStateKeys';
 import type { ManagedEndpointSupervisor } from '@happier-dev/connection-supervisor';
 import { createSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
@@ -1304,6 +1304,54 @@ describe('sync.sendMessage optimistic thinking', () => {
         expect((await loadPendingOutboxForSession(sessionId, outboxScope))).toHaveLength(1);
     });
 
+    it.each(['accepted', 'rejected', 'unknown'] as const)('hands desktop text to the existing local projection before control resolves: %s', async (outcome) => {
+        const sessionId = `desktop-local-handoff-${outcome}`;
+        const { sync, machineRpc, sessionRpc, emitWithAck } = await prepareExternalDirectSend(sessionId);
+        let finish!: (value: typeof outcome) => void;
+        const control = new Promise<typeof outcome>((resolve) => { finish = resolve; });
+        const handedOff = vi.fn();
+        const submit = vi.fn(async (_localId: string) => control);
+        const pending = sync.sendDirectSessionTextMessage(sessionId, 'first draft', undefined, undefined, {
+            submit,
+            onLocalPendingProjectionCreated: handedOff,
+        });
+        const projected = storage.getState().sessionPending[sessionId]?.messages ?? [];
+        expect(projected).toEqual([expect.objectContaining({ text: 'first draft', source: 'local_outbound', directSessionExternalControl: true })]);
+        expect(handedOff).toHaveBeenCalledWith({ localId: projected[0]!.localId });
+        expect(submit).toHaveBeenCalledWith(projected[0]!.localId);
+        finish(outcome);
+        await expect(pending).resolves.toEqual({ localId: projected[0]!.localId, outcome });
+        expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([expect.objectContaining({
+            localId: projected[0]!.localId,
+            ...(outcome === 'accepted' ? { deliveryStatus: 'accepted' } : { sendState: outcome === 'rejected' ? 'failed' : 'unconfirmed' }),
+        })]);
+        expect(machineRpc).not.toHaveBeenCalled();
+        expect(sessionRpc).not.toHaveBeenCalled();
+        expect(emitWithAck).not.toHaveBeenCalled();
+    });
+
+    it.each(['accepted', 'unknown'] as const)('does not recreate a desktop projection after its echo retires it before %s receipt', async (outcome) => {
+        const sessionId = 'desktop-echo-before-receipt';
+        const { sync } = await prepareExternalDirectSend(sessionId);
+        const receipt = createDeferred<'accepted' | 'unknown'>();
+        let localId = '';
+        const submitted = sync.sendDirectSessionTextMessage(sessionId, 'synthetic desktop echo', undefined, undefined, {
+            onLocalPendingProjectionCreated: (event) => { localId = event.localId; },
+            submit: () => receipt.promise,
+        });
+        storage.getState().applyMessages(sessionId, [{
+            id: 'native-echo', seq: 1, localId, createdAt: Date.now(), isSidechain: false,
+            role: 'user', content: { type: 'text', text: 'synthetic desktop echo' },
+        }]);
+        expect(storage.getState().sessionPending[sessionId]?.messages).toHaveLength(0);
+        receipt.resolve(outcome);
+        await submitted;
+        expect(storage.getState().sessionPending[sessionId]?.messages).toHaveLength(0);
+        expect(Object.values(storage.getState().sessionMessages[sessionId]?.messagesById ?? {})).toEqual([
+            expect.objectContaining({ realID: 'native-echo', localId, text: 'synthetic desktop echo' }),
+        ]);
+    });
+
     // 外部文本发送只能使用关联机器，接受结果仍由现有 pending 投影显示。
     it('sends external desktop text through the linked machine and preserves provider acceptance', async () => {
         const sessionId = 'external-desktop-accepted';
@@ -1327,7 +1375,7 @@ describe('sync.sendMessage optimistic thinking', () => {
         }, expect.objectContaining({ authorization: { kind: 'session.write', sessionId }, onIssued: expect.any(Function) }));
         expect(projected).toHaveBeenCalledWith({ localId });
         expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([
-            expect.objectContaining({ localId, deliveryStatus: 'accepted', text: 'continue on desktop' }),
+            expect.objectContaining({ localId, deliveryStatus: 'queued', sendState: 'unconfirmed', text: 'continue on desktop' }),
         ]);
         expect(sessionRpc).not.toHaveBeenCalled();
         expect(emitWithAck).not.toHaveBeenCalled();
@@ -1378,7 +1426,7 @@ describe('sync.sendMessage optimistic thinking', () => {
                 options?.onIssued?.();
                 if (method === RPC_METHODS.DAEMON_DIRECT_SESSION_SEND) {
                     return (outcome === 'accepted'
-                        ? { ok: true, providerAcceptancePending: true }
+                        ? { ok: true }
                         : { ok: false, errorCode: 'delivery_outcome_unknown', error: 'owner receipt lost' }) as never;
                 }
                 if (method === RPC_METHODS.DAEMON_DIRECT_SESSION_TRANSCRIPT_PAGE) {
@@ -1410,7 +1458,7 @@ describe('sync.sendMessage optimistic thinking', () => {
             await expect(sync.sendMessage(sessionId, text, undefined, undefined, {
                 localId, directSessionExternalControl: true,
             })).resolves.toEqual(outcome === 'accepted'
-                ? { localId, persistence: 'provider_direct', providerAcceptancePending: true }
+                ? { localId, persistence: 'provider_direct' }
                 : { localId, persistence: 'pending' });
             const expectedPending = expect.objectContaining({
                 localId, source: 'local_outbound', text,
@@ -1498,7 +1546,9 @@ describe('sync.sendMessage optimistic thinking', () => {
             expect(machineRpc).not.toHaveBeenCalled();
             expect(sessionRpc).not.toHaveBeenCalled();
             expect(emitWithAck).not.toHaveBeenCalled();
-            expect(storage.getState().sessionPending[sessionId]?.messages ?? []).toHaveLength(0);
+            expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([
+                expect.objectContaining({ localId: 'server-bound-message', sendState: 'failed', directSessionExternalControl: true }),
+            ]);
         } finally {
             setActiveServerId(originalActiveServerId, { scope: 'device' });
         }
@@ -1561,7 +1611,7 @@ describe('sync.sendMessage optimistic thinking', () => {
     );
 
     // 发出前失败和明确拒绝可恢复草稿；显式元数据必须原样送达校验，不能静默丢弃。
-    it.each(['before_issue', 'rejected'] as const)('rejects external desktop sends on %s without retaining a new pending row', async (failure) => {
+    it.each(['before_issue', 'rejected'] as const)('retains external desktop text for explicit edit after %s', async (failure) => {
         const sessionId = `external-desktop-${failure}`;
         const localId = 'rejected-external-message';
         const { sync, sessionRpc, machineRpc, emitWithAck, send } = await prepareExternalDirectSend(sessionId);
@@ -1576,7 +1626,9 @@ describe('sync.sendMessage optimistic thinking', () => {
         })).rejects.toThrow(failure === 'before_issue' ? 'preflight unavailable' : 'unsupported_input');
 
         expect(machineRpc.mock.calls[0]?.[2]).toMatchObject({ meta: { appendSystemPrompt: 'explicit instruction' } });
-        expect(storage.getState().sessionPending[sessionId]?.messages ?? []).toHaveLength(0);
+        expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([
+            expect.objectContaining({ localId, text: 'keep draft', sendState: 'failed', directSessionExternalControl: true }),
+        ]);
         expect(storage.getState().sessions[sessionId].optimisticThinkingAt).toBeNull();
         expect(sessionRpc).not.toHaveBeenCalled();
         expect(emitWithAck).not.toHaveBeenCalled();

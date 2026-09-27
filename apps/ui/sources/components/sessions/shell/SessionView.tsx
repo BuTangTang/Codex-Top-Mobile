@@ -4847,6 +4847,7 @@ function SessionViewLoaded({
             ?? inputComposerCaptureTransientStateRef.current();
         setPendingMessageEdit({
             pendingId: request.id,
+            ...(request.message.directSessionExternalControl ? { directSessionExternalControl: true as const } : {}),
             previousDraftText,
             previousAttachmentDrafts,
             previousSemanticDraftSnapshot,
@@ -4870,6 +4871,8 @@ function SessionViewLoaded({
     React.useEffect(() => {
         const edit = pendingMessageEditRef.current;
         if (!edit) return;
+        // 本地失败正文由用户完成编辑或取消；迟到 echo 退休旧行不夺走编辑草稿。
+        if (edit.directSessionExternalControl) return;
         const stillQueued = pendingMessages.some((pending) =>
             pending.id === edit.pendingId || pending.localId === edit.pendingId
         );
@@ -5549,7 +5552,11 @@ function SessionViewLoaded({
 
         const composerMessage = sendOptions?.inputTextOverride ?? message;
         const activePendingEdit = pendingMessageEditRef.current;
-        if (activePendingEdit) {
+        if (activePendingEdit?.directSessionExternalControl && !inheritsDesktopSettings) {
+            Modal.alert(t('errors.failedToSendMessage'), t('chatFooter.directSessionDesktopUnknown'));
+            return;
+        }
+        if (activePendingEdit && !activePendingEdit.directSessionExternalControl) {
             const nextText = composerMessage;
             if (nextText.trim().length === 0) {
                 return;
@@ -6220,12 +6227,13 @@ function SessionViewLoaded({
 
             // 保留原普通 SEND 与草稿交接；桌面调用者另外提供本次控制操作的寿命校验。
             const submitTextToSession = async (isCurrent: () => boolean): Promise<'accepted' | 'rejected' | 'unknown'> => {
-                const readyForSend = await directSessionTakeover.ensureReadyForSend({ intent: 'text' });
+                const readyForSend = await directSessionTakeover.ensureReadyForSend({ intent: 'text',
+                    ...(inheritsDesktopSettings && outboundHandoffLocalId ? { suppressFailureAlert: true } : {}),
+                });
                 if (!isCurrent()) return 'unknown';
                 if (!readyForSend) return 'rejected';
                 // 控制快照之后若已换成 runner，本次桌面意图不得降级到另一个执行器。
                 if (inheritsDesktopSettings && readyForSend !== 'external') {
-                    Modal.alert(t('errors.failedToSendMessage'), t('chatFooter.directSessionDesktopUnknown'), [{ text: t('common.ok') }]);
                     return 'rejected';
                 }
 
@@ -6259,6 +6267,7 @@ function SessionViewLoaded({
                     sessionId,
                     session: sessionRuntimeStatusSource,
                     ...(readyForSend === 'external' ? { directSessionExternalControl: true as const } : {}),
+                    ...(inheritsDesktopSettings && outboundHandoffLocalId ? { localId: outboundHandoffLocalId } : {}),
                     text: outbound.text,
                     displayText: outbound.displayText,
                     metaOverrides: steerWithoutConfigMetaOverrides
@@ -6294,7 +6303,7 @@ function SessionViewLoaded({
                     onOutboundHandoff: (handoff) => {
                         if (!isCurrent()) return;
                         outboundHandoffLocalId = handoff.localId ?? outboundHandoffLocalId;
-                        // 桌面本地 pending 不是受理证明；等本次回执后再按当前草稿清理。
+                        // 桌面已在 CONTROL 前完成本地交接；回执不能再清理下一条草稿。
                         if (inheritsDesktopSettings) return;
                         clearAfterOutboundHandoff();
                         if (handoff.persistence === 'pending') {
@@ -6305,12 +6314,10 @@ function SessionViewLoaded({
 
                 if (!isCurrent()) return 'unknown';
                 if (result.type === 'send_failed' || result.type === 'rejected') {
-                    if (result.persistence === 'none') {
+                    if (result.persistence === 'none' && !inheritsDesktopSettings) {
                         restoreAfterFailedOutboundHandoff();
                     }
-                    if (inheritsDesktopSettings) {
-                        Modal.alert(t('common.error'), result.errorMessage ?? t('errors.failedToSendMessage'), [{ text: t('common.ok') }]);
-                    } else {
+                    if (!inheritsDesktopSettings) {
                         Modal.alert(t('common.error'), result.errorMessage ?? t('errors.failedToSendMessage'));
                     }
                     return 'rejected';
@@ -6318,9 +6325,9 @@ function SessionViewLoaded({
 
                 if (inheritsDesktopSettings) {
                     if (result.persistence === 'pending' || result.providerAcceptancePending) return 'unknown';
-                    clearAfterOutboundHandoff();
+                } else {
+                    recordOutboundAccepted();
                 }
-                recordOutboundAccepted();
 
                 if (shouldSendReviewComments) {
                     clearSentReviewCommentDrafts();
@@ -6336,14 +6343,24 @@ function SessionViewLoaded({
                             Modal.alert(t('errors.failedToSendMessage'), t('chatFooter.directSessionDesktopUnknown'), [{ text: t('common.ok') }]);
                             return;
                         }
-                        const result = await control.sendText(outbound.text, submitTextToSession);
-                        if (result.mode === 'steer' && result.outcome === 'accepted') {
-                            clearAfterOutboundHandoff();
+                        if (control.busy) return;
+                        const result = await sync.sendDirectSessionTextMessage(sessionId, outbound.text,
+                            outbound.displayText, outbound.metaOverrides, {
+                                onLocalPendingProjectionCreated: ({ localId }) => {
+                                    outboundHandoffLocalId = localId;
+                                    const cleared = clearAfterOutboundHandoff();
+                                    requestMountedTranscriptFollow();
+                                    if (activePendingEdit?.directSessionExternalControl
+                                        && pendingMessageEditRef.current?.pendingId === activePendingEdit.pendingId) {
+                                        storage.getState().removePendingMessage(sessionId, activePendingEdit.pendingId);
+                                        setPendingMessageEdit(null);
+                                        if (cleared) restorePendingEditComposerSnapshotIfSafe(activePendingEdit);
+                                    }
+                                },
+                                submit: async (localId) => (await control.sendText(outbound.text, submitTextToSession, localId)).outcome,
+                            });
+                        if (result.outcome === 'accepted') {
                             recordOutboundAccepted();
-                        } else if (result.outcome === 'rejected' && !result.mode) {
-                            Modal.alert(t('errors.failedToSendMessage'),
-                                `${t('chatFooter.directSessionDesktopUnknown')}\n\n${t('chatFooter.directSessionDraftKept')}`,
-                                [{ text: t('common.ok') }]);
                         }
                         return;
                     }
