@@ -88,18 +88,23 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
       return { canSend: false, unavailableReason: 'source_mismatch' };
     }
     const control = await getDesktopSessionControl({ codexHome: linked.codexHome, remoteSessionId, getFollowedIpc: followedIpc(getFollowLease) });
-    return control.available ? { canSend: true } : { canSend: false, unavailableReason: control.reason };
+    return control.available ? { canSend: true, textSendProtocol: 'native-auto-v1' }
+      : { canSend: false, unavailableReason: control.reason };
   },
   /** 纯文本向现有 Desktop owner 投递；不支持的输入必须拒绝，不能静默丢弃。 */
   send: async ({ source, remoteSessionId, text, localId, meta, accountId, getFollowLease }) => {
-    if (Object.keys(meta).some((key) => !DESKTOP_TEXT_TRACKING_META_KEYS.has(key))) {
+    // 复用原 meta 透传，只接受明确 opt-in；旧客户端缺字段仍保持 start 契约。
+    const nativeAutoText = meta.desktopTextSendProtocol === 'native-auto-v1';
+    if (Object.keys(meta).some((key) => !DESKTOP_TEXT_TRACKING_META_KEYS.has(key)
+      && !(key === 'desktopTextSendProtocol' && nativeAutoText))) {
       return { status: 'rejected', reason: 'unsupported_input' };
     }
     const homes = await resolveCodexHomeEntriesForDirectSessionsSource({
       source, activeServerDir: configuration.activeServerDir, env: process.env,
     });
     if (homes.length !== 1) return { status: 'rejected', reason: 'source_unavailable' };
-    return sendDesktopSessionUserMessage({ codexHome: homes[0]!.codexHome, remoteSessionId, text, localId, accountId, getFollowedIpc: followedIpc(getFollowLease) });
+    return sendDesktopSessionUserMessage({ codexHome: homes[0]!.codexHome, remoteSessionId, text, localId, accountId,
+      ...(nativeAutoText ? { textSendProtocol: 'native-auto-v1' as const } : {}), getFollowedIpc: followedIpc(getFollowLease) });
   },
   pageTranscript: async ({ source, remoteSessionId, direction, cursor, maxBytes, maxItems }) => {
     const res = await pageCodexTranscript({

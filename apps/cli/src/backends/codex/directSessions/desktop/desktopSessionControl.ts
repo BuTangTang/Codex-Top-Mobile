@@ -156,7 +156,11 @@ export type DesktopSessionTarget = Readonly<{
     /** 仅由认证目标的现有 lease 提供；每次使用仍核对原连接的连续控制锚。 */
     getFollowedIpc?: () => DesktopIpc | null;
 }>;
-export type DesktopSessionMessage = DesktopSessionTarget & Readonly<{ text: string; localId: string; accountId: string }>;
+export type DesktopSessionMessage = DesktopSessionTarget & Readonly<{
+    text: string; localId: string; accountId: string;
+    /** 已协商的普通文本协议；缺省保持已发布客户端的 start 语义。 */
+    textSendProtocol?: 'native-auto-v1';
+}>;
 
 /** 只规范本机路径，不创建或修改 Codex 的任何文件。 */
 async function resolveHome(codexHome: string): Promise<string> {
@@ -274,27 +278,79 @@ async function replayIntent(intentPath: string, receiptPath: string, payloadHash
     return { ...duplicate, status: 'unknown', reason: 'delivery_outcome_unknown', ...(requestId ? { requestId } : {}) };
 }
 
-/** 在固定 owner 上复核 start 证明后提交一次；只有匹配成功应答和 turn ID 才算接受。 */
+/**
+ * 普通文本由原生决定当前轮次；仅明确未接受的 inactive 拒绝允许再 start 一次。
+ * Desktop 26.924.22138 / CLI 0.158.0-alpha.2.1：原生 JS 把 NoActiveTurn 拒绝变为下方精确文案。
+ * 对应官方源码（active-turn 锁内先拒绝，之后才移交/入队输入）：
+ * https://github.com/openai/codex/blob/0d9c7cbfa6cf1489f55a8a9542b75ddd2c061807/codex-rs/core/src/session/turn_input.rs#L624-L706
+ * 错误帧只有 requestId/error；既有 router 按定向 owner 请求的 requestId 回送，不补成功帧的身份字段。
+ */
+function isNativeInactiveRejection(response: Record<string, unknown>, conversationId: string, ownerClientId: string): boolean {
+    return response.resultType === 'error'
+        && response.error === `Cannot steer conversation ${conversationId} because its active turn already ended`
+        && (response.method === undefined || response.method === 'thread-follower-steer-turn')
+        && (response.handledByClientId === undefined || response.handledByClientId === ownerClientId);
+}
+
+/** 复用同一持久化意图；仅匹配原 owner 的成功应答和 turn ID 才算接受。 */
 async function submitOnce(codexHome: string, message: DesktopSessionMessage, requestId: string,
     identity: SendIdentity): Promise<DesktopSessionSendResult> {
     let control: Awaited<ReturnType<typeof acquireDesktopControl>> | undefined;
+    let textIpc: DesktopIpc | undefined;
     let ownerClientId: string | undefined;
     let dispatched = false;
     try {
-        control = await acquireDesktopControl({ ...message, codexHome });
-        ownerClientId = control.ownerClientId;
-        // 手机读取后的闲忙变化必须由真正投递者复核；不把 busy 自动改投 steer。
-        const snapshot = readDesktopControlSnapshot(control.read(), message.remoteSessionId);
-        if (snapshot.textSendMode !== 'start') throw new DesktopIpcError('turn_not_idle');
+        let ipc: DesktopIpc;
+        const nativeAuto = message.textSendProtocol === 'native-auto-v1';
+        if (nativeAuto) {
+            // 独立短连接不 follow，避免发送排在完整历史大帧之后；getter 只复核原 RPC 寿命。
+            message.getFollowedIpc?.();
+            textIpc = await DesktopIpc.open(codexHome);
+            message.getFollowedIpc?.();
+            ownerClientId = await textIpc.discoverOwner(message.remoteSessionId);
+            message.getFollowedIpc?.();
+            ipc = textIpc;
+            dispatched = true;
+            const response = await ipc.request('thread-follower-steer-turn', 1, {
+                conversationId: message.remoteSessionId, clientUserMessageId: message.localId,
+                input: [{ type: 'text', text: message.text, text_elements: [] }], attachments: [],
+                // cwd/workspaceRoots 由原生当前会话继承；保留原生恢复编辑框所需的完整正文/context 形状。
+                restoreMessage: { id: message.localId, text: message.text, createdAt: Date.now(),
+                    context: { prompt: message.text, addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [] } },
+            }, requestId, ownerClientId);
+            message.getFollowedIpc?.();
+            if (!isNativeInactiveRejection(response, message.remoteSessionId, ownerClientId)) {
+                if (response.resultType === 'error') {
+                    const reason = desktopResponseFailure(response);
+                    return { ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',
+                        reason, ownerClientId, requestId };
+                }
+                const result = ipcRecord(ipcRecord(response.result)?.result);
+                if (response.resultType !== 'success' || response.method !== 'thread-follower-steer-turn'
+                    || response.handledByClientId !== ownerClientId || !ipcString(result?.turnId)) {
+                    return { ...identity, status: 'unknown', reason: 'invalid_response', ownerClientId, requestId };
+                }
+                return { ...identity, status: 'accepted', ownerClientId, requestId, turnId: result.turnId, receiptPersisted: false };
+            }
+        } else {
+            // 已发布客户端仍复核 start 证明；固定旧轮的显式 steer/审批也继续使用原控制锚。
+            control = await acquireDesktopControl({ ...message, codexHome });
+            ownerClientId = control.ownerClientId;
+            const snapshot = readDesktopControlSnapshot(control.read(), message.remoteSessionId);
+            if (snapshot.textSendMode !== 'start') throw new DesktopIpcError('turn_not_idle');
+            ipc = control.ipc;
+        }
+        if (nativeAuto) message.getFollowedIpc?.();
         dispatched = true;
-        const response = await control.ipc.request('thread-follower-start-turn', 2, {
+        const response = await ipc.request('thread-follower-start-turn', 2, {
             conversationId: message.remoteSessionId,
             turnStart: {
                 request: { threadId: message.remoteSessionId, clientUserMessageId: message.localId,
                     input: [{ type: 'text', text: message.text, text_elements: [] }] },
                 context: { inheritThreadSettings: true },
             },
-        }, requestId, ownerClientId);
+        }, nativeAuto ? randomUUID() : requestId, ownerClientId);
+        if (nativeAuto) message.getFollowedIpc?.();
         if (response.resultType === 'error') {
             const reason = desktopResponseFailure(response);
             return { ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',
@@ -310,13 +366,13 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
     } catch (error) {
         return { ...identity, status: dispatched ? 'unknown' : 'rejected', reason: reasonFor(error), requestId,
             ...(ownerClientId ? { ownerClientId } : {}) };
-    } finally { control?.close(); }
+    } finally { control?.close(); textIpc?.close(); }
 }
 
 /**
  * 先持久化独占意图，再向原 Desktop owner 提交。相同 localId 的重复/冲突不再发送。
  * 意图落盘后崩溃会牺牲自动重试，保留 unknown；不能证明跨重启 exactly-once。
- * 普通发送路径不创建 router、app-server 或会话，也不使用 resume/steer/进程控制回退。
+ * 不创建 router、app-server 或会话；新普通文本协议仅在原生明确拒绝 steer 后 start，未知结果不重投。
  */
 export async function sendDesktopSessionUserMessage(params: DesktopSessionMessage): Promise<DesktopSessionSendResult> {
     const identity: SendIdentity = { localId: params.localId, remoteSessionId: params.remoteSessionId, deduplicated: false };

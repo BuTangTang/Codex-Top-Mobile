@@ -41,6 +41,18 @@ describe('Direct session external-owner control capability', () => {
       externalControl: { canSend: true },
     })).toMatchObject({ runnerActive: false, externalControl: { canSend: true } });
   });
+
+  // 手机仅按本次明确的可选能力选择新版普通文本；旧状态不隐式升级。
+  it('preserves the exact native auto text protocol and rejects other capability values', () => {
+    expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.parse({
+      ...status, externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' },
+    })).toMatchObject({ externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' } });
+    for (const textSendProtocol of ['native-auto-v2', true, null]) {
+      expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.safeParse({
+        ...status, externalControl: { canSend: true, textSendProtocol },
+      }).success).toBe(false);
+    }
+  });
 });
 
 describe('DirectSessionSendRequestSchema', () => {

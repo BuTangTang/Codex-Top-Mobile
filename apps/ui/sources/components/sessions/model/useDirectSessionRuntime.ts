@@ -119,6 +119,7 @@ export function areDirectSessionRuntimeStatusesEqual(
         if (!Object.prototype.hasOwnProperty.call(right, key)) return false;
         if (key === 'externalControl') {
             if (left.externalControl?.canSend !== right.externalControl?.canSend
+                || left.externalControl?.textSendProtocol !== right.externalControl?.textSendProtocol
                 || left.externalControl?.unavailableReason !== right.externalControl?.unavailableReason) {
                 return false;
             }
@@ -515,6 +516,14 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
         return latest?.machineOnline === true && latest.runnerActive !== true;
     }, [refreshNow, targetKey, viewerActive]);
 
+    const getTextSendProtocol = React.useCallback((): 'native-auto-v1' | undefined => {
+        const latest = statusRef.current;
+        return latest?.machineOnline === true && latest.runnerActive !== true
+            && latest.externalControl?.canSend === true
+            && latest.externalControl.textSendProtocol === 'native-auto-v1'
+            ? 'native-auto-v1' : undefined;
+    }, []);
+
     // 冷点击保持可进入；首次控制读取和实际操作均复用原 runtime 确认连接与 runner 归属。
     const control = useDirectSessionControl({
         sessionId: params.sessionId,
@@ -523,6 +532,7 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
         enabled: viewerActive && directSessionLink?.providerId === 'codex' && status?.runnerActive !== true,
         observationKey: JSON.stringify(status?.observation ?? null),
         prepareForMutation,
+        getTextSendProtocol,
     });
 
     return React.useMemo(() => ({

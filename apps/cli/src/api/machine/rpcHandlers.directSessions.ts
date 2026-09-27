@@ -643,7 +643,10 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       }) };
       await followLeaseManager.invalidateMismatchedTarget(followTarget);
       if (!isCurrentLifecycle(currentEpoch)) return { ok: false, error: 'source_unavailable', errorCode: 'source_unavailable' };
-      const followedLease = await followLeaseManager.waitForProviderControl(followTarget);
+      // 仅协商后的 Codex 普通文本交由原生选路；旧 SEND 与审批仍等待原控制锚。
+      const nativeAutoText = linked.session.providerId === 'codex' && parsed.data.meta.desktopTextSendProtocol === 'native-auto-v1';
+      const followedLease = nativeAutoText ? followLeaseManager.getFollowLease(followTarget)
+        : await followLeaseManager.waitForProviderControl(followTarget);
       /** provider 每次取控制连接时复核认证寿命；已撤销与从未获取必须区别处理。 */
       const getFollowLease = () => {
         // 失效身份必须终止；不能将撤销伪装成没有 lease 而触发 provider 新建控制连接。

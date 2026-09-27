@@ -6226,7 +6226,7 @@ function SessionViewLoaded({
             }
 
             // 保留原普通 SEND 与草稿交接；桌面调用者另外提供本次控制操作的寿命校验。
-            const submitTextToSession = async (isCurrent: () => boolean): Promise<'accepted' | 'rejected' | 'unknown'> => {
+            const submitTextToSession = async (isCurrent: () => boolean, textSendProtocol?: 'native-auto-v1'): Promise<'accepted' | 'rejected' | 'unknown'> => {
                 const readyForSend = await directSessionTakeover.ensureReadyForSend({ intent: 'text',
                     ...(inheritsDesktopSettings && outboundHandoffLocalId ? { suppressFailureAlert: true } : {}),
                 });
@@ -6271,9 +6271,11 @@ function SessionViewLoaded({
                     ...(inheritsDesktopSettings && outboundHandoffLocalId ? { localId: outboundHandoffLocalId } : {}),
                     text: outbound.text,
                     displayText: outbound.displayText,
-                    metaOverrides: steerWithoutConfigMetaOverrides
-                        ? { ...outbound.metaOverrides, ...steerWithoutConfigMetaOverrides }
-                        : outbound.metaOverrides,
+                    metaOverrides: inheritsDesktopSettings && readyForSend === 'external' && textSendProtocol === 'native-auto-v1'
+                        ? { ...outbound.metaOverrides, ...steerWithoutConfigMetaOverrides, desktopTextSendProtocol: textSendProtocol }
+                        : steerWithoutConfigMetaOverrides
+                            ? { ...outbound.metaOverrides, ...steerWithoutConfigMetaOverrides }
+                            : outbound.metaOverrides,
                     configuredMode,
                     busySteerSendPolicy,
                     sessionInactiveResumePolicy,

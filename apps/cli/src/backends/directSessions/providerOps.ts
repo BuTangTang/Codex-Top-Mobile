@@ -37,6 +37,7 @@ export type DirectSessionActivitySample = Readonly<{
 export type DirectSessionExternalControl = Readonly<{
   canSend: boolean;
   unavailableReason?: string;
+  textSendProtocol?: 'native-auto-v1';
 }>;
 
 /** 已接收、明确拒绝与结果未知必须分别保留，调用方不得据此自动接管重试。 */

@@ -8,7 +8,7 @@ import { randomUUID } from '@/platform/randomUUID';
 type ControlOutcome = 'accepted' | 'unknown' | 'rejected';
 type ControlOutcomeContext = Readonly<{ kind: 'start' | 'steer' | 'approval'; turnId: string }>;
 type TextSendResult = Readonly<{ outcome: ControlOutcome; mode?: 'start' | 'steer' }>;
-type StartTextSend = (isCurrent: () => boolean) => Promise<ControlOutcome>;
+type StartTextSend = (isCurrent: () => boolean, textSendProtocol?: 'native-auto-v1') => Promise<ControlOutcome>;
 type ControlViewState = {
     snapshot: DesktopControlSnapshotV1 | null;
     error: string | null;
@@ -27,6 +27,8 @@ export function useDirectSessionControl(params: Readonly<{
     enabled: boolean;
     observationKey: string;
     prepareForMutation: () => Promise<boolean>;
+    /** 从原 runtime 读取已确认的电脑能力，连接准备结束后再取，避免使用旧渲染值。 */
+    getTextSendProtocol?: () => 'native-auto-v1' | undefined;
 }>) {
     const scope = useActiveServerAccountScope();
     const serverId = params.serverId ?? scope?.serverId;
@@ -171,7 +173,7 @@ export function useDirectSessionControl(params: Readonly<{
         }
     }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.prepareForMutation, params.sessionId, releaseFlight, snapshot, updateView]);
 
-    /** 同寿命控制快照只用于文本选路；缺失时补读，CLI 投递前仍复核原 owner 和轮次。 */
+    /** 新电脑负责普通文本选路；旧电脑与显式追加继续使用原控制快照。 */
     const sendTextWithMode = React.useCallback(async (
         text: string,
         start: StartTextSend,
@@ -188,6 +190,23 @@ export function useDirectSessionControl(params: Readonly<{
             if (!await params.prepareForMutation().catch(() => false) || !isFlightCurrent()) {
                 if (isFlightCurrent()) updateView({ outcome: 'rejected' });
                 return { outcome: 'rejected' };
+            }
+            if (!requiredMode && localId && params.getTextSendProtocol?.() === 'native-auto-v1') {
+                // 一条消息绑定一个既有 localId；未知结果不重投，也不锁住其他消息。
+                const key = JSON.stringify(['text', localId]);
+                if (lifetime.issued.has(key)) {
+                    updateView({ outcome: 'unknown' });
+                    return { outcome: 'unknown' };
+                }
+                lifetime.issued.add(key);
+                let result: ControlOutcome;
+                try { result = await start(isFlightCurrent, 'native-auto-v1'); }
+                catch { result = 'unknown'; }
+                if (!isFlightCurrent()) return { outcome: result === 'rejected' ? 'rejected' : 'unknown' };
+                if (result !== 'unknown') lifetime.issued.delete(key);
+                // 交付显示由消息自身负责；不猜开始/追加，也不为发送再拉完整历史。
+                updateView({ outcome: result === 'accepted' ? null : result, outcomeContext: null });
+                return { outcome: result };
             }
             if (!lifetime.snapshot) await refresh();
             // 补读可被同寿命的新读取替代；只使用 owner 已发布的当前事实，不使用迟到返回值。
@@ -230,7 +249,7 @@ export function useDirectSessionControl(params: Readonly<{
         } finally {
             releaseFlight(flight);
         }
-    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.prepareForMutation, params.sessionId, refresh, releaseFlight, updateView]);
+    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.prepareForMutation, params.getTextSendProtocol, params.sessionId, refresh, releaseFlight, updateView]);
 
     /** 普通文本允许明确的 start 或 steer，实际开始仍交给既有 SEND owner。 */
     const sendText = React.useCallback((text: string, start: StartTextSend, localId?: string) => sendTextWithMode(text, start, undefined, localId), [sendTextWithMode]);

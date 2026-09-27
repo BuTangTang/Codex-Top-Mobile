@@ -772,6 +772,40 @@ vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOrigin
 });
 
 describe('SessionView (direct sessions)', () => {
+  it('sends negotiated native-auto text without waiting for CONTROL and preserves the next draft', async () => {
+    const status = createDeferred<any>();
+    const control = createDeferred<any>();
+    const receipt = createDeferred<any>();
+    machineDirectSessionStatusGetSpy.mockReturnValue(status.promise);
+    machineControlReadSpy.mockReturnValue(control.promise);
+    syncSubmitMessageSpy.mockReturnValue(receipt.promise);
+    const screen = await renderSessionViewAndSettle();
+    await act(async () => { findAgentInput(screen).props.onChangeText('native auto text'); });
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    const { storage } = await import('@/sync/domains/state/storage');
+    const pending = storage.getState().sessionPending.s1?.messages ?? [];
+    expect(pending).toHaveLength(1);
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    await act(async () => { findAgentInput(screen).props.onChangeText('next draft'); });
+    await act(async () => { status.resolve({ ok: true, machineOnline: true, runnerActive: false,
+      activity: 'idle', canForceStop: false,
+      externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' } }); });
+    await flushHookEffects();
+    expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+    expect(machineControlReadSpy).toHaveBeenCalledTimes(1);
+    expect(syncSubmitMessageSpy).toHaveBeenCalledWith('s1', 'native auto text', undefined,
+      { desktopTextSendProtocol: 'native-auto-v1' },
+      expect.objectContaining({ localId: pending[0].localId, directSessionExternalControl: true }));
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    expect(machineDirectSessionTakeoverSpy).not.toHaveBeenCalled();
+    await act(async () => { receipt.resolve({ localId: pending[0].localId, persistence: 'provider_direct' }); });
+    await flushHookEffects();
+    expect(findAgentInput(screen).props.value).toBe('next draft');
+    expect(machineControlReadSpy).toHaveBeenCalledTimes(1);
+    expect(modalAlertSpy).not.toHaveBeenCalled();
+  });
+
   it.each(['cancel', 'send', 'echo_before_send'] as const)('restores a failed desktop message for %s while preserving the next draft', async (action) => {
     machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
       activity: 'idle', canForceStop: false, externalControl: { canSend: true } });

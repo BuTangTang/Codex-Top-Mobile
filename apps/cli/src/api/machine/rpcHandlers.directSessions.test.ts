@@ -275,6 +275,63 @@ async function withDesktopRpcFixture(
 }
 
 describe('registerMachineDirectSessionsRpcHandlers', () => {
+  // 能力由真实关联和 owner 发现产生，不能仅凭新版 daemon 或配置宣告可发送。
+  it.each(['accepted', 'owner_unavailable'] as const)('advertises native auto text only for an available owner (%s)', async (outcome) => {
+    await withDesktopRpcFixture(outcome, async ({ handlers, request, source }) => {
+      const result = await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!({
+        machineId: request.machineId, sessionId: request.sessionId, providerId: 'codex',
+        remoteSessionId: 'native-linked-thread', source,
+      });
+      if (outcome === 'accepted') expect(result).toMatchObject({ externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' } });
+      else {
+        expect(result).toMatchObject({ externalControl: { canSend: false } });
+        expect((result as { externalControl?: unknown }).externalControl).not.toHaveProperty('textSendProtocol');
+      }
+    });
+  });
+
+  // meta 是既有透传边界，但 opt-in 只接受固定协议值；不能把 truthy 值当成授权。
+  it.each(['native-auto-v2', true, null, ''])('rejects unsupported native auto text opt-in %s before native delivery', async (desktopTextSendProtocol) => {
+    await withDesktopRpcFixture('accepted', async ({ invokeTransport, request, requests }) => {
+      await expect(invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND, {
+        ...request, meta: { ...request.meta, desktopTextSendProtocol },
+      })).resolves.toMatchObject({ ok: false, errorCode: 'unsupported_input' });
+      expect(requests).toHaveLength(0);
+    });
+  });
+
+  // 原 viewer 水合继续用于状态和审批；新版普通文本加入原 SEND，不再排在这份历史之后。
+  it('delivers opted-in native auto text while history is pending and keeps legacy send and control waiting', async () => {
+    await withDesktopRpcFixture('accepted', async ({ handlers, invokeTransport, request, source, requests, releaseHistory }) => {
+      const target = { machineId: request.machineId, sessionId: request.sessionId };
+      await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, providerId: 'codex',
+        remoteSessionId: 'native-linked-thread', source, leaseId: 'viewer', ttlMs: 45_000 });
+      await vi.waitFor(() => expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1));
+      let legacySettled = false;
+      let controlSettled = false;
+      const legacy = invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND, { ...request, localId: 'legacy-text' })
+        .finally(() => { legacySettled = true; });
+      const control = invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ, target)
+        .finally(() => { controlSettled = true; });
+      const auto = invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND, {
+        ...request, meta: { ...request.meta, desktopTextSendProtocol: 'native-auto-v1' },
+      });
+      try {
+        await vi.waitFor(() => expect(requests.filter((entry) => entry.method === 'thread-follower-steer-turn')).toHaveLength(1));
+        await expect(auto).resolves.toEqual({ ok: true });
+        expect(legacySettled).toBe(false);
+        expect(controlSettled).toBe(false);
+        expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+        expect(requests.some((entry) => entry.method === 'thread-follower-start-turn')).toBe(false);
+      } finally {
+        releaseHistory();
+        await Promise.all([auto, legacy, control]);
+      }
+      await expect(legacy).resolves.toMatchObject({ ok: false, errorCode: 'turn_not_idle' });
+      await expect(control).resolves.toMatchObject({ ok: true, snapshot: { textSendMode: 'steer' } });
+    }, { holdHistory: true, initialRuntime: 'active' });
+  });
+
   it('recovers control through the original cold read when a live viewer baseline has no anchor', async () => {
     await withDesktopRpcFixture('accepted', async ({ handlers, invokeTransport, request, source, requests }) => {
       const target = { machineId: request.machineId, sessionId: request.sessionId };
@@ -473,7 +530,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
     });
   });
 
-  it('does not open a replacement control connection after suspension during provider path resolution', async () => {
+  it.each(['legacy', 'native-auto-v1'] as const)('does not open a replacement control connection after suspension during provider path resolution (%s)', async (protocol) => {
     await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, lifecycle }) => {
       const target = { machineId: request.machineId, sessionId: request.sessionId,
         providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
@@ -492,12 +549,13 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
         await continued;
       };
       try {
-        const pending = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND)!(request);
+        const pending = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND)!({ ...request,
+          ...(protocol === 'native-auto-v1' ? { meta: { ...request.meta, desktopTextSendProtocol: protocol } } : {}) });
         await paused;
         await lifecycle.suspend();
         resume();
         await expect(pending).resolves.toMatchObject({ ok: false });
-        expect(requests.some((entry) => entry.method === 'thread-follower-start-turn')).toBe(false);
+        expect(requests.some((entry) => entry.method === 'thread-follower-start-turn' || entry.method === 'thread-follower-steer-turn')).toBe(false);
         expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
       } finally {
         fileBoundary.beforeRealpath = null;
@@ -777,7 +835,7 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       });
     });
 
-    it.each(['status', 'attach', 'control_read', 'send', 'steer'] as const)('rejects a late %s read after suspension without invalidating the new viewer', async (operation) => {
+    it.each(['status', 'attach', 'control_read', 'send', 'auto_send', 'steer'] as const)('rejects a late %s read after suspension without invalidating the new viewer', async (operation) => {
       await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishTurnsPatch, lifecycle }) => {
         const target = { machineId: request.machineId, sessionId: request.sessionId, providerId: 'codex',
           remoteSessionId: 'native-linked-thread', source };
@@ -792,7 +850,8 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
         const late = operation === 'status' ? status(target)
           : operation === 'attach' ? attach({ ...target, leaseId: 'old-viewer', ttlMs: 45_000 })
             : operation === 'control_read' ? handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_READ)!({ machineId: target.machineId, sessionId: target.sessionId })
-              : operation === 'send' ? handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND)!(request)
+              : operation === 'send' || operation === 'auto_send' ? handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND)!({ ...request,
+                ...(operation === 'auto_send' ? { meta: { ...request.meta, desktopTextSendProtocol: 'native-auto-v1' } } : {}) })
                 : handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_CONTROL_ACTION)!({ machineId: target.machineId, sessionId: target.sessionId, kind: 'steer',
                   operationId: 'late-steer', expectedTurnId: 'observed-active-turn', text: request.text });
         await entered;

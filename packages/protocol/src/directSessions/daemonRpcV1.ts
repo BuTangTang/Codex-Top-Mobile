@@ -333,6 +333,8 @@ export const DirectSessionStatusGetResponseSchema = z.union([
       externalControl: z.object({
         canSend: z.boolean(),
         unavailableReason: z.string().min(1).optional(),
+        // 只有明确协商的新普通文本入口可跳过手机控制快照，缺失时保留旧选路。
+        textSendProtocol: z.literal('native-auto-v1').optional(),
       }).optional(),
       trustedPid: z.number().int().min(1).nullish(),
       lastKnownActivityAtMs: z.number().int().min(0).optional(),

@@ -758,6 +758,23 @@ describe('useDirectSessionRuntime', () => {
     });
     expect(harness.getCurrent()).toBe(beforeRefresh);
 
+    const nativeAutoStatus = {
+      ...writableStatus,
+      externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' as const },
+    };
+    machineDirectSessionStatusGetSpy.mockResolvedValue(nativeAutoStatus);
+    await act(async () => { await harness.getCurrent().refreshNow(); });
+    expect(harness.getCurrent().status).toEqual(nativeAutoStatus);
+    const beforeEquivalentProtocol = harness.getCurrent();
+    machineDirectSessionStatusGetSpy.mockResolvedValue({ ...nativeAutoStatus,
+      externalControl: { ...nativeAutoStatus.externalControl } });
+    await act(async () => { await harness.getCurrent().refreshNow(); });
+    expect(harness.getCurrent()).toBe(beforeEquivalentProtocol);
+
+    machineDirectSessionStatusGetSpy.mockResolvedValue(writableStatus);
+    await act(async () => { await harness.getCurrent().refreshNow(); });
+    expect(harness.getCurrent().status).toEqual(writableStatus);
+
     const unavailableStatus = {
       ...writableStatus,
       externalControl: { canSend: false, unavailableReason: 'desktop_disconnected' },

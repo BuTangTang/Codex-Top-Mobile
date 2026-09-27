@@ -883,6 +883,117 @@ describe('Desktop-owned session control', () => {
         ipc.close();
     });
 
+    it('delivers opted-in ordinary text to the native active turn without waiting for history', async () => {
+        onHistory = () => {};
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
+            result: { result: { turnId: 'native-current-turn' } } });
+        await startRouter();
+        const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+        const result = sendDesktopSessionUserMessage(message);
+        try {
+            await vi.waitFor(() => expect(requests.some((request) => request.method === 'thread-follower-steer-turn')).toBe(true), { timeout: 1000 });
+            const acceptedResult = await result;
+            expect(acceptedResult).toMatchObject({ status: 'accepted', turnId: 'native-current-turn', receiptPersisted: true });
+            expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...acceptedResult, deduplicated: true });
+            expect(requests.map((request) => request.method)).toEqual(['initialize', 'thread-owner-discovery', 'thread-follower-steer-turn']);
+            expect(requests.at(-1)).toMatchObject({ version: 1, targetClientId: 'owner-synthetic', params: {
+                conversationId: input.remoteSessionId, clientUserMessageId: input.localId,
+                input: [{ type: 'text', text: input.text, text_elements: [] }], attachments: [],
+                restoreMessage: { id: input.localId, text: input.text, context: { prompt: input.text,
+                    addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [] } },
+            } });
+            expect(requests.at(-1)?.params.restoreMessage).not.toHaveProperty('cwd');
+        } finally {
+            for (const socket of sockets) socket.destroy();
+            await result;
+        }
+    });
+
+    it('starts the same ordinary message once only after the exact native inactive rejection', async () => {
+        // 当前原生错误只保留 requestId/error，不带成功回执的 method/handledByClientId。
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            resultType: 'error', error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` });
+        await startRouter();
+        const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+        const first = await sendDesktopSessionUserMessage(message);
+        expect(first).toMatchObject({ status: 'accepted', turnId: 'turn-synthetic', receiptPersisted: true });
+        expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...first, deduplicated: true });
+        const delivery = requests.filter((request) => request.method.startsWith('thread-follower-'));
+        expect(delivery.map((request) => request.method)).toEqual(['thread-follower-steer-turn', 'thread-follower-start-turn']);
+        expect(delivery[1]).toMatchObject({ version: 2, targetClientId: 'owner-synthetic', params: {
+            conversationId: input.remoteSessionId, turnStart: { request: { threadId: input.remoteSessionId,
+                clientUserMessageId: input.localId, input: [{ type: 'text', text: input.text, text_elements: [] }] },
+            context: { inheritThreadSettings: true } },
+        } });
+        expect(delivery[0].requestId).not.toBe(delivery[1].requestId);
+    });
+
+    it.each(['other_thread', 'raw_backend_error', 'timeout', 'wrong_owner', 'wrong_method', 'missing_turn', 'disconnect'] as const)(
+        'does not fall back or replay opted-in text after %s', async (variant) => {
+            const inactive = `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended`;
+            onAction = (request, socket) => {
+                if (variant === 'disconnect') { socket.destroy(); return; }
+                respond(socket, { type: 'response', requestId: request.requestId,
+                    ...(variant === 'missing_turn' ? { resultType: 'success', method: request.method,
+                        handledByClientId: 'owner-synthetic', result: { result: {} } }
+                        : { resultType: 'error', error: variant === 'other_thread' ? inactive.replace(input.remoteSessionId, 'other-thread')
+                            : variant === 'raw_backend_error' ? 'no active turn to steer' : variant === 'timeout' ? 'request-timeout' : inactive,
+                        ...(variant === 'wrong_owner' ? { handledByClientId: 'another-owner' } : {}),
+                        ...(variant === 'wrong_method' ? { method: 'thread-follower-start-turn' } : {}) }),
+                });
+            };
+            await startRouter();
+            const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+            expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'unknown' });
+            expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'unknown', deduplicated: true });
+            expect(requests.filter((request) => request.method.startsWith('thread-follower-')).map((request) => request.method))
+                .toEqual(['thread-follower-steer-turn']);
+        },
+    );
+
+    it.each(['discovery', 'inactive'] as const)('stops opted-in text when the RPC lifetime is revoked after %s', async (stage) => {
+        let revoked = false;
+        const discover = onDiscover;
+        onDiscover = (request, socket) => { discover(request, socket); if (stage === 'discovery') revoked = true; };
+        onAction = (request, socket) => {
+            revoked = true;
+            respond(socket, { type: 'response', requestId: request.requestId, resultType: 'error',
+                error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` });
+        };
+        await startRouter();
+        const result = await sendDesktopSessionUserMessage({ codexHome, ...input, textSendProtocol: 'native-auto-v1',
+            getFollowedIpc: () => { if (revoked) throw new DesktopIpcError('owner_changed'); return null; } });
+        expect(result).toMatchObject({ status: stage === 'discovery' ? 'rejected' : 'unknown', reason: 'owner_changed' });
+        expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
+        expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(stage === 'discovery' ? 0 : 1);
+    });
+
+    it('does not start after an inactive rejection followed by an owner disconnect in the same batch', async () => {
+        onAction = (request, socket) => socket.write(Buffer.concat([
+            frame({ type: 'response', requestId: request.requestId, resultType: 'error',
+                error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` }),
+            frame({ type: 'broadcast', method: 'client-status-changed', version: 0, sourceClientId: 'owner-synthetic',
+                params: { clientId: 'owner-synthetic', status: 'disconnected' } }),
+        ]));
+        await startRouter();
+        expect(await sendDesktopSessionUserMessage({ codexHome, ...input, textSendProtocol: 'native-auto-v1' }))
+            .toMatchObject({ status: 'unknown', reason: 'owner_changed' });
+        expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
+    });
+
+    it('keeps a lost start acknowledgement unknown after definite inactive and never repeats either send', async () => {
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            resultType: 'error', error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` });
+        onStart = (_request, socket) => socket.destroy();
+        await startRouter();
+        const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+        expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'unknown' });
+        expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'unknown', deduplicated: true });
+        expect(requests.filter((request) => request.method.startsWith('thread-follower-')).map((request) => request.method))
+            .toEqual(['thread-follower-steer-turn', 'thread-follower-start-turn']);
+    });
+
     // 检查完整线上形状、目标身份和消息身份的字节保持。
     it('requires an owner response containing a turn id and preserves the exact localId', async () => {
         await startRouter();

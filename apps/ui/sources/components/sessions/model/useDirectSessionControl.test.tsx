@@ -17,6 +17,65 @@ function resetControlMocks() {
 }
 describe('desktop control lifecycle', () => {
     beforeEach(resetControlMocks);
+    /** 新连接组件承担文本选路；未返回的完整历史不能阻塞普通发送。 */
+    it('sends opted-in ordinary text while the initial control history is pending', async () => {
+        const history = createDeferred<unknown>();
+        const receipt = createDeferred<'accepted'>();
+        mocks.read.mockReturnValue(history.promise);
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input,
+            getTextSendProtocol: () => 'native-auto-v1' as const }));
+        const send = vi.fn(() => receipt.promise);
+        let operation!: ReturnType<ReturnType<typeof useDirectSessionControl>['sendText']>;
+        await act(async () => { operation = hook.getCurrent().sendText('cold ordinary text', send, 'local-cold'); });
+        expect(send).toHaveBeenCalledWith(expect.any(Function), 'native-auto-v1');
+        expect(mocks.read).toHaveBeenCalledTimes(1);
+        expect(mocks.action).not.toHaveBeenCalled();
+        await act(async () => {
+            receipt.resolve('accepted');
+            expect(await operation).toEqual({ outcome: 'accepted' });
+        });
+        expect(hook.getCurrent().busy).toBe(false);
+        expect(hook.getCurrent().snapshot).toBeNull();
+        expect(hook.getCurrent().outcome).toBeNull();
+        expect(mocks.read).toHaveBeenCalledTimes(1);
+        await act(async () => { history.resolve({ ok: true, snapshot }); });
+        await hook.unmount();
+    });
+
+    /** 准备连接后才读取能力；撤销的新能力不能沿用点击时的旧值。 */
+    it('uses the capability after readiness and preserves the legacy path when revoked', async () => {
+        let protocol: 'native-auto-v1' | undefined = 'native-auto-v1';
+        const prepareForMutation = vi.fn().mockResolvedValue(true);
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation,
+            getTextSendProtocol: () => protocol }));
+        prepareForMutation.mockImplementationOnce(async () => { protocol = undefined; return true; });
+        mocks.action.mockResolvedValue({ ok: true, result: { status: 'accepted', turnId: 'turn' } });
+        const send = vi.fn(async () => 'accepted' as const);
+        await act(async () => { expect((await hook.getCurrent().sendText('legacy text', send, 'local-legacy')).outcome).toBe('accepted'); });
+        expect(send).not.toHaveBeenCalled();
+        expect(mocks.action).toHaveBeenCalledTimes(1);
+        await hook.unmount();
+    });
+
+    /** 未知消息不重投；另一条普通消息仍可发送，不按旧轮次锁死整段对话。 */
+    it('keeps an uncertain ordinary message locked without blocking a different message', async () => {
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input,
+            getTextSendProtocol: () => 'native-auto-v1' as const }));
+        const send = vi.fn().mockResolvedValueOnce('unknown').mockResolvedValueOnce('accepted');
+        await act(async () => {
+            expect((await hook.getCurrent().sendText('first', send, 'local-first')).outcome).toBe('unknown');
+            expect((await hook.getCurrent().sendText('first', send, 'local-first')).outcome).toBe('unknown');
+            expect((await hook.getCurrent().sendText('second', send, 'local-second')).outcome).toBe('accepted');
+            expect((await hook.getCurrent().sendText('first', send, 'local-first')).outcome).toBe('unknown');
+        });
+        expect(send).toHaveBeenCalledTimes(2);
+        expect(mocks.action).not.toHaveBeenCalled();
+        await hook.unmount();
+    });
+
     /** 原状态 owner 尚未确认可操作时不抢跑；明确失败不能消耗本次审批或追加的去重锁。 */
     it.each(['steer', 'approval'] as const)('waits for runtime readiness before %s and allows explicit retry after rejection', async (kind) => {
         const ready = createDeferred<boolean>();
@@ -45,15 +104,16 @@ describe('desktop control lifecycle', () => {
     });
 
     /** 准备期间换号也只能结束旧点击，不能用新账号或旧控制事实继续投递。 */
-    it('rejects a prepared mutation after its account changes', async () => {
+    it.each([false, true])('rejects a prepared mutation after its account changes (native auto %s)', async (nativeAuto) => {
         const ready = createDeferred<boolean>();
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const prepareForMutation = () => ready.promise;
-        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation }));
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation,
+            getTextSendProtocol: () => nativeAuto ? 'native-auto-v1' : undefined }));
         expect(mocks.read).not.toHaveBeenCalled();
         const start = vi.fn(async () => 'accepted' as const);
         let operation!: Promise<unknown>;
-        await act(async () => { operation = hook.getCurrent().sendText('old account text', start); });
+        await act(async () => { operation = hook.getCurrent().sendText('old account text', start, 'old-account-message'); });
         expect(mocks.action).not.toHaveBeenCalled();
         mocks.accountId = 'account-b';
         await hook.rerender();
