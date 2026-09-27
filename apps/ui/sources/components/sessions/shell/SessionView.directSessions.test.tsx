@@ -835,6 +835,115 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.value).toBe('desktop next draft');
   });
 
+  // 冷开首个 STATUS 未返回时，点击等待同一真实探测；不能先拒绝，也不能抢跑 runner 归属判断。
+  it.each(['start', 'steer', 'runner', 'offline'] as const)('prepares a cold desktop click before mutation (%s)', async (next) => {
+    vi.useFakeTimers();
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
+    const status = createDeferred<any>();
+    machineDirectSessionStatusGetSpy.mockReturnValue(status.promise);
+    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'cold-turn',
+      state: next === 'start' ? 'completed' : 'running', textSendMode: next === 'start' ? 'start' : 'steer', requests: [] } });
+    const receipt = createDeferred<any>();
+    syncSubmitMessageSpy.mockReturnValue(receipt.promise);
+    machineControlActionSpy.mockReturnValue(receipt.promise);
+    const screen = await renderSessionViewAndSettle();
+    expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+    await act(async () => { findAgentInput(screen).props.onChangeText('cold recovery text'); });
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    await flushHookEffects();
+    const { storage } = await import('@/sync/domains/state/storage');
+    const rows = storage.getState().sessionPending.s1?.messages ?? [];
+    expect(rows).toHaveLength(1);
+    const localId = rows[0].localId;
+    expect(rows[0].sendState).toBeUndefined();
+    expect(findAgentInput(screen).props.value).toBe('');
+    expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    await act(async () => { findAgentInput(screen).props.onChangeText('next draft to preserve'); });
+    await act(async () => { status.resolve({ ok: true, machineOnline: next !== 'offline', runnerActive: next === 'runner',
+      activity: 'idle', canForceStop: false, externalControl: { canSend: next !== 'offline' } }); });
+    await flushHookEffects();
+    if (next === 'runner' || next === 'offline') {
+      expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+      expect(machineControlActionSpy).not.toHaveBeenCalled();
+      expect(storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ localId,
+        text: 'cold recovery text', sendState: 'failed', directSessionExternalControl: true })]);
+    } else {
+      if (next === 'start') {
+        expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+        expect(syncSubmitMessageSpy).toHaveBeenCalledWith('s1', 'cold recovery text', undefined, undefined,
+          expect.objectContaining({ localId, directSessionExternalControl: true }));
+        expect(machineControlActionSpy).not.toHaveBeenCalled();
+      } else {
+        expect(machineControlActionSpy).toHaveBeenCalledTimes(1);
+        expect(machineControlActionSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'steer',
+          expectedTurnId: 'cold-turn', operationId: localId, text: 'cold recovery text' }), expect.anything());
+        expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+      }
+      await act(async () => { receipt.resolve(next === 'start' ? { localId, persistence: 'provider_direct' }
+        : { ok: true, result: { status: 'accepted', turnId: 'cold-turn' } }); });
+      await flushHookEffects();
+      expect(storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({ localId,
+        text: 'cold recovery text', deliveryStatus: 'accepted', directSessionExternalControl: true })]);
+    }
+    expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+  });
+
+  // 原 STATUS 轮询发布新控制事实后，等待旧读取的点击仍只追加一次，并保留本地身份和下一条草稿。
+  it('steers a waiting desktop click from the newer automatic control refresh without losing its draft', async () => {
+    vi.useFakeTimers();
+    responsiveHarnessState.platformOs = 'android';
+    responsiveHarnessState.deviceType = 'phone';
+    const previousIdlePollMs = process.env.EXPO_PUBLIC_HAPPIER_DIRECT_SESSIONS_TAIL_POLL_MS_IDLE;
+    process.env.EXPO_PUBLIC_HAPPIER_DIRECT_SESSIONS_TAIL_POLL_MS_IDLE = '2000';
+    try {
+      machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
+        activity: 'idle', canForceStop: false, externalControl: { canSend: true },
+        observation: { v: 1, state: 'unknown', reason: 'not_observed' } });
+      const screen = await renderSessionViewAndSettle();
+      const readsBeforeClick = machineControlReadSpy.mock.calls.length;
+      const oldControl = createDeferred<unknown>();
+      const receipt = createDeferred<unknown>();
+      machineControlReadSpy.mockReturnValueOnce(oldControl.promise);
+      machineControlActionSpy.mockReturnValue(receipt.promise);
+      await act(async () => { findAgentInput(screen).props.onChangeText('waiting desktop text'); });
+      await act(async () => { findAgentInput(screen).props.onSend(); });
+      const { storage } = await import('@/sync/domains/state/storage');
+      const pending = storage.getState().sessionPending.s1?.messages ?? [];
+      expect(pending).toHaveLength(1);
+      expect(findAgentInput(screen).props.value).toBe('');
+      expect(machineControlReadSpy.mock.calls.length).toBe(readsBeforeClick + 1);
+      await act(async () => { findAgentInput(screen).props.onChangeText('next draft to preserve'); });
+
+      machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
+        activity: 'running', canForceStop: false, externalControl: { canSend: true },
+        observation: { v: 1, state: 'running', source: 'desktop', turnId: 'new-running' } });
+      machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'new-running', state: 'running', requests: [], textSendMode: 'steer' } });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+      await flushHookEffects();
+      expect(machineControlReadSpy.mock.calls.length).toBe(readsBeforeClick + 2);
+      expect(machineControlActionSpy).not.toHaveBeenCalled();
+      await act(async () => { oldControl.resolve({ ok: true, snapshot: { v: 1, turnId: 'old-turn', state: 'completed', requests: [], textSendMode: 'start' } }); });
+      await flushHookEffects();
+      expect(machineControlActionSpy).toHaveBeenCalledTimes(1);
+      expect(machineControlActionSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'steer', expectedTurnId: 'new-running',
+        text: 'waiting desktop text', operationId: pending[0].localId }), expect.anything());
+      expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+      await act(async () => { receipt.resolve({ ok: true, result: { status: 'accepted', turnId: 'new-running' } }); });
+      await flushHookEffects();
+      expect(storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({
+        localId: pending[0].localId, text: 'waiting desktop text', deliveryStatus: 'accepted', directSessionExternalControl: true,
+      })]);
+      expect(findAgentInput(screen).props.value).toBe('next draft to preserve');
+      expect(machineControlActionSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previousIdlePollMs === undefined) delete process.env.EXPO_PUBLIC_HAPPIER_DIRECT_SESSIONS_TAIL_POLL_MS_IDLE;
+      else process.env.EXPO_PUBLIC_HAPPIER_DIRECT_SESSIONS_TAIL_POLL_MS_IDLE = previousIdlePollMs;
+    }
+  });
+
   // 前置 STATUS 等待期间页面失活尚未发送；失败正文可编辑，后续草稿仍由原输入 owner 保留。
   it('keeps desktop text failed and editable when the surface deactivates before STATUS permits send', async () => {
     responsiveHarnessState.platformOs = 'android';

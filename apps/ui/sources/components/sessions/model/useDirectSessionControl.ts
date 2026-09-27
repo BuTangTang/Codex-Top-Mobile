@@ -26,6 +26,7 @@ export function useDirectSessionControl(params: Readonly<{
     serverId?: string;
     enabled: boolean;
     observationKey: string;
+    prepareForMutation: () => Promise<boolean>;
 }>) {
     const scope = useActiveServerAccountScope();
     const serverId = params.serverId ?? scope?.serverId;
@@ -148,16 +149,20 @@ export function useDirectSessionControl(params: Readonly<{
         const flight = acquireFlight();
         if (!flight) return;
         const isFlightCurrent = () => isCurrent() && lifetime.flight === flight;
-        lifetime.issued.add(key);
-        updateView({ outcomeContext: { kind: 'approval', turnId: snapshot.turnId } });
         try {
+            if (!await params.prepareForMutation().catch(() => false) || !isFlightCurrent()) {
+                if (isFlightCurrent()) updateView({ outcome: 'rejected' });
+                return;
+            }
+            lifetime.issued.add(key);
+            updateView({ outcomeContext: { kind: 'approval', turnId: snapshot.turnId } });
             const result = await dispatch({ machineId: params.machineId, sessionId: params.sessionId, kind: 'approval', operationId: randomUUID(), expectedTurnId: snapshot.turnId, requestId: request.requestId, revision: request.revision, decision }, isFlightCurrent);
             // 只有明确未提交才解除本地锁；未知结果保持锁定，刷新不会重放授权。
             if (result === 'rejected' && isFlightCurrent()) lifetime.issued.delete(key);
         } finally {
             releaseFlight(flight);
         }
-    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.sessionId, releaseFlight, snapshot, updateView]);
+    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.prepareForMutation, params.sessionId, releaseFlight, snapshot, updateView]);
 
     /** 同寿命控制快照只用于文本选路；缺失时补读，CLI 投递前仍复核原 owner 和轮次。 */
     const sendTextWithMode = React.useCallback(async (
@@ -173,7 +178,13 @@ export function useDirectSessionControl(params: Readonly<{
         if (!flight) return { outcome: 'unknown' };
         const isFlightCurrent = () => isCurrent() && lifetime.flight === flight;
         try {
-            const fresh = lifetime.snapshot ?? await refresh();
+            if (!await params.prepareForMutation().catch(() => false) || !isFlightCurrent()) {
+                if (isFlightCurrent()) updateView({ outcome: 'rejected' });
+                return { outcome: 'rejected' };
+            }
+            if (!lifetime.snapshot) await refresh();
+            // 补读可被同寿命的新读取替代；只使用 owner 已发布的当前事实，不使用迟到返回值。
+            const fresh = lifetime.snapshot;
             const mode = fresh?.textSendMode;
             if (!isFlightCurrent() || !fresh || !fresh.turnId.trim()
                 || (mode !== 'start' && mode !== 'steer')
@@ -212,7 +223,7 @@ export function useDirectSessionControl(params: Readonly<{
         } finally {
             releaseFlight(flight);
         }
-    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.sessionId, refresh, releaseFlight, updateView]);
+    }, [acquireFlight, dispatch, isCurrent, lifetime, params.machineId, params.prepareForMutation, params.sessionId, refresh, releaseFlight, updateView]);
 
     /** 普通文本允许明确的 start 或 steer，实际开始仍交给既有 SEND owner。 */
     const sendText = React.useCallback((text: string, start: StartTextSend, localId?: string) => sendTextWithMode(text, start, undefined, localId), [sendTextWithMode]);

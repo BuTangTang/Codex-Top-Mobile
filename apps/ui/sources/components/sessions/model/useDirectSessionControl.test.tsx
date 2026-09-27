@@ -7,7 +7,7 @@ vi.mock('@/sync/store/hooks', () => ({ useActiveServerAccountScope: () => ({ ser
 vi.mock('@/platform/randomUUID', () => ({ randomUUID: () => 'operation-once' }));
 const request = { requestId: 'request', revision: 'rev', kind: 'command' as const, command: 'echo example', canDecide: true };
 const snapshot = { v: 1, turnId: 'turn', state: 'running', requests: [request], textSendMode: 'steer' };
-const input = { sessionId: 'linked', machineId: 'machine', serverId: 'server', enabled: true, observationKey: 'turn' };
+const input = { sessionId: 'linked', machineId: 'machine', serverId: 'server', enabled: true, observationKey: 'turn', prepareForMutation: async () => true };
 // 两组测试共用确定性的边界初始化，不依赖执行顺序。
 function resetControlMocks() {
     mocks.serverId = 'server';
@@ -17,6 +17,48 @@ function resetControlMocks() {
 }
 describe('desktop control lifecycle', () => {
     beforeEach(resetControlMocks);
+    /** 原状态 owner 尚未确认可操作时不抢跑；明确失败不能消耗本次审批或追加的去重锁。 */
+    it.each(['steer', 'approval'] as const)('waits for runtime readiness before %s and allows explicit retry after rejection', async (kind) => {
+        const ready = createDeferred<boolean>();
+        const prepareForMutation = vi.fn().mockReturnValueOnce(ready.promise).mockResolvedValue(true);
+        mocks.action.mockResolvedValue({ ok: true, result: { status: 'accepted', turnId: 'turn' } });
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation }));
+        const start = vi.fn(async () => 'accepted' as const);
+        let operation!: Promise<unknown>;
+        await act(async () => {
+            operation = kind === 'approval' ? hook.getCurrent().decide(request, 'allow_once') : hook.getCurrent().sendText('once ready', start);
+        });
+        expect(hook.getCurrent().busy).toBe(true);
+        expect(mocks.action).not.toHaveBeenCalled();
+        expect(start).not.toHaveBeenCalled();
+        await act(async () => { ready.resolve(false); await operation; });
+        expect(hook.getCurrent().outcome).toBe('rejected');
+        expect(mocks.action).not.toHaveBeenCalled();
+        await act(async () => {
+            if (kind === 'approval') await hook.getCurrent().decide(request, 'allow_once');
+            else await hook.getCurrent().sendText('once ready', start);
+        });
+        expect(mocks.action).toHaveBeenCalledTimes(1);
+        await hook.unmount();
+    });
+
+    /** 准备期间换号也只能结束旧点击，不能用新账号或旧控制事实继续投递。 */
+    it('rejects a prepared mutation after its account changes', async () => {
+        const ready = createDeferred<boolean>();
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl({ ...input, prepareForMutation: () => ready.promise }));
+        const start = vi.fn(async () => 'accepted' as const);
+        let operation!: Promise<unknown>;
+        await act(async () => { operation = hook.getCurrent().sendText('old account text', start); });
+        expect(mocks.action).not.toHaveBeenCalled();
+        mocks.accountId = 'account-b';
+        await hook.rerender();
+        await act(async () => { ready.resolve(true); expect(await operation).toEqual({ outcome: 'rejected' }); });
+        expect(mocks.action).not.toHaveBeenCalled();
+        expect(start).not.toHaveBeenCalled();
+        await hook.unmount();
+    });
     /** 已发布的同寿命快照只负责选路，下一次慢水合不能延迟真实投递。 */
     it.each(['start', 'steer'] as const)('dispatches %s from the current snapshot without waiting for another history read', async (mode) => {
         mocks.read.mockResolvedValue({ ok: true, snapshot: mode === 'start'
@@ -196,19 +238,62 @@ describe('desktop control lifecycle', () => {
         expect(start).not.toHaveBeenCalled(); expect(mocks.action).not.toHaveBeenCalled();
     });
 
-    /** 读取被更新请求替代时，不拿较早返回的同目标快照放行。 */
-    it('rejects a click read superseded by a newer refresh', async () => {
+    /** 同寿命较新读取已发布事实时保留用户动作，只按新轮次追加，旧结果不能覆盖它。 */
+    it('steers a superseded click through the newer published control snapshot', async () => {
         mocks.read.mockRejectedValueOnce(new Error('initially offline'));
         const { useDirectSessionControl } = await import('./useDirectSessionControl');
         const hook = await renderHook(() => useDirectSessionControl(input));
         const pending = createDeferred<unknown>();
         mocks.read.mockReturnValueOnce(pending.promise);
+        mocks.read.mockResolvedValue({ ok: true, snapshot: { ...snapshot, turnId: 'new-running' } });
+        mocks.action.mockResolvedValue({ ok: true, result: { status: 'accepted', turnId: 'new-running' } });
         const start = vi.fn(async () => 'accepted' as const);
         let first!: ReturnType<ReturnType<typeof useDirectSessionControl>['sendText']>;
-        await act(async () => { first = hook.getCurrent().sendText('old read', start); });
+        await act(async () => { first = hook.getCurrent().sendText('old read', start, 'local-superseded'); });
         await act(async () => { await hook.getCurrent().refresh(); });
-        await act(async () => { pending.resolve({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } }); await first; });
-        expect(start).not.toHaveBeenCalled(); expect(mocks.action).not.toHaveBeenCalled();
+        expect(hook.getCurrent().snapshot?.turnId).toBe('new-running');
+        let result!: Awaited<typeof first>;
+        await act(async () => {
+            pending.resolve({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+            result = await first;
+        });
+        expect(result).toEqual({ outcome: 'accepted', mode: 'steer' });
+        expect(mocks.action).toHaveBeenCalledTimes(1);
+        expect(mocks.action).toHaveBeenCalledWith(expect.objectContaining({ kind: 'steer', expectedTurnId: 'new-running',
+            text: 'old read', operationId: 'local-superseded' }), expect.anything());
+        expect(start).not.toHaveBeenCalled();
+        expect(hook.getCurrent().snapshot?.turnId).toBe('new-running');
+    });
+
+    /** 较新读取失败或仍未发布时，迟到旧成功不能授权发送，也不能在之后自动重投。 */
+    it.each(['failed', 'pending'] as const)('rejects a superseded click while the newer refresh is %s', async (phase) => {
+        mocks.read.mockRejectedValueOnce(new Error('initially offline'));
+        const { useDirectSessionControl } = await import('./useDirectSessionControl');
+        const hook = await renderHook(() => useDirectSessionControl(input));
+        const older = createDeferred<unknown>();
+        const newer = createDeferred<unknown>();
+        mocks.read.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+        const start = vi.fn(async () => 'accepted' as const);
+        let sending!: ReturnType<ReturnType<typeof useDirectSessionControl>['sendText']>;
+        let refreshing!: ReturnType<ReturnType<typeof useDirectSessionControl>['refresh']>;
+        await act(async () => { sending = hook.getCurrent().sendText('unsent text', start); });
+        await act(async () => { refreshing = hook.getCurrent().refresh(); });
+        if (phase === 'failed') {
+            await act(async () => { newer.resolve({ ok: false, error: 'unavailable' }); await refreshing; });
+        }
+        let result!: Awaited<typeof sending>;
+        await act(async () => {
+            older.resolve({ ok: true, snapshot: { ...snapshot, state: 'completed', textSendMode: 'start' } });
+            result = await sending;
+        });
+        expect(result).toEqual({ outcome: 'rejected' });
+        expect(hook.getCurrent().snapshot).toBeNull();
+        if (phase === 'pending') {
+            await act(async () => { newer.resolve({ ok: true, snapshot }); await refreshing; });
+            expect(hook.getCurrent().snapshot?.turnId).toBe('turn');
+        }
+        expect(start).not.toHaveBeenCalled();
+        expect(mocks.action).not.toHaveBeenCalled();
     });
 
     /** 新快照变为运行中时只追加到该轮次，未知回执锁定原操作不重投。 */

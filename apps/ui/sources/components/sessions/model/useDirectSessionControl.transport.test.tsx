@@ -8,7 +8,7 @@ vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', (
 vi.mock('@/sync/domains/state/storage', () => createStorageModuleStub({ storage: { getState: () => transport.state } }));
 vi.mock('@/sync/store/hooks', () => ({ useActiveServerAccountScope: () => ({ serverId: 'server', accountId: 'account' }) }));
 const request = { requestId: 'request', revision: 'rev', kind: 'command' as const, command: 'echo example', canDecide: true };
-const input = { sessionId: 'linked', machineId: 'machine', serverId: 'server', enabled: true, observationKey: 'turn' };
+const input = { sessionId: 'linked', machineId: 'machine', serverId: 'server', enabled: true, observationKey: 'turn', prepareForMutation: async () => true };
 
 describe('desktop control issuance boundary', () => {
     beforeEach(() => {

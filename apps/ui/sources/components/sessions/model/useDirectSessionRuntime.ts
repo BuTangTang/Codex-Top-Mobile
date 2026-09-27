@@ -492,13 +492,23 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
         };
     }, [directSessionLink, enabled, refreshNow, viewerActive]);
 
-    // 控制只跟随当前聚焦的原生桌面任务，观察事件触发快照刷新而不另起轮询器。
+    /** 离线或冷开点击复用原 STATUS 探测；已有在线事实不重复读取，runner 归属仍须先确认。 */
+    const prepareForMutation = React.useCallback(async (): Promise<boolean> => {
+        if (!viewerActive || !foregroundRef.current || !committedViewerDemandRef.current?.active
+            || committedViewerDemandRef.current.targetKey !== targetKey) return false;
+        const latest = statusRef.current?.machineOnline === true
+            ? statusRef.current : await refreshNow().catch(() => null);
+        return latest?.machineOnline === true && latest.runnerActive !== true;
+    }, [refreshNow, targetKey, viewerActive]);
+
+    // 控制读取不以缓存在线状态为前提；实际操作先由原 runtime 确认连接与 runner 归属。
     const control = useDirectSessionControl({
         sessionId: params.sessionId,
         machineId: directSessionLink?.machineId ?? null,
         serverId: sessionServerId,
-        enabled: viewerActive && directSessionLink?.providerId === 'codex' && status?.machineOnline === true && status.runnerActive !== true,
+        enabled: viewerActive && directSessionLink?.providerId === 'codex' && status?.runnerActive !== true,
         observationKey: JSON.stringify(status?.observation ?? null),
+        prepareForMutation,
     });
 
     return React.useMemo(() => ({
