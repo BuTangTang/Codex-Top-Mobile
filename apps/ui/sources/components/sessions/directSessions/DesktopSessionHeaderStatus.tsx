@@ -26,15 +26,16 @@ type DesktopSessionHeaderStatusProps = Readonly<{
     notice?: Readonly<{ title: string; body: string }> | null;
 }>;
 
-type DesktopSessionDetailsProps = Pick<DesktopSessionHeaderStatusProps, 'sourceLabel' | 'status' | 'control' | 'canWrite' | 'notice'>;
+type DesktopSessionDetailsProps = Pick<DesktopSessionHeaderStatusProps, 'sourceLabel' | 'status' | 'control' | 'canWrite' | 'notice'>
+    & Readonly<{ syncing: boolean }>;
 
 /** 详情只在用户打开时挂载，审批继续使用原请求、权限及控制器的锁定规则。 */
 function DesktopSessionDetails(props: DesktopSessionDetailsProps) {
     const observation = resolveDirectSessionObservationStatus(props.status);
     return <View style={styles.details} testID="desktop-session-details">
         {props.sourceLabel ? <Text selectable style={styles.detailText}>{props.sourceLabel}</Text> : null}
-        <Text style={styles.detailText}>{t(observation.textKey)}</Text>
-        <Text style={styles.hint}>{resolveDirectSessionControlNotice(props.status, true)}</Text>
+        <Text style={styles.detailText}>{props.syncing ? '同步中' : t(observation.textKey)}</Text>
+        {!props.syncing ? <Text style={styles.hint}>{resolveDirectSessionControlNotice(props.status, true)}</Text> : null}
         {props.notice ? <View testID="desktop-session-details-notice" style={styles.notice}>
             <Text selectable style={styles.detailText}>{props.notice.title}</Text>
             <Text selectable style={styles.hint}>{props.notice.body}</Text>
@@ -57,18 +58,25 @@ export function DesktopSessionHeaderStatus(props: DesktopSessionHeaderStatusProp
     const opacity = React.useRef(new Animated.Value(1)).current;
     const modalId = React.useRef<string | null>(null);
     const observation = resolveDirectSessionObservationStatus(props.status);
-    const observationText = t(observation.textKey);
-    const color = theme.colors.status[observation.colorKey];
+    const observed = props.status?.observation;
+    // 只解释原首读在途，不覆盖旧快照、明确错误或已知生命周期，也不推导任务运行。
+    const syncing = props.active && props.control?.loading === true && props.control.snapshot === null
+        && props.control.error === null && props.control.outcome === null && !props.notice
+        && props.status?.machineOnline !== false && props.status?.externalControl?.canSend !== false
+        && !props.status?.externalControl?.unavailableReason
+        && (!observed || (observed.state === 'unknown' && observed.reason === 'not_observed'));
+    const observationText = syncing ? '同步中' : t(observation.textKey);
+    const color = theme.colors.status[syncing ? 'connecting' : observation.colorKey];
     const requestCount = props.control?.snapshot?.state === 'running' ? props.control.snapshot.requests.length : 0;
     const hasPending = requestCount > 0 || props.status?.observation?.state === 'needs_input';
-    const controlUnavailable = props.control?.error != null || props.status?.machineOnline === false
-        || props.status?.externalControl?.canSend !== true;
+    const controlUnavailable = !syncing && (props.control?.error != null || props.status?.machineOnline === false
+        || props.status?.externalControl?.canSend !== true);
     const attentionText = hasPending ? (requestCount > 0 ? `待处理 ${requestCount}` : '待处理')
         : props.control?.outcome === 'unknown' ? '待确认'
         : controlUnavailable || props.notice ? '详情' : null;
     const detailsProps = React.useMemo(() => ({
-        sourceLabel: props.sourceLabel, status: props.status, control: props.control, canWrite: props.canWrite, notice: props.notice,
-    }), [props.sourceLabel, props.status, props.control, props.canWrite, props.notice]);
+        sourceLabel: props.sourceLabel, status: props.status, control: props.control, canWrite: props.canWrite, notice: props.notice, syncing,
+    }), [props.sourceLabel, props.status, props.control, props.canWrite, props.notice, syncing]);
 
     /** 只有状态切换才做一次短淡入；不启动持续动画或刷新定时器。 */
     React.useEffect(() => {
@@ -80,7 +88,7 @@ export function DesktopSessionHeaderStatus(props: DesktopSessionHeaderStatusProp
         const animation = Animated.timing(opacity, { toValue: 1, duration: 160, useNativeDriver: true });
         animation.start();
         return () => animation.stop();
-    }, [observation.textKey, opacity, props.active, reducedMotion]);
+    }, [observationText, opacity, props.active, reducedMotion]);
 
     /** 弹层复用最新控制快照；请求撤回、权限变化和审批锁定不会停留在打开时的旧值。 */
     React.useEffect(() => {

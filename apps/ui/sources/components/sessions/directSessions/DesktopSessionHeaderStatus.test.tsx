@@ -8,6 +8,7 @@ import type { UseDirectSessionRuntimeResult } from '@/components/sessions/model/
 import { DesktopSessionHeaderStatus } from './DesktopSessionHeaderStatus';
 
 const modal = vi.hoisted(() => ({ show: vi.fn(() => 'status-details'), update: vi.fn(), hide: vi.fn() }));
+vi.mock('expo-network', () => ({ addNetworkStateListener: vi.fn(() => ({ remove: vi.fn() })) }));
 vi.mock('react-native', async () => {
     const { createReactNativeNativeMock } = await import('@/dev/testkit/mocks/reactNative');
     return createReactNativeNativeMock({ platformOS: 'android' });
@@ -66,6 +67,83 @@ describe('desktop session header status', () => {
         storage.setState((state) => ({ localSettings: { ...state.localSettings, uiFontScale: 1 } }));
         vi.clearAllMocks();
     });
+
+    /** 首读等待只是同步反馈；同一顶栏和已打开详情随后显示真实结果。 */
+    it.each(['success', 'failure'] as const)('keeps the first pending read truthful through %s', async (result) => {
+        const { StyleSheet } = await import('react-native');
+        const props = createProps({ status: null, control: createControl({ loading: true }) });
+        const screen = await renderScreen(<DesktopSessionHeaderStatus {...props} />);
+        const row = screen.findByTestId('desktop-session-header-status');
+        const height = StyleSheet.flatten(row?.props.style).height;
+        expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toBe('同步中');
+        expect(screen.findByTestId('desktop-session-header-attention')).toBeNull();
+        expect(screen.findByTestId('desktop-session-header-refresh')?.props.disabled).toBe(true);
+        const { details, renderDetails } = await openDetails(screen);
+        expect(details.getTextContent()).toContain('同步中');
+        expect(details.getTextContent()).not.toContain('directSessions.observation.unknown');
+        expect(details.getTextContent()).not.toContain('chatFooter.directSessionDesktopUnknown');
+
+        const waiting = { ...props, status: { ...createProps().status!, externalControl: undefined,
+            observation: { v: 1 as const, state: 'unknown' as const, reason: 'not_observed' as const } } };
+        await act(async () => { screen.tree.update(<DesktopSessionHeaderStatus {...waiting} />); });
+        expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toBe('同步中');
+        expect(screen.findByTestId('desktop-session-header-attention')).toBeNull();
+        const settled = result === 'success'
+            ? createProps({ status: { ...createProps().status!, observation: { v: 1, state: 'completed', source: 'desktop', turnId: 'turn-1' } } })
+            : { ...waiting, control: createControl({ error: 'private transport failure' }) };
+        await act(async () => { screen.tree.update(<DesktopSessionHeaderStatus {...settled} />); });
+        await act(async () => { details.tree.update(renderDetails(modal.update.mock.calls.at(-1)?.[1])); });
+        const stateKey = `directSessions.observation.${result === 'success' ? 'completed' : 'unknown'}`;
+        expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toBe(stateKey);
+        expect(details.getTextContent()).toContain(stateKey);
+        expect(details.getTextContent()).not.toContain('同步中');
+        expect(details.getTextContent()).not.toContain('private transport failure');
+        expect(screen.findByTestId('desktop-session-header-status')).toBe(row);
+        expect(StyleSheet.flatten(row?.props.style).height).toBe(height);
+        expect(screen.findByTestId('desktop-session-header-refresh')?.props.disabled).toBe(false);
+        if (result === 'failure') {
+            expect(screen.findByTestId('desktop-session-header-attention')).not.toBeNull();
+            expect(details.getTextContent()).toContain('暂无法读取桌面待处理详情');
+            await act(async () => { screen.tree.update(<DesktopSessionHeaderStatus {...settled}
+                control={{ ...settled.control!, loading: true }} />); });
+            expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toBe(stateKey);
+            expect(screen.findByTestId('desktop-session-header-attention')).not.toBeNull();
+        }
+        expect(props.refreshNow).not.toHaveBeenCalled();
+        expect(props.control?.refresh).not.toHaveBeenCalled();
+    });
+
+    /** loading 不覆盖旧快照、已知状态、失活或真实错误；未知投递仍有原待确认入口。 */
+    it.each(['inactive', 'snapshot', 'offline', 'unavailable', 'other_unknown', 'outcome', 'notice', 'running', 'completed', 'needs_input'] as const)(
+        'preserves existing status while a read is pending (%s)', async (kind) => {
+            const base = createProps();
+            let props = createProps({ control: createControl({ loading: true }),
+                status: { ...base.status!, observation: { v: 1, state: 'unknown', reason: 'not_observed' } } });
+            if (kind === 'inactive') props = { ...props, active: false };
+            if (kind === 'snapshot') props = { ...props, control: createControl({ loading: true,
+                snapshot: { v: 1, state: 'completed', turnId: 'old', requests: [] } }) };
+            if (kind === 'offline') props = { ...props, status: { ...props.status!, machineOnline: false } };
+            if (kind === 'unavailable') props = { ...props, status: { ...props.status!, externalControl: { canSend: false, unavailableReason: 'owner_unavailable' } } };
+            if (kind === 'other_unknown') props = { ...props, status: { ...props.status!, observation: { v: 1, state: 'unknown', reason: 'revision_gap' } } };
+            if (kind === 'outcome') props = { ...props, control: createControl({ loading: true, outcome: 'unknown' }) };
+            if (kind === 'notice') props = { ...props, notice: { title: '无法恢复此会话', body: '请在电脑上查看。' } };
+            if (kind === 'running' || kind === 'completed') props = { ...props, status: { ...props.status!,
+                observation: { v: 1, state: kind, source: 'desktop', turnId: 'turn-1' } } };
+            if (kind === 'needs_input') props = { ...props, status: { ...props.status!, observation: { v: 1, state: 'needs_input', source: 'desktop',
+                turnId: 'turn-1', requests: [{ requestId: 'question', kind: 'user_action_request' }] } } };
+            const screen = await renderScreen(<DesktopSessionHeaderStatus {...props} />);
+            expect(screen.findByTestId('desktop-session-header-observation')?.props.children).toBe(
+                `directSessions.observation.${['running', 'completed', 'needs_input'].includes(kind) ? kind : 'unknown'}`);
+            if (['offline', 'unavailable', 'outcome', 'notice', 'needs_input'].includes(kind)) {
+                expect(screen.findByTestId('desktop-session-header-attention')).not.toBeNull();
+            }
+            if (kind === 'outcome') expect(screen.getTextContent()).toContain('待确认');
+            if (kind === 'notice') {
+                const { details } = await openDetails(screen);
+                expect(details.getTextContent()).toContain(props.notice!.title);
+            }
+        },
+    );
 
     /** 使用真实 Text 缩放和本地字号设置，验证父行能容纳文字及真实按钮边界。 */
     it.each([1, 2.5])('fits real scaled text and touch targets without changing height for lifecycle updates (scale %s)', async (uiFontScale) => {
