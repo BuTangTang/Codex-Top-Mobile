@@ -392,6 +392,8 @@ function LegendListTranscriptRendererInner<TItem>(
         // A command boundary ends the prior gesture as continuation authority. Preserve live
         // drag/momentum suppression itself: an explicit command issued mid-fling must not let
         // the held corrector fight the still-active native gesture.
+        // 新命令已接管位置，旧 reveal 测量不得在随后回写。
+        viewportRevealMeasurementGenerationRef.current = null;
         advanceMovementEpoch();
         userScrollIntent.revokeInputEvidence();
     }, [advanceMovementEpoch, userScrollIntent]);
@@ -2104,6 +2106,8 @@ function LegendListTranscriptRendererInner<TItem>(
     }, [emitRendererAtEndState, isWebFrame, props.frame.rendererOptions.identity.nativeID, recordViewportHeight, recordVisualBottomSlotHeight]);
 
     const handleLegendScroll = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+        // 已收到实际滚动位置，不再采用事件之前的 reveal 测量。
+        viewportRevealMeasurementGenerationRef.current = null;
         invalidateNativePhysicalViewportCapture();
         const cause = pendingViewportCauseRef.current;
         const state = readRendererAtEndState();

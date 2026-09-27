@@ -24,6 +24,11 @@ import type {
     TranscriptRendererNativePhysicalViewportObservationResult,
 } from './types';
 
+// 此处只验证原生滚动，网络事件订阅使用与 Sync 测试相同的系统边界桩。
+vi.mock('expo-network', () => ({
+    addNetworkStateListener: vi.fn(() => ({ remove: vi.fn() })),
+}));
+
 vi.mock('react-native', async () => {
     const actual = await vi.importActual<typeof import('@/dev/reactNativeStub')>('@/dev/reactNativeStub');
     return {

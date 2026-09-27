@@ -5216,7 +5216,7 @@ describe('Legend transcript renderer adapter', () => {
         expect(assignedLegendRef.clearCaches).not.toHaveBeenCalled();
     });
 
-    it('re-observes the natively displayed offset into Legend state on screen reveal (S-E route-pop desync)', async () => {
+    it.each([false, true])('re-observes the natively displayed offset on reveal across an unrelated commit: %s', async (withUnrelatedCommit) => {
         // Live native S-E capture (2026-07-11): after a tool-details route push/pop the
         // transcript shows a persistent blank region — Legend state believes an offset the
         // native scroll view is not at (a write issued/settled while the screen was covered
@@ -5239,7 +5239,7 @@ describe('Legend transcript renderer adapter', () => {
             scrollLength: 773,
             start: 3,
         };
-        await renderScreen(
+        const renderer = (
             <Renderer
                 webDomObservation={mountedWebDomObservation}
                 ref={listRef}
@@ -5252,8 +5252,9 @@ describe('Legend transcript renderer adapter', () => {
                     nativeID: 'legend-main-native-id',
                     platformOS: 'ios',
                 })}
-            />,
+            />
         );
+        const screen = await renderScreen(renderer);
         type NativeMeasureCallback = (
             x: number,
             y: number,
@@ -5288,6 +5289,11 @@ describe('Legend transcript renderer adapter', () => {
         getShellRef(listRef).revalidateViewportAfterReveal?.();
         getShellRef(listRef).revalidateViewportAfterReveal?.();
 
+        // 只有无几何变化的提交：原生仍未上报新落点，正常 reveal 修复必须继续有效。
+        if (withUnrelatedCommit) {
+            await screen.update(React.cloneElement(renderer, { extraData: 'unrelated-commit' }));
+        }
+
         expect(nativeMeasurementWarnings).toEqual([]);
         expect(innerNode.measure).toHaveBeenCalledTimes(2);
         expect(nativeScrollHost.measure).toHaveBeenCalledTimes(2);
@@ -5309,6 +5315,100 @@ describe('Legend transcript renderer adapter', () => {
         });
         expect(assignedLegendRef.scrollToOffset).toHaveBeenCalledTimes(1);
     });
+
+    it.each(['end', 'offset', 'native-scroll'] as const)(
+        'does not replay a stale reveal measurement after a newer %s landing',
+        async (newerMovement) => {
+            setPlatformOS('android');
+            const { legendListRenderer } = await import('./legendListRenderer');
+            const Renderer = legendListRenderer.Component;
+            const listRef = React.createRef<TranscriptListShellRef<{ id: string }>>();
+            let physicalOffset = 200;
+            legendStateOverride = {
+                contentLength: 2_013,
+                end: 4,
+                isAtEnd: false,
+                isNearEnd: false,
+                isWithinMaintainScrollAtEndThreshold: false,
+                scroll: physicalOffset,
+                scrollLength: 773,
+                start: 0,
+            };
+            await renderScreen(
+                <Renderer
+                    webDomObservation={mountedWebDomObservation}
+                    ref={listRef}
+                    data={Array.from({ length: 5 }, (_value, index) => ({ id: `row-${index}` }))}
+                    dataKey="session-test"
+                    keyExtractor={(item: { id: string }) => item.id}
+                    renderItem={({ item }: { item: { id: string } }) => React.createElement('Row', { id: item.id })}
+                    frame={resolveMainTranscriptListShellFrame({
+                        legendInitialScrollAtEnd: false,
+                        nativeID: 'legend-main-native-id',
+                        platformOS: 'android',
+                    })}
+                />,
+            );
+            type NativeMeasureCallback = (
+                x: number, y: number, width: number, height: number, pageX: number, pageY: number,
+            ) => void;
+            const pendingHostMeasurements: NativeMeasureCallback[] = [];
+            const pendingInnerMeasurements: NativeMeasureCallback[] = [];
+            const nativeScrollHost = {
+                measure: vi.fn((onSuccess: NativeMeasureCallback) => pendingHostMeasurements.push(onSuccess)),
+            };
+            const innerNode = {
+                measure: vi.fn((onSuccess: NativeMeasureCallback) => pendingInnerMeasurements.push(onSuccess)),
+            };
+            assignedLegendRef.getNativeScrollRef = vi.fn(() => ({
+                getInnerViewRef: () => innerNode,
+                getNativeScrollRef: () => nativeScrollHost,
+            }));
+            // 只模拟命令落点；旧测量是否失效仍由真实 renderer 判断。
+            const recordNativeLanding = (offset: number): void => {
+                physicalOffset = offset;
+                legendStateOverride = {
+                    ...legendStateOverride,
+                    isAtEnd: offset === 1_240,
+                    isNearEnd: offset === 1_240,
+                    isWithinMaintainScrollAtEndThreshold: offset === 1_240,
+                    scroll: offset,
+                };
+            };
+            assignedLegendRef.scrollToEnd.mockImplementation(() => {
+                recordNativeLanding(1_240);
+                return Promise.resolve();
+            });
+            assignedLegendRef.scrollToOffset.mockImplementation(({ offset }: { offset: number }) => {
+                recordNativeLanding(offset);
+                return Promise.resolve();
+            });
+
+            getShellRef(listRef).revalidateViewportAfterReveal?.();
+            expect(pendingInnerMeasurements).toHaveLength(1);
+            expect(pendingHostMeasurements).toHaveLength(1);
+            const newerOffset = newerMovement === 'end' ? 1_240 : 1_000;
+            await act(async () => {
+                if (newerMovement === 'end') getShellRef(listRef).scrollToEnd?.({ animated: false });
+                else if (newerMovement === 'offset') getShellRef(listRef).scrollToOffset({ animated: false, offset: newerOffset });
+                else {
+                    recordNativeLanding(newerOffset);
+                    capturedLegendListProps.onScroll({ nativeEvent: { contentOffset: { x: 0, y: newerOffset } } });
+                }
+                await Promise.resolve();
+            });
+            expect(physicalOffset).toBe(newerOffset);
+            expect(getShellRef(listRef).getAbsoluteLastScrollOffset?.()).toBe(newerOffset);
+
+            // 同一视图的旧测量晚到：不得覆盖已经落地的新动作或原生滚动。
+            act(() => {
+                pendingInnerMeasurements[0]?.(0, 0, 320, 2_013, 0, -120);
+                pendingHostMeasurements[0]?.(0, 0, 320, 773, 0, 80);
+            });
+            expect(physicalOffset).toBe(newerOffset);
+            expect(getShellRef(listRef).getAbsoluteLastScrollOffset?.()).toBe(newerOffset);
+        },
+    );
 
     it('leaves an aligned viewport untouched on screen reveal', async () => {
         setPlatformOS('ios');
