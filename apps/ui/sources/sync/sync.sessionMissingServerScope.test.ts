@@ -288,6 +288,74 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         }
     });
 
+    it('persists the first message of an unopened empty conversation and restores it after memory eviction', async () => {
+        const variant = 'empty-to-first';
+        const cache = await import('./domains/state/warmCachePersistence');
+        await cache.prepareWarmCacheStorage();
+        const { sync } = await import('./sync');
+        const internals = sync as any;
+        const owner = upsertServerProfile({ serverUrl: `https://recent-prefetch-${variant}.example`, name: 'Recent prefetch' });
+        setActiveServerId(owner.id, { scope: 'device' });
+        const previous = { account: internals.serverID, credentials: internals.credentials, pause: internals.pauseController };
+        const accountId = `recent-prefetch-account-${variant}`;
+        const sessionId = `never-opened-recent-${variant}`;
+        internals.serverID = accountId;
+        internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+        internals.pauseController = new PauseController();
+        internals.pauseController.resume();
+        resolvePreferredServerIdForSessionIdMock.mockReturnValue(owner.id);
+        storage.getState().applySessions([{ ...createDirectSession(sessionId), encryptionMode: 'plain', serverId: owner.id }]);
+        internals.activeServerSessionIds = new Set([sessionId]);
+        internals.hasFetchedSessionsSnapshotForActiveServer = true;
+        const isCurrent = () => true;
+        const request = { link: { machineId: 'machine-1', providerId: 'codex' as const, remoteSessionId: 'vendor-session-1',
+            source: { kind: 'codexHome' as const, home: 'user' as const } }, transcriptVersion: 'v1', sourceUpdatedAtMs: 100 };
+        const input = { serverId: owner.id, accountId, requests: [request], isCurrent };
+        cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+        try {
+            // 仅元数据的新对话先接受空页；尚未打开页面，也没有首条正文。
+            machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [],
+                tailCursor: 'empty-tail', nextCursor: null, hasMore: false });
+            await sync.prefetchPhoneRecentDirectSessions(input);
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)).toMatchObject({ items: [], tailCursor: 'empty-tail' });
+            await sync.prefetchPhoneRecentDirectSessions(input);
+            expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+            expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+
+            // 下一次发现版本改变，必须从空页游标读入首条，而不是将空缓存视为永远完成。
+            machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+                { id: 'first-after-empty', createdAtMs: 2, raw: { role: 'user', content: { type: 'text', text: 'first message after empty' } } },
+            ], nextCursor: 'first-tail', truncated: false });
+            const changed = { ...input, requests: [{ ...request, transcriptVersion: 'v2' }] };
+            await sync.prefetchPhoneRecentDirectSessions(changed);
+            await sync.prefetchPhoneRecentDirectSessions(changed);
+            expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+            expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledTimes(1);
+            expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'empty-tail' }), { serverId: owner.id });
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)).toMatchObject({
+                tailCursor: 'first-tail', items: [expect.objectContaining({ id: 'first-after-empty' })],
+            });
+            // 清掉原内存投影并暂停网络；首次打开只能沿原持久缓存恢复。
+            internals.evictSessionTranscript(sessionId);
+            expect(storage.getState().sessionMessages[sessionId]?.isLoaded).not.toBe(true);
+            internals.pauseController.pause();
+            machineDirectSessionTranscriptPageMock.mockClear();
+            machineDirectSessionTranscriptReadAfterMock.mockClear();
+            sync.onSessionVisible(sessionId);
+            expect(storage.getState().sessionMessages[sessionId]?.isLoaded).toBe(true);
+            expect(Object.values(storage.getState().sessionMessages[sessionId]?.messagesById ?? {})).toEqual([expect.objectContaining({ kind: 'user-text', text: 'first message after empty' })]);
+            expect(machineDirectSessionTranscriptPageMock).not.toHaveBeenCalled();
+            expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+        } finally {
+            internals.messagesSync.get(sessionId)?.stop();
+            internals.messagesSync.delete(sessionId);
+            internals.serverID = previous.account;
+            internals.credentials = previous.credentials;
+            internals.pauseController = previous.pause;
+            cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+        }
+    });
+
     it.each(['readonly-link', 'deferred', 'background', 'source-changed', 'cache-evicted', 'unavailable', 'shared', 'completed-read', 'no-version', 'cancel-selection', 'different-server', 'visible-during-read', 'source-time-missing'] as const)(
         'keeps recent prefetch on the original hydration and cache acceptance boundary: %s', async (variant) => {
             const cache = await import('./domains/state/warmCachePersistence');
