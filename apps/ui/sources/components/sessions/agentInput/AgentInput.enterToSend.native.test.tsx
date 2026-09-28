@@ -7,6 +7,8 @@ import type { AutocompleteSuggestion } from '@/components/autocomplete/autocompl
 import { installAgentInputCommonModuleMocks } from './agentInputTestHelpers';
 
 
+vi.mock('expo-network', () => ({ addNetworkStateListener: vi.fn(() => ({ remove: vi.fn() })) }));
+
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mocks = vi.hoisted(() => ({
@@ -671,34 +673,47 @@ describe('AgentInput (enter to send on native)', () => {
         expect(findMultiTextInput(newSessionScreen).props.textStyle).toMatchObject({ fontSize: 16 });
     });
 
-    it('sends and blurs on Enter for existing sessions when native enter-to-send is enabled', async () => {
-        const { AgentInput } = await import('./AgentInput');
-        const screen = await renderScreen(
-            <AgentInput
-                sessionId="session-1"
-                value="hello"
-                onChangeText={mocks.onChangeText}
-                placeholder="p"
-                onSend={mocks.onSend}
-                autocompleteKinds={[]}
-                autocompleteSuggestions={async () => []}
-                isSendDisabled={false}
-                disabled={false}
-                showAbortButton={false}
-            />
-        );
+    it.each([
+        { name: 'phone existing session', width: 390, height: 844, sessionId: 'session-1', blurCount: 0 },
+        { name: 'tablet existing session', width: 900, height: 600, sessionId: 'session-1', blurCount: 1 },
+        { name: 'phone new session', width: 390, height: 844, sessionId: undefined, blurCount: 0 },
+    ].flatMap((testCase) => (['button', 'Enter'] as const).map((sendPath) => ({ ...testCase, sendPath }))))(
+        'preserves send focus policy for $name via $sendPath',
+        async ({ width, height, sessionId, blurCount, sendPath }) => {
+            mocks.dimensions = { width, height, scale: 1, fontScale: 1 };
+            const { AgentInput } = await import('./AgentInput');
+            const screen = await renderScreen(
+                <AgentInput
+                    sessionId={sessionId}
+                    value="hello"
+                    onChangeText={mocks.onChangeText}
+                    placeholder="p"
+                    onSend={mocks.onSend}
+                    autocompleteKinds={[]}
+                    autocompleteSuggestions={async () => []}
+                    isSendDisabled={false}
+                    disabled={false}
+                    showAbortButton={false}
+                />
+            );
 
-        const input = findMultiTextInput(screen);
+            const input = findMultiTextInput(screen);
 
-        expect(input.props.submitBehavior).toBe('submit');
+            expect(input.props.submitBehavior).toBe('submit');
 
-        await act(async () => {
-            input.props.onSubmitEditing?.();
-        });
+            if (sendPath === 'button') {
+                await screen.pressByTestIdAsync(sessionId ? 'session-composer-send' : 'new-session-composer-send');
+            } else {
+                await act(async () => {
+                    input.props.onSubmitEditing?.();
+                });
+            }
 
-        expect(mocks.onSend).toHaveBeenCalledTimes(1);
-        expect(mocks.inputBlur).toHaveBeenCalledTimes(1);
-    });
+            expect(mocks.onSend).toHaveBeenCalledTimes(1);
+            expect(mocks.inputBlur).toHaveBeenCalledTimes(blurCount);
+            expect(mocks.inputFocus).not.toHaveBeenCalled();
+        },
+    );
 
     it('inserts a newline for focused hardware Shift+Enter when native enter-to-send is enabled', async () => {
         settingState.webEnterToSend = false;

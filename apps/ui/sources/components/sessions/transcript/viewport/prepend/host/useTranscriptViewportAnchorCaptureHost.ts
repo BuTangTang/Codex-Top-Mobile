@@ -169,7 +169,7 @@ export function useTranscriptViewportAnchorCaptureHost(deps: ViewportAnchorCaptu
                     anchor: null,
                     failureStatus: 'native_physical_unavailable',
                     fireTimeOffsetY: null,
-                    retryWorthy: false,
+                    retryWorthy: true,
                 };
             }
             const itemIndex = capture.itemIndex;
@@ -211,7 +211,7 @@ export function useTranscriptViewportAnchorCaptureHost(deps: ViewportAnchorCaptu
                 ),
                 onComplete: onNativePhysicalComplete
                     ? (capture) => onNativePhysicalComplete(
-                        deps.listRef.current === listRef
+                        capture === null || deps.listRef.current === listRef
                             ? resolveNativePhysicalCapture(capture)
                             : {
                                 anchor: null,
@@ -407,17 +407,28 @@ export function useTranscriptViewportAnchorCaptureHost(deps: ViewportAnchorCaptu
                     return;
                 }
                 deps.scheduledViewportAnchorCaptureRef.current = null;
+                const retryCapture = (verdict: 'dropped' | 'emitted' | 'pending' | 'retry') => {
+                    if (verdict !== 'retry' || deps.scheduledViewportAnchorCaptureRef.current) return;
+                    const retried: ScheduledViewportAnchorCapture = {
+                        ...scheduled,
+                        dueAtMs: Date.now() + deps.debounceMs,
+                        emptyCaptureRetriesRemaining: scheduled.emptyCaptureRetriesRemaining - 1,
+                    };
+                    deps.scheduledViewportAnchorCaptureRef.current = retried;
+                    retried.timeoutId = armTimeout(deps.debounceMs);
+                };
                 const completeNativePhysicalCapture = (attempt: ViewportAnchorCaptureAttempt) => {
-                    emitViewportAnchorCapture(
+                    retryCapture(emitViewportAnchorCapture(
                         scheduled.state,
                         scheduled.generation,
                         scheduled.wantsPinned,
                         scheduled.emit,
                         () => attempt,
                         scheduled.sessionId,
-                    );
+                        { allowEmptyCaptureRetry: scheduled.emptyCaptureRetriesRemaining > 0 },
+                    ));
                 };
-                const verdict = emitViewportAnchorCapture(
+                retryCapture(emitViewportAnchorCapture(
                     scheduled.state,
                     scheduled.generation,
                     scheduled.wantsPinned,
@@ -428,15 +439,7 @@ export function useTranscriptViewportAnchorCaptureHost(deps: ViewportAnchorCaptu
                         allowEmptyCaptureRetry: scheduled.emptyCaptureRetriesRemaining > 0,
                         onNativePhysicalComplete: completeNativePhysicalCapture,
                     },
-                );
-                if (verdict !== 'retry') return;
-                const retried: ScheduledViewportAnchorCapture = {
-                    ...scheduled,
-                    dueAtMs: Date.now() + deps.debounceMs,
-                    emptyCaptureRetriesRemaining: scheduled.emptyCaptureRetriesRemaining - 1,
-                };
-                deps.scheduledViewportAnchorCaptureRef.current = retried;
-                retried.timeoutId = armTimeout(deps.debounceMs);
+                ));
             }, Math.max(0, delayMs));
             return timeoutId;
         };

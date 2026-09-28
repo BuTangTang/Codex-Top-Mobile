@@ -1661,7 +1661,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
             setLiveTextStatus(nextStatus);
             updateInputSelectionState(nextState.selection);
         }
-        if (props.sessionId) {
+        if (props.sessionId && !isPhoneSession) {
             inputRef.current?.blur();
         }
         messageHistory.reset();
@@ -1682,6 +1682,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                 : (shouldCarryLiveInputText ? { inputTextOverride: liveInputText } : undefined),
         );
     }, [
+        isPhoneSession,
         messageHistory,
         props.onSend,
         props.sessionId,

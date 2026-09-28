@@ -303,7 +303,7 @@ function LegendListTranscriptRendererInner<TItem>(
     const nativePhysicalEntryMeasurementGenerationRef = React.useRef<object>({});
     const latestNativePhysicalViewportCaptureRef =
         React.useRef<TranscriptRendererNativePhysicalViewportCapture | null>(null);
-    const nativePhysicalViewportObservationRef = React.useRef<Readonly<{ refresh: () => void }> | null>(null);
+    const nativePhysicalViewportObservationRef = React.useRef<Readonly<{ cancel: () => void; refresh: () => void }> | null>(null);
     const explicitJumpTakeoverOperationRef = React.useRef<TranscriptExplicitJumpOperationId | null>(null);
     // Native prop: `react-native-unistyles` installs `nativeProps_DEPRECATED` stickily, so a fresh
     // object here deep-copies on every commit of a styled family. Built once per mount because the
@@ -564,9 +564,11 @@ function LegendListTranscriptRendererInner<TItem>(
     ]);
     const nativePhysicalViewportIdentityRef = React.useRef(nativePhysicalViewportIdentity);
     nativePhysicalViewportIdentityRef.current = nativePhysicalViewportIdentity;
-    const invalidateNativePhysicalViewportCapture = React.useCallback(() => {
+    const invalidateNativePhysicalViewportCapture = React.useCallback((notifyPending = false) => {
+        const pending = nativePhysicalViewportObservationRef.current;
         latestNativePhysicalViewportCaptureRef.current = null;
         nativePhysicalViewportObservationRef.current = null;
+        if (notifyPending) pending?.cancel();
     }, []);
     const observeNativePhysicalViewport = React.useCallback((
         request: TranscriptRendererNativePhysicalViewportObservationRequest,
@@ -661,12 +663,19 @@ function LegendListTranscriptRendererInner<TItem>(
         if (candidates.length === 0) return { status: 'unavailable' };
 
         const observation = {
+            cancel: () => request.onComplete?.(null),
             // Re-measure after a commit while retaining the original observation request.
             refresh: () => {
                 if (
                     nativePhysicalViewportIdentityRef.current !== identity
                     || legendListRef.current !== legendRef
-                ) return;
+                ) {
+                    if (
+                        nativePhysicalViewportIdentityRef.current.dataKey === identity.dataKey
+                        && legendListRef.current === legendRef
+                    ) request.onComplete?.(null);
+                    return;
+                }
                 observeNativePhysicalViewport(request);
             },
         };
@@ -2077,7 +2086,7 @@ function LegendListTranscriptRendererInner<TItem>(
     }, [advanceMovementEpoch, requestHeldIntentSettle]);
 
     const handleLegendLayout = React.useCallback((event: LayoutChangeEvent) => {
-        invalidateNativePhysicalViewportCapture();
+        invalidateNativePhysicalViewportCapture(true);
         props.onLayout?.(event);
         recordViewportHeight(event.nativeEvent.layout.height);
     }, [invalidateNativePhysicalViewportCapture, props.onLayout, recordViewportHeight]);
@@ -2117,7 +2126,7 @@ function LegendListTranscriptRendererInner<TItem>(
     const handleLegendScroll = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
         // 已收到实际滚动位置，不再采用事件之前的 reveal 测量。
         viewportRevealMeasurementGenerationRef.current = null;
-        invalidateNativePhysicalViewportCapture();
+        invalidateNativePhysicalViewportCapture(true);
         const cause = pendingViewportCauseRef.current;
         const state = readRendererAtEndState();
         const webScroll = webScrollableElementRef.current?.scrollTop;
@@ -2721,7 +2730,7 @@ function LegendListTranscriptRendererInner<TItem>(
     }, [props.onStartReached]);
 
     const handleLegendItemSizeChanged = React.useCallback(() => {
-        invalidateNativePhysicalViewportCapture();
+        invalidateNativePhysicalViewportCapture(true);
         advanceMovementEpoch();
         emitSynthesizedContentSize();
         requestHeldIntentSettle({ deferFirstVerification: true });
@@ -2950,7 +2959,7 @@ function LegendListTranscriptRendererInner<TItem>(
                 onCommitLayoutEffect={() => {
                     // Renew only an in-flight observation; scrolling and identity changes still cancel it.
                     const pendingPhysicalObservation = nativePhysicalViewportObservationRef.current;
-                    invalidateNativePhysicalViewportCapture();
+                    invalidateNativePhysicalViewportCapture(false);
                     pendingPhysicalObservation?.refresh();
                     // LayoutCommitObserver is a no-dependency useLayoutEffect shim on Legend and
                     // therefore runs for every React commit, including commits with no transcript

@@ -1104,6 +1104,45 @@ describe('Legend transcript renderer installed native-package cleanup', () => {
                 layoutMeasurement: { width: 800, height: 600 },
             },
         });
+        for (const change of ['scroll', 'same-session-data', 'layout', 'item-size'] as const) {
+            act(() => drag(1_467));
+            const cancelledCompletion = vi.fn();
+            act(() => {
+                expect(listRef.current?.observeNativePhysicalViewport?.({
+                    focusOffsetPx: 108,
+                    onComplete: cancelledCompletion,
+                })).toEqual({ status: 'pending' });
+            });
+            await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+            if (change === 'same-session-data') {
+                await act(async () => {
+                    requireMountedScreen(screen).update(render('physical-capture-b', rows.map((row) => ({ ...row })), 3));
+                });
+            } else if (change === 'scroll') {
+                act(() => requireMountedScreen(screen).root.findByType('ScrollView').props.onScroll({
+                    nativeEvent: {
+                        contentOffset: { x: 0, y: 1_487 },
+                        contentSize: { width: 800, height: 4_000 },
+                        layoutMeasurement: { width: 800, height: 600 },
+                    },
+                }));
+            } else if (change === 'layout') {
+                const identityHost = requireMountedScreen(screen).root.findAll((node) => (
+                    node.props.nativeID === 'physical-capture-b' && typeof node.props.onLayout === 'function'
+                ))[0];
+                act(() => identityHost.props.onLayout({ nativeEvent: { layout: { height: 600, width: 800, x: 0, y: 0 } } }));
+            } else {
+                const list = requireMountedScreen(screen).root.findAll((node) => typeof node.props.onItemSizeChanged === 'function')[0];
+                act(() => list.props.onItemSizeChanged());
+            }
+            expect(cancelledCompletion, change).toHaveBeenCalledExactlyOnceWith(null);
+            act(() => pendingMeasurements.splice(0).forEach((complete) => complete()));
+            // Cancellation reports no physical fact; late measurements cannot replace it.
+            expect(cancelledCompletion, change).toHaveBeenCalledExactlyOnceWith(null);
+            expect(listRef.current?.observeNativePhysicalViewport?.({ focusOffsetPx: 108 }))
+                .toEqual({ status: 'unavailable' });
+        }
+
         act(() => drag(1_467));
         const movedCompletion = vi.fn();
         act(() => {

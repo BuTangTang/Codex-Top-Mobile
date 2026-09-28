@@ -572,7 +572,7 @@ describe('useTranscriptViewportAnchorCaptureHost deferral', () => {
         }
     });
 
-    it.each(['renderer-remount', 'session-exit'] as const)('drops a delayed native physical completion after %s', async (transition) => {
+    it.each(['renderer-remount', 'session-exit', 'cancel-retry', 'cancel-new-handle', 'retry-exhaustion', 'newer-schedule'] as const)('settles a delayed native physical observation after %s', async (transition) => {
         const originalPlatformOS = Platform.OS;
         Object.defineProperty(Platform, 'OS', { configurable: true, value: 'ios' });
         try {
@@ -621,24 +621,77 @@ describe('useTranscriptViewportAnchorCaptureHost deferral', () => {
             expect(members.emitViewportChange).not.toHaveBeenCalled();
             expect(vi.getTimerCount()).toBe(0);
 
-            if (transition === 'renderer-remount') {
-                members.listRef.current = {
-                    ...originalListRef,
-                    observeNativePhysicalViewport: vi.fn(() => ({ status: 'unavailable' })),
-                } as never;
-            } else {
-                hook.getCurrent().captureAtExit({ deferEmit: false });
-            }
-            completePhysicalCapture?.({
+            const capture = {
                 capturedAtMs: 100,
                 dataKey: 's1',
                 itemIndex: 0,
                 itemKey: 'row-physical',
                 itemOffsetPx: -2_196,
                 offsetY: 1_280,
-            });
-
-            expect(members.emitViewportChange).not.toHaveBeenCalled();
+            };
+            if (transition === 'renderer-remount' || transition === 'session-exit') {
+                if (transition === 'renderer-remount') {
+                    members.listRef.current = {
+                        ...originalListRef,
+                        observeNativePhysicalViewport: vi.fn(() => ({ status: 'unavailable' })),
+                    } as never;
+                } else {
+                    hook.getCurrent().captureAtExit({ deferEmit: false });
+                    completePhysicalCapture?.(null);
+                }
+                completePhysicalCapture?.(capture);
+                await vi.advanceTimersByTimeAsync(1_000);
+                expect(members.emitViewportChange).not.toHaveBeenCalled();
+                expect(vi.getTimerCount()).toBe(0);
+            } else {
+                if (transition === 'cancel-new-handle') {
+                    // Same renderer, new data: useImperativeHandle publishes a new handle.
+                    // Its cancellation carries no stale geometry and may rebind on retry.
+                    members.listRef.current = { ...originalListRef } as never;
+                }
+                if (transition === 'retry-exhaustion') {
+                    for (let attempt = 0; attempt < 4; attempt += 1) {
+                        completePhysicalCapture?.(null);
+                        await vi.advanceTimersByTimeAsync(200);
+                        expect(observeNativePhysicalViewport).toHaveBeenCalledTimes(Math.min(attempt + 2, 4));
+                    }
+                    await vi.advanceTimersByTimeAsync(1_000);
+                    expect(vi.getTimerCount()).toBe(0);
+                    expect(members.emitViewportChange).not.toHaveBeenCalled();
+                    // A subsequent user capture starts a fresh budget, not a polling loop.
+                    hook.getCurrent().schedule({ isPinned: false, offsetY: 1_800, shouldRestoreViewport: true });
+                    await vi.advanceTimersByTimeAsync(200);
+                } else if (transition === 'newer-schedule') {
+                    const oldCompletion = completePhysicalCapture;
+                    await vi.advanceTimersByTimeAsync(50);
+                    hook.getCurrent().schedule({ isPinned: false, offsetY: 1_800, shouldRestoreViewport: true });
+                    await vi.advanceTimersByTimeAsync(100);
+                    oldCompletion?.(null);
+                    // The old cancellation must not replace the newer debounce deadline.
+                    await vi.advanceTimersByTimeAsync(100);
+                    expect(observeNativePhysicalViewport).toHaveBeenCalledTimes(2);
+                } else {
+                    completePhysicalCapture?.(null);
+                    await vi.advanceTimersByTimeAsync(199);
+                    expect(observeNativePhysicalViewport).toHaveBeenCalledTimes(1);
+                    expect(members.emitViewportChange).not.toHaveBeenCalled();
+                    await vi.advanceTimersByTimeAsync(1);
+                    expect(observeNativePhysicalViewport).toHaveBeenCalledTimes(2);
+                }
+                completePhysicalCapture?.(capture);
+                expect(members.emitViewportChange).toHaveBeenCalledExactlyOnceWith({
+                    anchor: {
+                        capturedAtMs: 100,
+                        itemId: 'row-physical',
+                        itemOffsetPx: -2_196,
+                        kind: 'message',
+                        messageId: 'message-physical',
+                    },
+                    isPinned: false,
+                    offsetY: 1_280,
+                    shouldRestoreViewport: true,
+                });
+            }
 
             await hook.unmount();
         } finally {

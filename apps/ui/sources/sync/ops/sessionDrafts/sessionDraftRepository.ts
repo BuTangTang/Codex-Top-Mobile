@@ -35,6 +35,8 @@ type DraftFieldMutationV1 = Readonly<{
     mutationId: string;
     intent: 'edit' | 'clearCaptured';
     baseMutationId: string | null;
+    /** 清稿只认本次捕获的精确 token；ACK 丢失不等于远端新稿。 */
+    capturedMutationId?: string;
     field: Readonly<{ mutationId: string; value: StrictJsonValue }> | null;
 }>;
 
@@ -942,6 +944,7 @@ export class SessionDraftRepository {
                 path,
                 mutationId: nextField?.mutationId ?? this.randomUUID(),
                 intent: 'clearCaptured',
+                capturedMutationId,
                 baseMutationId: getField(replica.baseRawDocument, path)?.mutationId ?? null,
                 field: nextField,
             });
@@ -1135,7 +1138,10 @@ export class SessionDraftRepository {
         const conflicts: SessionDraftConflictField[] = [];
         for (const mutation of replica.pendingFieldMutations) {
             const remoteField = getField(remoteDocument, mutation.path);
-            if (remoteField?.mutationId === mutation.baseMutationId || (!remoteField && mutation.baseMutationId === null)) {
+            const matchesCapturedClear = mutation.intent === 'clearCaptured'
+                && typeof mutation.capturedMutationId === 'string'
+                && remoteField?.mutationId === mutation.capturedMutationId;
+            if (matchesCapturedClear || remoteField?.mutationId === mutation.baseMutationId || (!remoteField && mutation.baseMutationId === null)) {
                 localDocument = setField(localDocument, mutation.path, mutation.field);
                 remaining.push(mutation);
                 continue;

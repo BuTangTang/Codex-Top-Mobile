@@ -2241,3 +2241,151 @@ describe('concurrent draft field reconciliation', () => {
             expect(content.v.document).toMatchObject({ composer: { text: { value: 'SYNTHETIC_NEW_B' } }, target: { routing: { recipient: { value: { kind: 'user', userId: 'synthetic-recipient-c' } } } } });
     });
 });
+
+
+describe('captured draft clear after lost acknowledgement', () => {
+    const address = sessionAddress;
+    const submittedText = 'A'.repeat(72);
+
+    /** 复用原 CAS 服务夹具，只在真实传输边界模拟提交后的 ACK 丢失与离线。 */
+    function createCapturedClearFixture(dropFirstAck: boolean) {
+        const storage = createMemoryStorage();
+        const cipher = plainCipher();
+        const remote = createRemote();
+        let attempts = 0;
+        let online = true;
+        const transport: SessionDraftRepositoryTransport = {
+            ...remote.transport,
+            mutate: vi.fn(async (params) => {
+                attempts += 1;
+                if (!online) throw new Error('synthetic offline');
+                const response = await remote.transport.mutate(params);
+                if (dropFirstAck && attempts === 1) throw new Error('synthetic ACK loss');
+                return response;
+            }),
+        };
+        return {
+            freshRepository: () => createSessionDraftRepository({ storage, cipher, transport, scope, syncEnabled: true }),
+            otherRepository: () => createSessionDraftRepository({ storage: createMemoryStorage(), cipher, transport, scope, syncEnabled: true }),
+            attempts: () => attempts,
+            readRemote: remote.readCurrent,
+            setOnline: (value: boolean) => { online = value; },
+            omitCapturedTokenForLegacyVector: () => {
+                // code50 前的 V1/V2 clear 记录不含此可选字段；保留原序列化的其他字节语义。
+                for (const [key, raw] of storage.values) {
+                    const parsed = JSON.parse(raw) as {
+                        replicas: Record<string, { pendingFieldMutations: Array<Record<string, unknown>> }>;
+                    };
+                    for (const replica of Object.values(parsed.replicas)) {
+                        for (const mutation of replica.pendingFieldMutations) delete mutation.capturedMutationId;
+                    }
+                    storage.set(key, JSON.stringify(parsed));
+                }
+            },
+        };
+    }
+
+    it.each([false, true])('does not restore the captured submitted text when first draft ACK is lost=%s', async (lostAck) => {
+        const f = createCapturedClearFixture(lostAck);
+        const repository = f.freshRepository();
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        const firstFlush = await repository.flushSessionDraft({ scope, address });
+        expect(firstFlush.status).toBe(lostAck ? 'offline' : 'clean');
+        const captured = repository.captureSessionDraftCurrentness({ scope, address });
+        const remoteContent = f.readRemote()?.content;
+        expect(remoteContent?.t).toBe('plain');
+        if (remoteContent?.t !== 'plain') throw new Error('synthetic server did not commit the draft');
+        expect(remoteContent.v.document.composer.text.mutationId).toBe(captured.mutationIds['composer.text']);
+        // This is the same currentness clear called by useDraft at the local send handoff.
+        const clearing = repository.clearSessionDraftCurrentness({ scope, address, currentness: captured });
+        expect(repository.getSessionDraftSnapshot(scope, address)?.document.composer.text.value ?? '').toBe('');
+        expect(await clearing).toBe(true);
+        expect(f.attempts()).toBeGreaterThanOrEqual(2);
+        expect(f.attempts()).toBeLessThanOrEqual(3);
+
+        // Fresh owner, same serialized storage: no private-field mutation and no late read.
+        const rebooted = f.freshRepository();
+        const recoveredSnapshot = rebooted.getSessionDraftSnapshot(scope, address);
+        const recovered = recoveredSnapshot?.document.composer.text.value ?? '';
+        expect(recovered).toBe('');
+    });
+
+    it('retains the captured token through an offline clear and cold restart before recovery', async () => {
+        const f = createCapturedClearFixture(true);
+        const repository = f.freshRepository();
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        expect((await repository.flushSessionDraft({ scope, address })).status).toBe('offline');
+        const captured = repository.captureSessionDraftCurrentness({ scope, address });
+        f.setOnline(false);
+        await repository.clearSessionDraftCurrentness({ scope, address, currentness: captured });
+        f.setOnline(true);
+        const rebooted = f.freshRepository();
+        await rebooted.flushSessionDraft({ scope, address });
+        expect(rebooted.getSessionDraftSnapshot(scope, address)?.document.composer.text.value ?? '').toBe('');
+        expect(f.readRemote()?.content).toBeNull();
+    });
+
+    it('still clears predecessor persisted pending records without the optional token', async () => {
+        const f = createCapturedClearFixture(false);
+        const repository = f.freshRepository();
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        await repository.flushSessionDraft({ scope, address });
+        const captured = repository.captureSessionDraftCurrentness({ scope, address });
+        f.setOnline(false);
+        await repository.clearSessionDraftCurrentness({ scope, address, currentness: captured });
+        f.omitCapturedTokenForLegacyVector();
+        f.setOnline(true);
+        const rebooted = f.freshRepository();
+        expect((await rebooted.flushSessionDraft({ scope, address })).status).toBe('clean');
+        expect(rebooted.getSessionDraftSnapshot(scope, address)).toBeNull();
+        expect(f.readRemote()?.content).toBeNull();
+    });
+
+    it('preserves a newer remote mutation even when its text equals the submitted text', async () => {
+        const f = createCapturedClearFixture(true);
+        const repository = f.freshRepository();
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        await repository.flushSessionDraft({ scope, address });
+        const captured = repository.captureSessionDraftCurrentness({ scope, address });
+        const other = f.otherRepository();
+        await other.materializeExact(scope, address);
+        other.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: 'B' } });
+        other.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        await other.flushSessionDraft({ scope, address });
+        const newer = other.getSessionDraftSnapshot(scope, address)!.document.composer.text;
+        expect(newer.mutationId).not.toBe(captured.mutationIds['composer.text']);
+        await repository.clearSessionDraftCurrentness({ scope, address, currentness: captured });
+        expect(repository.getSessionDraftSnapshot(scope, address)?.document.composer.text).toEqual(newer);
+        expect(repository.getSessionDraftSnapshot(scope, address)?.status).toBe('clean');
+    });
+
+    it('clears captured remote text while merging a genuinely newer independent remote field', async () => {
+        const f = createCapturedClearFixture(true);
+        const repository = f.freshRepository();
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        await repository.flushSessionDraft({ scope, address });
+        const captured = repository.captureSessionDraftCurrentness({ scope, address });
+        const other = f.otherRepository();
+        await other.materializeExact(scope, address);
+        other.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { mentions: [{ kind: 'synthetic', tokenText: '@C' }] } });
+        await other.flushSessionDraft({ scope, address });
+        const remoteMentions = other.getSessionDraftSnapshot(scope, address)!.document.composer.mentions;
+        await repository.clearSessionDraftCurrentness({ scope, address, currentness: captured });
+        const recovered = f.freshRepository().getSessionDraftSnapshot(scope, address);
+        expect(recovered?.document.composer.mentions).toEqual(remoteMentions);
+        expect(recovered?.document.composer.text.value ?? '').toBe('');
+        expect(recovered?.status).toBe('clean');
+    });
+
+    it('keeps a newer local draft when an older send capture is cleared', async () => {
+        const f = createCapturedClearFixture(true);
+        const repository = f.freshRepository();
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: submittedText } });
+        await repository.flushSessionDraft({ scope, address });
+        const captured = repository.captureSessionDraftCurrentness({ scope, address });
+        repository.writeExistingSessionDraft({ scope, sessionId: address.sessionId, patch: { text: 'next draft' } });
+        const newer = repository.getSessionDraftSnapshot(scope, address)!.document.composer.text;
+        await repository.clearSessionDraftCurrentness({ scope, address, currentness: captured });
+        expect(repository.getSessionDraftSnapshot(scope, address)?.document.composer.text).toEqual(newer);
+    });
+});

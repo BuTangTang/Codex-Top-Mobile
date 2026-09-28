@@ -3,6 +3,7 @@ import { isRecoveredHistoryTranscriptObservationProvenance } from '@happier-dev/
 import {
     useSessionActionDrafts,
     useSessionPendingMessages,
+    useSessionMessagesVersion,
     useSetting,
 } from '@/sync/domains/state/storage';
 import { buildSessionMetadataStabilitySignatureValue, buildStableJsonSignature } from '@/sync/domains/session/metadata/sessionMetadataStability';
@@ -73,13 +74,18 @@ export function useChatListRootState(props: ChatListProps) {
         });
     }, [props.session.accessLevel, props.session.canApprovePermissions, props.session.active, props.session.presence]);
     // 在分组前排除普通工具，避免仅隐藏组件却仍挂载整段过程；审批沿用既有可操作判断。
-    const visibleMessageIds = props.hideOrdinaryToolCalls
-        ? sourceMessageIdsOldestFirst.filter((id) => messagesById[id]?.kind !== 'tool-call' || shouldKeepPendingToolCallVisible(
-            messagesById[id] ?? null,
-            deriveReadOnlyTranscriptInteraction(interaction, forkAwareMessageDescriptors?.metadataByMessageId[id]?.isReadOnlyContext === true),
-        ))
-        : sourceMessageIdsOldestFirst;
-    const stableVisibleMessageIds = useStableValueBySignature(visibleMessageIds, props.hideOrdinaryToolCalls ? JSON.stringify(visibleMessageIds) : '');
+    const messagesVersion = useSessionMessagesVersion(props.session.id);
+    const forkMessageMetadataById = forkAwareMessageDescriptors?.metadataByMessageId;
+    const visibleProjection = React.useMemo(() => {
+        const ids = props.hideOrdinaryToolCalls
+            ? sourceMessageIdsOldestFirst.filter((id) => messagesById[id]?.kind !== 'tool-call' || shouldKeepPendingToolCallVisible(
+                messagesById[id] ?? null,
+                deriveReadOnlyTranscriptInteraction(interaction, forkMessageMetadataById?.[id]?.isReadOnlyContext === true),
+            ))
+            : sourceMessageIdsOldestFirst;
+        return { ids, signature: props.hideOrdinaryToolCalls ? JSON.stringify(ids) : '' };
+    }, [props.session.id, props.hideOrdinaryToolCalls, sourceMessageIdsOldestFirst, messagesById, messagesVersion, interaction, forkMessageMetadataById]);
+    const stableVisibleMessageIds = useStableValueBySignature(visibleProjection.ids, visibleProjection.signature);
     const messageIdsOldestFirst = props.hideOrdinaryToolCalls ? stableVisibleMessageIds : sourceMessageIdsOldestFirst;
 
     const activeServerAccountScope = useActiveServerAccountScope();
