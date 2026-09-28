@@ -751,16 +751,13 @@ vi.mock('@/sync/domains/state/storage', async (importOriginal) => {
     useMessage: (_sessionId: string, messageId: string) =>
         (sessionMessagesState.messages ?? []).find((message: any) => message.id === messageId) ?? null,
     useSetting: (key: string) => settingValues[key],
-    getStorage: () => ({
-        getState: () => ({
-            sessionMessages: {
-                [sessionState?.id ?? 'session-1']: {
-                    messagesById: getSessionMessagesByIdSnapshot(),
-                    messagesMap: getSessionMessagesByIdSnapshot(),
-                },
-            },
-        }),
-    }),
+    // Zustand 边界同时支持 selector 调用与 getState，保留原合成消息来源。
+    getStorage: () => {
+        const getState = () => ({ sessionMessages: { [sessionState?.id ?? 'session-1']: {
+            messagesById: getSessionMessagesByIdSnapshot(), messagesMap: getSessionMessagesByIdSnapshot(),
+        } } });
+        return Object.assign((selector: (state: ReturnType<typeof getState>) => unknown) => selector(getState()), { getState });
+    },
 });
 });
 
@@ -3612,7 +3609,7 @@ describe('ChatList (FlashList v2)', () => {
         expect(nativeScreen.getCapturedFlashListProps().drawDistance).toBe(1600);
     });
 
-    it('keeps native first-paint placeholder until FlashList mount settle', async () => {
+    it.each(['settled', 'deadline', 'history', 'jump'] as const)('keeps native first-paint placeholder until FlashList mount settle: %s', async (outcome) => {
         await withWebFlashListFakeTimers(0, async () => {
             runtimeMockState.platformOs = 'ios';
             sessionMessagesState = {
@@ -3620,19 +3617,41 @@ describe('ChatList (FlashList v2)', () => {
                 messages: [{ kind: 'user-text', id: 'u1', localId: null, createdAt: 1, text: 'hi' }],
             };
 
+            const derived = await import('./items/useTranscriptRootDerivedItems');
+            const originalDerived = derived.useTranscriptRootDerivedItems;
+            const presented = vi.fn();
+            const derivedSpy = vi.spyOn(derived, 'useTranscriptRootDerivedItems').mockImplementation((input) => {
+                const result = originalDerived(input);
+                return { ...result, onInitialBackfillReady: presented };
+            });
+            if (outcome === 'history') sessionViewportByIdState.set('session-1', {
+                isPinned: false, offsetY: 200, anchor: null, lastUpdatedAt: 1, source: 'observed',
+            });
             const { ChatList } = await import('./ChatList');
-            const screen = await renderTrackedFlashListChatList(<ChatList session={{ ...sessionState }} />);
+            const screen = await renderTrackedFlashListChatList(<ChatList session={{ ...sessionState }} jumpToSeq={outcome === 'jump' ? 1 : null} />);
+
+            if (outcome === 'history' || outcome === 'jump') {
+                expect(presented).toHaveBeenCalled();
+                derivedSpy.mockRestore();
+                return;
+            }
+            expect(countExactTestId(screen, 'transcript-first-paint-placeholder')).toBe(1);
+
+            if (outcome === 'settled') await triggerFlashListChatListLoad(12, { turns: 1 });
 
             expect(countExactTestId(screen, 'transcript-first-paint-placeholder')).toBe(1);
 
-            await triggerFlashListChatListLoad(12, { turns: 1 });
-
-            expect(countExactTestId(screen, 'transcript-first-paint-placeholder')).toBe(1);
-
-            await primeFlashListMetrics(100, 1000, { turns: 2 });
-            await settleNativeFlashListMount(screen);
+            expect(presented).not.toHaveBeenCalled();
+            if (outcome === 'settled') {
+                await primeFlashListMetrics(100, 1000, { turns: 2 });
+                await settleNativeFlashListMount(screen);
+            } else {
+                await screen.settle({ advanceTimersMs: 3000, cycles: 2, turns: 2 });
+            }
 
             expect(countExactTestId(screen, 'transcript-first-paint-placeholder')).toBe(0);
+            expect(presented).toHaveBeenCalled();
+            derivedSpy.mockRestore();
         });
     });
 

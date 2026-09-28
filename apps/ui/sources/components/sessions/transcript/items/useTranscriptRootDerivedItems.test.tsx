@@ -109,4 +109,37 @@ describe('useTranscriptRootDerivedItems', () => {
 
         await hook.unmount();
     });
+    it('holds cold bottom history until content is presented and fences stale session receipts', async () => {
+        deferredCallbacks.length = 0;
+        const params = { ...buildHookParams(buildTurnMessages(300)), sessionId: 'cold-gated-a', deferOlderBackfillUntilPresented: true };
+        const hook = await renderHook((input: typeof params) => useTranscriptRootDerivedItems(input), { initialProps: params });
+        expect(turnUserIds(hook.getCurrent())).toHaveLength(48);
+        expect(deferredCallbacks).toHaveLength(0);
+        const oldReceipt = hook.getCurrent().onInitialBackfillReady;
+        await hook.rerender({ ...params, sessionId: 'cold-gated-b' });
+        await act(async () => { oldReceipt(); });
+        expect(deferredCallbacks).toHaveLength(0);
+        await act(async () => { hook.getCurrent().onInitialBackfillReady(); });
+        expect(deferredCallbacks.length).toBeGreaterThan(0);
+        while (deferredCallbacks.length) {
+            await act(async () => { deferredCallbacks.shift()!(); });
+            await flushHookEffects();
+        }
+        expect(turnUserIds(hook.getCurrent())).toHaveLength(300);
+        await hook.unmount();
+    });
+
+    it('keeps short records complete and releases a newly requested historical entry without waiting for paint', async () => {
+        deferredCallbacks.length = 0;
+        const params = { ...buildHookParams(buildTurnMessages(12)), sessionId: 'cold-short', deferOlderBackfillUntilPresented: true };
+        const hook = await renderHook((input: typeof params) => useTranscriptRootDerivedItems(input), { initialProps: params });
+        expect(turnUserIds(hook.getCurrent())).toHaveLength(12);
+        expect(deferredCallbacks).toHaveLength(0);
+        await hook.rerender({ ...buildHookParams(buildTurnMessages(300)), sessionId: 'cold-historical', deferOlderBackfillUntilPresented: true });
+        expect(deferredCallbacks).toHaveLength(0);
+        await hook.rerender({ ...buildHookParams(buildTurnMessages(300)), sessionId: 'cold-historical', deferOlderBackfillUntilPresented: false });
+        expect(deferredCallbacks.length).toBeGreaterThan(0);
+        await hook.unmount();
+    });
+
 });

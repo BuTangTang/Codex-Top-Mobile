@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { Platform } from 'react-native';
 import { isRecoveredHistoryTranscriptObservationProvenance } from '@happier-dev/protocol';
 import {
     useSessionActionDrafts,
@@ -118,7 +119,10 @@ export function useChatListRootState(props: ChatListProps) {
     const toolCallsGroupStrategy =
         transcriptTurnToolCallsGroupStrategy === 'all_tools_in_turn' ? 'all_tools_in_turn' : 'consecutive_tools';
 
-    const { groupedItems, transcriptMaxTurnEntriesPerListItem } = useTranscriptRootDerivedItems({
+    // 原生冷打开先保留尾窗；具体定位/首帧放行由 Internal 的既有入口事实统一决定。
+    const deferOlderBackfillUntilPresented = Platform.OS === 'ios' || Platform.OS === 'android';
+    const { groupedItems, transcriptMaxTurnEntriesPerListItem, onInitialBackfillReady } = useTranscriptRootDerivedItems({
+        deferOlderBackfillUntilPresented,
         actionDrafts,
         discardedPendingMessages,
         fork,
@@ -176,6 +180,7 @@ export function useChatListRootState(props: ChatListProps) {
             selectionEnabled: transcriptSessionCommon.messageDisplay.transcriptMessageSelectionEnabled === true,
         },
         internalProps: {
+            onInitialBackfillReady,
             metadata: stableSessionMetadata,
             sessionId: props.session.id,
             sessionActive: props.session.active === true,

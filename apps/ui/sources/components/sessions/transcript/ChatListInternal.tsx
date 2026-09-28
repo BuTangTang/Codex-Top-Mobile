@@ -1743,6 +1743,14 @@ export const ChatListInternal = React.memo((props: ChatListInternalProps) => {
         showFirstPaintPlaceholder,
         showRouteHydrationFirstPaintPlaceholder,
     } = firstPaintState;
+    // 历史定位可能需要尾窗外的行，立即沿原路径补齐；普通底部等原呈现门禁结束。
+    // 原 deadline 仅终止这次可选等待，不把兜底当成真实绘制，也不添加新的计时器。
+    const initialBackfillReady = entryShouldFollowBottomForRender === false
+        || entryAnchorForRender != null || targetWindowActive || props.jumpToSeq != null
+        || (!showFirstPaintPlaceholder && (nativeMountSettleStable || nativeMountSettleDeadlineReached));
+    React.useEffect(() => {
+        if (initialBackfillReady) props.onInitialBackfillReady?.();
+    }, [initialBackfillReady, props.onInitialBackfillReady]);
     useTranscriptPaintTelemetryEffects({
         firstListPaintObserved,
         isWarmKeepAliveInstance,

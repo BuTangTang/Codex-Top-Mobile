@@ -27,6 +27,8 @@ const TRANSCRIPT_COLD_MOUNT_TAIL_MESSAGE_COUNT = 96;
 const TRANSCRIPT_COLD_MOUNT_BACKFILL_MESSAGE_COUNT = 256;
 
 export function useTranscriptRootDerivedItems(params: Readonly<{
+    /** 正常底部冷打开先展示尾窗，历史定位入口不等待此回执。 */
+    deferOlderBackfillUntilPresented?: boolean;
     actionDrafts: NonNullable<BuildChatListItemsOptions['actionDrafts']>;
     discardedPendingMessages: NonNullable<BuildChatListItemsOptions['discardedMessages']>;
     fork: ForkedTranscriptSnapshot | null;
@@ -56,6 +58,19 @@ export function useTranscriptRootDerivedItems(params: Readonly<{
         sessionId,
         toolCallsGroupStrategy,
     } = params;
+    const entryToken = React.useMemo(() => ({}), [sessionId]);
+    const currentEntryRef = React.useRef<object | null>(entryToken);
+    currentEntryRef.current = entryToken;
+    const [presentedEntry, setPresentedEntry] = React.useState<object | null>(null);
+    React.useLayoutEffect(() => {
+        currentEntryRef.current = entryToken;
+        return () => { if (currentEntryRef.current === entryToken) currentEntryRef.current = null; };
+    }, [entryToken]);
+    /** 仅接受当前挂载会话的补齐许可回执，旧页或卸载后的通知不能释放新页补齐。 */
+    const onInitialBackfillReady = React.useCallback(() => {
+        if (currentEntryRef.current === entryToken) setPresentedEntry(entryToken);
+    }, [entryToken]);
+    const olderBackfillAllowed = params.deferOlderBackfillUntilPresented !== true || presentedEntry === entryToken;
     const syncTuning = sync.getSyncTuning();
     const derivedItemsCacheMaxSessions = resolveTranscriptDerivedItemsCacheMaxSessions(
         syncTuning.transcriptDerivedItemsCacheMaxSessions,
@@ -115,7 +130,7 @@ export function useTranscriptRootDerivedItems(params: Readonly<{
     }, [derivedItemsCacheMaxSessions, groupingMode, sessionId, turnsCache]);
 
     React.useEffect(() => {
-        if (groupingMode !== 'turns' || !turnsCache || isTranscriptTurnsBuildCacheComplete(turnsCache)) return;
+        if (!olderBackfillAllowed || groupingMode !== 'turns' || !turnsCache || isTranscriptTurnsBuildCacheComplete(turnsCache)) return;
 
         let cancelled = false;
         let cancelScheduled: (() => void) | null = null;
@@ -158,6 +173,7 @@ export function useTranscriptRootDerivedItems(params: Readonly<{
             cancelScheduled?.();
         };
     }, [
+        olderBackfillAllowed,
         derivedItemsCacheMaxSessions,
         discardedPendingMessages,
         forkAwareMessageDescriptors,
@@ -274,6 +290,7 @@ export function useTranscriptRootDerivedItems(params: Readonly<{
     ]);
 
     return {
+        onInitialBackfillReady,
         groupedItems,
         transcriptMaxTurnEntriesPerListItem,
     };

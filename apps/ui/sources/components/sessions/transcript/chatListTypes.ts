@@ -79,6 +79,8 @@ export type ChatListProps = Readonly<{
 }>;
 
 export type ChatListInternalProps = Readonly<{
+    /** 原入口允许继续补齐时通知派生owner；包括定位需求与原有等待终止。 */
+    onInitialBackfillReady?: () => void;
     metadata: Metadata | null;
     sessionId: string;
     sessionActive: boolean;
