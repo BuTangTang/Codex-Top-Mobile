@@ -12,6 +12,8 @@ import { flushHookEffects, renderHook } from '@/dev/testkit';
 import type { WebTranscriptScrollMetrics } from '@/components/sessions/transcript/webTranscriptScrollMetrics';
 import { useCommittedTranscriptRef } from '@/components/sessions/transcript/viewport/lifecycle/host/useCommittedTranscriptRef';
 import { storage } from '@/sync/domains/state/storage';
+import type { NormalizedMessage } from '@/sync/typesRaw';
+import { createSessionMessagesFixture } from '@/dev/testkit/fixtures/transcriptFixtures';
 
 import type { ScrollableChatListRef } from '../../transcriptScrollableListTypes';
 import { useTranscriptJumpHost } from './useTranscriptJumpHost';
@@ -152,6 +154,72 @@ describe('useTranscriptJumpHost identity stability', () => {
     beforeEach(() => {
         loadTargetWindowMessagesMock.mockReset();
         storage.setState({ sessionDeferredNewerMessages: {} });
+    });
+
+    // 长历史导航复用同一批原始映射；只计真实 Map 遍历，不替换路由或锚点算法。
+    it('builds long-list navigation anchors with at most one original-route scan per batch', async () => {
+        const previousSessionMessages = storage.getState().sessionMessages;
+        storage.setState({ sessionMessages: { ...previousSessionMessages, s1: createSessionMessagesFixture() } });
+        const normalized: NormalizedMessage[] = Array.from({ length: 847 }, (_, index) => ({
+            id: `source-${index}`, seq: index + 1, localId: null, createdAt: index + 1,
+            role: 'user', content: { type: 'text', text: 'Synthetic route fixture' }, isSidechain: false,
+        }));
+        storage.getState().applyMessages('s1', normalized);
+        const materialized = storage.getState().sessionMessages.s1!;
+        const originalIds = materialized.reducerState.messageIds;
+        expect(originalIds.size).toBe(847);
+        const listData = materialized.messageIdsOldestFirst.slice(-643).map((messageId) => ({
+            id: messageId, kind: 'message' as const, messageId,
+            createdAt: materialized.messagesById[messageId]!.createdAt,
+            seq: materialized.messagesById[messageId]!.seq ?? null,
+        }));
+        const targetIndices = [0, 321, 642];
+        const entries: JumpHostDeps['transcriptNavigationEntries'] = targetIndices.map((sourceIndex) => {
+            const message = materialized.messagesById[listData[sourceIndex]!.messageId]!;
+            return {
+                id: `navigation-${sourceIndex}`, sessionId: 's1', seq: message.seq!,
+                routeMessageId: `server:source-${sourceIndex + 204}`, transcriptBlockIndex: null,
+                kind: 'user-turn', role: 'user', label: 'Synthetic entry',
+                promptPreview: null, responsePreview: null, createdAtMs: message.createdAt,
+                pinned: false, pinnedAtMs: null, loaded: true,
+            };
+        });
+        let scanCount = 0;
+        let visitedEntries = 0;
+        const originalEntries = originalIds.entries.bind(originalIds);
+        const observeIteration = () => {
+            scanCount += 1;
+            const iterator = originalEntries();
+            const next = iterator.next.bind(iterator);
+            iterator.next = (...args) => {
+                const result = next(...args);
+                if (!result.done) visitedEntries += 1;
+                return result;
+            };
+            return iterator;
+        };
+        const entriesSpy = vi.spyOn(originalIds, 'entries').mockImplementation(observeIteration);
+        const iteratorSpy = vi.spyOn(originalIds, Symbol.iterator).mockImplementation(observeIteration);
+        const members = createStableMembers();
+        const deps: JumpHostDeps = {
+            ...buildDeps(members), platformOS: 'android', committedMessagesCount: normalized.length,
+            listData, messagesById: materialized.messagesById, transcriptNavigationEntries: entries,
+        };
+        const hook = await renderHook(() => useTranscriptJumpHost(deps));
+        try {
+            await flushHookEffects();
+            expect(members.transcriptNavigationRuntimeAnchorsRef.current).toEqual(entries.map((entry, index) => ({
+                id: entry.id, kind: entry.kind, sourceIndex: targetIndices[index],
+                messageIds: [listData[targetIndices[index]!]!.messageId], role: entry.role,
+                routeMessageId: entry.routeMessageId, seq: entry.seq, transcriptBlockIndex: null,
+            })));
+            expect({ scanCount, visitedEntries }).toEqual({ scanCount: 1, visitedEntries: originalIds.size });
+        } finally {
+            await hook.unmount();
+            entriesSpy.mockRestore();
+            iteratorSpy.mockRestore();
+            storage.setState({ sessionMessages: previousSessionMessages });
+        }
     });
 
     // 已加载列表的物理底部也可能落后于源尾部，沿用下箭头入口且不虚构未读数量。

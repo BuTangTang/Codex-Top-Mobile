@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ToolCallMessage } from './messageTypes';
 import {
     buildSessionMessageRouteId,
+    createSessionMessageRouteIdResolver,
     parseStableSessionMessageRouteId,
     resolveMessageRouteIdForDisplay,
     resolveSessionMessageRouteId,
@@ -74,6 +75,55 @@ describe('messageRouteIds', () => {
         });
 
         expect(routeId).toBe('server:server-msg-1');
+    });
+
+    it('keeps canonical route priority for every message in a batch', () => {
+        const reducerState = createReducer();
+        reducerState.messageIds.set(' first-original ', 'aliased');
+        reducerState.messageIds.set('later-original', 'aliased');
+        reducerState.messageIds.set('   ', 'blank-first');
+        reducerState.messageIds.set('ignored-alias', 'blank-first');
+        reducerState.messageIds.set('original-without-message', 'missing');
+        const messagesById = {
+            aliased: { ...makeToolMessage('aliased'), realID: 'current-real' },
+            'blank-first': { ...makeToolMessage('blank-first'), realID: 'fallback-real' },
+            real: { ...makeToolMessage('real'), realID: ' real-server ' },
+            tool: makeToolMessage('tool'),
+            local: {
+                ...makeToolMessage('local'), localId: ' local-opaque ',
+                tool: { ...makeToolMessage('local').tool, id: undefined },
+            },
+            internal: {
+                ...makeToolMessage('internal'), tool: { ...makeToolMessage('internal').tool, id: undefined },
+            },
+        };
+        const resolve = createSessionMessageRouteIdResolver(reducerState);
+        for (const [messageId, expected] of [
+            ['aliased', 'server:first-original'],
+            ['blank-first', 'server:fallback-real'],
+            ['missing', 'server:original-without-message'],
+            ['real', 'server:real-server'],
+            ['tool', 'tool:call_read_1'],
+            ['local', 'local: local-opaque '],
+            ['internal', 'internal'],
+            [' real ', 'server:real-server'],
+            ['unknown', 'unknown'],
+            ['   ', null],
+        ] as const) {
+            expect(buildSessionMessageRouteId({ messageId, messagesById, reducerState })).toBe(expected);
+            expect(resolve({ messageId, messagesById })).toBe(expected);
+        }
+    });
+
+    it('reads mutated mappings in a fresh batch instead of retaining an earlier index', () => {
+        const reducerState = createReducer();
+        reducerState.messageIds.set('original-before', 'internal');
+        const input = { messageId: 'internal', messagesById: { internal: makeToolMessage('internal') } };
+        expect(createSessionMessageRouteIdResolver(reducerState)(input)).toBe('server:original-before');
+        reducerState.messageIds.delete('original-before');
+        reducerState.messageIds.set('original-after', 'internal');
+        expect(createSessionMessageRouteIdResolver(reducerState)(input)).toBe('server:original-after');
+        expect(createSessionMessageRouteIdResolver(null)(input)).toBe('tool:call_read_1');
     });
 
     it('prefers reducer-backed durable routes over the stale public message id used for display', () => {

@@ -13,6 +13,9 @@ import { installTranscriptCommonModuleMocks } from './transcriptTestHelpers';
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 const keyboardDismissMock = vi.fn();
 const scaffoldHarness = createMockComposerKeyboardScaffoldHarness();
+const deviceMetricsState = vi.hoisted(() => ({
+    type: 'phone' as 'phone' | 'tablet',
+}));
 
 installTranscriptCommonModuleMocks({
     reactNative: async () => {
@@ -34,6 +37,7 @@ installTranscriptCommonModuleMocks({
 
 vi.mock('@/utils/platform/responsive', () => ({
     useHeaderHeight: () => 0,
+    useDeviceType: () => deviceMetricsState.type,
 }));
 
 vi.mock('react-native-safe-area-context', () => ({
@@ -71,17 +75,27 @@ describe('AgentContentView (android keyboard)', () => {
     beforeEach(() => {
         keyboardDismissMock.mockReset();
         scaffoldHarness.clear();
+        deviceMetricsState.type = 'phone';
     });
 
-    it('uses the composer keyboard scaffold with stable transcript and composer slots on Android', async () => {
+    it.each([
+        { deviceType: 'phone' as const, expectedInset: 0 },
+        { deviceType: 'tablet' as const, expectedInset: 96 },
+    ])('uses stable scaffold slots and the effective chrome inset on first $deviceType render', async ({ deviceType, expectedInset }) => {
+        deviceMetricsState.type = deviceType;
         const { AgentContentView } = await import('./AgentContentView.native');
+        const { SessionCockpitBottomChromeHeightContext } = await import('@/components/workspaceCockpit/session/SessionCockpitChromeRegistry');
 
         let tree: renderer.ReactTestRenderer | null = null;
-        tree = (await renderScreen(<AgentContentView
+        tree = (await renderScreen(
+            <SessionCockpitBottomChromeHeightContext.Provider value={96}>
+                <AgentContentView
                     content={<React.Fragment>content</React.Fragment>}
                     input={<React.Fragment>input</React.Fragment>}
                     placeholder={<React.Fragment>placeholder</React.Fragment>}
-        />)).tree;
+                />
+            </SessionCockpitBottomChromeHeightContext.Provider>,
+        )).tree;
 
         expect(tree!.root.findAllByType('KeyboardAvoidingView' as any)).toHaveLength(0);
         const scaffold = tree!.root.findByType('MockComposerKeyboardScaffold' as any);
@@ -91,6 +105,10 @@ describe('AgentContentView (android keyboard)', () => {
         expect(scaffoldRender?.props.mode).toBe('session');
         expect(scaffoldRender?.props.contentTestID).toBe('agent-content-scroll-region');
         expect(scaffoldRender?.props.composerTestID).toBe('agent-content-input-footer');
+        expect(scaffoldRender?.props.layoutBottomInset).toBe(expectedInset);
+        const contentHost = tree!.root.findAllByType('View' as never).filter((node) => node.props.style?.paddingBottom !== undefined);
+        expect(contentHost).toHaveLength(1);
+        expect(contentHost[0].props.style.paddingBottom).toBe(expectedInset);
 
         const contentRegion = tree!.root.findByProps({ testID: 'agent-content-scroll-region' });
         expect(contentRegion).toBeTruthy();

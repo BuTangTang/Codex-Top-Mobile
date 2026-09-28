@@ -9,7 +9,7 @@ import {
 } from '@/sync/domains/state/storage';
 import { fireAndForget } from '@/utils/system/fireAndForget';
 import type { Message } from '@/sync/domains/messages/messageTypes';
-import { buildSessionMessageRouteId } from '@/sync/domains/messages/messageRouteIds';
+import { buildSessionMessageRouteId, createSessionMessageRouteIdResolver } from '@/sync/domains/messages/messageRouteIds';
 import { resolveJumpToBottomAffordanceState } from '@/components/sessions/transcript/scroll/jumpToBottomAffordanceState';
 import { resolveNextJumpToBottomDistanceVisibilityState } from '@/components/sessions/transcript/scroll/jumpToBottomVisibilityDistanceState';
 import { settingsDefaults } from '@/sync/domains/settings/settings';
@@ -559,6 +559,8 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         const session = state?.sessionMessages?.[sessionId];
         const stateMessagesById = (session?.messagesById ?? session?.messagesMap ?? {}) as Readonly<Record<string, Message>>;
         const reducerState = session?.reducerState ?? null;
+        // 每次派生批次共用一次映射，避免每个可见行重新扫描原始 ID 表。
+        const buildRouteId = createSessionMessageRouteIdResolver(reducerState);
         return listData.flatMap((item, sourceIndex) => {
             const messageIds = collectTranscriptNavigationMessageIdsForItem(item);
             const messages = messageIds.flatMap((messageId) => {
@@ -566,10 +568,9 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
                 if (!message) return [];
                 return [{
                     messageId,
-                    routeMessageId: buildSessionMessageRouteId({
+                    routeMessageId: buildRouteId({
                         messageId,
                         messagesById: { [messageId]: message },
-                        reducerState,
                     }),
                     seq: typeof message.seq === 'number' && Number.isFinite(message.seq)
                         ? Math.trunc(message.seq)

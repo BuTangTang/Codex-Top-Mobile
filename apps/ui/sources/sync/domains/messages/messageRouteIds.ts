@@ -97,9 +97,23 @@ export function buildMessageRouteId(message: Message): string {
     return stableServerMessageId ? `server:${stableServerMessageId}` : stableLocalMessageId ? `local:${stableLocalMessageId}` : message.id;
 }
 
-export function buildSessionMessageRouteId(params: Readonly<{
+type SessionMessageRouteInput = Readonly<{
     messageId: string;
     messagesById: Readonly<Record<string, Message>>;
+}>;
+
+/** 单条与批量入口共用原始 ID 优先级及消息降级规则。 */
+function buildSessionMessageRouteIdFromOriginal(
+    messageId: string,
+    message: Message | undefined,
+    originalMessageId: string | null,
+): string {
+    if (originalMessageId) return `server:${originalMessageId}`;
+    return message ? buildMessageRouteId(message) : messageId;
+}
+
+/** 单条查询读取当前 reducer 映射，再沿原规则生成稳定路由。 */
+export function buildSessionMessageRouteId(params: SessionMessageRouteInput & Readonly<{
     reducerState: RouteLookupState | null | undefined;
 }>): string | null {
     const messageId = normalizeNonEmptyString(params.messageId);
@@ -107,18 +121,30 @@ export function buildSessionMessageRouteId(params: Readonly<{
 
     const message = params.messagesById[messageId];
     const originalMessageId = findOriginalMessageIdForInternalId(params.reducerState, messageId);
-    if (originalMessageId) {
-        return `server:${originalMessageId}`;
-    }
+    return buildSessionMessageRouteIdFromOriginal(messageId, message, originalMessageId);
+}
 
-    if (message) {
-        const routeMessageId = buildMessageRouteId(message);
-        if (routeMessageId !== messageId) {
-            return routeMessageId;
+/** 仅供一次同步派生批次使用；重建时读取当前映射，不跨批次缓存。 */
+export function createSessionMessageRouteIdResolver(
+    reducerState: RouteLookupState | null | undefined,
+): (params: SessionMessageRouteInput) => string | null {
+    const originalIdsByInternalId = new Map<string, string | null>();
+    for (const [originalId, internalId] of reducerState?.messageIds?.entries() ?? []) {
+        // 首个空白原始 ID 也占位，保留单条查询不会继续寻找后续 alias 的语义。
+        if (!originalIdsByInternalId.has(internalId)) {
+            originalIdsByInternalId.set(internalId, normalizeNonEmptyString(originalId));
         }
     }
-
-    return message ? buildMessageRouteId(message) : messageId;
+    /** 批内逐条查询复用已选定的首个映射，仍使用调用方当前消息作降级。 */
+    return (params: SessionMessageRouteInput): string | null => {
+        const messageId = normalizeNonEmptyString(params.messageId);
+        if (!messageId) return null;
+        return buildSessionMessageRouteIdFromOriginal(
+            messageId,
+            params.messagesById[messageId],
+            originalIdsByInternalId.get(messageId) ?? null,
+        );
+    };
 }
 
 export function resolveMessageRouteIdForDisplay(params: Readonly<{

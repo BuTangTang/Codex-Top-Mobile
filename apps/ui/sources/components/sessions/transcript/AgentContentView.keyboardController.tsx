@@ -1,5 +1,6 @@
-import { useHeaderHeight } from '@/utils/platform/responsive';
+import { useDeviceType, useHeaderHeight } from '@/utils/platform/responsive';
 import { ComposerKeyboardScaffold } from '@/components/sessions/keyboardAvoidance';
+import { isMobileWorkspaceExperienceLockedToClassic } from '@/components/workspaceCockpit/mobileWorkspaceExperience';
 import { useSessionCockpitBottomChromeHeight } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 import * as React from 'react';
 import { ScrollView, View } from 'react-native';
@@ -14,6 +15,7 @@ interface AgentContentViewProps {
     safeAreaBottom?: number;
 }
 
+/** 统一原生会话的内容、输入区与键盘布局，并沿用设备的有效底栏策略。 */
 export const AgentContentView: React.FC<AgentContentViewProps> = React.memo(({
     input,
     content,
@@ -22,7 +24,12 @@ export const AgentContentView: React.FC<AgentContentViewProps> = React.memo(({
 }) => {
     const safeArea = useSafeAreaInsets();
     const headerHeight = useHeaderHeight();
-    const bottomChromeHeight = useSessionCockpitBottomChromeHeight();
+    const deviceType = useDeviceType();
+    const measuredBottomChromeHeight = useSessionCockpitBottomChromeHeight();
+    // 原生手机会话不显示工作台底栏；导航期间注册表可能仍保留上一页的测量高度。
+    const bottomChromeHeight = isMobileWorkspaceExperienceLockedToClassic({ deviceType })
+        ? 0
+        : measuredBottomChromeHeight;
     const keyboardDismissOnTapHandlers = useKeyboardDismissOnTap();
     const { theme } = useUnistyles();
 

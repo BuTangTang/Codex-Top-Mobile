@@ -1,5 +1,5 @@
 import React from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     createMockComposerKeyboardScaffoldHarness,
     MockComposerKeyboardScaffold,
@@ -10,8 +10,8 @@ import { installTranscriptCommonModuleMocks } from './transcriptTestHelpers';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const scaffoldHarness = createMockComposerKeyboardScaffoldHarness();
-const bottomChromeMetricsState = vi.hoisted(() => ({
-    height: 0,
+const deviceMetricsState = vi.hoisted(() => ({
+    type: 'phone' as 'phone' | 'tablet',
 }));
 const safeAreaMetricsState = vi.hoisted(() => ({
     bottom: 0,
@@ -39,6 +39,7 @@ installTranscriptCommonModuleMocks({
 
 vi.mock('@/utils/platform/responsive', () => ({
     useHeaderHeight: () => 0,
+    useDeviceType: () => deviceMetricsState.type,
 }));
 
 vi.mock('react-native-safe-area-context', () => ({
@@ -48,10 +49,6 @@ vi.mock('react-native-safe-area-context', () => ({
         left: 0,
         right: 0,
     }),
-}));
-
-vi.mock('@/components/workspaceCockpit/session/SessionCockpitChromeRegistry', () => ({
-    useSessionCockpitBottomChromeHeight: () => bottomChromeMetricsState.height,
 }));
 
 vi.mock('react-native-keyboard-controller', () => ({
@@ -66,19 +63,25 @@ vi.mock('@/components/sessions/keyboardAvoidance', () => ({
 }));
 
 describe('AgentContentView (iOS keyboard)', () => {
-    it('uses the composer keyboard scaffold instead of whole-container keyboard avoidance on iOS', async () => {
+    beforeEach(() => {
         scaffoldHarness.clear();
-        bottomChromeMetricsState.height = 80;
+        deviceMetricsState.type = 'phone';
         safeAreaMetricsState.bottom = 0;
         safeAreaMetricsState.top = 0;
+    });
+
+    it('uses the phone scaffold with no stale chrome inset on its first render', async () => {
         const { AgentContentView } = await import('./AgentContentView.native');
+        const { SessionCockpitBottomChromeHeightContext } = await import('@/components/workspaceCockpit/session/SessionCockpitChromeRegistry');
 
         const { tree } = await renderScreen(
-            <AgentContentView
-                content={<React.Fragment>content</React.Fragment>}
-                input={<React.Fragment>input</React.Fragment>}
-                placeholder={<React.Fragment>placeholder</React.Fragment>}
-            />,
+            <SessionCockpitBottomChromeHeightContext.Provider value={96}>
+                <AgentContentView
+                    content={<React.Fragment>content</React.Fragment>}
+                    input={<React.Fragment>input</React.Fragment>}
+                    placeholder={<React.Fragment>placeholder</React.Fragment>}
+                />
+            </SessionCockpitBottomChromeHeightContext.Provider>,
         );
 
         expect(tree.root.findAllByType('KeyboardAvoidingView' as never)).toHaveLength(0);
@@ -89,26 +92,33 @@ describe('AgentContentView (iOS keyboard)', () => {
         expect(scaffoldRender?.props.mode).toBe('session');
         expect(scaffoldRender?.props.contentTestID).toBe('agent-content-scroll-region');
         expect(scaffoldRender?.props.composerTestID).toBe('agent-content-input-footer');
-        expect(scaffoldRender?.props.layoutBottomInset).toBe(80);
+        expect(scaffoldRender?.props.layoutBottomInset).toBe(0);
+        const contentHost = tree.root.findAllByType('View' as never).filter((node) => node.props.style?.paddingBottom !== undefined);
+        expect(contentHost).toHaveLength(1);
+        expect(contentHost[0].props.style.paddingBottom).toBe(0);
     });
 
-    it('uses the full bottom chrome height for the session scaffold inset even when safe area is injected separately', async () => {
-        scaffoldHarness.clear();
-        bottomChromeMetricsState.height = 80;
+    it('preserves the full non-phone chrome inset when safe area is injected separately', async () => {
+        deviceMetricsState.type = 'tablet';
         safeAreaMetricsState.bottom = 8;
-        safeAreaMetricsState.top = 0;
         const { AgentContentView } = await import('./AgentContentView.native');
+        const { SessionCockpitBottomChromeHeightContext } = await import('@/components/workspaceCockpit/session/SessionCockpitChromeRegistry');
 
-        await renderScreen(
-            <AgentContentView
-                content={<React.Fragment>content</React.Fragment>}
-                input={<React.Fragment>input</React.Fragment>}
-                safeAreaBottom={0}
-            />,
+        const { tree } = await renderScreen(
+            <SessionCockpitBottomChromeHeightContext.Provider value={80}>
+                <AgentContentView
+                    content={<React.Fragment>content</React.Fragment>}
+                    input={<React.Fragment>input</React.Fragment>}
+                    safeAreaBottom={0}
+                />
+            </SessionCockpitBottomChromeHeightContext.Provider>,
         );
 
         const scaffoldRender = scaffoldHarness.getLastRender();
         expect(scaffoldRender?.props.safeAreaBottom).toBe(0);
         expect(scaffoldRender?.props.layoutBottomInset).toBe(80);
+        const contentHost = tree.root.findAllByType('View' as never).filter((node) => node.props.style?.paddingBottom !== undefined);
+        expect(contentHost).toHaveLength(1);
+        expect(contentHost[0].props.style.paddingBottom).toBe(80);
     });
 });
