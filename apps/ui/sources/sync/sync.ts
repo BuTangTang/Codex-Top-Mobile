@@ -6261,19 +6261,34 @@ class Sync {
           this.directTranscriptCacheWrites.clear();
       }
 
+      /** 列表导航复用原恢复owner完成一次正文读取；只返回本账号、服务及来源已实际加载的事实。 */
+      public restoreDirectTranscriptForNavigation(input: Readonly<{
+          sessionId: string; serverId: string; accountId: string; sourceKey: string;
+      }>): boolean {
+          const scope = this.directTranscriptCacheScope(input.sessionId, input.serverId);
+          if (!scope || scope.accountId !== input.accountId || !input.sourceKey.trim()) return false;
+          return this.restoreDirectTranscriptWarmCache(input.sessionId, input.serverId, input.sourceKey);
+      }
+
       /** 只为尚未加载的已缓存正文恢复 reducer、游标和原阅读锚点，不恢复旧运行状态或审批快照。 */
-      private restoreDirectTranscriptWarmCache(sessionId: string, serverId?: string | null): void {
-          if (storage.getState().sessionMessages[sessionId]?.isLoaded) return;
+      private restoreDirectTranscriptWarmCache(sessionId: string, serverId?: string | null, expectedSourceKey?: string): boolean {
           const scope = this.directTranscriptCacheScope(sessionId, serverId);
-          if (!scope || !this.credentials) return;
+          if (!scope || !this.credentials) return false;
           const existing = storage.getState().sessions[sessionId];
           const currentLink = readDirectSessionLink(existing?.metadata);
-          if (existing?.metadata && currentLink?.providerId !== 'codex') return;
+          if (existing?.metadata && currentLink?.providerId !== 'codex') return false;
           const sourceKey = this.getDirectSessionTranscriptSourceKey(currentLink);
-          const cached = loadDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, sessionId, sourceKey ?? undefined);
-          if (!cached || !MetadataSchema.safeParse(cached.session.metadata).success) return;
+          if (existing?.serverId && !areServerProfileIdentifiersEquivalent(existing.serverId, scope.serverId)) return false;
+          if (expectedSourceKey && sourceKey && sourceKey !== expectedSourceKey) return false;
+          // 已加载也先核对真实来源；不能把另一来源的旧正文当作本次导航成功。
+          if (storage.getState().sessionMessages[sessionId]?.isLoaded) {
+              return sourceKey !== null && this.directSessionTailStateBySessionId.get(sessionId)?.sourceKey === sourceKey;
+          }
+          const cached = loadDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, sessionId, sourceKey ?? expectedSourceKey);
+          if (!cached || !MetadataSchema.safeParse(cached.session.metadata).success) return false;
           const cachedLink = readDirectSessionLink(cached?.session.metadata);
-          if (!cached || cachedLink?.providerId !== 'codex' || this.getDirectSessionTranscriptSourceKey(cachedLink) !== cached.sourceKey) return;
+          if (!cached || cachedLink?.providerId !== 'codex' || this.getDirectSessionTranscriptSourceKey(cachedLink) !== cached.sourceKey
+              || (expectedSourceKey && cached.sourceKey !== expectedSourceKey)) return false;
           if (!existing?.metadata) {
               this.directTranscriptCacheOnlySessionIds.add(sessionId);
               storage.getState().applySessions([{ ...cached.session, serverId: scope.serverId, seq: 0,
@@ -6298,6 +6313,7 @@ class Sync {
           }
           storage.getState().applyMessagesLoaded(sessionId);
           storage.getState().setDirectSessionHistoryAvailability(sessionId, cached.historyAvailability);
+          return storage.getState().sessionMessages[sessionId]?.isLoaded === true;
       }
 
       /** 只读缓存壳可显示正文，但必须继续原路由的线上元数据校验和恢复。 */

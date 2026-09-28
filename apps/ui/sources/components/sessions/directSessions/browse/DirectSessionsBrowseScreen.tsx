@@ -31,7 +31,7 @@ import { useDirectBrowseCandidates, type DirectBrowseCandidate, type DirectBrows
 import { Icon } from '@/components/ui/icons/Icon';
 import type { PhoneBrowseSnapshot } from './phoneBrowseAggregation';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
-import { loadDirectSessionTranscriptWarmCacheIndex, loadDirectSessionTranscriptWarmCache } from '@/sync/domains/state/warmCachePersistence';
+import { loadDirectSessionTranscriptWarmCacheIndex } from '@/sync/domains/state/warmCachePersistence';
 import { readDirectSessionLink } from '@/sync/domains/session/directSessions/readDirectSessionLink';
 import { getVisibleSessionIds } from '@/sync/domains/session/activeViewingSession';
 
@@ -378,7 +378,14 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
                     return link?.machineId === effectiveSelectedMachineId && link.providerId === selectedProviderId
                         && link.remoteSessionId === candidate.remoteSessionId && stableJsonStringify(link.source) === stableJsonStringify(effectiveSource);
                 });
-                if (cached && loadDirectSessionTranscriptWarmCache(browseServerId, activeScope.accountId, cached.session.id, cached.sourceKey)) {
+                // 原恢复owner一次校验并入库；页面后续可见时命中已加载正文，不重复全文解析。
+                const restored = cached ? await import('@/sync/sync').then(({ sync }) => {
+                    if (!mountedRef.current || actionScopeRef.current !== actionActivation) return false;
+                    return sync.restoreDirectTranscriptForNavigation({ sessionId: cached.session.id,
+                        serverId: browseServerId, accountId: activeScope.accountId, sourceKey: cached.sourceKey });
+                }) : false;
+                if (!mountedRef.current || actionScopeRef.current !== actionActivation) return;
+                if (cached && restored) {
                     cachedSessionId = cached.session.id;
                     await navigateToSession(cached.session.id, { serverId: browseServerId });
                     if (socket.status !== 'connected') {

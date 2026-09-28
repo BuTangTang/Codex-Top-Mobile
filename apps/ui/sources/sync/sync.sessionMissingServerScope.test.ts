@@ -447,6 +447,60 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
     );
 
     // 会话元数据仍在时路由不会重新 hydration；正文必须在 visible 返回前恢复，不能等同步暂停解除。
+    it.each(['good', 'missing', 'corrupt', 'loaded-source', 'loaded-account', 'loaded-server'] as const)(
+        'restores indexed navigation once with exact scope proof: %s', async (variant) => {
+            const cache = await import('./domains/state/warmCachePersistence');
+            await cache.prepareWarmCacheStorage();
+            const { sync } = await import('./sync');
+            const internals = sync as any;
+            const owner = upsertServerProfile({ serverUrl: 'https://indexed-navigation.example', name: 'Indexed navigation' });
+            setActiveServerId(owner.id, { scope: 'device' });
+            const previous = { account: internals.serverID, credentials: internals.credentials, pause: internals.pauseController };
+            const accountId = 'indexed-account';
+            const sessionId = `indexed-${variant}`;
+            internals.serverID = accountId;
+            internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+            internals.pauseController = new PauseController();
+            internals.pauseController.pause();
+            const session = { ...createDirectSession(sessionId), encryptionMode: 'plain' as const, serverId: owner.id };
+            storage.getState().applySessions([session]);
+            internals.evictSessionTranscript(sessionId);
+            const sourceKey = internals.getDirectSessionTranscriptSourceKey(session.metadata.directSessionV1);
+            cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            if (variant !== 'missing') cache.saveDirectSessionTranscriptWarmCache(owner.id, accountId, {
+                version: 1, sourceKey, cachedAtMs: 1, session,
+                items: variant === 'corrupt' ? [null] as any : [{ id: 'indexed-body', createdAtMs: 1,
+                    raw: { role: 'user', content: { type: 'text', text: 'synthetic indexed body' } } }],
+                tailCursor: 'indexed-tail', olderCursor: null, hasMoreOlder: false,
+            });
+            const read = vi.spyOn(cache, 'loadDirectSessionTranscriptWarmCache');
+            const input = { sessionId, serverId: owner.id, accountId, sourceKey };
+            try {
+                if (variant.startsWith('loaded-')) expect(sync.restoreDirectTranscriptForNavigation(input)).toBe(true);
+                const result = sync.restoreDirectTranscriptForNavigation({ ...input,
+                    ...(variant === 'loaded-source' ? { sourceKey: 'foreign-source' } : {}),
+                    ...(variant === 'loaded-account' ? { accountId: 'foreign-account' } : {}),
+                    ...(variant === 'loaded-server' ? { serverId: 'foreign-server' } : {}),
+                });
+                expect(result).toBe(variant === 'good');
+                if (variant === 'good') {
+                    expect(storage.getState().sessionMessages[sessionId]?.isLoaded).toBe(true);
+                    sync.onSessionVisible(sessionId);
+                    expect(sync.restoreDirectTranscriptForNavigation(input)).toBe(true);
+                    expect(read).toHaveBeenCalledTimes(1);
+                }
+                expect(machineDirectSessionTranscriptPageMock).not.toHaveBeenCalled();
+                expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+            } finally {
+                read.mockRestore();
+                internals.messagesSync.get(sessionId)?.stop(); internals.messagesSync.delete(sessionId);
+                internals.evictSessionTranscript(sessionId);
+                internals.serverID = previous.account; internals.credentials = previous.credentials; internals.pauseController = previous.pause;
+                cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            }
+        },
+    );
+
     it.each(['same scope', 'different account', 'different server', 'different source', 'already loaded'] as const)(
         'restores persisted direct history synchronously on visibility while sync is paused: %s',
         async (variant) => {

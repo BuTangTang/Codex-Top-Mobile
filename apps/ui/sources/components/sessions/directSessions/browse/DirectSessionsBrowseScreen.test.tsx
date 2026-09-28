@@ -60,6 +60,8 @@ const profileMock = vi.hoisted(() => ({
     ],
 }));
 const activeScopeState = vi.hoisted(() => ({ value: null as { serverId: string; accountId: string } | null }));
+const restoreForNavigation = vi.hoisted(() => vi.fn(() => true));
+vi.mock('@/sync/sync', () => ({ sync: { restoreDirectTranscriptForNavigation: restoreForNavigation } }));
 const cachedMachineDisplays = vi.hoisted(() => ({ value: {} as Record<string, unknown> }));
 const focusState = vi.hoisted(() => ({ value: true }));
 const socketState = vi.hoisted(() => ({ status: 'connected' }));
@@ -252,7 +254,17 @@ describe('DirectSessionsBrowseScreen', () => {
         expect(linkEnsureSpy).not.toHaveBeenCalled();
     });
 
-    it.each(['disconnected', 'connected'] as const)('opens the exact already-read native source immediately while %s, preserving online LINK', async (connection) => {
+    it('keeps the original LINK path when the account index has no matching source', async () => {
+        activeScopeState.value = { serverId: 'uncached-server', accountId: 'uncached-account' };
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const screen = await renderScreen(<DirectSessionsBrowseScreen />);
+        await screen.pressByTestIdAsync('direct-session-candidate:codex-session-1');
+        expect(restoreForNavigation).not.toHaveBeenCalled();
+        expect(linkEnsureSpy).toHaveBeenCalledTimes(1);
+        expect(routerNavigateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([['disconnected', true], ['connected', true], ['disconnected', false], ['connected', false]] as const)('opens the exact already-read native source immediately while %s, preserving online LINK', async (connection, readable) => {
         await prepareWarmCacheStorage();
         activeScopeState.value = { serverId: 'cached-server', accountId: 'cached-account' };
         socketState.status = connection;
@@ -263,11 +275,25 @@ describe('DirectSessionsBrowseScreen', () => {
                 metadata: { path: '/synthetic', host: 'fixture', directSessionV1: { v: 1, providerId: 'codex', machineId: 'machine-1', remoteSessionId: 'codex-session-1', source } } },
             items: [], tailCursor: 'tail', olderCursor: null, hasMoreOlder: false,
         });
-        linkEnsureSpy.mockResolvedValueOnce({ ok: true, sessionId: 'local-cached', created: false });
+        restoreForNavigation.mockReturnValue(readable);
+        const cacheModule = await import('@/sync/domains/state/warmCachePersistence');
+        const bodyRead = vi.spyOn(cacheModule, 'loadDirectSessionTranscriptWarmCache');
+        linkEnsureSpy.mockResolvedValueOnce(readable
+            ? { ok: true, sessionId: 'local-cached', created: false }
+            : { ok: false, error: 'cache unavailable' } as any);
         const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
         const screen = await renderScreen(<DirectSessionsBrowseScreen />);
         await screen.pressByTestIdAsync('direct-session-candidate:codex-session-1');
-        expect(linkEnsureSpy).toHaveBeenCalledTimes(connection === 'connected' ? 1 : 0);
+        expect(bodyRead).not.toHaveBeenCalled();
+        bodyRead.mockRestore();
+        expect(linkEnsureSpy).toHaveBeenCalledTimes(connection === 'connected' || !readable ? 1 : 0);
+        expect(restoreForNavigation).toHaveBeenCalledWith({ sessionId: 'local-cached', serverId: 'cached-server', accountId: 'cached-account', sourceKey: 'fixture' });
+        if (!readable) {
+            expect(routerNavigateSpy).not.toHaveBeenCalled();
+            expect(modalAlertSpy).toHaveBeenCalled();
+            clearDirectSessionTranscriptWarmCache('cached-server', 'cached-account');
+            return;
+        }
         expect(routerNavigateSpy.mock.calls.at(-1)?.[0]).toContain('/session/local-cached');
         if (connection === 'disconnected') {
             const { markSessionVisible, markSessionHidden } = await import('@/sync/domains/session/activeViewingSession');
@@ -281,6 +307,7 @@ describe('DirectSessionsBrowseScreen', () => {
         clearDirectSessionTranscriptWarmCache('cached-server', 'cached-account');
     });
     beforeEach(() => {
+        restoreForNavigation.mockClear().mockReturnValue(true);
         cachedMachineDisplays.value = {};
         settingsMock.phoneRecentSessionLimit = 50;
         projectsListSpy.mockReset().mockResolvedValue({ ok: true, projects: [], nativeCreate: false, unavailableReason: 'desktop_native_create_unavailable' });
