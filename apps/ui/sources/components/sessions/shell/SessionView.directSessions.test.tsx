@@ -44,6 +44,7 @@ vi.mock('expo-network', () => ({ addNetworkStateListener: () => ({ remove() {} }
 const TEST_SERVER_ACCOUNT_SCOPE = { serverId: 'server-1', accountId: 'account-1' } as const;
 const TEST_SESSION_DRAFT_ADDRESS = { kind: 'session' as const, sessionId: 's1' };
 
+const agentInputNativeClearSpy = vi.hoisted(() => vi.fn((_text: string) => true));
 const machineControlReadSpy = vi.hoisted(() => vi.fn());
 const machineControlActionSpy = vi.hoisted(() => vi.fn());
 const machineDirectSessionStatusGetSpy = vi.hoisted(() => vi.fn());
@@ -712,7 +713,10 @@ vi.mock('@/sync/ops/actions/defaultActionExecutor', () => ({
   createDefaultActionExecutor: () => ({ execute: vi.fn() }),
 }));
 vi.mock('@/components/sessions/agentInput', () => ({
-  AgentInput: (props: any) => React.createElement('AgentInput', { testID: 'session-agent-input', ...props }),
+  AgentInput: React.forwardRef((props: any, ref: React.ForwardedRef<unknown>) => {
+    React.useImperativeHandle(ref, () => ({ clearIfTextMatches: agentInputNativeClearSpy }), []);
+    return React.createElement('AgentInput', { testID: 'session-agent-input', ...props });
+  }),
 }));
 vi.mock('@/components/sessions/keyboardAvoidance', () => ({
   useComposerAvailablePanelHeight: () => keyboardAvoidanceState.availablePanelHeight,
@@ -1783,6 +1787,7 @@ describe('SessionView (direct sessions)', () => {
   }
 
   beforeEach(() => {
+    agentInputNativeClearSpy.mockReset().mockReturnValue(true);
     machineControlReadSpy.mockReset().mockResolvedValue({ ok: false, error: 'not observed', errorCode: 'unsupported' });
     machineControlActionSpy.mockReset();
     __resetConnectedServiceQuotaSnapshotStore();
@@ -4088,6 +4093,44 @@ describe('SessionView (direct sessions)', () => {
       }),
       expectDirectSendProjectionOptions(),
     );
+  });
+
+  it.each(['android', 'web'] as const)('passes the existing input ref to the accepted local handoff on %s', async (platform) => {
+    responsiveHarnessState.platformOs = platform;
+    machineDirectSessionStatusGetSpy.mockResolvedValue({ ok: true, machineOnline: true, runnerActive: false,
+      activity: 'idle', canForceStop: false, externalControl: { canSend: true } });
+    machineControlReadSpy.mockResolvedValue({ ok: true, snapshot: { v: 1, turnId: 'synthetic-turn',
+      state: 'completed', requests: [], textSendMode: 'start' } });
+    const events: string[] = [];
+    agentInputNativeClearSpy.mockImplementation(() => {
+      events.push('native-dispatch');
+      expect(getSessionDraftSnapshot(TEST_SERVER_ACCOUNT_SCOPE, TEST_SESSION_DRAFT_ADDRESS)?.document.composer.text.value ?? '').toBe('');
+      return true;
+    });
+    let resolveSubmit!: () => void;
+    syncSubmitMessageSpy.mockImplementationOnce(async () => {
+      events.push('provider-submit');
+      return new Promise<void>((resolve) => { resolveSubmit = resolve; });
+    });
+    showDirectSessionTakeoverDialogSpy.mockResolvedValueOnce({ action: 'direct', forceStop: false });
+    const screen = await renderSessionViewAndSettle();
+    await act(async () => {
+      writeExistingSessionDraft({ scope: TEST_SERVER_ACCOUNT_SCOPE, sessionId: 's1', patch: { text: 'synthetic handoff' } });
+      findAgentInput(screen).props.onChangeText('synthetic handoff');
+    });
+    expect(agentInputNativeClearSpy).not.toHaveBeenCalled();
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    await flushHookEffects({ cycles: 1, turns: 1 });
+    expect(findAgentInput(screen).props.value).toBe('');
+    if (platform === 'android') {
+      expect(agentInputNativeClearSpy).toHaveBeenCalledExactlyOnceWith('synthetic handoff');
+      expect(events).toEqual(['native-dispatch', 'provider-submit']);
+    } else {
+      expect(agentInputNativeClearSpy).not.toHaveBeenCalled();
+      expect(events).toEqual(['provider-submit']);
+    }
+    await act(async () => { resolveSubmit(); });
+    await settleDirectSessionView();
   });
 
   it('clears composer text at direct-session outbound handoff and leaves it clear after acceptance', async () => {

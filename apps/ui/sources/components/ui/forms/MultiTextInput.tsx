@@ -43,6 +43,8 @@ export type OnKeyPressCallback = (event: KeyPressEvent) => boolean;
 export interface MultiTextInputHandle {
     setTextAndSelection: (text: string, selection: { start: number; end: number }) => void;
     setSelection: (selection: { start: number; end: number }) => void;
+    /** Dispatches a native clear only while the observed input still matches; not an application acknowledgement. */
+    clearIfTextMatches: (expectedText: string) => boolean;
     getText: () => string;
     flushPendingTextChange: () => string;
     focus: () => void;
@@ -473,6 +475,11 @@ export const MultiTextInput = React.forwardRef<MultiTextInputHandle, MultiTextIn
             if (onSelectionChange) {
                 onSelectionChange(nextSelection);
             }
+        },
+        clearIfTextMatches: (expectedText: string) => {
+            if (!inputRef.current || latestNativeTextRef.current !== expectedText) return false;
+            inputRef.current.clear();
+            return true;
         },
         getText: () => latestNativeTextRef.current,
         flushPendingTextChange: () => latestNativeTextRef.current,

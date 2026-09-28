@@ -34,6 +34,8 @@ export type OnKeyPressCallback = (event: KeyPressEvent) => boolean;
 export interface MultiTextInputHandle {
     setTextAndSelection: (text: string, selection: { start: number; end: number }) => void;
     setSelection: (selection: { start: number; end: number }) => void;
+    /** Dispatches a native clear only while the observed input still matches; not an application acknowledgement. */
+    clearIfTextMatches: (expectedText: string) => boolean;
     getText: () => string;
     flushPendingTextChange: () => string;
     focus: () => void;
@@ -581,6 +583,8 @@ export const MultiTextInput = React.forwardRef<MultiTextInputHandle, MultiTextIn
                 onSelectionChange(nextSelection);
             }
         },
+        // Web keeps its existing controlled/editor synchronization path.
+        clearIfTextMatches: () => false,
         getText: () => textareaRef.current?.value ?? liveValueRef.current,
         flushPendingTextChange,
         focus: () => {

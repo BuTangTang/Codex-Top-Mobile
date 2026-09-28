@@ -3,6 +3,7 @@ import { isRecoveredHistoryTranscriptObservationProvenance } from '@happier-dev/
 
 import { AgentContentView } from '@/components/sessions/transcript/AgentContentView';
 import { AgentInput, type AgentInputSendOptions } from '@/components/sessions/agentInput';
+import type { MultiTextInputHandle } from '@/components/ui/forms/MultiTextInput';
 import { COMPOSER_CONTENT_HORIZONTAL_INSET } from '@/components/sessions/agentInput/composerContentInset';
 import {
     computeExistingSessionComposerInputMaxHeight,
@@ -83,6 +84,7 @@ import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreferenc
 import {
     captureComposerTransientInputStateForOutboundHandoff,
     clearComposerAfterOutboundHandoff,
+    clearNativeInputAfterOutboundHandoff,
     restoreComposerAfterFailedOutboundHandoff,
 } from '@/hooks/session/sessionComposerSendCoordinator';
 import { useFeatureDecision } from '@/hooks/server/useFeatureDecision';
@@ -1241,6 +1243,7 @@ const SessionHeaderRightElement = React.memo(function SessionHeaderRightElement(
 });
 
 type SessionAgentInputWithUsageProps = Omit<React.ComponentProps<typeof AgentInput>, 'usageData'> & {
+    composerInputRef: React.RefObject<MultiTextInputHandle | null>;
     sessionId: string;
     sessionLatestUsage: Session['latestUsage'] | null | undefined;
     inputComposerClearTransientStateRef: React.MutableRefObject<() => void>;
@@ -1347,6 +1350,7 @@ function useComposerKeyboardHeight(): number {
 }
 
 const SessionAgentInputWithUsage = React.memo(function SessionAgentInputWithUsage({
+    composerInputRef,
     sessionId,
     sessionLatestUsage,
     inputComposerClearTransientStateRef,
@@ -1436,6 +1440,7 @@ const SessionAgentInputWithUsage = React.memo(function SessionAgentInputWithUsag
     return (
         <AgentInput
             {...agentInputProps}
+            ref={composerInputRef}
             sessionId={sessionId}
             contentPaddingHorizontal={COMPOSER_CONTENT_HORIZONTAL_INSET}
             inputMaxHeight={inputMaxHeight}
@@ -4611,6 +4616,7 @@ function SessionViewLoaded({
     React.useEffect(() => {
         pendingMessageEditRef.current = pendingMessageEdit;
     }, [pendingMessageEdit]);
+    const composerInputRef = React.useRef<MultiTextInputHandle>(null);
     const inputComposerClearTransientStateRef = React.useRef<() => void>(noopInputComposerClearTransientState);
     const inputComposerCaptureTransientStateRef = React.useRef<() => AgentInputLocalUiStateV1 | null>(
         noopInputComposerCaptureTransientState,
@@ -6358,7 +6364,17 @@ function SessionViewLoaded({
                             outbound.displayText, outbound.metaOverrides, {
                                 onLocalPendingProjectionCreated: ({ localId }) => {
                                     outboundHandoffLocalId = localId;
+                                    const beforeClear = captureDraftForOutboundHandoff?.(['composer.text']) ?? null;
                                     const cleared = clearAfterOutboundHandoff();
+                                    if (Platform.OS === 'android') {
+                                        clearNativeInputAfterOutboundHandoff({
+                                            snapshot: sendSnapshot,
+                                            beforeClear,
+                                            afterClear: captureDraftForOutboundHandoff?.(['composer.text']) ?? null,
+                                            didClear: cleared,
+                                            input: composerInputRef.current,
+                                        });
+                                    }
                                     requestMountedTranscriptFollow();
                                     if (activePendingEdit?.directSessionExternalControl
                                         && pendingMessageEditRef.current?.pendingId === activePendingEdit.pendingId) {
@@ -6659,6 +6675,7 @@ function SessionViewLoaded({
                 <DesktopApprovalPanel control={directSessionRuntime.control} canWrite={hasWriteAccess} />
             </ComposerAuxiliaryFrame> : null}
             <SessionAgentInputRuntimeStatusBoundary
+                composerInputRef={composerInputRef}
                 desktopStatusInHeader={desktopStatusInHeader}
                 desktopObservationStatus={inheritsDesktopSettings ? resolveDirectSessionObservationStatus(directSessionRuntime.status) : null}
                 session={session}

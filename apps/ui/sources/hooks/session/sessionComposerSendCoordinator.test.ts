@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
     captureComposerTransientInputStateForOutboundHandoff,
     clearComposerAfterOutboundHandoff,
+    clearNativeInputAfterOutboundHandoff,
     restoreComposerAfterFailedOutboundHandoff,
 } from './sessionComposerSendCoordinator';
 
@@ -186,5 +187,36 @@ describe('sessionComposerSendCoordinator', () => {
         expect(restoreDraftForSessionIfCurrentValueMatches).not.toHaveBeenCalled();
         expect(restoreSemanticDraftValues).not.toHaveBeenCalled();
         expect(restoreTransientInputState).not.toHaveBeenCalled();
+    });
+});
+
+describe('native input handoff clear', () => {
+    const snapshot = (text: string, mutationId: string | null, sessionId = 'session-a') => {
+        const mutationIds: Record<string, string> = mutationId ? { 'composer.text': mutationId } : {};
+        return {
+            sessionId, text, scope: { serverId: 'server', accountId: 'account' },
+            currentness: { address: { kind: 'session' as const, sessionId }, mutationIds },
+        };
+    };
+    it.each(['cleared-token', null])('dispatches after the captured text is cleared or its empty replica is deleted: %s', (afterToken) => {
+        const clearIfTextMatches = vi.fn(() => true);
+        expect(clearNativeInputAfterOutboundHandoff({
+            snapshot: snapshot('sent', 'captured'), beforeClear: snapshot('sent', 'captured'),
+            afterClear: snapshot('', afterToken), didClear: true, input: { clearIfTextMatches },
+        })).toBe(true);
+        expect(clearIfTextMatches).toHaveBeenCalledExactlyOnceWith('sent');
+    });
+    it.each([
+        { before: snapshot('next', 'newer'), after: snapshot('next', 'newer'), didClear: true },
+        { before: snapshot('sent', 'newer'), after: snapshot('sent', 'newer'), didClear: true },
+        { before: snapshot('sent', 'captured'), after: snapshot('', 'cleared', 'session-b'), didClear: true },
+        { before: snapshot('sent', 'captured'), after: snapshot('', 'cleared'), didClear: false },
+    ])('does not infer text custody from semantic-only clearing or another owner: %#', ({ before, after, didClear }) => {
+        const clearIfTextMatches = vi.fn(() => true);
+        expect(clearNativeInputAfterOutboundHandoff({
+            snapshot: snapshot('sent', 'captured'), beforeClear: before, afterClear: after,
+            didClear, input: { clearIfTextMatches },
+        })).toBe(false);
+        expect(clearIfTextMatches).not.toHaveBeenCalled();
     });
 });

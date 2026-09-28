@@ -90,3 +90,23 @@ export function restoreComposerAfterFailedOutboundHandoff({
     restoreTransientInputState?.();
     return true;
 }
+
+/** The draft owner must have cleared the captured text before dispatching this native optimization. */
+export function clearNativeInputAfterOutboundHandoff(params: Readonly<{
+    snapshot: SessionDraftTextSnapshot;
+    beforeClear: SessionDraftTextSnapshot | null;
+    afterClear: SessionDraftTextSnapshot | null;
+    didClear: boolean;
+    input: { clearIfTextMatches: (expectedText: string) => boolean } | null;
+}>): boolean {
+    const { snapshot, beforeClear, afterClear, didClear, input } = params;
+    const capturedTextMutation = snapshot.currentness?.mutationIds['composer.text'];
+    const afterTextMutation = afterClear?.currentness?.mutationIds['composer.text'];
+    if (!didClear || !capturedTextMutation || !afterClear?.currentness || !snapshot.scope) return false;
+    if (beforeClear?.sessionId !== snapshot.sessionId || afterClear?.sessionId !== snapshot.sessionId) return false;
+    if (beforeClear.scope?.serverId !== snapshot.scope.serverId || afterClear.scope?.serverId !== snapshot.scope.serverId
+        || beforeClear.scope?.accountId !== snapshot.scope.accountId || afterClear.scope?.accountId !== snapshot.scope.accountId) return false;
+    if (beforeClear.currentness?.mutationIds['composer.text'] !== capturedTextMutation
+        || afterTextMutation === capturedTextMutation || afterClear.text !== '') return false;
+    return input?.clearIfTextMatches(snapshot.text) ?? false;
+}

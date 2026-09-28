@@ -59,6 +59,41 @@ describe('MultiTextInput', () => {
         recordLargeTextInputDiagnosticMock.mockReset();
     });
 
+    it('dispatches native clear only for the observed text without publishing another edit', async () => {
+        const { MultiTextInput } = await import('./MultiTextInput');
+        const ref = React.createRef<NativeMultiTextInputHandle>();
+        const clear = vi.fn();
+        const onChangeText = vi.fn();
+        const onStateChange = vi.fn();
+        const onSelectionChange = vi.fn();
+        const screen = await renderScreen(<MultiTextInput
+            ref={ref} value="submitted" onChangeText={onChangeText}
+            onStateChange={onStateChange} onSelectionChange={onSelectionChange}
+        />, { createNodeMock: (element) => element.type === 'TextInput' ? { clear } : null });
+        const handle = ref.current!;
+        expect(handle.clearIfTextMatches('newer draft')).toBe(false);
+        expect(clear).not.toHaveBeenCalled();
+        expect(handle.clearIfTextMatches('submitted')).toBe(true);
+        expect(clear).toHaveBeenCalledTimes(1);
+        expect(handle.getText()).toBe('submitted'); // dispatch is not a native acknowledgement
+        expect(onChangeText).not.toHaveBeenCalled();
+        expect(onStateChange).not.toHaveBeenCalled();
+        expect(onSelectionChange).not.toHaveBeenCalled();
+        await screen.unmount();
+        expect(handle.clearIfTextMatches('submitted')).toBe(false);
+        expect(clear).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the native handoff clear a no-op on the web handle', async () => {
+        const { MultiTextInput } = await import('./MultiTextInput.web');
+        const ref = React.createRef<WebMultiTextInputHandle>();
+        const onChangeText = vi.fn();
+        const screen = await renderScreen(<MultiTextInput ref={ref} value="web draft" onChangeText={onChangeText}/>);
+        expect(ref.current!.clearIfTextMatches('web draft')).toBe(false);
+        expect(screen.tree.findByType('textarea').props.defaultValue).toBe('web draft');
+        expect(onChangeText).not.toHaveBeenCalled();
+    });
+
     it('forwards testID to the TextInput', async () => {
         const { MultiTextInput } = await import('./MultiTextInput');
         let tree!: renderer.ReactTestRenderer;
