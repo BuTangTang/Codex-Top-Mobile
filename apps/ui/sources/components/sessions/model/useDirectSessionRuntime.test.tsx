@@ -253,6 +253,11 @@ describe('useDirectSessionRuntime', () => {
       expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
       expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(2);
       expect(machineDirectSessionAttachSpy.mock.calls[1][0].leaseId).toBe(leaseId);
+      // 原 flight 接续过期成功后仍须单飞，不能因捕获代次未同步而另开 STATUS。
+      let concurrentPreparation!: Promise<boolean>;
+      await act(async () => {
+        concurrentPreparation = controlParamsSpy.mock.calls.at(-1)![0].prepareForMutation();
+      });
       if (outcome === 'expired') await act(async () => { await vi.advanceTimersByTimeAsync(45_001); });
       if (outcome === 'background') await act(async () => { (await appStateEmitter).emit('inactive'); });
       let result: HookValue['status'] = null;
@@ -261,6 +266,7 @@ describe('useDirectSessionRuntime', () => {
         else if (outcome === 'rejected') freshAttach.resolve({ ok: false, errorCode: 'machine_offline', error: 'offline' });
         else freshAttach.resolve({ ok: true, leaseId, expiresAtMs: Date.now() + 9_000_000 });
         result = await pending;
+        expect(await concurrentPreparation).toBe(outcome === 'ready');
       });
       expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(2);
       if (outcome === 'ready') {
@@ -272,6 +278,118 @@ describe('useDirectSessionRuntime', () => {
         if (outcome === 'background') expect(machineDirectSessionDetachSpy.mock.calls.map(([input]) => input.leaseId)).toEqual([leaseId, leaseId]);
       }
     } finally { await hook.unmount(); vi.useRealTimers(); }
+  });
+
+  // 恢复时不能借用失效代次的旧 STATUS；续租迟到过期仍沿原 viewer 仅接续一次。
+  it('prepares a new generation while an invalidated status remains pending', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const oldStatus = createDeferred<any>();
+    const renewal = createDeferred<any>();
+    machineDirectSessionStatusGetSpy.mockResolvedValueOnce(observedStatus)
+      .mockReturnValueOnce(oldStatus.promise).mockResolvedValue(observedStatus);
+    machineDirectSessionAttachSpy.mockImplementationOnce(async (input) => ({ ok: true, leaseId: input.leaseId }))
+      .mockReturnValueOnce(renewal.promise);
+    refreshSessionMessagesSpy.mockResolvedValue(undefined);
+    const hook = await renderHarness();
+    let oldRefresh!: Promise<HookValue['status']>;
+    let prepared: boolean | undefined;
+    try {
+      await act(async () => { oldRefresh = hook.getCurrent().refreshNow(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(73_321); });
+      expect(hook.getCurrent().status?.observation?.state).toBe('unknown');
+      await act(async () => {
+        void controlParamsSpy.mock.calls.at(-1)![0].prepareForMutation().then((value: boolean) => { prepared = value; });
+        renewal.resolve({ ok: true, leaseId: machineDirectSessionAttachSpy.mock.calls[0][0].leaseId });
+      });
+      expect(prepared).toBe(true);
+      expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(3);
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(3);
+      expect(hook.getCurrent().status?.observation?.state).toBe('completed');
+      await act(async () => { oldStatus.resolve(observedStatus); expect(await oldRefresh).toBeNull(); });
+      expect(hook.getCurrent().status?.observation?.state).toBe('completed');
+    } finally {
+      oldStatus.resolve(observedStatus);
+      renewal.resolve({ ok: false });
+      await hook.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  // 旧代次结束不能清掉当前单飞，也不能让迟到失败撤回新准备所需的能力。
+  it.each(['success', 'failure'] as const)('keeps the new generation single-flight after a stale status %s', async (outcome) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const oldStatus = createDeferred<any>();
+    const currentStatus = createDeferred<any>();
+    machineDirectSessionStatusGetSpy.mockResolvedValueOnce(observedStatus)
+      .mockReturnValueOnce(oldStatus.promise).mockReturnValueOnce(currentStatus.promise);
+    machineDirectSessionAttachSpy.mockImplementationOnce(async (input) => ({ ok: true, leaseId: input.leaseId }))
+      .mockResolvedValueOnce({ ok: false, errorCode: 'machine_offline' });
+    refreshSessionMessagesSpy.mockResolvedValue(undefined);
+    const hook = await renderHarness();
+    let oldRefresh!: Promise<HookValue['status']>;
+    let firstPreparation!: Promise<boolean>;
+    let secondPreparation!: Promise<boolean>;
+    try {
+      await act(async () => { oldRefresh = hook.getCurrent().refreshNow(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(17_000); });
+      await act(async () => { firstPreparation = controlParamsSpy.mock.calls.at(-1)![0].prepareForMutation(); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(3);
+      await act(async () => {
+        if (outcome === 'success') oldStatus.resolve(observedStatus);
+        else oldStatus.reject(new Error('offline'));
+        expect(await oldRefresh).toBeNull();
+        secondPreparation = controlParamsSpy.mock.calls.at(-1)![0].prepareForMutation();
+      });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(3);
+      await act(async () => {
+        currentStatus.resolve(observedStatus);
+        expect(await firstPreparation).toBe(true);
+        expect(await secondPreparation).toBe(true);
+      });
+      expect(hook.getCurrent().status?.observation?.state).toBe('completed');
+    } finally {
+      oldStatus.resolve(observedStatus);
+      currentStatus.resolve(observedStatus);
+      await hook.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  // attach 自身撤代与旧 await 恢复之间可以出现新调用，旧 flight 不得借 +1 重新入场。
+  it('does not revive a replaced flight through an expired attach handoff', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const expiredAttach = createDeferred<any>();
+    const currentAttach = createDeferred<any>();
+    machineDirectSessionAttachSpy.mockReturnValueOnce(expiredAttach.promise).mockReturnValueOnce(currentAttach.promise);
+    machineDirectSessionStatusGetSpy.mockResolvedValue(observedStatus);
+    refreshSessionMessagesSpy.mockResolvedValue(undefined);
+    const hook = await renderHarness();
+    let oldResult: HookValue['status'] | undefined;
+    let currentRefresh!: Promise<HookValue['status']>;
+    try {
+      await act(async () => { void hook.getCurrent().refreshNow().then(value => { oldResult = value; }); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(45_001); });
+      const leaseId = machineDirectSessionAttachSpy.mock.calls[0][0].leaseId;
+      await act(async () => {
+        expiredAttach.resolve({ ok: true, leaseId });
+        // 让 attach 先完成撤代，再在旧 refresh 的 await 接续前进入新刷新。
+        await Promise.resolve();
+        currentRefresh = hook.getCurrent().refreshNow();
+      });
+      expect(oldResult).toBeNull();
+      expect(machineDirectSessionAttachSpy).toHaveBeenCalledTimes(2);
+      expect(machineDirectSessionStatusGetSpy).not.toHaveBeenCalled();
+      await act(async () => {
+        currentAttach.resolve({ ok: true, leaseId });
+        expect(await currentRefresh).toEqual(observedStatus);
+      });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      expiredAttach.resolve({ ok: false });
+      currentAttach.resolve({ ok: false });
+      await hook.unmount();
+      vi.useRealTimers();
+    }
   });
 
   // 正文请求挂起时租约仍续期；续期也挂起并过期后，旧 status 不能晚到恢复完成态。

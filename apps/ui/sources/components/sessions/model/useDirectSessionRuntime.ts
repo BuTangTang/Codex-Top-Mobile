@@ -167,7 +167,11 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
     const statusRef = React.useRef<DirectSessionRuntimeStatus | null>(null);
     // 只记录本 owner 的撤回事实；服务器观察未知仍可能是有效在线能力。
     const statusWithdrawnRef = React.useRef(false);
-    const inFlightRefreshRef = React.useRef<Promise<DirectSessionRuntimeStatus | null> | null>(null);
+    // 单飞只属于仍有效的刷新；失效请求保留自身收尾，不能阻塞新代次的发送准备。
+    const inFlightRefreshRef = React.useRef<{
+        promise: Promise<DirectSessionRuntimeStatus | null>;
+        isCurrent: () => boolean;
+    } | null>(null);
     // 只保存本 runtime 尚未结束的正文请求；按 sync 的 sessionId owner 合并，不缓存正文或状态。
     const inFlightTranscriptsRef = React.useRef(new Map<string, Promise<void>>());
     const generationRef = React.useRef(0);
@@ -341,8 +345,8 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
             };
         }
         const viewer = viewerRef.current;
-        if (inFlightRefreshRef.current) {
-            return inFlightRefreshRef.current;
+        if (inFlightRefreshRef.current?.isCurrent()) {
+            return inFlightRefreshRef.current.promise;
         }
 
         let currentGeneration = generationRef.current;
@@ -354,8 +358,10 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
         refreshPromise = (async () => {
             if (viewer.validUntilMs <= Date.now()) {
                 let attached = await attachViewer(viewer);
-                // 只接续本次过期成功自身的一次撤代；其他失活仍作废原刷新，不接受旧租约。
-                if (attached === 'expired' && generationRef.current === currentGeneration + 1) {
+                // 只接续本次过期成功自身的一次撤代；被新刷新替换后不得再次接续。
+                // 其他失活仍作废原刷新，不接受旧租约。
+                if (attached === 'expired' && generationRef.current === currentGeneration + 1
+                    && inFlightRefreshRef.current?.promise === refreshPromise) {
                     currentGeneration += 1;
                     if (!isRefreshCurrent()) return null;
                     attached = await attachViewer(viewer);
@@ -403,12 +409,12 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
             }
             return statusRef.current;
         })().finally(() => {
-            if (inFlightRefreshRef.current === refreshPromise) {
+            if (inFlightRefreshRef.current?.promise === refreshPromise) {
                 inFlightRefreshRef.current = null;
             }
         });
 
-        inFlightRefreshRef.current = refreshPromise;
+        inFlightRefreshRef.current = { promise: refreshPromise, isCurrent: isRefreshCurrent };
         return refreshPromise;
     }, [activeServerId, attachViewer, directSessionLink, explicitServerId, markUnavailable, params.sessionId, releaseViewer, targetKey, viewerActive]);
 
