@@ -772,11 +772,12 @@ vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOrigin
 });
 
 describe('SessionView (direct sessions)', () => {
-  it('sends negotiated native-auto text without waiting for CONTROL and preserves the next draft', async () => {
+  it('sends negotiated native-auto text without a second STATUS or waiting for CONTROL and preserves the next draft', async () => {
     const status = createDeferred<any>();
+    const nextStatus = createDeferred<any>();
     const control = createDeferred<any>();
     const receipt = createDeferred<any>();
-    machineDirectSessionStatusGetSpy.mockReturnValue(status.promise);
+    machineDirectSessionStatusGetSpy.mockReturnValue(nextStatus.promise).mockReturnValueOnce(status.promise);
     machineControlReadSpy.mockReturnValue(control.promise);
     syncSubmitMessageSpy.mockReturnValue(receipt.promise);
     const screen = await renderSessionViewAndSettle();
@@ -793,6 +794,7 @@ describe('SessionView (direct sessions)', () => {
       externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' } }); });
     await flushHookEffects();
     expect(syncSubmitMessageSpy).toHaveBeenCalledTimes(1);
+    expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
     expect(machineControlReadSpy).toHaveBeenCalledTimes(1);
     expect(syncSubmitMessageSpy).toHaveBeenCalledWith('s1', 'native auto text', undefined,
       { desktopTextSendProtocol: 'native-auto-v1' },
@@ -804,6 +806,35 @@ describe('SessionView (direct sessions)', () => {
     expect(findAgentInput(screen).props.value).toBe('next draft');
     expect(machineControlReadSpy).toHaveBeenCalledTimes(1);
     expect(modalAlertSpy).not.toHaveBeenCalled();
+  });
+
+  // 首次协商尚在进行时撤销写权限或离开页面，不能借已协商协议跳过本次提交边界。
+  it.each(['write_access', 'surface', 'capability', 'runner'] as const)('rejects native-auto text when %s is revoked during initial STATUS', async (revoked) => {
+    const status = createDeferred<any>();
+    machineDirectSessionStatusGetSpy.mockReturnValue(status.promise);
+    const screen = await renderSessionViewAndSettle();
+    await act(async () => { findAgentInput(screen).props.onChangeText('unsent native auto text'); });
+    await act(async () => { findAgentInput(screen).props.onSend(); });
+    await act(async () => { findAgentInput(screen).props.onChangeText('next draft'); });
+    if (revoked === 'write_access') {
+      storageState.sessions.s1 = { ...storageState.sessions.s1, accessLevel: 'view' };
+      await updateSessionView(screen);
+    } else if (revoked === 'surface') {
+      const { SessionView } = await import('./SessionView');
+      await screen.update(<AppPaneProvider><SessionView id="s1" surfaceFocusedOverride={false} routeAnchorOverride /></AppPaneProvider>);
+    }
+    await act(async () => { status.resolve({ ok: true, machineOnline: true, runnerActive: revoked === 'runner',
+      activity: 'idle', canForceStop: false,
+      externalControl: { canSend: revoked !== 'capability', textSendProtocol: 'native-auto-v1' } }); });
+    await flushHookEffects();
+    expect(syncSubmitMessageSpy).not.toHaveBeenCalled();
+    expect(machineControlActionSpy).not.toHaveBeenCalled();
+    expect(machineDirectSessionTakeoverSpy).not.toHaveBeenCalled();
+    const { storage } = await import('@/sync/domains/state/storage');
+    expect(storage.getState().sessionPending.s1?.messages).toEqual([expect.objectContaining({
+      text: 'unsent native auto text', sendState: 'failed', directSessionExternalControl: true,
+    })]);
+    expect(draftHookState.valuesBySessionId.get('s1')).toBe('next draft');
   });
 
   it.each(['cancel', 'send', 'echo_before_send'] as const)('restores a failed desktop message for %s while preserving the next draft', async (action) => {

@@ -6225,9 +6225,16 @@ function SessionViewLoaded({
                 return;
             }
 
-            // 保留原普通 SEND 与草稿交接；桌面调用者另外提供本次控制操作的寿命校验。
+            // 保留原 SEND 与草稿交接；已协商的普通桌面文本不再串行等待第二次 STATUS。
             const submitTextToSession = async (isCurrent: () => boolean, textSendProtocol?: 'native-auto-v1'): Promise<'accepted' | 'rejected' | 'unknown'> => {
-                const readyForSend = await directSessionTakeover.ensureReadyForSend({ intent: 'text',
+                if (!isCurrent()) return 'rejected';
+                const nativeAutoText = inheritsDesktopSettings && textSendProtocol === 'native-auto-v1';
+                if (nativeAutoText) {
+                    // hook 刚同步复核当前 runner/能力并调用此回调；准备期间写权限仍可能已撤销。
+                    const currentSession = storage.getState().sessions[sessionId];
+                    if (!currentSession || !hasSessionWriteAccess(currentSession.accessLevel)) return 'rejected';
+                }
+                const readyForSend = nativeAutoText ? 'external' : await directSessionTakeover.ensureReadyForSend({ intent: 'text',
                     ...(inheritsDesktopSettings && outboundHandoffLocalId ? { suppressFailureAlert: true } : {}),
                 });
                 // 就绪探测期间失活尚未提交消息，明确拒绝才能保留可编辑的失败正文。
