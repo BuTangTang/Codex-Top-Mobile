@@ -43,8 +43,10 @@ vi.mock('@/sync/runtime/orchestration/serverScopedRpc/resolvePreferredServerIdFo
   resolvePreferredServerIdForSessionId: (sessionId: string) => resolvePreferredServerIdForSessionIdSpy(sessionId),
 }));
 
+const controlParamsSpy = vi.hoisted(() => vi.fn());
+
 // 控制请求寿命有独立专项，此处聚焦原观察租约 owner。
-vi.mock('./useDirectSessionControl', () => ({ useDirectSessionControl: () => null }));
+vi.mock('./useDirectSessionControl', () => ({ useDirectSessionControl: (params: unknown) => { controlParamsSpy(params); return null; } }));
 
 type HookValue = ReturnType<typeof import('./useDirectSessionRuntime')['useDirectSessionRuntime']>;
 
@@ -356,6 +358,59 @@ describe('useDirectSessionRuntime', () => {
       await act(async () => { oldStatus.resolve(observedStatus); await pending; });
       expect(hook.getCurrent().status?.observation?.state).toBe('unknown');
     } finally { await hook.unmount(); vi.useRealTimers(); }
+  });
+
+  // 成功 STATUS 的观察未知不等于本地撤回，不能给每次普通发送增加状态请求。
+  it.each(['native', 'legacy'] as const)('reuses successful unknown observation for %s mutation preparation', async (protocol) => {
+    const ready = { ...observedStatus,
+      observation: { v: 1, state: 'unknown', reason: 'source_unavailable' },
+      ...(protocol === 'native' ? { externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' } } : {}) };
+    machineDirectSessionStatusGetSpy.mockResolvedValue(ready);
+    refreshSessionMessagesSpy.mockResolvedValue(undefined);
+    const hook = await renderHarness();
+    try {
+      const prepare = () => controlParamsSpy.mock.calls.at(-1)![0].prepareForMutation() as Promise<boolean>;
+      await act(async () => { expect(await prepare()).toBe(true); expect(await prepare()).toBe(true); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+      // 再次失败须撤回；合法成功即使返回同一未知投影，也须恢复本地新鲜度。
+      machineDirectSessionStatusGetSpy.mockRejectedValueOnce(new Error('offline'));
+      await act(async () => { await hook.getCurrent().refreshNow(); });
+      machineDirectSessionStatusGetSpy.mockRejectedValueOnce(new Error('still offline'));
+      await act(async () => { expect(await prepare()).toBe(false); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(3);
+      await act(async () => { expect(await prepare()).toBe(true); expect(await prepare()).toBe(true); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(4);
+    } finally { await hook.unmount(); }
+  });
+
+  // 断线撤回能力后，旧 online 摘要不能绕过首次发送准备；旧端无需宣告新协议。
+  it.each(['native', 'legacy'] as const)('refreshes withdrawn online status before preparing mutation and preserves %s capabilities', async (protocol) => {
+    const ready = { ...observedStatus, ...(protocol === 'native'
+      ? { externalControl: { canSend: true, textSendProtocol: 'native-auto-v1' } } : {}) };
+    machineDirectSessionStatusGetSpy.mockResolvedValue(ready);
+    refreshSessionMessagesSpy.mockResolvedValue(undefined);
+    const hook = await renderHarness();
+    try {
+      const prepare = () => controlParamsSpy.mock.calls.at(-1)![0].prepareForMutation() as Promise<boolean>;
+      await act(async () => { expect(await prepare()).toBe(true); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(1);
+      machineDirectSessionStatusGetSpy.mockRejectedValueOnce(new Error('offline'));
+      await act(async () => { await hook.getCurrent().refreshNow(); });
+      expect(hook.getCurrent().status).toMatchObject({ machineOnline: true,
+        observation: { state: 'unknown', reason: 'source_unavailable' } });
+      expect(hook.getCurrent().status?.externalControl).toBeUndefined();
+      const recovered = createDeferred<any>();
+      machineDirectSessionStatusGetSpy.mockReturnValueOnce(recovered.promise);
+      let settled = false;
+      let flight!: Promise<boolean>;
+      await act(async () => { flight = prepare().then(value => { settled = true; return value; }); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(3);
+      expect(settled).toBe(false);
+      await act(async () => { recovered.resolve(ready); expect(await flight).toBe(true); });
+      expect(hook.getCurrent().status).toEqual(ready);
+      await act(async () => { expect(await prepare()).toBe(true); });
+      expect(machineDirectSessionStatusGetSpy).toHaveBeenCalledTimes(3);
+    } finally { await hook.unmount(); }
   });
 
   // 慢历史不能挡住运行态或断线；同一正文刷新未结束时不堆积下一批请求/等待者。

@@ -165,6 +165,8 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
     const activeServerSnapshot = useActiveServerSnapshot();
     const [status, setStatus] = React.useState<DirectSessionRuntimeStatus | null>(null);
     const statusRef = React.useRef<DirectSessionRuntimeStatus | null>(null);
+    // 只记录本 owner 的撤回事实；服务器观察未知仍可能是有效在线能力。
+    const statusWithdrawnRef = React.useRef(false);
     const inFlightRefreshRef = React.useRef<Promise<DirectSessionRuntimeStatus | null> | null>(null);
     // 只保存本 runtime 尚未结束的正文请求；按 sync 的 sessionId owner 合并，不缓存正文或状态。
     const inFlightTranscriptsRef = React.useRef(new Map<string, Promise<void>>());
@@ -192,6 +194,7 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
 
     /** 撤回旧生命周期与能力，保留已显示的普通摘要，不把缺失观察伪装成完成。 */
     const markUnavailable = React.useCallback(() => {
+        statusWithdrawnRef.current = true;
         if (!statusRef.current) return;
         const { externalControl: _control, notifications: _notifications, ...cached } = statusRef.current;
         const next: DirectSessionRuntimeStatus = {
@@ -391,6 +394,8 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
                 return null;
             }
             const response = statusResult.response;
+            // 成功回执已通过寿命及租约校验，投影对象相同也应清除本地撤回事实。
+            statusWithdrawnRef.current = false;
 
             if (!areDirectSessionRuntimeStatusesEqual(statusRef.current, response)) {
                 statusRef.current = response;
@@ -511,8 +516,10 @@ export function useDirectSessionRuntime(params: UseDirectSessionRuntimeParams): 
     const prepareForMutation = React.useCallback(async (): Promise<boolean> => {
         if (!viewerActive || !foregroundRef.current || !committedViewerDemandRef.current?.active
             || committedViewerDemandRef.current.targetKey !== targetKey) return false;
-        const latest = statusRef.current?.machineOnline === true
-            ? statusRef.current : await refreshNow().catch(() => null);
+        // 撤回来源后 online 只是旧摘要，必须沿原刷新确认；旧端缺少新控制能力本身不表示失效。
+        const cached = statusRef.current;
+        const latest = cached?.machineOnline === true && !statusWithdrawnRef.current
+            ? cached : await refreshNow().catch(() => null);
         return latest?.machineOnline === true && latest.runnerActive !== true;
     }, [refreshNow, targetKey, viewerActive]);
 
