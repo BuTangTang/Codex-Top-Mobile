@@ -170,6 +170,15 @@ async function settleFrames() {
     }
 }
 
+/** 推进到真实首次定位派发，避免固定等待跨过 Android 原有的静默滚动完成时点。 */
+async function advanceToInitialTargetDispatch(list: Awaited<ReturnType<typeof mountFooterList>>, offset: number) {
+    const hasDispatched = () => list.writes.some((write) => write.footerLaidOut && write.requested === offset);
+    for (let pass = 0; pass < 80 && !hasDispatched(); pass += 1) {
+        await act(async () => { await vi.advanceTimersToNextTimerAsync(); });
+    }
+    expect(hasDispatched()).toBe(true);
+}
+
 describe('shipped Fabric initial-end footer geometry', () => {
     it.each([false, true])('keeps automatic initial-end targets within native range with footer after first command=%s', async (footerAfterFirstCommand) => {
         const list = await mountFooterList(true, footerAfterFirstCommand);
@@ -191,15 +200,13 @@ describe('shipped Fabric initial-end footer geometry', () => {
             measureRows: true,
             nativeScrollDelayMs: 40,
         });
-        // 分帧提交真实行测量及 layout-ready 的下一帧派发；原生确认仍在途中。
-        for (let frame = 0; frame < 2; frame += 1) {
-            await act(async () => { await vi.advanceTimersByTimeAsync(16); });
-        }
+        // 原始目标已派发但尚未完成，立即触发第二次 footer 变化。
+        await advanceToInitialTargetDispatch(list, 654);
         expect(list.read()).toMatchObject({ loadCount: 0, contentLength: 1054 });
         expect(list.writes.some((write) => write.requested === 654 && write.contentLength === 1054)).toBe(true);
         const beforeGrowth = list.writes.length;
         await list.setFooterHeight(118);
-        // 旧原生回调已到、新目标仍在途中；重复同高布局不应再派发同一目标。
+        // 新目标仍在途中；重复同高布局不应再派发同一目标。
         await act(async () => { await vi.advanceTimersByTimeAsync(8); });
         const beforeRepeatedLayout = list.writes.length;
         await list.setFooterHeight(118);
@@ -218,9 +225,7 @@ describe('shipped Fabric initial-end footer geometry', () => {
             measureRows: true,
             nativeScrollDelayMs: 40,
         });
-        for (let frame = 0; frame < 2; frame += 1) {
-            await act(async () => { await vi.advanceTimersByTimeAsync(16); });
-        }
+        await advanceToInitialTargetDispatch(list, 654);
         expect(list.read().loadCount).toBe(0);
         if (takeover === 'cancel') {
             await act(async () => { list.ref.current!.cancelScroll(); });
