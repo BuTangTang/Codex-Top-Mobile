@@ -572,7 +572,7 @@ describe('useTranscriptViewportAnchorCaptureHost deferral', () => {
         }
     });
 
-    it('drops a delayed native physical completion after the renderer ref remounts', async () => {
+    it.each(['renderer-remount', 'session-exit'] as const)('drops a delayed native physical completion after %s', async (transition) => {
         const originalPlatformOS = Platform.OS;
         Object.defineProperty(Platform, 'OS', { configurable: true, value: 'ios' });
         try {
@@ -593,6 +593,7 @@ describe('useTranscriptViewportAnchorCaptureHost deferral', () => {
                 focusOffsetPx: number;
                 onComplete?: typeof completePhysicalCapture;
             }>) => {
+                if (!request.onComplete) return { status: 'unavailable' };
                 completePhysicalCapture = request.onComplete;
                 return { cancel: vi.fn(), status: 'pending' };
             });
@@ -620,10 +621,14 @@ describe('useTranscriptViewportAnchorCaptureHost deferral', () => {
             expect(members.emitViewportChange).not.toHaveBeenCalled();
             expect(vi.getTimerCount()).toBe(0);
 
-            members.listRef.current = {
-                ...originalListRef,
-                observeNativePhysicalViewport: vi.fn(() => ({ status: 'unavailable' })),
-            } as never;
+            if (transition === 'renderer-remount') {
+                members.listRef.current = {
+                    ...originalListRef,
+                    observeNativePhysicalViewport: vi.fn(() => ({ status: 'unavailable' })),
+                } as never;
+            } else {
+                hook.getCurrent().captureAtExit({ deferEmit: false });
+            }
             completePhysicalCapture?.({
                 capturedAtMs: 100,
                 dataKey: 's1',

@@ -548,6 +548,8 @@ export function useTranscriptViewportAnchorCaptureHost(deps: ViewportAnchorCaptu
         options?: Readonly<{ deferEmit?: boolean }>,
     ): TranscriptExitSnapshotSelection | null => {
         if (deps.shouldSuppressGenericViewportStateForProtectedJumpSeq()) return null;
+        // The exit snapshot supersedes any capture that has not completed yet.
+        deps.viewportAnchorCaptureGenerationRef.current += 1;
         if (
             deps.isEntryViewportCommandActive()
             || deps.listRef.current?.hasActiveEntryPlacement?.() === true
@@ -680,6 +682,7 @@ export function useTranscriptViewportAnchorCaptureHost(deps: ViewportAnchorCaptu
         deps.recordViewportTelemetryEvent,
         deps.resolveWebScrollMetrics,
         deps.shouldSuppressGenericViewportStateForProtectedJumpSeq,
+        deps.viewportAnchorCaptureGenerationRef,
     ]);
 
     return React.useMemo(() => ({

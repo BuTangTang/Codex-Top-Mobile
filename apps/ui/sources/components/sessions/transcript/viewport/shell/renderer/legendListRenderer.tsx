@@ -303,7 +303,7 @@ function LegendListTranscriptRendererInner<TItem>(
     const nativePhysicalEntryMeasurementGenerationRef = React.useRef<object>({});
     const latestNativePhysicalViewportCaptureRef =
         React.useRef<TranscriptRendererNativePhysicalViewportCapture | null>(null);
-    const nativePhysicalViewportObservationRef = React.useRef<object | null>(null);
+    const nativePhysicalViewportObservationRef = React.useRef<Readonly<{ refresh: () => void }> | null>(null);
     const explicitJumpTakeoverOperationRef = React.useRef<TranscriptExplicitJumpOperationId | null>(null);
     // Native prop: `react-native-unistyles` installs `nativeProps_DEPRECATED` stickily, so a fresh
     // object here deep-copies on every commit of a styled family. Built once per mount because the
@@ -660,7 +660,16 @@ function LegendListTranscriptRendererInner<TItem>(
         }
         if (candidates.length === 0) return { status: 'unavailable' };
 
-        const observation = {};
+        const observation = {
+            // Re-measure after a commit while retaining the original observation request.
+            refresh: () => {
+                if (
+                    nativePhysicalViewportIdentityRef.current !== identity
+                    || legendListRef.current !== legendRef
+                ) return;
+                observeNativePhysicalViewport(request);
+            },
+        };
         nativePhysicalViewportObservationRef.current = observation;
         latestNativePhysicalViewportCaptureRef.current = null;
         let remainingMeasurements = candidates.length + 2;
@@ -2939,7 +2948,10 @@ function LegendListTranscriptRendererInner<TItem>(
                 The same commit signal drives the synthesized onContentSizeChange emission. */}
             <LayoutCommitObserver
                 onCommitLayoutEffect={() => {
+                    // Renew only an in-flight observation; scrolling and identity changes still cancel it.
+                    const pendingPhysicalObservation = nativePhysicalViewportObservationRef.current;
                     invalidateNativePhysicalViewportCapture();
+                    pendingPhysicalObservation?.refresh();
                     // LayoutCommitObserver is a no-dependency useLayoutEffect shim on Legend and
                     // therefore runs for every React commit, including commits with no transcript
                     // row, size, or viewport news. Keep this callback limited to the shell's

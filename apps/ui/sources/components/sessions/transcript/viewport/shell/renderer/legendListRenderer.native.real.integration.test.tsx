@@ -951,6 +951,8 @@ describe('Legend transcript renderer installed native-package cleanup', () => {
     it('captures source-order identity and bottom distance from one installed-native physical observation', async () => {
         const Renderer = legendListRenderer.Component;
         const listRef = React.createRef<TranscriptListShellRef<Row>>();
+        let contentPageY = -1_000;
+        let rowPageY = 150;
         const contentHost = {
             measure: (callback: (
                 x: number,
@@ -959,7 +961,7 @@ describe('Legend transcript renderer installed native-package cleanup', () => {
                 height: number,
                 pageX: number,
                 pageY: number,
-            ) => void) => callback(0, 0, 800, 4_000, 0, -1_000),
+            ) => void) => callback(0, 0, 800, 4_000, 0, contentPageY),
         };
         const scrollHost = {
             measure: (callback: (
@@ -987,7 +989,8 @@ describe('Legend transcript renderer installed native-package cleanup', () => {
                 pageX: number,
                 pageY: number,
             ) => void) => {
-                const complete = () => callback(0, 0, 800, 240, 0, 150);
+                const measuredPageY = rowPageY;
+                const complete = () => callback(0, 0, 800, 240, 0, measuredPageY);
                 if (deferPhysicalMeasurements) pendingMeasurements.push(complete);
                 else complete();
             },
@@ -997,18 +1000,20 @@ describe('Legend transcript renderer installed native-package cleanup', () => {
             { id: 'middle' },
             { id: 'oldest' },
         ];
-        const render = (dataKey: string, data: readonly Row[]) => (
+        const keyExtractor = (item: Row) => item.id;
+        const render = (dataKey: string, data: readonly Row[], revision = 0) => (
             <Renderer
                 webDomObservation={createWebDomScrollObservation()}
                 data={data}
                 dataKey={dataKey}
+                extraData={revision}
                 frame={resolveMainTranscriptListShellFrame({
                     legendInitialScrollAtEnd: false,
                     maintainScrollAtEndThreshold: 0.1,
                     nativeID: dataKey,
                     platformOS: 'ios',
                 })}
-                keyExtractor={(item: Row) => item.id}
+                keyExtractor={keyExtractor}
                 ref={listRef}
                 renderItem={({ item }: { item: Row }) => <React.Fragment>{item.id}</React.Fragment>}
             />
@@ -1060,6 +1065,60 @@ describe('Legend transcript renderer installed native-package cleanup', () => {
             .toEqual({ status: 'unavailable' });
 
         deferPhysicalMeasurements = true;
+        const refreshedCompletion = vi.fn();
+        act(() => {
+            listRef.current?.observeNativePhysicalViewport?.({
+                focusOffsetPx: 108,
+                onComplete: refreshedCompletion,
+            });
+        });
+        const beforeCommitMeasurements = pendingMeasurements.splice(0);
+        // Ordinary commits must renew an in-flight observation with current geometry,
+        // without accepting the coordinates measured before those commits.
+        rowPageY = -167;
+        contentPageY = -1_317;
+        await act(async () => {
+            requireMountedScreen(screen).update(render('physical-capture-b', rows, 1));
+        });
+        rowPageY = -217;
+        contentPageY = -1_367;
+        await act(async () => {
+            requireMountedScreen(screen).update(render('physical-capture-b', rows, 2));
+        });
+        act(() => beforeCommitMeasurements.forEach((complete) => complete()));
+        expect(refreshedCompletion).not.toHaveBeenCalled();
+        act(() => pendingMeasurements.splice(0).forEach((complete) => complete()));
+        expect(refreshedCompletion).toHaveBeenCalledExactlyOnceWith({
+            capturedAtMs: expect.any(Number),
+            dataKey: 'physical-capture-b',
+            itemIndex: 2,
+            itemKey: 'oldest',
+            itemOffsetPx: -317,
+            offsetY: 1_933,
+        });
+
+        const drag = (offsetY: number) => requireMountedScreen(screen).root.findByType('ScrollView').props.onScrollBeginDrag({
+            nativeEvent: {
+                contentOffset: { x: 0, y: offsetY },
+                contentSize: { width: 800, height: 4_000 },
+                layoutMeasurement: { width: 800, height: 600 },
+            },
+        });
+        act(() => drag(1_467));
+        const movedCompletion = vi.fn();
+        act(() => {
+            listRef.current?.observeNativePhysicalViewport?.({
+                focusOffsetPx: 108,
+                onComplete: movedCompletion,
+            });
+        });
+        act(() => drag(1_547));
+        await act(async () => {
+            requireMountedScreen(screen).update(render('physical-capture-b', rows, 3));
+        });
+        act(() => pendingMeasurements.splice(0).forEach((complete) => complete()));
+        expect(movedCompletion).not.toHaveBeenCalled();
+
         const staleCompletion = vi.fn();
         act(() => {
             expect(listRef.current?.observeNativePhysicalViewport?.({

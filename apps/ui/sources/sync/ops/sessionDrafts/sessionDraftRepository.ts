@@ -177,11 +177,14 @@ type ScopeState = {
     persistenceError?: boolean;
     loaded: boolean;
     replicas: Map<string, PersistedReplica>;
+    // Keep only a runtime invalidation token after removal; no draft data is retained.
+    replicaClearVersions: Map<string, number>;
     ordinaryEntryDraftId: string | null;
 };
 type Listener = () => void;
 type ScopeMutationBatch = {
     originalReplicas: Map<string, PersistedReplica>;
+    originalReplicaClearVersions: Map<string, number>;
     originalOrdinaryEntryDraftId: string | null;
     changedAddresses: Map<string, SessionDraftAddressV1>;
 };
@@ -484,7 +487,7 @@ export class SessionDraftRepository {
         const scopeKey = this.scopeKey(scope);
         const cached = this.scopeStates.get(scopeKey);
         if (cached) return cached;
-        const state: ScopeState = { loaded: true, replicas: new Map(), ordinaryEntryDraftId: null };
+        const state: ScopeState = { loaded: true, replicas: new Map(), replicaClearVersions: new Map(), ordinaryEntryDraftId: null };
         const raw = this.storage.getString(this.storageKey(scope));
         if (raw) {
             try {
@@ -594,6 +597,7 @@ export class SessionDraftRepository {
         const state = this.getScopeState(scope);
         const batch: ScopeMutationBatch = {
             originalReplicas: new Map(state.replicas),
+            originalReplicaClearVersions: new Map(state.replicaClearVersions),
             originalOrdinaryEntryDraftId: state.ordinaryEntryDraftId,
             changedAddresses: new Map(),
         };
@@ -606,6 +610,7 @@ export class SessionDraftRepository {
             return result;
         } catch (error) {
             state.replicas = batch.originalReplicas;
+            state.replicaClearVersions = batch.originalReplicaClearVersions;
             state.ordinaryEntryDraftId = batch.originalOrdinaryEntryDraftId;
             this.newListProjectionCache.delete(scopeKey);
             this.mutationBatches.delete(scopeKey);
@@ -632,7 +637,9 @@ export class SessionDraftRepository {
 
     private deleteReplica(scope: SessionDraftRepositoryScope, address: SessionDraftAddressV1): void {
         const state = this.getScopeState(scope);
-        const deleted = state.replicas.delete(canonicalSessionDraftAddressV1(address));
+        const key = canonicalSessionDraftAddressV1(address);
+        const deleted = state.replicas.delete(key);
+        if (deleted) state.replicaClearVersions.set(key, (state.replicaClearVersions.get(key) ?? 0) + 1);
         const clearedOrdinaryEntryPointer = address.kind === 'newSession'
             && state.ordinaryEntryDraftId === address.draftId;
         if (clearedOrdinaryEntryPointer) state.ordinaryEntryDraftId = null;
@@ -942,6 +949,9 @@ export class SessionDraftRepository {
         }
         if (!changed) return false;
         const meaningfulContent = hasMeaningfulContent(document);
+        const state = this.getScopeState(params.scope);
+        const key = canonicalSessionDraftAddressV1(params.address);
+        state.replicaClearVersions.set(key, (state.replicaClearVersions.get(key) ?? 0) + 1);
         this.writeReplica(params.scope, {
             ...replica,
             localRawDocument: document,
@@ -1229,26 +1239,31 @@ export class SessionDraftRepository {
         if (activeFlush) await activeFlush;
         const runtime = this.syncRuntime(scope);
         if (!runtime) return;
+        const state = this.getScopeState(scope);
+        const key = canonicalSessionDraftAddressV1(address);
+        const version = state.replicaClearVersions.get(key) ?? 0;
+        const isCurrentRead = () => this.isCurrentRuntime(runtime)
+            && (state.replicaClearVersions.get(key) ?? 0) === version;
         let response: SessionDraftReadResponseV1;
         try {
             response = await runtime.transport.read(address);
         } catch (error) {
-            if (!this.isCurrentRuntime(runtime)) return;
+            if (!isCurrentRead()) return;
             this.writeLatestReplicaStatus(scope, address, 'offline');
             throw error;
         }
-        if (!this.isCurrentRuntime(runtime)) return;
+        if (!isCurrentRead()) return;
         let remoteDocument: SessionDraftDocumentV1 | null = null;
         if (response.status === 'present') {
             try {
                 remoteDocument = await this.openRequiredDocument(runtime, response.record);
             } catch (error) {
-                if (!this.isCurrentRuntime(runtime)) return;
+                if (!isCurrentRead()) return;
                 if (isSessionDraftContextUnavailableError(error)) throw error;
                 this.writeLatestReplicaStatus(scope, address, 'error');
                 throw error;
             }
-            if (!this.isCurrentRuntime(runtime)) return;
+            if (!isCurrentRead()) return;
         }
         const shouldFlush = this.reconcileStagedRead(scope, address, response, remoteDocument);
         if (shouldFlush) await this.flushSessionDraft({ scope, address });
@@ -1356,6 +1371,8 @@ export class SessionDraftRepository {
         if (this.storage.prepare) await this.storage.prepare();
         const runtime = this.syncRuntime(scope);
         if (!runtime) return;
+        const state = this.getScopeState(scope);
+        const readVersions = new Map(state.replicaClearVersions);
         const staged = new Map<string, Readonly<{
             address: SessionDraftAddressV1;
             response: SessionDraftReadResponseV1;
@@ -1416,6 +1433,8 @@ export class SessionDraftRepository {
                     addressesToRematerialize.push(address);
                     continue;
                 }
+                const key = canonicalSessionDraftAddressV1(address);
+                if ((state.replicaClearVersions.get(key) ?? 0) !== (readVersions.get(key) ?? 0)) continue;
                 if (this.reconcileStagedRead(scope, address, response, document)) addressesToFlush.push(address);
             }
         });

@@ -2021,3 +2021,223 @@ function createNewSessionDocument(text: string, mutationId: string): NewSessionD
 function assertNewSessionDocument(document: SessionDraftDocumentV1): asserts document is NewSessionDraftDocument {
     if (document.target.kind !== 'newSession') throw new Error('expected new-session fixture');
 }
+
+type ReadPath = 'exact read' | 'snapshot hydration';
+async function seededDraft() {
+    const storage = createMemoryStorage();
+    const remote = createRemote();
+    const cipher = plainCipher();
+    const repository = createSessionDraftRepository({ storage, transport: remote.transport, cipher, syncEnabled: true });
+    repository.writeExistingSessionDraft({ scope, sessionId: sessionAddress.sessionId, patch: { text: 'SYNTHETIC_SENT_A' } });
+    await repository.flushSessionDraft({ scope, address: sessionAddress });
+    const oldResponse = await remote.transport.read(sessionAddress);
+    if (oldResponse.status !== 'present')
+        throw new Error('Synthetic seed missing');
+    return { storage, remote, cipher, repository, oldResponse };
+}
+function deferOldRead(f: Awaited<ReturnType<typeof seededDraft>>, path: ReadPath) {
+    const deferred = createDeferred<void>();
+    if (path === 'exact read') {
+        vi.mocked(f.remote.transport.read).mockImplementationOnce(async () => {
+            await deferred.promise;
+            return f.oldResponse;
+        });
+    }
+    else {
+        vi.mocked(f.remote.transport.list).mockImplementationOnce(async () => {
+            await deferred.promise;
+            return { items: [f.oldResponse.record], nextAfter: undefined };
+        });
+    }
+    const operation = path === 'exact read'
+        ? f.repository.materializeExact(scope, sessionAddress)
+        : f.repository.ensureSessionDraftRepositoryHydrated(scope);
+    return { operation, release: () => deferred.resolve() };
+}
+function textOf(repository: ReturnType<typeof createSessionDraftRepository>) {
+    return repository.getSessionDraftSnapshot(scope, sessionAddress)?.document.composer.text.value ?? null;
+}
+describe('cleared draft read currentness', () => {
+    it.each(['exact read', 'snapshot hydration'] as const)('does not restore a sent draft when an older %s finishes after clear', async (path) => {
+        const f = await seededDraft();
+        const reading = deferOldRead(f, path);
+        const currentness = f.repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        expect(await f.repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness })).toBe(true);
+        expect(textOf(f.repository)).toBeNull();
+        expect(f.remote.readCurrent()?.content).toBeNull();
+        reading.release();
+        await reading.operation;
+        expect(textOf(f.repository)).toBeNull();
+        const recreated = createSessionDraftRepository({ storage: f.storage, transport: f.remote.transport, cipher: f.cipher, syncEnabled: true });
+        expect(textOf(recreated)).toBeNull();
+    });
+
+    it('keeps an acknowledged clear absent after a fresh read and recreation', async () => {
+        const f = await seededDraft();
+        const currentness = f.repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        await f.repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        await f.repository.materializeExact(scope, sessionAddress);
+        expect(textOf(f.repository)).toBeNull();
+        expect(textOf(createSessionDraftRepository({ storage: f.storage, cipher: f.cipher, syncEnabled: false }))).toBeNull();
+    });
+
+    it('keeps a local-only clear absent through repository recreation', async () => {
+        const storage = createMemoryStorage();
+        const cipher = plainCipher();
+        const repository = createSessionDraftRepository({ storage, cipher, syncEnabled: false });
+        repository.writeExistingSessionDraft({ scope, sessionId: sessionAddress.sessionId, patch: { text: 'SYNTHETIC_SENT_A' } });
+        const currentness = repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        await repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        expect(textOf(createSessionDraftRepository({ storage, cipher, syncEnabled: false }))).toBeNull();
+    });
+
+    it.each(['exact read', 'snapshot hydration'] as const)('keeps B typed after acknowledged clear when old A %s returns', async (path) => {
+        const f = await seededDraft();
+        const oldRead = deferOldRead(f, path);
+        const currentness = f.repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        await f.repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        f.repository.writeExistingSessionDraft({ scope, sessionId: sessionAddress.sessionId, patch: { text: 'SYNTHETIC_NEW_B' } });
+        oldRead.release();
+        await oldRead.operation;
+        expect(f.repository.getSessionDraftSnapshot(scope, sessionAddress)).toMatchObject({ status: 'pending', conflict: null, document: { composer: { text: { value: 'SYNTHETIC_NEW_B' } } } });
+        expect(f.remote.readCurrent()?.content).toBeNull();
+        const recreated = createSessionDraftRepository({ storage: f.storage, cipher: f.cipher, syncEnabled: true });
+        expect(textOf(recreated)).toBe('SYNTHETIC_NEW_B');
+        expect(recreated.getSessionDraftSnapshot(scope, sessionAddress)?.status).toBe('pending');
+    });
+
+    it.each(['exact read', 'snapshot hydration'] as const)('rejects stale %s across absent -> write -> clear (ABA)', async (path) => {
+        const f = await seededDraft();
+        // A server draft exists, but this newly created local repository has not hydrated it yet.
+        const repository = createSessionDraftRepository({ storage: createMemoryStorage(), cipher: f.cipher, transport: f.remote.transport, syncEnabled: true });
+        const g = { ...f, repository };
+        expect(textOf(repository)).toBeNull();
+        const oldRead = deferOldRead(g, path);
+        repository.writeExistingSessionDraft({ scope, sessionId: sessionAddress.sessionId, patch: { text: 'SYNTHETIC_SENT_A' } });
+        await repository.flushSessionDraft({ scope, address: sessionAddress });
+        // Equal text is reconciled through the existing CAS path; this is not a forced write.
+        expect(repository.getSessionDraftSnapshot(scope, sessionAddress)?.conflict).toBeNull();
+        const currentness = repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        await repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        expect(textOf(repository)).toBeNull();
+        expect(f.remote.readCurrent()?.content).toBeNull();
+        oldRead.release();
+        await oldRead.operation;
+        expect(textOf(repository)).toBeNull();
+    });
+
+    it.each(['not committed', 'committed but acknowledgement lost'] as const)('preserves unresolved clear status after a %s failure', async (failure) => {
+        const f = await seededDraft();
+        const oldRead = deferOldRead(f, 'exact read');
+        vi.mocked(f.remote.transport.mutate).mockImplementation(async (request) => {
+            if (failure === 'committed but acknowledgement lost') {
+                // Commit on the server, then lose the acknowledgement while the local clear stays unresolved.
+                const old = f.remote.readCurrent()!;
+                if (request.expectedRevision === old.revision) {
+                    f.remote.replaceCurrent({ ...old, revision: old.revision + 1, content: request.content });
+                }
+            }
+            throw new Error('Synthetic network reply unavailable');
+        });
+        const currentness = f.repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        const clearing = f.repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        expect(f.repository.getSessionDraftSnapshot(scope, sessionAddress)).toMatchObject({ status: 'pending', document: { composer: { text: { value: '' } } } });
+        // true means a local currentness clear; it has never promised a server acknowledgement.
+        expect(await clearing).toBe(true);
+        expect(f.repository.getSessionDraftSnapshot(scope, sessionAddress)).toMatchObject({ status: 'offline', document: { composer: { text: { value: '' } } } });
+        const calls = vi.mocked(f.remote.transport.mutate).mock.calls.length;
+        oldRead.release();
+        await oldRead.operation;
+        expect(f.repository.getSessionDraftSnapshot(scope, sessionAddress)?.status).toBe('offline');
+        expect(textOf(f.repository)).toBe('');
+        expect(vi.mocked(f.remote.transport.mutate).mock.calls.length).toBe(calls);
+        const recreated = createSessionDraftRepository({ storage: f.storage, cipher: f.cipher, syncEnabled: true });
+        expect(recreated.getSessionDraftSnapshot(scope, sessionAddress)?.status).toBe('offline');
+        expect(textOf(recreated)).toBe('');
+    });
+
+    it.each(['exact read', 'snapshot hydration'] as const)('adopts a valid newer remote draft from a fresh %s after clear', async (path) => {
+        const f = await seededDraft();
+        const currentness = f.repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        await f.repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        const oldDocument = (f.oldResponse.record.content as Extract<SessionDraftStoredContentEnvelopeV1, {
+            t: 'plain';
+        }>).v.document;
+        const newerDocument = { ...oldDocument, composer: { ...oldDocument.composer, text: { value: 'SYNTHETIC_REMOTE_C', mutationId: uuid(910) } } };
+        const prior = f.remote.readCurrent()!;
+        f.remote.replaceCurrent({ ...prior, revision: prior.revision + 1, content: await f.cipher.seal(sessionAddress, newerDocument) });
+        if (path === 'snapshot hydration') {
+            const fresh = await f.remote.transport.read(sessionAddress);
+            if (fresh.status !== 'present')
+                throw new Error('Synthetic fresh draft missing');
+            vi.mocked(f.remote.transport.list).mockResolvedValueOnce({ items: [fresh.record], nextAfter: undefined });
+            await f.repository.ensureSessionDraftRepositoryHydrated(scope);
+        }
+        else
+            await f.repository.materializeExact(scope, sessionAddress);
+        expect(f.repository.getSessionDraftSnapshot(scope, sessionAddress)).toMatchObject({ status: 'clean', conflict: null, document: { composer: { text: { value: 'SYNTHETIC_REMOTE_C' } } } });
+        expect(textOf(createSessionDraftRepository({ storage: f.storage, cipher: f.cipher, syncEnabled: true }))).toBe('SYNTHETIC_REMOTE_C');
+    });
+
+    it('does not invalidate an unrelated address read while another draft is edited', async () => {
+        const f = await seededDraft();
+        const oldDocument = (f.oldResponse.record.content as Extract<SessionDraftStoredContentEnvelopeV1, {
+            t: 'plain';
+        }>).v.document;
+        const nextDocument = { ...oldDocument, composer: { ...oldDocument.composer, text: { value: 'SYNTHETIC_REMOTE_C', mutationId: uuid(911) } } };
+        const prior = f.remote.readCurrent()!;
+        f.remote.replaceCurrent({ ...prior, revision: prior.revision + 1, content: await f.cipher.seal(sessionAddress, nextDocument) });
+        const fresh = await f.remote.transport.read(sessionAddress);
+        if (fresh.status !== 'present')
+            throw new Error('Synthetic fresh draft missing');
+        const oldRead = deferOldRead({ ...f, oldResponse: fresh }, 'exact read');
+        f.repository.writeExistingSessionDraft({ scope, sessionId: 'other-session', patch: { text: 'SYNTHETIC_UNRELATED' } });
+        oldRead.release();
+        await oldRead.operation;
+        expect(textOf(f.repository)).toBe('SYNTHETIC_REMOTE_C');
+        expect(f.repository.getExistingSessionDraftProjection(scope, 'other-session')?.text).toBe('SYNTHETIC_UNRELATED');
+    });
+
+    it('discards an old read that is still decrypting when clear finishes', async () => {
+        const f = await seededDraft();
+        const deferred = createDeferred<SessionDraftDocumentV1>();
+        const started = createDeferred<void>();
+        const oldDocument = (f.oldResponse.record.content as Extract<SessionDraftStoredContentEnvelopeV1, {
+            t: 'plain';
+        }>).v.document;
+        vi.mocked(f.cipher.open).mockImplementationOnce(async () => { started.resolve(); return deferred.promise; });
+        const reading = f.repository.materializeExact(scope, sessionAddress);
+        await started.promise;
+        const currentness = f.repository.captureSessionDraftCurrentness({ scope, address: sessionAddress });
+        await f.repository.clearSessionDraftCurrentness({ scope, address: sessionAddress, currentness });
+        deferred.resolve(oldDocument);
+        await reading;
+        expect(textOf(f.repository)).toBeNull();
+    });
+});
+describe('concurrent draft field reconciliation', () => {
+    it.each(['exact read', 'snapshot hydration'] as const)('keeps local B and merges a newer remote routing edit while %s is in flight', async (path) => {
+        const f = await seededDraft();
+        const oldDocument = (f.oldResponse.record.content as Extract<SessionDraftStoredContentEnvelopeV1, {
+            t: 'plain';
+        }>).v.document as ExistingSessionDraftDocument;
+        const document = { ...oldDocument, target: { ...oldDocument.target, routing: { ...oldDocument.target.routing, recipient: { mutationId: uuid(950), value: { kind: 'user', userId: 'synthetic-recipient-c' } } } } };
+        const prior = f.remote.readCurrent()!;
+        f.remote.replaceCurrent({ ...prior, revision: prior.revision + 1, content: await f.cipher.seal(sessionAddress, document) });
+        const fresh = await f.remote.transport.read(sessionAddress);
+        if (fresh.status !== 'present')
+            throw new Error('Synthetic remote update missing');
+        const reading = deferOldRead({ ...f, oldResponse: fresh }, path);
+        f.repository.writeExistingSessionDraft({ scope, sessionId: sessionAddress.sessionId, patch: { text: 'SYNTHETIC_NEW_B' } });
+        reading.release();
+        await reading.operation;
+        expect(f.repository.getSessionDraftSnapshot(scope, sessionAddress)).toMatchObject({
+            status: 'clean', conflict: null,
+            document: { composer: { text: { value: 'SYNTHETIC_NEW_B' } }, target: { routing: { recipient: { value: { kind: 'user', userId: 'synthetic-recipient-c' } } } } },
+        });
+        const content = f.remote.readCurrent()?.content;
+        expect(content?.t).toBe('plain');
+        if (content?.t === 'plain')
+            expect(content.v.document).toMatchObject({ composer: { text: { value: 'SYNTHETIC_NEW_B' } }, target: { routing: { recipient: { value: { kind: 'user', userId: 'synthetic-recipient-c' } } } } });
+    });
+});
