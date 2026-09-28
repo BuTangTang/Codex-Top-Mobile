@@ -1911,7 +1911,8 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         // keystroke landed in an empty handler map and the menu's first paint fell back
         // to the composer-view anchor — the "menu appears at the top of the composer,
         // then jumps on the next keystroke" report.
-        enabled: isInputFocused && !props.disabled,
+        // 没有补全类型时没有菜单需要光标锚点；有补全能力时仍在首字符前随焦点订阅。
+        enabled: props.autocompleteKinds.length > 0 && isInputFocused && !props.disabled,
     });
     const commandMenuAnchor: CommandMenuAnchor = React.useMemo(
         () => resolveAgentInputCommandMenuAnchor(caretRect, composerAnchorRef),

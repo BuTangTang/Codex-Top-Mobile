@@ -292,8 +292,17 @@ export function useSessionAgentInputComposerPersistence({
             fontScale?: number;
         }>,
     ) => {
-        setScopedState(readScopedComposerPersistenceState(nextScope, nextOwner, nextOptions));
-    }, []);
+        const next = readScopedComposerPersistenceState(nextScope, nextOwner, nextOptions);
+        // 正文 basis 已在 render 投影；原生输入已写入相同 UI 状态时，不能再排一笔等价的 effect 更新。
+        if (
+            areOwnersEqual(scopedState.owner, nextOwner)
+            && areNullableScopesEqual(scopedState.scope, nextScope)
+            && scopedState.expanded === next.expanded
+            && JSON.stringify(scopedState.inputState) === JSON.stringify(next.inputState)
+            && areMentionListsEqual(scopedState.structuredInputMentions, next.structuredInputMentions)
+        ) return;
+        setScopedState(next);
+    }, [scopedState]);
     const setScopedStateWithExpanded = React.useCallback((nextExpanded: boolean) => {
         setScopedState((current) => {
             const base = isScopedComposerPersistenceStateCurrent(current, scope, owner, scopedStateReadOptions)

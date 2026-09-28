@@ -12,6 +12,7 @@ const activeScopeState = vi.hoisted(() => ({
     value: { serverId: 'server-a', accountId: 'account-a' } as ServerAccountScope,
 }));
 const appStateListeners = vi.hoisted(() => new Set<(nextState: string) => void>());
+const focusState = vi.hoisted(() => ({ value: true }));
 
 function installMockDocument(visibilityState: 'hidden' | 'visible' = 'visible') {
     const listeners = new Set<() => void>();
@@ -119,7 +120,11 @@ vi.mock('react-native-mmkv', () => {
 });
 
 vi.mock('@react-navigation/native', () => ({
-    useIsFocused: () => true,
+    useIsFocused: () => focusState.value,
+}));
+
+vi.mock('@/sync/sync', () => ({
+    sync: { materializeExistingSessionDraft: vi.fn(async () => undefined) },
 }));
 
 vi.mock('react-native', async () => {
@@ -174,6 +179,7 @@ describe('useSessionAgentInputComposerPersistence', () => {
     beforeEach(async () => {
         mmkvStore.clear();
         appStateListeners.clear();
+        focusState.value = true;
         activeScopeState.value = { serverId: 'server-a', accountId: 'account-a' };
         vi.resetModules();
         await resetBrowserSessionDraftPersistenceForTest();
@@ -522,6 +528,85 @@ describe('useSessionAgentInputComposerPersistence', () => {
         }
     });
 
+    it('does not commit an equivalent passive mirror after controlled draft input', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+        const { useSessionAgentInputComposerPersistence } = await importHook();
+        const { useDraft } = await import('./useDraft');
+        const repository = await importSessionDraftRepository();
+        const commits: Array<{ text: string; selection: unknown; restoreToken: string }> = [];
+        const hook = await renderHook(() => {
+            const [text, setText] = React.useState('');
+            const draft = useDraft('session-a', text, setText);
+            const persistence = useSessionAgentInputComposerPersistence({
+                sessionId: 'session-a', text, textLength: text.length, fontScale: 1,
+            });
+            React.useLayoutEffect(() => {
+                commits.push({
+                    text,
+                    selection: persistence.inputPersistence.initialSelection,
+                    restoreToken: persistence.inputPersistence.restoreToken,
+                });
+            });
+            return { draft, persistence };
+        });
+        const restoreToken = hook.getCurrent().persistence.inputPersistence.restoreToken;
+        commits.length = 0;
+        const draftText = 'ordinary typing with spaces '.repeat(3);
+        const inputs = [
+            ...Array.from({ length: draftText.length }, (_, index) => draftText.slice(0, index + 1)),
+            ...Array.from({ length: draftText.length }, (_, index) => draftText.slice(0, draftText.length - index - 1)),
+            ...Array.from({ length: draftText.length }, (_, index) => draftText.slice(0, index + 1)),
+        ];
+        try {
+            for (const text of inputs) {
+                await act(async () => {
+                    // 与原生 onChange 相同：受控正文和选择范围在同一次输入中写入。
+                    hook.getCurrent().draft.setDraftValue(text);
+                    hook.getCurrent().persistence.inputPersistence.onSelectionChangePersist(
+                        { start: text.length, end: text.length }, text.length,
+                    );
+                });
+            }
+            expect(repository.getSessionDraftSnapshot(activeScopeState.value, {
+                kind: 'session', sessionId: 'session-a',
+            })?.document.composer.text.value).toBe(draftText);
+            // 每次输入已发布完整投影，effect 不应再提交一份完全相同的结果。
+            expect(commits).toEqual(inputs.map((text) => ({
+                text, selection: { start: text.length, end: text.length }, restoreToken,
+            })));
+        } finally {
+            vi.useRealTimers();
+            await hook.unmount();
+            await repository.flushSessionDraft({
+                scope: activeScopeState.value, address: { kind: 'session', sessionId: 'session-a' },
+            });
+        }
+    });
+
+    it('reads external UI state again on refocus without a text or owner change', async () => {
+        const { useSessionAgentInputComposerPersistence } = await importHook();
+        const localUiStateStore = await importLocalUiStateStore();
+        const owner = { kind: 'session' as const, sessionId: 'session-a' };
+        localUiStateStore.patchAgentInputLocalUiState(activeScopeState.value, owner, {
+            expanded: false, scrollY: 10, selection: { start: 1, end: 1 }, textLength: 10, fontScale: 1,
+        });
+        const hook = await renderHook(() => useSessionAgentInputComposerPersistence({
+            sessionId: 'session-a', text: 'abcdefghij', textLength: 10, fontScale: 1,
+        }));
+        const restoreToken = hook.getCurrent().inputPersistence.restoreToken;
+        focusState.value = false;
+        await hook.rerender();
+        localUiStateStore.patchAgentInputLocalUiState(activeScopeState.value, owner, {
+            expanded: true, scrollY: 44, selection: { start: 8, end: 8 }, textLength: 10, fontScale: 1,
+        });
+        focusState.value = true;
+        await hook.rerender();
+        expect(hook.getCurrent().expanded).toBe(true);
+        expect(hook.getCurrent().inputPersistence.initialScrollY).toBe(44);
+        expect(hook.getCurrent().inputPersistence.initialSelection).toEqual({ start: 8, end: 8 });
+        expect(hook.getCurrent().inputPersistence.restoreToken).toBe(restoreToken);
+    });
+
     it('keeps restoreToken stable across self-originated selection and scroll persists', async () => {
         // Live incident (web composer, 2026-07-22): every keystroke persisted the
         // caret, which bumped the store's updatedAt, which churned restoreToken,
@@ -577,14 +662,15 @@ describe('useSessionAgentInputComposerPersistence', () => {
             fontScale: 1,
         });
 
+        const initialProps: Readonly<{ textLength: number; fontScale?: number }> = { textLength: 0 };
         const hook = await renderHook(
-            (params: Readonly<{ textLength: number }>) =>
+            (params: typeof initialProps) =>
                 useSessionAgentInputComposerPersistence({
                     sessionId: 'session-a',
                     textLength: params.textLength,
-                    fontScale: 1,
+                    fontScale: params.fontScale ?? 1,
                 }),
-            { initialProps: { textLength: 0 } },
+            { initialProps },
         );
 
         const pendingToken = hook.getCurrent().inputPersistence.restoreToken;
@@ -596,6 +682,15 @@ describe('useSessionAgentInputComposerPersistence', () => {
         expect(adoptedToken).not.toBe(pendingToken);
         expect(hook.getCurrent().inputPersistence.initialScrollY).toBe(88);
         expect(hook.getCurrent().inputPersistence.initialSelection).toEqual({ start: 30, end: 30 });
+
+        await hook.rerender({ textLength: 42, fontScale: 2 });
+        expect(hook.getCurrent().inputPersistence.initialScrollY).toBeUndefined();
+        await hook.rerender({ textLength: 0 });
+        expect(hook.getCurrent().inputPersistence.initialScrollY).toBeUndefined();
+        await hook.rerender({ textLength: 42 });
+        expect(hook.getCurrent().inputPersistence.initialScrollY).toBe(88);
+        expect(hook.getCurrent().inputPersistence.initialSelection).toEqual({ start: 30, end: 30 });
+        expect(hook.getCurrent().inputPersistence.restoreToken).toBe(adoptedToken);
 
         await act(async () => {
             hook.getCurrent().inputPersistence.onSelectionChangePersist({ start: 31, end: 31 }, 43);
