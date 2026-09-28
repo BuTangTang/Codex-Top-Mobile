@@ -303,11 +303,15 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
         let ipc: DesktopIpc;
         const nativeAuto = message.textSendProtocol === 'native-auto-v1';
         if (nativeAuto) {
-            // 独立短连接不 follow，避免发送排在完整历史大帧之后；getter 只复核原 RPC 寿命。
-            message.getFollowedIpc?.();
+            // 只借当前 reader 的连续 owner 证明；正文仍留在原连接，发送不排在完整历史大帧之后。
+            control = borrowDesktopControl(message) ?? undefined;
             textIpc = await DesktopIpc.open(codexHome);
             message.getFollowedIpc?.();
-            ownerClientId = await textIpc.discoverOwner(message.remoteSessionId);
+            if (control) {
+                // 初始化期间可能撤销租约、owner 或修订链；只验证原 reader，不转借后继连接。
+                control.read();
+                ownerClientId = textIpc.bindControlOwner(control.ipc, message.remoteSessionId);
+            } else ownerClientId = await textIpc.discoverOwner(message.remoteSessionId);
             message.getFollowedIpc?.();
             ipc = textIpc;
             dispatched = true;
@@ -319,6 +323,7 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
                     context: { prompt: message.text, addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [] } },
             }, requestId, ownerClientId);
             message.getFollowedIpc?.();
+            control?.read();
             if (!isNativeInactiveRejection(response, message.remoteSessionId, ownerClientId)) {
                 if (response.resultType === 'error') {
                     const reason = desktopResponseFailure(response);
@@ -340,7 +345,7 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
             if (snapshot.textSendMode !== 'start') throw new DesktopIpcError('turn_not_idle');
             ipc = control.ipc;
         }
-        if (nativeAuto) message.getFollowedIpc?.();
+        if (nativeAuto) { message.getFollowedIpc?.(); control?.read(); }
         dispatched = true;
         const response = await ipc.request('thread-follower-start-turn', 2, {
             conversationId: message.remoteSessionId,
@@ -350,7 +355,7 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
                 context: { inheritThreadSettings: true },
             },
         }, nativeAuto ? randomUUID() : requestId, ownerClientId);
-        if (nativeAuto) message.getFollowedIpc?.();
+        if (nativeAuto) { message.getFollowedIpc?.(); control?.read(); }
         if (response.resultType === 'error') {
             const reason = desktopResponseFailure(response);
             return { ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',

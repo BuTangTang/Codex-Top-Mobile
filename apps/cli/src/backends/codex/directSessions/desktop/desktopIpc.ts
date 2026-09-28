@@ -169,7 +169,19 @@ export class DesktopIpc {
         if (response.resultType !== 'success' || response.method !== 'thread-owner-discovery'
             || !ipcString(response.handledByClientId) || response.handledByClientId === this.clientId
             || result?.supportsUntrustedAppInput !== true) throw new DesktopIpcError('incompatible_protocol');
-        this.ownerClientId = response.handledByClientId;
+        return this.bindOwner(response.handledByClientId);
+    }
+
+    /** 短发送连接复用现有 reader 的连续证明，不订阅正文或重新发现；调用者仍负责原租约寿命。 */
+    bindControlOwner(followed: DesktopIpc, conversationId: string): string {
+        const proof = followed.getControlSnapshot(conversationId);
+        if (!proof) throw new DesktopIpcError('owner_changed');
+        return this.bindOwner(proof.ownerClientId);
+    }
+
+    /** 发现回执与已有控制证明共用同一绑定；初始化期间已经收到的失联不能被覆盖。 */
+    private bindOwner(ownerClientId: string): string {
+        this.ownerClientId = ownerClientId;
         // 发现应答与断连广播可能在同一个 data 回调中到达，早于 await 恢复。
         if (this.disconnectedClients.has(this.ownerClientId)) throw new DesktopIpcError('owner_changed');
         if (this.failure) throw this.failure;

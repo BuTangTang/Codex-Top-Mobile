@@ -38,6 +38,7 @@ describe('Desktop-owned session control', () => {
     const servers = new Set<Server>();
     let requests: Request[];
     const sockets = new Set<Socket>();
+    let onInitialize: (request: Request, socket: Socket) => void;
     let onStart: (request: Request, socket: Socket) => void;
     let onDiscover: (request: Request, socket: Socket) => void;
     let onFollow: (request: Request, socket: Socket) => void;
@@ -121,8 +122,7 @@ describe('Desktop-owned session control', () => {
                     pending = pending.subarray(4 + size);
                     requests.push(request);
                     if (request.method === 'initialize') {
-                        respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
-                            resultType: 'success', handledByClientId: 'follower-synthetic', result: { clientId: 'follower-synthetic' } });
+                        onInitialize(request, socket);
                     } else if (request.method === 'thread-owner-discovery') {
                         onDiscover(request, socket);
                     } else if (request.method === 'thread-follower-start-turn') {
@@ -150,6 +150,8 @@ describe('Desktop-owned session control', () => {
         codexHome = join(root, 'codex');
         environment.activeServerDir = join(root, 'happier');
         requests = [];
+        onInitialize = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+            resultType: 'success', handledByClientId: 'follower-synthetic', result: { clientId: 'follower-synthetic' } });
         vi.mocked(execFile).mockReset();
         snapshotRevisions.clear();
         onHistory = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
@@ -908,6 +910,142 @@ describe('Desktop-owned session control', () => {
             for (const socket of sockets) socket.destroy();
             await result;
         }
+    });
+
+    it.each(['active', 'inactive'] as const)('uses the confirmed reader owner on a separate text connection when fresh discovery stalls (%s)', async (mode) => {
+        let readerSocket: Socket | undefined;
+        const follow = onFollow;
+        onFollow = (request, socket) => { readerSocket = socket; follow(request, socket); };
+        onAction = (request, socket) => {
+            expect(socket).not.toBe(readerSocket);
+            respond(socket, mode === 'active'
+                ? { type: 'response', requestId: request.requestId, method: request.method,
+                    resultType: 'success', handledByClientId: 'owner-synthetic', result: { result: { turnId: 'native-current-turn' } } }
+                : { type: 'response', requestId: request.requestId, resultType: 'error',
+                    error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` });
+        };
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        await followed.readControlSnapshot(input.remoteSessionId, () => {});
+        const getFollowedIpc = () => followed;
+        // reader 的关联锚仍有效，但新客户端发现不再回复；不能将可读事实等同于新发现成功。
+        onDiscover = () => {};
+        onHistory = () => {};
+        try {
+            expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, getFollowedIpc }))
+                .toMatchObject({ available: true });
+            expect(await getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId, getFollowedIpc }))
+                .toMatchObject({ state: 'completed', textSendMode: 'start' });
+            // reader 后续大帧尚未收全，文本也必须走另一物理 socket，不能等待正文排空。
+            const partialHeader = Buffer.alloc(4);
+            partialHeader.writeUInt32LE(1024 * 1024);
+            readerSocket!.write(Buffer.concat([partialHeader, Buffer.from('{')]));
+            const result = await sendDesktopSessionUserMessage({ codexHome, ...input,
+                textSendProtocol: 'native-auto-v1', getFollowedIpc });
+            expect(result).toMatchObject({ status: 'accepted', turnId: mode === 'active' ? 'native-current-turn' : 'turn-synthetic' });
+            // 第二连接只初始化和定向发送，不跟随或重新水合；原 reader 由原查看者继续持有。
+            expect(requests.filter((request) => request.method === 'initialize')).toHaveLength(2);
+            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-stream-following-changed')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(mode === 'inactive' ? 1 : 0);
+            expect(followed.isClosed()).toBe(false);
+        } finally { followed.close(); }
+    });
+
+    it.each(['released', 'owner_disconnected', 'revision_gap', 'continuous_revision'] as const)(
+        'rechecks the original reader after text initialization: %s', async (change) => {
+            let readerSocket: Socket | undefined;
+            const follow = onFollow;
+            onFollow = (request, socket) => { readerSocket = socket; follow(request, socket); };
+            onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+                method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
+                result: { result: { turnId: 'native-current-turn' } } });
+            await startRouter();
+            const followed = await DesktopIpc.open(codexHome);
+            await followed.discoverOwner(input.remoteSessionId);
+            await followed.readControlSnapshot(input.remoteSessionId, () => {});
+            let current: DesktopIpc | null = followed;
+            const initialize = onInitialize;
+            let pendingInitialize: { request: Request; socket: Socket } | undefined;
+            onInitialize = (request, socket) => { pendingInitialize = { request, socket }; };
+            const result = sendDesktopSessionUserMessage({ codexHome, ...input, textSendProtocol: 'native-auto-v1',
+                getFollowedIpc: () => current });
+            try {
+                await vi.waitFor(() => expect(pendingInitialize).toBeDefined());
+                if (change === 'released') current = null;
+                else if (change === 'owner_disconnected') {
+                    respond(readerSocket!, { type: 'broadcast', method: 'client-status-changed', version: 0,
+                        params: { clientId: 'owner-synthetic', status: 'disconnected' } });
+                    await vi.waitFor(() => expect(followed.getControlSnapshot(input.remoteSessionId)).toBeNull());
+                } else {
+                    respond(readerSocket!, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+                        sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: input.remoteSessionId,
+                            change: { type: 'patches', baseRevision: change === 'revision_gap' ? 99 : 1,
+                                revision: change === 'revision_gap' ? 100 : 2,
+                                patches: [{ op: 'replace', path: ['cwd'], value: '/synthetic-next' }] } } });
+                    await vi.waitFor(() => change === 'revision_gap'
+                        ? expect(followed.getControlSnapshot(input.remoteSessionId)).toBeNull()
+                        : expect(followed.getControlSnapshot(input.remoteSessionId)?.state).toMatchObject({ cwd: '/synthetic-next' }));
+                }
+                initialize(pendingInitialize!.request, pendingInitialize!.socket);
+                expect(await result).toMatchObject(change === 'continuous_revision'
+                    ? { status: 'accepted' } : { status: 'rejected', reason: 'owner_changed' });
+                expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+                expect(requests.filter((request) => request.method === 'thread-follower-steer-turn'))
+                    .toHaveLength(change === 'continuous_revision' ? 1 : 0);
+                expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
+            } finally { followed.close(); for (const socket of sockets) socket.destroy(); await result; }
+        },
+    );
+
+    it.each(['initialization', 'inactive'] as const)('honors a disconnect on the borrowed-owner text connection during %s', async (stage) => {
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        await followed.readControlSnapshot(input.remoteSessionId, () => {});
+        const disconnected = { type: 'broadcast', method: 'client-status-changed', version: 0,
+            params: { clientId: 'owner-synthetic', status: 'disconnected' } };
+        if (stage === 'initialization') onInitialize = (request, socket) => socket.write(Buffer.concat([
+            frame({ type: 'response', requestId: request.requestId, method: request.method, resultType: 'success',
+                handledByClientId: 'follower-synthetic', result: { clientId: 'follower-synthetic' } }), frame(disconnected),
+        ]));
+        else onAction = (request, socket) => socket.write(Buffer.concat([
+            frame({ type: 'response', requestId: request.requestId, resultType: 'error',
+                error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` }), frame(disconnected),
+        ]));
+        try {
+            expect(await sendDesktopSessionUserMessage({ codexHome, ...input, textSendProtocol: 'native-auto-v1',
+                getFollowedIpc: () => followed }))
+                .toMatchObject({ status: stage === 'initialization' ? 'rejected' : 'unknown', reason: 'owner_changed' });
+            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(stage === 'inactive' ? 1 : 0);
+            expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
+            expect(followed.getControlSnapshot(input.remoteSessionId)).not.toBeNull();
+        } finally { followed.close(); }
+    });
+
+    it('does not substitute a valid successor reader while the text connection initializes', async () => {
+        await startRouter();
+        const followed = await DesktopIpc.open(codexHome);
+        await followed.discoverOwner(input.remoteSessionId);
+        await followed.readControlSnapshot(input.remoteSessionId, () => {});
+        const successor = await DesktopIpc.open(codexHome);
+        await successor.discoverOwner(input.remoteSessionId);
+        await successor.readControlSnapshot(input.remoteSessionId, () => {});
+        let current = followed;
+        const initialize = onInitialize;
+        onInitialize = (request, socket) => { current = successor; initialize(request, socket); };
+        try {
+            expect(await sendDesktopSessionUserMessage({ codexHome, ...input, textSendProtocol: 'native-auto-v1',
+                getFollowedIpc: () => current })).toMatchObject({ status: 'rejected', reason: 'owner_changed' });
+            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(2);
+            expect(requests.filter((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toHaveLength(0);
+            expect(followed.getControlSnapshot(input.remoteSessionId)).not.toBeNull();
+            expect(successor.getControlSnapshot(input.remoteSessionId)).not.toBeNull();
+        } finally { followed.close(); successor.close(); }
     });
 
     it('starts the same ordinary message once only after the exact native inactive rejection', async () => {
