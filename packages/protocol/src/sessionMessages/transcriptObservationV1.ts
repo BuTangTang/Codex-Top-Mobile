@@ -20,9 +20,11 @@ export const SessionTranscriptObservationProvenanceV1Schema = z.object({
 
 export type SessionTranscriptObservationProvenanceV1 = z.infer<typeof SessionTranscriptObservationProvenanceV1Schema>;
 
+/** 缺失来源直接视为普通消息；存在来源时仍以严格协议校验判断恢复历史。 */
 export function isRecoveredHistoryTranscriptObservationProvenance(
   value: unknown,
 ): value is SessionTranscriptObservationProvenanceV1 & { source: 'history' } {
+  if (value === undefined || value === null) return false;
   const provenance = SessionTranscriptObservationProvenanceV1Schema.safeParse(value);
   return provenance.success && provenance.data.source === 'history';
 }
