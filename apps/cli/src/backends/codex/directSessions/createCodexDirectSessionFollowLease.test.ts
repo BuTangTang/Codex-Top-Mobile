@@ -1,5 +1,5 @@
 import { createServer, type Socket } from 'node:net';
-import { appendFile, mkdtemp, mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, afterEach, expect, it, vi } from 'vitest';
 
@@ -35,7 +35,7 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
   const sockets = new Set<Socket>();
   const followers: Socket[] = [];
   const updates: DirectSessionTranscriptUpdate[] = [];
-  const historyRequests: Array<{ socket: Socket; requestId: string }> = [];
+  const historyRequests: Array<{ socket: Socket; requestId: string; timeoutMs?: number }> = [];
   let roundTrips = 0;
   let resumeUpdates: (() => void) | undefined;
   const updateGate = options.holdUpdates ? new Promise<void>((resolve) => { resumeUpdates = resolve; }) : undefined;
@@ -80,7 +80,7 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
       bytes = Buffer.concat([bytes, chunk]);
       while (bytes.length >= 4 && bytes.length >= bytes.readUInt32LE(0) + 4) {
         const size = bytes.readUInt32LE(0);
-        const request = JSON.parse(bytes.subarray(4, size + 4).toString()) as { requestId: string; method: string; params?: { following?: boolean } };
+        const request = JSON.parse(bytes.subarray(4, size + 4).toString()) as { requestId: string; method: string; timeoutMs?: number; params?: { following?: boolean } };
         bytes = bytes.subarray(size + 4);
         if (request.method === 'initialize' || request.method === 'thread-owner-discovery') {
           const initializing = request.method === 'initialize';
@@ -91,7 +91,7 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
           if (!followers.includes(socket)) followers.push(socket);
           snapshot(socket, 1);
         } else if (request.method === 'thread-follower-load-complete-history') {
-          historyRequests.push({ socket, requestId: request.requestId });
+          historyRequests.push({ socket, requestId: request.requestId, timeoutMs: request.timeoutMs });
           if (!options.holdBaseline) replyBaseline();
         } else if (request.requestId === 'test-read-boundary') {
           roundTrips += 1;
@@ -131,9 +131,14 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
     send([...sockets][0]!, { type: 'request', method: 'test-read-boundary', requestId: 'test-read-boundary' });
     await vi.waitFor(() => expect(roundTrips).toBeGreaterThan(before));
   }
+  /** 直接执行正式 poll 单飞，时钟边界测试无需等待真实 15 秒。 */
+  async function poll() {
+    if (!('pollNow' in lease) || typeof lease.pollNow !== 'function') throw new Error('missing real pollNow');
+    await lease.pollNow();
+  }
   return { /** 始终取最近一次创建的真实租约。 */ get lease() { return lease; },
     path, meta, followers, updates, remoteSessionId, snapshot, append, close, openLease, historyRequests, replyBaseline, rejectBaseline, send,
-    roundTrip,
+    roundTrip, poll,
     /** 仅释放测试消费者的提交屏障，让正式轮询继续读取下一批。 */ resumeUpdates: () => resumeUpdates?.() };
 }
 
@@ -176,8 +181,56 @@ it('recovers a timed-out initial baseline once without waiting for a new rollout
   } finally { await harness.close(); }
 });
 
-/** 第二次仍失败就维持未知；随后正常重连不能变成重复全历史水合循环。 */
-it('stops initial baseline recovery after a second transient failure', async () => {
+/** 后续暂时失败按原 history 预算暂停；静止来源恢复后无需新事件或重建 lease。 */
+it('pauses repeated transient baseline failures for the history budget and recovers the same static lease', async () => {
+  let now = performance.now();
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const harness = await createFallbackHarness({ holdBaseline: true });
+  try {
+    const lease = harness.lease;
+    const originalBytes = await readFile(harness.path);
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    const readBudgetMs = harness.historyRequests[0]!.timeoutMs!;
+    expect(readBudgetMs).toBe(15_000);
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
+    for (let index = 0; index < 20; index += 1) await harness.poll();
+    await lease.waitForProviderControl?.();
+    now += readBudgetMs - 1;
+    await harness.poll();
+    await harness.roundTrip();
+    expect(harness.historyRequests).toHaveLength(2);
+    expect(lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    expect(lease.getProviderControl?.()).toBeNull();
+    now += 1;
+    await harness.poll();
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(3));
+    // 第三次仍失败也必须重新暂停，不能重置为首次立即补试。
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.followers).toHaveLength(5));
+    now += readBudgetMs - 1;
+    await harness.poll();
+    await harness.roundTrip();
+    expect(harness.historyRequests).toHaveLength(3);
+    now += 1;
+    await harness.poll();
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(4));
+    harness.replyBaseline({ turnId: 'recovered-static', status: 'completed' });
+    await vi.waitFor(() => expect(lease.getObservation?.()).toMatchObject({ state: 'completed', source: 'desktop', turnId: 'recovered-static' }));
+    expect(lease.getProviderControl?.()).toBeTruthy();
+    expect(harness.lease).toBe(lease);
+    expect(await readFile(harness.path)).toEqual(originalBytes);
+    expect(harness.updates.flatMap((update) => update.observations ?? []).filter((fact) => fact.observation.state === 'completed'))
+      .toEqual([{ continuity: 'snapshot', observation: { v: 1, state: 'completed', source: 'desktop', turnId: 'recovered-static' } }]);
+  } finally { await harness.close(); clock.mockRestore(); }
+});
+
+/** 暂停到期也不能越过释放、失效来源或已经采用的前向事实。 */
+it.each(['release', 'source', 'forward'] as const)('does not restart a paused baseline after %s removes its recovery eligibility', async (change) => {
+  let now = performance.now();
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
   const harness = await createFallbackHarness({ holdBaseline: true });
   try {
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
@@ -185,11 +238,58 @@ it('stops initial baseline recovery after a second transient failure', async () 
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     harness.rejectBaseline('request-timeout');
     await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
-    await harness.append('agent_message');
-    await harness.roundTrip();
-    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    if (change === 'release') await harness.lease.release();
+    else if (change === 'source') await rm(harness.path);
+    else await harness.append('task_started', 'new-forward');
+    now += harness.historyRequests[0]!.timeoutMs!;
+    await harness.poll();
     expect(harness.historyRequests).toHaveLength(2);
-  } finally { await harness.close(); }
+    expect(harness.lease.getProviderControl?.()).toBeNull();
+    expect(harness.lease.getObservation?.()).toMatchObject(change === 'forward'
+      ? { state: 'running', source: 'rollout', turnId: 'new-forward' }
+      : { state: 'unknown', reason: change === 'release' ? 'connection_closed' : 'source_unavailable' });
+  } finally { await harness.close(); clock.mockRestore(); }
+});
+
+/** 到期恢复仍等原批次 ACK，旧 pending 不得被控制等待或新读取绕过。 */
+it('waits for the pending transcript batch before restarting a paused baseline', async () => {
+  let now = performance.now();
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const harness = await createFallbackHarness({ holdBaseline: true });
+  let acknowledge!: () => void;
+  const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+  let unsubscribe = () => {};
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
+    unsubscribe = harness.lease.subscribeToTranscriptUpdates!(async (update) => {
+      if (Array.from(update.items).length) await acknowledgement;
+    });
+    const committedCursor = harness.lease.getTailCursor?.();
+    await appendFile(harness.path, `${JSON.stringify({ type: 'response_item', payload: {
+      type: 'message', role: 'assistant', content: [{ type: 'text', text: 'synthetic pending boundary' }],
+    } })}\n`);
+    const pendingPoll = harness.poll();
+    await vi.waitFor(() => expect(harness.updates.flatMap((update) => Array.from(update.items))).toHaveLength(1));
+    now += harness.historyRequests[0]!.timeoutMs!;
+    let joined = false;
+    const joinedPoll = harness.poll().then(() => { joined = true; });
+    await Promise.resolve();
+    expect(joined).toBe(false);
+    expect(harness.historyRequests).toHaveLength(2);
+    expect(harness.lease.getTailCursor?.()).toBe(committedCursor);
+    acknowledge();
+    await Promise.all([pendingPoll, joinedPoll]);
+    await harness.poll();
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(3));
+    harness.replyBaseline({ turnId: 'after-pending', status: 'completed' });
+    await vi.waitFor(() => expect(harness.lease.getProviderControl?.()).toBeTruthy());
+    expect(harness.updates.flatMap((update) => Array.from(update.items))).toHaveLength(1);
+    expect(harness.lease.getTailCursor?.()).not.toBe(committedCursor);
+  } finally { acknowledge(); unsubscribe(); await harness.close(); clock.mockRestore(); }
 });
 
 /** 等待原消费链提交时来源失效，恢复预算也不能越过失效边界去新建连接。 */
@@ -384,17 +484,24 @@ it('keeps facts restored from an existing cursor ahead of a later cold baseline'
 
 /** 一次请求明确失败后只重连订阅；前向读取继续可用，不能循环请求 history。 */
 it('continues forward observation after the single cold baseline request fails', async () => {
+  let now = performance.now();
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
   const harness = await createFallbackHarness({ holdBaseline: true });
   try {
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
     harness.rejectBaseline();
     await vi.waitFor(() => expect(harness.followers).toHaveLength(2));
     expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    // 不支持的方法不是暂时传输失败；超过两个读取预算也不能重试 history。
+    now += harness.historyRequests[0]!.timeoutMs! * 2;
+    await harness.poll();
+    await harness.roundTrip();
+    expect(harness.historyRequests).toHaveLength(1);
     await harness.append('task_started', 'new');
     await harness.append('task_complete', 'new');
     expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', source: 'rollout', turnId: 'new' });
     expect(harness.historyRequests).toHaveLength(1);
-  } finally { await harness.close(); }
+  } finally { await harness.close(); clock.mockRestore(); }
 });
 
 /** 等待关联应答时发生来源断代，旧请求不能重新证明新来源的当前状态。 */
@@ -507,7 +614,7 @@ it('rejects a control waiter released during immediate recovery without waiting 
   } finally { await harness.close(); }
 });
 
-/** 恢复成功连接也只有原有的一次补试，不因快路径增加失败水合循环。 */
+/** 恢复成功连接保留一次立即补试，后续失败进入暂停，不因快路径形成水合循环。 */
 it('keeps reconnect hydration recovery bounded after an established control connection fails', async () => {
   const options = { baseline: { turnId: 'current', status: 'completed' }, holdBaseline: false };
   const harness = await createFallbackHarness(options);

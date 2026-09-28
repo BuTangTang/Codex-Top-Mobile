@@ -17,7 +17,7 @@ enablePatches();
 // 这里独立实现协议边界，没有复制 Remodex 实现。
 const REQUEST_TIMEOUT_MS = 5_000;
 // 真实长会话的关联回执在 9.4 秒到达；只读水合的本地与 router 等待均为 15 秒，其余请求仍为 5 秒。
-const CONTROL_READ_TIMEOUT_MS = 15_000;
+export const CONTROL_READ_TIMEOUT_MS = 15_000;
 const MAX_FRAME_BYTES = 268_435_456;
 
 export type DesktopIpcResponse = Record<string, unknown>;

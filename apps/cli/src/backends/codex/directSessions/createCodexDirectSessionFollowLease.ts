@@ -2,9 +2,10 @@ import { DirectSessionObservationV1Schema, resolveDirectTranscriptContinuation, 
 import { createPollingDirectSessionFollowLease } from '@/api/directSessions/backgroundFollow/createPollingDirectSessionFollowLease';
 import type { DirectSessionFollowLease, DirectSessionObservationFact } from '@/api/directSessions/backgroundFollow/createManagedDirectSessionFollowLease';
 import { configuration } from '@/configuration';
+import { logger } from '@/ui/logger';
 import { readAfterCodexTranscript } from './readAfterCodexTranscript';
 import { resolveCodexHomeEntriesForDirectSessionsSource } from './resolveCodexHomeEntriesForDirectSessionsSource';
-import { DesktopIpc, DesktopIpcError } from './desktop/desktopIpc';
+import { CONTROL_READ_TIMEOUT_MS, DesktopIpc, DesktopIpcError } from './desktop/desktopIpc';
 import { readDesktopConversationObservation } from './desktop/desktopConversationObservation';
 import { readDesktopControlSnapshot } from './desktop/desktopControlSnapshot';
 
@@ -19,6 +20,7 @@ export async function createCodexDirectSessionFollowLease(params: {
   let baseline: Promise<void> | null = null;
   let sourceRead: Promise<void> | null = null;
   let baselineAttempts = 0;
+  let baselineRetryAt: number | null = null;
   let baselineSelected = false;
   let baselineInvalidated = false;
   let anchoredConnection: DesktopIpc | null = null;
@@ -82,7 +84,7 @@ export async function createCodexDirectSessionFollowLease(params: {
   const follow = (opened: DesktopIpc) => {
     opened.followConversation(params.remoteSessionId, (next, continuity) => observeConnection(opened, next, continuity));
   };
-  /** 首次关联读取遇到暂时传输失败只恢复一次；每次先有文件边界，新事实仍优先于迟到基线。 */
+  /** 首次暂时失败立即补试，后续失败按原读取预算暂停；新事实仍优先于迟到基线。 */
   const initializeBaseline = async (opened: DesktopIpc) => {
     baselineStarted = true;
     baselineAttempts += 1;
@@ -102,9 +104,15 @@ export async function createCodexDirectSessionFollowLease(params: {
     } catch (error) {
       // 基线不可证时保持现有未知或前向事实，不能把历史首包降级为当前状态。
       if (error instanceof DesktopIpcError && ['timeout', 'connection_closed', 'owner_changed', 'owner_unavailable'].includes(error.reason)
-        && baselineAttempts === 1 && !released && ipc === opened && !baselineInvalidated && observation.state === 'unknown') {
+        && !released && ipc === opened && !baselineInvalidated && observation.state === 'unknown') {
         // 清掉本次失败订阅，由同一按需 poller 验证来源后重新发现 owner；不添加定时器或后台循环。
-        opened.close(); ipc = null; baselineStarted = false;
+        opened.close(); ipc = null;
+        if (baselineAttempts === 1) baselineStarted = false;
+        // 完整历史可能很大；失败后至少让出一个完整读取预算，不能每个 poll 都重新水合。
+        else {
+          baselineRetryAt = performance.now() + CONTROL_READ_TIMEOUT_MS;
+          logger.infoFile('[directSessions] Codex baseline recovery paused', { reason: error.reason, retryAfterMs: CONTROL_READ_TIMEOUT_MS });
+        }
         return;
       }
     }
@@ -118,7 +126,7 @@ export async function createCodexDirectSessionFollowLease(params: {
       if (observation.state === 'unknown' || observation.source !== 'rollout') markSourceUnavailable();
     }
   };
-  /** 失效控制锚由原 poller 的有效来源边界恢复；旧 producer 或已耗尽恢复次数时仅恢复观察订阅。 */
+  /** 失效控制锚由原 poller 的有效来源边界恢复；旧 producer 或恢复暂停时仍保留观察订阅。 */
   const connect = async () => {
     if (ipc || released || homes.length !== 1) return;
     let opened: DesktopIpc | null = null;
@@ -156,6 +164,12 @@ export async function createCodexDirectSessionFollowLease(params: {
           if (observation.state !== 'unknown' && fact.data.state !== 'unknown'
               && observation.turnId === fact.data.turnId && isTerminal(observation)) continue;
           publish(fact.data, 'event');
+        }
+        // 到期仍须由本轮来源与 unknown 事实准入；撤销旧观察订阅后复用原连接／基线流程。
+        if (!released && !rolloutUnavailable && observation.state === 'unknown'
+          && baselineRetryAt !== null && performance.now() >= baselineRetryAt) {
+          baselineRetryAt = null; baselineStarted = false;
+          ipc?.close(); ipc = null;
         }
         // 恢复前先确认本批来源仍连续可用；失效来源和已释放租约不能启动恢复连接。
         if (!baselineStarted && baseline !== null && !released && !rolloutUnavailable) await connect();
