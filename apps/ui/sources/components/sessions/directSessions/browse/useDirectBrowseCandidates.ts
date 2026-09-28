@@ -317,7 +317,8 @@ export function useDirectBrowseCandidates(params: Readonly<{
                 if (source.kind === 'codexHome' && source.homePath && link.source.kind === 'codexHome' && source.homePath !== link.source.homePath) return [];
                 const title = metadata.name || metadata.summary?.text || link.remoteSessionId;
                 if (query && !`${title} ${metadata.path}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())) return [];
-                return [{ remoteSessionId: link.remoteSessionId, title, updatedAtMs: entry.session.updatedAt,
+                // 关联会话的 updatedAt 是 LINK 时间；没有来源证据的旧缓存保持未知时间。
+                return [{ remoteSessionId: link.remoteSessionId, title, updatedAtMs: entry.sourceUpdatedAtMs ?? 0,
                     details: { cwd: metadata.path, source: link.source } }];
             }).sort(compareDirectBrowseCandidates).slice(0, requestLimit) : [];
         pagesRef.current = cached.length ? [{ candidates: cached, nextCursor: null, incomplete: true }] : [];

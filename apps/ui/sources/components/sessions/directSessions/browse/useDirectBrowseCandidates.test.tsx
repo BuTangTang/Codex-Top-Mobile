@@ -94,6 +94,23 @@ describe('direct browse discovery window', () => {
         clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId);
     });
 
+    it('sorts offline history by source time while old caches have unknown time', async () => {
+        await prepareWarmCacheStorage();
+        clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId);
+        for (const [id, sourceUpdatedAtMs, linkedAt] of [['old', 10, 900], ['new', 20, 800], ['legacy', undefined, 1000]] as const) {
+            saveDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, {
+                version: 1, sourceKey: id, cachedAtMs: 2000, sourceUpdatedAtMs,
+                session: { id, createdAt: linkedAt, updatedAt: linkedAt, metadataVersion: 1,
+                    metadata: { path: '/synthetic', host: 'fixture', directSessionV1: { v: 1, providerId: 'codex', machineId: scope.machineId, remoteSessionId: id, source: scope.source } } },
+                items: [], tailCursor: 'tail', olderCursor: null, hasMoreOlder: false,
+            });
+        }
+        const hook = await renderHook(() => useDirectBrowseCandidates({ ...scope, autoRefreshEnabled: false }));
+        expect(hook.getCurrent().candidates.map((row) => [row.remoteSessionId, row.updatedAtMs])).toEqual([['new', 20], ['old', 10], ['legacy', 0]]);
+        expect(list).not.toHaveBeenCalled();
+        clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId);
+    });
+
     /** 数量偏好改变时重新查询首屏，旧游标与进行中的深页结果都不能流入新范围。 */
     it('invalidates an old cursor and late page when the request limit changes', async () => {
         const oldPage = deferred();

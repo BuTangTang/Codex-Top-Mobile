@@ -42,6 +42,7 @@ vi.mock('react-native-mmkv', () => {
 
 import {
     loadDirectSessionTranscriptWarmCache,
+    loadDirectSessionTranscriptWarmCacheIndex,
     saveDirectSessionTranscriptWarmCache,
     clearDirectSessionTranscriptWarmCache,
     clearWarmCacheAccountScope,
@@ -94,6 +95,23 @@ describe('warmCachePersistence', () => {
         expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id, 'other-source')).toBeNull();
         clearDirectSessionTranscriptWarmCache('server-a', 'account-a');
         expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id)).toBeNull();
+    });
+
+    it('retains source update evidence in the same body and index without using link or cache time', () => {
+        const snapshot = { ...directSnapshot(), sourceUpdatedAtMs: 3, cachedAtMs: 900,
+            session: { ...directSnapshot().session, updatedAt: 800 } };
+        saveDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot);
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id)?.sourceUpdatedAtMs).toBe(3);
+        expect(loadDirectSessionTranscriptWarmCacheIndex('server-a', 'account-a')[snapshot.session.id]?.sourceUpdatedAtMs).toBe(3);
+        saveDirectSessionTranscriptWarmCache('server-a', 'account-a', { ...snapshot, sourceUpdatedAtMs: null });
+        expect(loadDirectSessionTranscriptWarmCacheIndex('server-a', 'account-a')[snapshot.session.id]?.sourceUpdatedAtMs).toBeNull();
+    });
+
+    it.each([-1, 0, 'bad'])('ignores invalid source time without discarding readable history: %s', (sourceUpdatedAtMs) => {
+        const snapshot = { ...directSnapshot(), sourceUpdatedAtMs };
+        saveDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot as any);
+        expect(loadDirectSessionTranscriptWarmCache('server-a', 'account-a', snapshot.session.id)?.items).toEqual(snapshot.items);
+        expect(loadDirectSessionTranscriptWarmCacheIndex('server-a', 'account-a')[snapshot.session.id]?.sourceUpdatedAtMs).toBeUndefined();
     });
 
     it('evicts whole least-recent cached conversations within the account byte budget', () => {

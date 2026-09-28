@@ -39,6 +39,8 @@ const DirectSessionTranscriptWarmCacheSchema = z.object({
     version: z.literal(1),
     sourceKey: z.string().min(1),
     cachedAtMs: z.number().finite(),
+    // 最后成功 LIST 的来源时间只用于离线排序；旧缓存缺失时不能用关联或缓存时间代替。
+    sourceUpdatedAtMs: z.number().finite().positive().nullable().optional().catch(undefined),
     session: z.object({
         id: z.string().min(1), createdAt: z.number(), updatedAt: z.number(), metadataVersion: z.number(),
         encryptionMode: z.enum(['plain', 'e2ee']).optional(),
@@ -57,6 +59,7 @@ export type DirectSessionTranscriptWarmCache = z.infer<typeof DirectSessionTrans
 const DirectTranscriptCacheIndexSchema = z.record(z.string(), z.object({
     bytes: z.number().nonnegative(), cachedAtMs: z.number(), sourceKey: z.string(),
     session: DirectSessionTranscriptWarmCacheSchema.shape.session,
+    sourceUpdatedAtMs: DirectSessionTranscriptWarmCacheSchema.shape.sourceUpdatedAtMs,
 }));
 /**
  * Superseded by `SESSION_ORGANIZATION_WARM_CACHE_PREFIX`, which carries the pinned ids as part
@@ -406,7 +409,7 @@ export function saveDirectSessionTranscriptWarmCache(
         const maxBytes = options?.maxBytes ?? DIRECT_TRANSCRIPT_WARM_CACHE_MAX_BYTES;
         if (bytes > maxBytes) return;
         const entries = loadDirectSessionTranscriptWarmCacheIndex(serverId, accountId);
-        entries[snapshot.session.id] = { bytes, cachedAtMs: snapshot.cachedAtMs, sourceKey: snapshot.sourceKey, session: snapshot.session };
+        entries[snapshot.session.id] = { bytes, cachedAtMs: snapshot.cachedAtMs, sourceKey: snapshot.sourceKey, session: snapshot.session, sourceUpdatedAtMs: snapshot.sourceUpdatedAtMs };
         let total = Object.values(entries).reduce((sum, entry) => sum + entry.bytes, 0);
         for (const [id, entry] of Object.entries(entries).sort((a, b) => a[1].cachedAtMs - b[1].cachedAtMs)) {
             if (total <= maxBytes) break;

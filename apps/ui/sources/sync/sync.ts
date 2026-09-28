@@ -2355,6 +2355,7 @@ class Sync {
                 link: import('@happier-dev/protocol').DirectSessionLinkEnsureRequest;
                 transcriptVersion?: string;
                 discoveryObservation?: object;
+                sourceUpdatedAtMs?: number | null;
             }>[];
         }>): Promise<void> => {
             const scopeCurrent = this.createServerScopeGuard();
@@ -2395,7 +2396,14 @@ class Sync {
                 if (previous?.completed && unchanged && previous.scope === input.isCurrent && previous.sessionId) {
                     const cached = cachedIndex[previous.sessionId];
                     if (cached?.sourceKey === request.sourceKey
-                        && this.directSessionTailStateBySessionId.get(previous.sessionId)?.requiresRefresh !== true) return;
+                        && this.directSessionTailStateBySessionId.get(previous.sessionId)?.requiresRefresh !== true) {
+                        // 同版本保留已有来源时间，避免 LIST 时钟校正抖动重写整份正文。
+                        if (typeof cached.sourceUpdatedAtMs !== 'number' && request.sourceUpdatedAtMs != null) {
+                            this.queueDirectTranscriptSourceTime(previous.sessionId, request.sourceKey, request.sourceUpdatedAtMs);
+                            this.flushDirectTranscriptWarmCache();
+                        }
+                        return;
+                    }
                 }
                 const record: PhoneRecentDirectPrefetchRecord = {
                     sourceKey: request.sourceKey, scope: input.isCurrent, version: request.transcriptVersion, completed: false,
@@ -2426,6 +2434,7 @@ class Sync {
                             || this.directSessionLatestSnapshotPendingBySessionId.has(sessionId)
                             || storage.getState().sessionMessages[sessionId]?.directHistoryAvailability !== 'available') return;
                         // await void 可能仅延期；只有真实接受过正文且原检查点落盘才确认版本。
+                        this.queueDirectTranscriptSourceTime(sessionId, request.sourceKey, request.sourceUpdatedAtMs);
                         this.flushDirectTranscriptWarmCache();
                         const cached = loadDirectSessionTranscriptWarmCache(input.serverId, input.accountId, sessionId, request.sourceKey);
                         record.completed = Boolean(cached && !cached.requiresRefresh && cached.tailCursor === accepted.cursor);
@@ -6222,6 +6231,20 @@ class Sync {
           this.scheduleSessionMaterializedMaxSeqFlush();
       }
 
+      /** LIST 来源时间只更新原检查点元数据，不借 LINK 时间排序，也不重载已淘汰的正文。 */
+      private queueDirectTranscriptSourceTime(sessionId: string, sourceKey: string, sourceUpdatedAtMs?: number | null): void {
+          if (sourceUpdatedAtMs === undefined) return;
+          const scope = this.directTranscriptCacheScope(sessionId);
+          if (!scope || this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)) !== sourceKey) return;
+          const pending = this.directTranscriptCacheWrites.get(sessionId);
+          if (pending && (pending.snapshot.sourceKey !== sourceKey || pending.serverId !== scope.serverId || pending.accountId !== scope.accountId)) return;
+          const snapshot = pending?.snapshot ?? loadDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId, sessionId, sourceKey);
+          if (!snapshot || snapshot.sourceUpdatedAtMs === sourceUpdatedAtMs) return;
+          this.directTranscriptCacheWrites.set(sessionId, { ...scope, replace: pending?.replace ?? false,
+              snapshot: { ...snapshot, sourceUpdatedAtMs } });
+          this.scheduleSessionMaterializedMaxSeqFlush();
+      }
+
       /** 与已有检查点一起提交正文和对应游标；单会话失败不影响同步或其他分区。 */
       private flushDirectTranscriptWarmCache(): void {
           for (const [sessionId, pending] of this.directTranscriptCacheWrites) {
@@ -6230,6 +6253,7 @@ class Sync {
               for (const item of pending.snapshot.items) rows.set(item.id, item);
               saveDirectSessionTranscriptWarmCache(pending.serverId, pending.accountId, {
                   ...pending.snapshot, items: [...rows.values()].sort((left, right) => left.createdAtMs - right.createdAtMs),
+                  sourceUpdatedAtMs: pending.snapshot.sourceUpdatedAtMs === undefined ? previous?.sourceUpdatedAtMs : pending.snapshot.sourceUpdatedAtMs,
                   // 整会话已被容量淘汰时，后续单条增量不是完整基线；恢复后仍需正常快照补齐。
                   ...(!previous && !pending.replace ? { requiresRefresh: true, olderCursor: null, hasMoreOlder: true } : {}),
               });

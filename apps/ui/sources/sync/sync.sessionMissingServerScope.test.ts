@@ -201,6 +201,8 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
 
     it.each(['unopened', 'hidden-history'] as const)('prefetches unopened direct history once per version, persists it and restores it offline after memory eviction: %s', async (variant) => {
         const cache = await import('./domains/state/warmCachePersistence');
+        const { MMKV } = await import('react-native-mmkv');
+        const writes = vi.spyOn(MMKV.prototype, 'set');
         await cache.prepareWarmCacheStorage();
         const { sync } = await import('./sync');
         const internals = sync as any;
@@ -219,7 +221,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         internals.hasFetchedSessionsSnapshotForActiveServer = true;
         const isCurrent = () => true;
         const request = { link: { machineId: 'machine-1', providerId: 'codex' as const, remoteSessionId: 'vendor-session-1',
-            source: { kind: 'codexHome' as const, home: 'user' as const } }, transcriptVersion: 'v1' };
+            source: { kind: 'codexHome' as const, home: 'user' as const } }, transcriptVersion: 'v1', sourceUpdatedAtMs: 100 };
         const input = { serverId: owner.id, accountId, requests: [request], isCurrent };
         cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
         try {
@@ -228,6 +230,13 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             ], tailCursor: 'recent-tail-1', nextCursor: 'older', hasMore: true });
             await sync.prefetchPhoneRecentDirectSessions(input);
             expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(1);
+            expect(cache.loadDirectSessionTranscriptWarmCacheIndex(owner.id, accountId)[sessionId]?.sourceUpdatedAtMs).toBe(100);
+            const sessionUpdatedAt = storage.getState().sessions[sessionId]?.updatedAt;
+            writes.mockClear();
+            await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: [{ ...request, sourceUpdatedAtMs: 200 }] });
+            expect(cache.loadDirectSessionTranscriptWarmCacheIndex(owner.id, accountId)[sessionId]?.sourceUpdatedAtMs).toBe(100);
+            expect(writes.mock.calls.filter(([key]) => key.startsWith('direct-transcript-warm-cache-v1:'))).toHaveLength(0);
+            expect(storage.getState().sessions[sessionId]?.updatedAt).toBe(sessionUpdatedAt);
             await sync.prefetchPhoneRecentDirectSessions(input);
             expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
             expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
@@ -242,12 +251,21 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
                 { id: 'recent-second', createdAtMs: 2, raw: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'new reply' } } } },
             ], nextCursor: 'recent-tail-2', truncated: false });
-            await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: [{ ...request, transcriptVersion: 'v2' }] });
+            await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: [{ ...request, transcriptVersion: 'v2', sourceUpdatedAtMs: 200 }] });
             expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'recent-tail-1' }), { serverId: owner.id });
             expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(2);
             expect(sync.getSessionViewport(sessionId)).toBe(viewport);
             expect(sync.getSessionTargetWindowState(sessionId)).toBe(window);
             internals.evictSessionTranscript(sessionId);
+            writes.mockClear();
+            await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: [{ ...request, transcriptVersion: 'v2', sourceUpdatedAtMs: 300 }] });
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)).toMatchObject({
+                sourceUpdatedAtMs: 200, tailCursor: 'recent-tail-2', olderCursor: 'older',
+            });
+            expect(writes.mock.calls.filter(([key]) => key.startsWith('direct-transcript-warm-cache-v1:'))).toHaveLength(0);
+            expect(storage.getState().sessionMessages[sessionId]?.isLoaded).not.toBe(true);
+            expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+            expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledTimes(1);
             internals.pauseController.pause();
             machineDirectSessionTranscriptPageMock.mockClear();
             machineDirectSessionTranscriptReadAfterMock.mockClear();
@@ -260,6 +278,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             expect(machineDirectSessionTranscriptPageMock).not.toHaveBeenCalled();
             expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
         } finally {
+            writes.mockRestore();
             internals.messagesSync.get(sessionId)?.stop();
             internals.messagesSync.delete(sessionId);
             internals.serverID = previous.account;
@@ -269,7 +288,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         }
     });
 
-    it.each(['readonly-link', 'deferred', 'background', 'source-changed', 'cache-evicted', 'unavailable', 'shared', 'completed-read', 'no-version', 'cancel-selection', 'different-server', 'visible-during-read'] as const)(
+    it.each(['readonly-link', 'deferred', 'background', 'source-changed', 'cache-evicted', 'unavailable', 'shared', 'completed-read', 'no-version', 'cancel-selection', 'different-server', 'visible-during-read', 'source-time-missing'] as const)(
         'keeps recent prefetch on the original hydration and cache acceptance boundary: %s', async (variant) => {
             const cache = await import('./domains/state/warmCachePersistence');
             await cache.prepareWarmCacheStorage();
@@ -302,7 +321,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
             const input = { serverId: owner.id, accountId, isCurrent, requests: [{ link: {
                 machineId: 'machine-1', providerId: 'codex' as const, remoteSessionId: 'vendor-session-1',
                 source: { kind: 'codexHome' as const, home: 'user' as const },
-            }, transcriptVersion: variant === 'no-version' ? undefined : 'unchanged-version', discoveryObservation: {} }] };
+            }, transcriptVersion: variant === 'no-version' ? undefined : 'unchanged-version', discoveryObservation: {}, sourceUpdatedAtMs: 100 }] };
             const page = { ok: true, historyAvailability: 'available', items: [
                 { id: 'boundary-user', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: 'synthetic new conversation' } } },
             ], tailCursor: 'boundary-tail', nextCursor: null, hasMore: false };
@@ -370,6 +389,18 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
                     await sync.prefetchPhoneRecentDirectSessions(input);
                     expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(2);
                 }
+                if (variant === 'source-time-missing') {
+                    const legacy = cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)!;
+                    cache.saveDirectSessionTranscriptWarmCache(owner.id, accountId, { ...legacy, sourceUpdatedAtMs: undefined });
+                    internals.evictSessionTranscript(sessionId);
+                    await sync.prefetchPhoneRecentDirectSessions(input);
+                    expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)).toMatchObject({
+                        sourceUpdatedAtMs: 100, tailCursor: 'boundary-tail', olderCursor: null,
+                    });
+                    expect(storage.getState().sessionMessages[sessionId]?.isLoaded).not.toBe(true);
+                    expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+                    expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+                }
                 if (variant === 'completed-read') {
                     current = false;
                     machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
@@ -378,6 +409,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
                     await sync.refreshSessionMessages(sessionId);
                     internals.flushSessionMaterializedMaxSeq();
                     expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(2);
+                    expect(cache.loadDirectSessionTranscriptWarmCacheIndex(owner.id, accountId)[sessionId]?.sourceUpdatedAtMs).toBe(100);
                     expect(Object.values(storage.getState().sessionMessages[sessionId]?.messagesById ?? {})).toEqual(expect.arrayContaining([
                         expect.objectContaining({ kind: 'user-text', text: 'ordinary hidden read' }),
                     ]));

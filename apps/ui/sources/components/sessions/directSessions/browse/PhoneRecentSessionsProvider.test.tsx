@@ -191,7 +191,7 @@ it('discovers and submits only global recent rows on another tab and invalidates
     expect(prefetch).toHaveBeenCalled();
     const call = prefetch.mock.calls.at(-1)![0] as any;
     expect(call.requests).toHaveLength(1);
-    expect(call.requests[0]).toMatchObject({ link: { remoteSessionId: 'newer', openExisting: false }, transcriptVersion: 'v2' });
+    expect(call.requests[0]).toMatchObject({ link: { remoteSessionId: 'newer', openExisting: false }, transcriptVersion: 'v2', sourceUpdatedAtMs: 20 });
     expect(call.isCurrent()).toBe(true);
     await act(async () => { appStateBoundary.emit('background'); appStateBoundary.emit('active'); });
     expect(call.isCurrent()).toBe(false);

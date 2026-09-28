@@ -118,7 +118,7 @@ function ScopedPhoneRecentSessionsProvider({ scope, children }: React.PropsWithC
                 ...extras, source: shouldUseCandidateSource(source.source, candidateSource) ? candidateSource! : source.source, openExisting: false,
             };
             // 无版本候选沿真实 LIST 轮次触发；仅转交原对象，重绘不制造新版本。
-            return [{ link, transcriptVersion: row.candidate.transcriptVersion, discoveryObservation: row.candidate.listObservation }];
+            return [{ link, transcriptVersion: row.candidate.transcriptVersion, discoveryObservation: row.candidate.listObservation, sourceUpdatedAtMs: row.timeMs }];
         });
         // 空集合也交回同步owner，立即撤销已离线、移除或失去能力来源的旧预取。
         // 延迟载入现成同步owner，版本账本、并发、增量落盘与失效守卫全部复用该owner。
