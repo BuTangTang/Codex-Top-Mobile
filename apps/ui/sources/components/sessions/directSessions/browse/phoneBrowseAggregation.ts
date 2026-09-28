@@ -25,6 +25,7 @@ export type PhoneBrowseSnapshot = Readonly<{
     refreshRequired: boolean;
     error: string | null;
     linkingSessionId: string | null;
+    canLinkWithoutOpening?: boolean;
     refresh: () => Promise<void>;
     loadMore: () => Promise<void>;
     selectCandidate: (candidate: DirectBrowseCandidate) => Promise<void>;

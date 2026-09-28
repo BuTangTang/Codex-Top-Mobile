@@ -125,6 +125,7 @@ export const DirectSessionsCandidatesListResponseSchema = z.union([
       searchIncomplete: z.boolean().optional(),
       capabilities: z.object({
         deleteCandidate: z.boolean(),
+        linkWithoutOpening: z.literal(true).optional(),
       }).optional(),
     })
     .passthrough(),
@@ -169,6 +170,7 @@ export const DirectSessionLinkEnsureRequestSchema = z
     codexBackendMode: z.enum(CODEX_BACKEND_MODES).optional(),
     runtimeDescriptor: AgentRuntimeDescriptorV1Schema.optional(),
     source: DirectSessionsSourceSchema,
+    openExisting: z.boolean().optional(),
   })
   .passthrough();
 export type DirectSessionLinkEnsureRequest = z.infer<typeof DirectSessionLinkEnsureRequestSchema>;
@@ -200,6 +202,7 @@ export const DirectSessionCandidateV1Schema = z
     remoteSessionId: z.string().min(1).max(2000),
     title: z.string().min(1).max(10_000).optional(),
     updatedAtMs: z.number().int().min(0),
+    transcriptVersion: z.string().min(1).optional(),
     createdAtMs: z.number().int().min(0).optional(),
     activity: DirectSessionActivityV1Schema.optional(),
     archived: z.boolean().optional(),

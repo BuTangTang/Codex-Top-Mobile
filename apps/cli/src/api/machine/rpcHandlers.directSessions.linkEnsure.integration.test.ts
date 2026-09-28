@@ -391,6 +391,41 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
     expect(desktopDiscoveryCount).toBe(4);
   });
 
+  it('links for background reading without desktop opening or follow and advertises that capability', async () => {
+    await prepareDesktop();
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<any>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, getDaemonIdentity: async () => ({ accountId: 'account_test', machineId: 'machine_1' }) });
+    const request = { machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' }, openExisting: false };
+    const handler = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!;
+    const result = await handler(request);
+    expect(result).toMatchObject({ ok: true, created: true });
+    await expect(handler(request)).resolves.toMatchObject({ ok: true, sessionId: result.sessionId, created: false });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(desktopDiscoveryCount).toBe(0);
+    expect(desktopSockets.size).toBe(0);
+    await expect(handler({ ...request, source: { kind: 'claudeConfig', configDir: '/synthetic' } })).resolves.toMatchObject({ ok: false, errorCode: 'invalid_request' });
+    const list = await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSIONS_CANDIDATES_LIST)!({ ...request, limit: 1, searchMode: 'fast' });
+    expect(list).toMatchObject({ ok: true, capabilities: { linkWithoutOpening: true } });
+  });
+
+  it('rejects a background reading link when its initiating lifecycle ends', async () => {
+    await prepareDesktop();
+    const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
+    const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
+    const rpcHandlerManager: RpcHandlerRegistrar = { registerHandler: (method, handler) => { handlers.set(method, async (raw) => handler(raw as never)); } };
+    const lifecycle = registerMachineDirectSessionsRpcHandlers({ rpcHandlerManager, getDaemonIdentity: async () => {
+      await lifecycle.suspend();
+      return { accountId: 'account_test', machineId: 'machine_1' };
+    } });
+    await expect(handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({ machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
+      source: { kind: 'codexHome', home: 'user' }, openExisting: false })).resolves.toMatchObject({ ok: false, error: 'source_unavailable' });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(desktopSockets.size).toBe(0);
+  });
+
   it.each(['request-timeout', 'no-client-found'])('keeps the canonical reading link when desktop discovery returns %s', async (reason) => {
     await prepareDesktop();
     desktopDiscoveryError = reason;
@@ -477,7 +512,7 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
     expect(execFile).not.toHaveBeenCalled();
   });
 
-  it('rejects a different authenticated account before an explicit desktop open', async () => {
+  it.each([undefined, false])('rejects a different authenticated account (openExisting=%s)', async (openExisting) => {
     await prepareDesktop();
     const { registerMachineDirectSessionsRpcHandlers } = await import('./rpcHandlers.directSessions');
     const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
@@ -486,7 +521,7 @@ describe('daemon.directSessions.link.ensure (integration)', () => {
       getDaemonIdentity: async () => ({ accountId: 'other_account', machineId: 'machine_1' }) });
     const result = await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_LINK_ENSURE)!({
       machineId: 'machine_1', providerId: 'codex', remoteSessionId: desktopId,
-      source: { kind: 'codexHome', home: 'user' },
+      source: { kind: 'codexHome', home: 'user' }, openExisting,
     });
     expect(result).toMatchObject({ ok: false, error: 'not_authenticated' });
     expect(execFile).not.toHaveBeenCalled();

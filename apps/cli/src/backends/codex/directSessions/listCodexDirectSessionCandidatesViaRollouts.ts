@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readdir, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
@@ -17,6 +18,7 @@ import { readCodexCandidateLifecycle } from './readCodexCandidateLifecycle';
 
 type RolloutCandidateGroup = Readonly<{
   lifecycleConflict: boolean;
+  transcriptFiles: readonly string[];
   updatedAtMs: number;
   archived: boolean;
   latestFilePath: string;
@@ -34,8 +36,8 @@ async function collectRolloutFiles(params: Readonly<{
   maxDepth: number;
   archived: boolean;
   filenameIncludes?: string;
-}>): Promise<Array<{ filePath: string; mtimeMs: number; archived: boolean }>> {
-  const out: Array<{ filePath: string; mtimeMs: number; archived: boolean }> = [];
+}>): Promise<Array<{ filePath: string; mtimeMs: number; archived: boolean; transcriptIdentity: string }>> {
+  const out: Array<{ filePath: string; mtimeMs: number; archived: boolean; transcriptIdentity: string }> = [];
   const maxDepth = Math.max(0, Math.trunc(params.maxDepth));
   const filenameIncludes = typeof params.filenameIncludes === 'string'
     ? params.filenameIncludes.trim().toLowerCase()
@@ -64,7 +66,9 @@ async function collectRolloutFiles(params: Readonly<{
       if (filenameIncludes && !name.toLowerCase().includes(filenameIncludes)) continue;
       try {
         const s = await stat(full);
-        out.push({ filePath: full, mtimeMs: s.mtimeMs, archived: params.archived });
+        // 复用本次枚举stat；版本只表示来源变化，不读取正文，也不对外暴露路径。
+        out.push({ filePath: full, mtimeMs: s.mtimeMs, archived: params.archived,
+          transcriptIdentity: JSON.stringify([full, s.dev, s.ino, s.size, s.mtimeMs, s.ctimeMs]) });
       } catch {
         throw new DirectSessionsProviderUnavailableError('codex_candidates_scan_unavailable');
       }
@@ -158,6 +162,7 @@ async function buildRolloutCandidate(params: Readonly<{
     ...(title ? { title } : {}),
     createdAtMs,
     updatedAtMs: Math.trunc(params.group.updatedAtMs),
+    transcriptVersion: createHash('sha256').update(JSON.stringify([...params.group.transcriptFiles].sort())).digest('hex'),
     archived: params.group.archived,
     activity: deriveDirectSessionActivityFromTimestamp({ updatedAtMs: params.group.updatedAtMs, env: params.env }),
     details: {
@@ -245,6 +250,7 @@ export async function indexCodexDirectSessionCandidatesViaRollouts(params: Reado
             codexHome: homeEntry.codexHome,
             group: {
               lifecycleConflict: false,
+              transcriptFiles: [entry.transcriptIdentity],
               updatedAtMs: entry.mtimeMs,
               archived: entry.archived,
               latestFilePath: entry.filePath,
@@ -264,6 +270,7 @@ export async function indexCodexDirectSessionCandidatesViaRollouts(params: Reado
           group: {
             // 同身份多文件/多home不能按文件名或mtime选择生命周期胜者。
             lifecycleConflict: true,
+            transcriptFiles: [...existing.group.transcriptFiles, entry.transcriptIdentity],
             updatedAtMs: Math.max(existing.group.updatedAtMs, entry.mtimeMs),
             archived: existing.group.archived && entry.archived,
             latestFilePath: entrySortMs >= existing.group.latestSortMs ? entry.filePath : existing.group.latestFilePath,

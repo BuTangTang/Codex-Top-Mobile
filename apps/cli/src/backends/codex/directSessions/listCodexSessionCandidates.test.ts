@@ -39,6 +39,32 @@ describe('listCodexSessionCandidates', () => {
     vi.unmock('node:fs/promises');
   });
 
+  it('versions all rollout files without treating timestamps as message versions', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-transcript-version-'));
+    const home = join(root, 'codex');
+    const dir = join(home, 'sessions');
+    const first = join(dir, 'rollout-2026-01-01T00-00-00-root.jsonl');
+    const second = join(dir, 'rollout-2026-01-02T00-00-00-root.jsonl');
+    const body = sessionMetaLine({ id: 'root', source: 'cli' });
+    const params = { source: { kind: 'codexHome' as const, home: 'user' as const }, activeServerDir: join(root, 'server'), env: createDirectSessionsEnv(home), limit: 50, searchMode: 'fast' as const };
+    const version = async () => (await listCodexSessionCandidates(params)).candidates[0]?.transcriptVersion;
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeFile(first, body);
+      const initial = await version();
+      expect(initial).toMatch(/^[a-f0-9]{64}$/);
+      expect(await version()).toBe(initial);
+      await writeFile(second, body);
+      const added = await version();
+      expect(added).not.toBe(initial);
+      await writeFile(first, body + responseItemLine({ type: 'message', role: 'assistant', content: 'synthetic' }));
+      expect(await version()).not.toBe(added);
+      const changed = await version();
+      await unlink(second);
+      expect(await version()).not.toBe(changed);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it('returns structured lifecycle facts for unlinked candidates and replaces stale or incomplete evidence with unknown', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-list-lifecycle-'));
     const home = join(root, 'codex');

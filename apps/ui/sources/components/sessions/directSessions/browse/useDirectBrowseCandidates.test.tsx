@@ -42,6 +42,40 @@ describe('direct browse discovery window', () => {
     beforeEach(() => { list.mockReset(); list.mockResolvedValue(page(['initial'])); });
     afterEach(() => vi.useRealTimers());
 
+    it('publishes readonly linking capability and replaces transcript versions without inheriting removed fields', async () => {
+        list.mockResolvedValueOnce({ ok: true, capabilities: { deleteCandidate: false, linkWithoutOpening: true }, candidates: [
+            { remoteSessionId: 'same', updatedAtMs: 100, transcriptVersion: 'v1' },
+        ], nextCursor: null });
+        const hook = await renderHook(() => useDirectBrowseCandidates(scope));
+        expect(hook.getCurrent().canLinkWithoutOpening).toBe(true);
+        expect(hook.getCurrent().candidates[0]?.transcriptVersion).toBe('v1');
+        list.mockResolvedValueOnce({ ok: true, capabilities: { deleteCandidate: false, linkWithoutOpening: true }, candidates: [
+            { remoteSessionId: 'same', updatedAtMs: 100, transcriptVersion: 'v2' },
+        ], nextCursor: null });
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().candidates[0]?.transcriptVersion).toBe('v2');
+        list.mockResolvedValueOnce(page(['same']));
+        await act(async () => { await hook.getCurrent().refresh(); });
+        expect(hook.getCurrent().canLinkWithoutOpening).toBe(false);
+        expect(hook.getCurrent().candidates[0]?.transcriptVersion).toBeUndefined();
+    });
+
+    it('requires a fresh readonly capability after a foreground or connection observation boundary', async () => {
+        list.mockResolvedValueOnce({ ok: true, capabilities: { deleteCandidate: false, linkWithoutOpening: true }, candidates: [], nextCursor: null });
+        let generation = 0;
+        const hook = await renderHook((props: { enabled: boolean; observationScope: { isCurrent: () => boolean } }) => useDirectBrowseCandidates({
+            ...scope, autoRefreshEnabled: props.enabled, observationScope: props.observationScope,
+        }), { initialProps: { enabled: true, observationScope: { isCurrent: () => generation === 0 } } });
+        expect(hook.getCurrent().canLinkWithoutOpening).toBe(true);
+        generation = 1;
+        await hook.rerender({ enabled: false, observationScope: { isCurrent: () => false } });
+        expect(hook.getCurrent().canLinkWithoutOpening).toBe(false);
+        generation = 2;
+        list.mockResolvedValueOnce(page([]));
+        await hook.rerender({ enabled: true, observationScope: { isCurrent: () => generation === 2 } });
+        expect(hook.getCurrent().canLinkWithoutOpening).toBe(false);
+    });
+
     it('offers previously read conversations offline without restoring their live status or another account', async () => {
         await prepareWarmCacheStorage();
         clearDirectSessionTranscriptWarmCache(scope.serverId, scope.accountId);

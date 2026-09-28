@@ -481,7 +481,7 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         candidates: res.candidates,
         nextCursor: res.nextCursor,
         ...(res.searchIncomplete ? { searchIncomplete: true } : {}),
-        ...(res.capabilities ? { capabilities: res.capabilities } : {}),
+        capabilities: { deleteCandidate: false, ...res.capabilities, linkWithoutOpening: true as const },
       } satisfies DirectSessionsCandidatesListResponse;
     } catch (error) {
       if (error instanceof DirectSessionsCandidateCursorError) {
@@ -581,7 +581,8 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         if (!openSource.ok) return err('invalid_request', 'source_mismatch') satisfies DirectSessionLinkEnsureResponse;
         if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable') satisfies DirectSessionLinkEnsureResponse;
         try {
-          await linkOps.openExistingSession({ source: openSource.source, remoteSessionId: linked.session.remoteSessionId,
+          // 后台阅读只建立并核验关联；缺省请求保留用户点击打开的旧行为。
+          if (parsed.data.openExisting !== false) await linkOps.openExistingSession({ source: openSource.source, remoteSessionId: linked.session.remoteSessionId,
             isCurrent: () => isCurrentLifecycle(currentEpoch) });
         } catch (error) {
           // 关联已核验时，桌面发现暂时不可用不阻断阅读；控制和发送仍由原 STATUS/CONTROL 判断。

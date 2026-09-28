@@ -23,6 +23,7 @@ const requestMock = vi.hoisted(() => vi.fn());
 const runtimeFetchMock = vi.hoisted(() => vi.fn());
 const getCredentialsForServerUrlMock = vi.hoisted(() => vi.fn());
 const createEncryptionFromAuthCredentialsMock = vi.hoisted(() => vi.fn());
+const machineDirectSessionLinkEnsureMock = vi.hoisted(() => vi.fn());
 const machineDirectSessionTranscriptPageMock = vi.hoisted(() => vi.fn());
 const machineDirectSessionTranscriptReadAfterMock = vi.hoisted(() => vi.fn());
 const resolvePreferredServerIdForSessionIdMock = vi.hoisted(() => vi.fn());
@@ -31,6 +32,7 @@ const emitSessionMetadataUpdateWithServerScopeMock = vi.hoisted(() => vi.fn());
 const notifyActivityReadyMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@/sync/ops/machineDirectSessions', () => ({
+    machineDirectSessionLinkEnsure: machineDirectSessionLinkEnsureMock,
     machineDirectSessionTranscriptPage: machineDirectSessionTranscriptPageMock,
     machineDirectSessionTranscriptReadAfter: machineDirectSessionTranscriptReadAfterMock,
 }));
@@ -71,6 +73,7 @@ vi.mock('@/activity/notifications/runtime/activityLocalNotificationBus', () => (
 }));
 
 import { storage } from './domains/state/storage';
+import { readDirectSessionLink } from './domains/session/directSessions/readDirectSessionLink';
 import { setActiveServerId, upsertServerProfile } from './domains/server/serverProfiles';
 import { saveAccountSettings, savePendingAccountSettings } from './domains/state/accountSettingsPersistence';
 import { createAccountSettingsScope } from './domains/settings/scope/accountSettingsScope';
@@ -83,6 +86,8 @@ import { buildServerFeaturesResponse } from '@/hooks/server/serverFeaturesTestUt
 import { resetServerFeaturesClientForTests } from '@/sync/api/capabilities/serverFeaturesClient';
 import { markSessionHidden, markSessionVisible } from './domains/session/activeViewingSession';
 import { createDeferred } from '@/dev/testkit/hooks/createDeferred';
+import { PauseController } from '@/utils/timing/pauseController';
+import type { InvalidateSync } from '@/utils/sessions/sync';
 
 const initialStorageState = storage.getState();
 
@@ -180,6 +185,7 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         runtimeFetchMock.mockReset();
         getCredentialsForServerUrlMock.mockReset();
         createEncryptionFromAuthCredentialsMock.mockReset();
+        machineDirectSessionLinkEnsureMock.mockReset();
         machineDirectSessionTranscriptPageMock.mockReset();
         machineDirectSessionTranscriptReadAfterMock.mockReset();
         resolvePreferredServerIdForSessionIdMock.mockReset();
@@ -192,6 +198,305 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
     afterEach(() => {
         vi.clearAllMocks();
     });
+
+    it.each(['unopened', 'hidden-history'] as const)('prefetches unopened direct history once per version, persists it and restores it offline after memory eviction: %s', async (variant) => {
+        const cache = await import('./domains/state/warmCachePersistence');
+        await cache.prepareWarmCacheStorage();
+        const { sync } = await import('./sync');
+        const internals = sync as any;
+        const owner = upsertServerProfile({ serverUrl: `https://recent-prefetch-${variant}.example`, name: 'Recent prefetch' });
+        setActiveServerId(owner.id, { scope: 'device' });
+        const previous = { account: internals.serverID, credentials: internals.credentials, pause: internals.pauseController };
+        const accountId = `recent-prefetch-account-${variant}`;
+        const sessionId = `never-opened-recent-${variant}`;
+        internals.serverID = accountId;
+        internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+        internals.pauseController = new PauseController();
+        internals.pauseController.resume();
+        resolvePreferredServerIdForSessionIdMock.mockReturnValue(owner.id);
+        storage.getState().applySessions([{ ...createDirectSession(sessionId), encryptionMode: 'plain', serverId: owner.id }]);
+        internals.activeServerSessionIds = new Set([sessionId]);
+        internals.hasFetchedSessionsSnapshotForActiveServer = true;
+        const isCurrent = () => true;
+        const request = { link: { machineId: 'machine-1', providerId: 'codex' as const, remoteSessionId: 'vendor-session-1',
+            source: { kind: 'codexHome' as const, home: 'user' as const } }, transcriptVersion: 'v1' };
+        const input = { serverId: owner.id, accountId, requests: [request], isCurrent };
+        cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+        try {
+            machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+                { id: 'recent-first', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: 'cached before opening' } } },
+            ], tailCursor: 'recent-tail-1', nextCursor: 'older', hasMore: true });
+            await sync.prefetchPhoneRecentDirectSessions(input);
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(1);
+            await sync.prefetchPhoneRecentDirectSessions(input);
+            expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+            expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+            if (variant === 'hidden-history') {
+                markSessionVisible(sessionId, owner.id);
+                sync.onSessionViewportChange(sessionId, { isPinned: false, offsetY: 420, shouldRestoreViewport: true,
+                    anchor: { kind: 'message', messageId: 'recent-first', itemId: 'recent-first', itemOffsetPx: 12, capturedAtMs: 1 } });
+                markSessionHidden(sessionId, owner.id);
+            }
+            const viewport = sync.getSessionViewport(sessionId);
+            const window = sync.getSessionTargetWindowState(sessionId);
+            machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+                { id: 'recent-second', createdAtMs: 2, raw: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'new reply' } } } },
+            ], nextCursor: 'recent-tail-2', truncated: false });
+            await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: [{ ...request, transcriptVersion: 'v2' }] });
+            expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'recent-tail-1' }), { serverId: owner.id });
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(2);
+            expect(sync.getSessionViewport(sessionId)).toBe(viewport);
+            expect(sync.getSessionTargetWindowState(sessionId)).toBe(window);
+            internals.evictSessionTranscript(sessionId);
+            internals.pauseController.pause();
+            machineDirectSessionTranscriptPageMock.mockClear();
+            machineDirectSessionTranscriptReadAfterMock.mockClear();
+            sync.onSessionVisible(sessionId);
+            expect(storage.getState().sessionMessages[sessionId]?.isLoaded).toBe(true);
+            expect(Object.values(storage.getState().sessionMessages[sessionId]?.messagesById ?? {})).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: 'user-text', text: 'cached before opening' }),
+                expect.objectContaining({ kind: 'agent-text', text: 'new reply' }),
+            ]));
+            expect(machineDirectSessionTranscriptPageMock).not.toHaveBeenCalled();
+            expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+        } finally {
+            internals.messagesSync.get(sessionId)?.stop();
+            internals.messagesSync.delete(sessionId);
+            internals.serverID = previous.account;
+            internals.credentials = previous.credentials;
+            internals.pauseController = previous.pause;
+            cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+        }
+    });
+
+    it.each(['readonly-link', 'deferred', 'background', 'source-changed', 'cache-evicted', 'unavailable', 'shared', 'completed-read', 'no-version', 'cancel-selection', 'different-server', 'visible-during-read'] as const)(
+        'keeps recent prefetch on the original hydration and cache acceptance boundary: %s', async (variant) => {
+            const cache = await import('./domains/state/warmCachePersistence');
+            await cache.prepareWarmCacheStorage();
+            const { sync } = await import('./sync');
+            const internals = sync as any;
+            const owner = upsertServerProfile({ serverUrl: `https://recent-${variant}.example`, name: 'Recent boundary' });
+            setActiveServerId(owner.id, { scope: 'device' });
+            const accountId = `recent-${variant}`;
+            const sessionId = `recent-boundary-${variant}`;
+            const previous = { account: internals.serverID, credentials: internals.credentials, pause: internals.pauseController, encryption: internals.encryption };
+            internals.serverID = accountId;
+            internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+            internals.pauseController = new PauseController();
+            internals.pauseController.resume();
+            internals.encryption = { decryptEncryptionKey: async () => null, initializeSessions: async () => {}, getSessionEncryption: () => null };
+            resolvePreferredServerIdForSessionIdMock.mockReturnValue(owner.id);
+            const session = { ...createDirectSession(sessionId), encryptionMode: 'plain' as const, serverId: owner.id };
+            const requiresLink = variant === 'readonly-link' || variant === 'different-server';
+            if (!requiresLink) storage.getState().applySessions([session]);
+            if (variant === 'different-server') {
+                const foreign = upsertServerProfile({ serverUrl: 'https://recent-foreign.example', name: 'Other server' });
+                const foreignSessionId = `${sessionId}-foreign`;
+                storage.getState().applySessions([{ ...session, id: foreignSessionId, serverId: undefined }]);
+                resolvePreferredServerIdForSessionIdMock.mockImplementation((id: string) => id === foreignSessionId ? foreign.id : owner.id);
+            }
+            internals.activeServerSessionIds = new Set(requiresLink ? [] : [sessionId]);
+            internals.hasFetchedSessionsSnapshotForActiveServer = true;
+            let current = true;
+            const isCurrent = () => current;
+            const input = { serverId: owner.id, accountId, isCurrent, requests: [{ link: {
+                machineId: 'machine-1', providerId: 'codex' as const, remoteSessionId: 'vendor-session-1',
+                source: { kind: 'codexHome' as const, home: 'user' as const },
+            }, transcriptVersion: variant === 'no-version' ? undefined : 'unchanged-version', discoveryObservation: {} }] };
+            const page = { ok: true, historyAvailability: 'available', items: [
+                { id: 'boundary-user', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: 'synthetic new conversation' } } },
+            ], tailCursor: 'boundary-tail', nextCursor: null, hasMore: false };
+            cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            machineDirectSessionTranscriptReadAfterMock.mockResolvedValue({ ok: true, historyAvailability: 'available', items: [], nextCursor: 'boundary-tail', truncated: false });
+            try {
+                if (requiresLink) {
+                    machineDirectSessionLinkEnsureMock.mockResolvedValueOnce({ ok: true, sessionId, created: true });
+                    requestMock.mockResolvedValueOnce(Response.json({ session: { ...session, metadata: JSON.stringify(session.metadata),
+                        dataEncryptionKey: null, agentState: null, share: null } }));
+                }
+                if (variant === 'shared') {
+                    const pending = createDeferred<typeof page>();
+                    machineDirectSessionTranscriptPageMock.mockReturnValueOnce(pending.promise);
+                    const first = sync.prefetchPhoneRecentDirectSessions(input);
+                    const second = sync.prefetchPhoneRecentDirectSessions(input);
+                    await vi.waitFor(() => expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1));
+                    pending.resolve(page);
+                    await Promise.all([first, second]);
+                    expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+                    expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+                    expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(1);
+                    return;
+                }
+                if (variant === 'background' || variant === 'source-changed' || variant === 'cancel-selection' || variant === 'visible-during-read') {
+                    const pending = createDeferred<typeof page>();
+                    machineDirectSessionTranscriptPageMock.mockReturnValueOnce(pending.promise);
+                    const flight = sync.prefetchPhoneRecentDirectSessions(input);
+                    await vi.waitFor(() => expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1));
+                    if (variant === 'background') current = false;
+                    else if (variant === 'visible-during-read') {
+                        markSessionVisible(sessionId, owner.id);
+                        sync.onSessionViewportChange(sessionId, { isPinned: false, offsetY: 420, shouldRestoreViewport: true });
+                    }
+                    else if (variant === 'cancel-selection') await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: [] });
+                    else storage.getState().applySessions([{ ...session, metadata: { ...session.metadata,
+                        directSessionV1: { ...readDirectSessionLink(session.metadata)!, remoteSessionId: 'replacement' },
+                    } }]);
+                    pending.resolve(page);
+                    await flight;
+                    expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)).toBeNull();
+                    expect(storage.getState().sessionMessages[sessionId]?.isLoaded).not.toBe(true);
+                    return;
+                }
+                machineDirectSessionTranscriptPageMock.mockResolvedValueOnce(variant === 'unavailable'
+                    ? { ...page, historyAvailability: 'unavailable', items: [] } : page);
+                await sync.prefetchPhoneRecentDirectSessions(input);
+                if (variant === 'deferred') {
+                    markSessionVisible(sessionId, owner.id);
+                    sync.onSessionViewportChange(sessionId, { isPinned: false, offsetY: 100, shouldRestoreViewport: true });
+                    const changed = { ...input, requests: [{ ...input.requests[0]!, transcriptVersion: 'changed' }] };
+                    await sync.prefetchPhoneRecentDirectSessions(changed);
+                    expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+                    sync.onSessionViewportChange(sessionId, { isPinned: true, offsetY: 100, shouldRestoreViewport: false });
+                    await sync.prefetchPhoneRecentDirectSessions(changed);
+                    expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalled();
+                } else if (variant === 'cache-evicted') {
+                    cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+                    internals.evictSessionTranscript(sessionId);
+                    machineDirectSessionTranscriptPageMock.mockResolvedValueOnce(page);
+                    await sync.prefetchPhoneRecentDirectSessions(input);
+                    expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(2);
+                } else if (variant === 'unavailable') {
+                    machineDirectSessionTranscriptPageMock.mockResolvedValueOnce(page);
+                    await sync.prefetchPhoneRecentDirectSessions(input);
+                    expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(2);
+                }
+                if (variant === 'completed-read') {
+                    current = false;
+                    machineDirectSessionTranscriptReadAfterMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+                        { id: 'after-prefetch', createdAtMs: 2, raw: { role: 'user', content: { type: 'text', text: 'ordinary hidden read' } } },
+                    ], nextCursor: 'ordinary-tail', truncated: false });
+                    await sync.refreshSessionMessages(sessionId);
+                    internals.flushSessionMaterializedMaxSeq();
+                    expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(2);
+                    expect(Object.values(storage.getState().sessionMessages[sessionId]?.messagesById ?? {})).toEqual(expect.arrayContaining([
+                        expect.objectContaining({ kind: 'user-text', text: 'ordinary hidden read' }),
+                    ]));
+                    return;
+                }
+                if (variant === 'no-version') {
+                    await sync.prefetchPhoneRecentDirectSessions(input);
+                    expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+                    const nextList = { ...input, requests: [{ ...input.requests[0]!, discoveryObservation: {} }] };
+                    await sync.prefetchPhoneRecentDirectSessions(nextList);
+                    expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledTimes(1);
+                    await sync.prefetchPhoneRecentDirectSessions(nextList);
+                    expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledTimes(1);
+                    await sync.prefetchPhoneRecentDirectSessions({ ...nextList, isCurrent: () => true });
+                    expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledTimes(2);
+                }
+                expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)?.items).toHaveLength(1);
+                if (requiresLink) {
+                    expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+                    expect(machineDirectSessionLinkEnsureMock).toHaveBeenCalledWith(expect.objectContaining({ openExisting: false }), { serverId: owner.id });
+                    expect(requestMock).toHaveBeenCalledWith(`/v2/sessions/${sessionId}`, expect.objectContaining({ method: 'GET' }));
+                    expect(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)?.remoteSessionId).toBe('vendor-session-1');
+                }
+            } finally {
+                if (variant === 'deferred' || variant === 'visible-during-read') markSessionHidden(sessionId, owner.id);
+                internals.messagesSync.get(sessionId)?.stop();
+                internals.messagesSync.delete(sessionId);
+                internals.serverID = previous.account;
+                internals.credentials = previous.credentials;
+                internals.pauseController = previous.pause;
+                internals.encryption = previous.encryption;
+                cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            }
+        },
+    );
+
+    // 会话元数据仍在时路由不会重新 hydration；正文必须在 visible 返回前恢复，不能等同步暂停解除。
+    it.each(['same scope', 'different account', 'different server', 'different source', 'already loaded'] as const)(
+        'restores persisted direct history synchronously on visibility while sync is paused: %s',
+        async (variant) => {
+            const { prepareWarmCacheStorage, clearDirectSessionTranscriptWarmCache } = await import('./domains/state/warmCachePersistence');
+            await prepareWarmCacheStorage();
+            const { sync } = await import('./sync');
+            const internals = sync as unknown as {
+                serverID: string | null;
+                credentials: { token: string; secret: string } | null;
+                pauseController: PauseController;
+                messagesSync: Map<string, InvalidateSync>;
+                fetchMessages(id: string): Promise<void>;
+                flushSessionMaterializedMaxSeq(): void;
+                evictSessionTranscript(id: string): void;
+            };
+            const owner = upsertServerProfile({ serverUrl: 'https://visibility-cache.example', name: 'Visibility cache' });
+            setActiveServerId(owner.id, { scope: 'device' });
+            const previousAccount = internals.serverID;
+            const previousCredentials = internals.credentials;
+            const previousPause = internals.pauseController;
+            const accountId = 'visibility-cache-account';
+            const sessionId = `visible-cache-${variant}`;
+            internals.serverID = accountId;
+            internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+            // 原暂停控制器是真实实现；隔离本例的未恢复等待，不放行测试以外的同步任务。
+            internals.pauseController = new PauseController();
+            internals.pauseController.pause();
+            try {
+                clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+                const session = { ...createDirectSession(sessionId), encryptionMode: 'plain' as const, serverId: owner.id };
+                storage.getState().applySessions([session]);
+                machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({ ok: true, historyAvailability: 'available', items: [
+                    { id: 'visible-cache-raw', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: 'synthetic persisted history' } } },
+                ], tailCursor: 'visible-cache-tail', nextCursor: null, hasMore: false });
+                await internals.fetchMessages(sessionId);
+                internals.flushSessionMaterializedMaxSeq();
+                const accepted = storage.getState().sessionMessages[sessionId];
+                if (variant !== 'already loaded') internals.evictSessionTranscript(sessionId);
+                if (variant === 'different account') internals.serverID = 'other-visibility-account';
+                if (variant === 'different server') {
+                    const other = upsertServerProfile({ serverUrl: 'https://other-visibility-cache.example', name: 'Other cache' });
+                    storage.getState().applySessions([{ ...session, serverId: other.id }]);
+                }
+                if (variant === 'different source') {
+                    storage.getState().applySessions([{ ...session, metadata: { ...session.metadata,
+                        directSessionV1: { ...session.metadata.directSessionV1!, remoteSessionId: 'different-vendor-session' },
+                    } }]);
+                }
+                machineDirectSessionTranscriptPageMock.mockClear();
+                machineDirectSessionTranscriptReadAfterMock.mockClear();
+                requestMock.mockClear();
+
+                sync.onSessionVisible(sessionId);
+
+                // 故意不 await：页面 layout effect 当轮就能读取原正文，且尚未访问网络。
+                const transcript = storage.getState().sessionMessages[sessionId];
+                if (variant === 'same scope' || variant === 'already loaded') {
+                    expect(transcript?.isLoaded).toBe(true);
+                    expect(Object.values(transcript?.messagesById ?? {})).toEqual(expect.arrayContaining([
+                        expect.objectContaining({ kind: 'user-text', text: 'synthetic persisted history' }),
+                    ]));
+                    if (variant === 'already loaded') expect(transcript).toBe(accepted);
+                    sync.onSessionVisible(sessionId);
+                    expect(storage.getState().sessionMessages[sessionId]).toBe(transcript);
+                } else {
+                    expect(transcript).toBeUndefined();
+                }
+                expect(internals.pauseController.isPaused()).toBe(true);
+                expect(machineDirectSessionTranscriptPageMock).not.toHaveBeenCalled();
+                expect(machineDirectSessionTranscriptReadAfterMock).not.toHaveBeenCalled();
+                expect(requestMock).not.toHaveBeenCalled();
+            } finally {
+                internals.messagesSync.get(sessionId)?.stop();
+                internals.messagesSync.delete(sessionId);
+                internals.pauseController = previousPause;
+                internals.serverID = previousAccount;
+                internals.credentials = previousCredentials;
+                internals.evictSessionTranscript(sessionId);
+                clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            }
+        },
+    );
 
     it.each(['plain', 'e2ee'] as const)('restores an opened direct conversation offline after memory eviction and catches up by the saved cursor (%s)', async (encryptionMode) => {
         const { prepareWarmCacheStorage } = await import('./domains/state/warmCachePersistence');

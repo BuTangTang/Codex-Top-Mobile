@@ -284,6 +284,7 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
         refresh,
         error,
         canDeleteCandidates,
+        canLinkWithoutOpening,
         loadMore,
         removeCandidate,
     } = useDirectBrowseCandidates({
@@ -412,8 +413,8 @@ export const DirectSessionsBrowseScreen = React.memo((props: Readonly<{
     const onPhoneSnapshot = props.phoneData?.onSnapshot;
     const phoneSnapshot = React.useMemo<PhoneBrowseSnapshot>(() => ({
         candidates, nextCursor, loading, loadingMore, searchAugmenting, searchIncomplete,
-        refreshRequired, error, linkingSessionId, refresh, loadMore, selectCandidate: handleOpenCandidate,
-    }), [candidates, nextCursor, loading, loadingMore, searchAugmenting, searchIncomplete, refreshRequired, error, linkingSessionId, refresh, loadMore, handleOpenCandidate]);
+        refreshRequired, error, linkingSessionId, canLinkWithoutOpening, refresh, loadMore, selectCandidate: handleOpenCandidate,
+    }), [candidates, nextCursor, loading, loadingMore, searchAugmenting, searchIncomplete, refreshRequired, error, linkingSessionId, canLinkWithoutOpening, refresh, loadMore, handleOpenCandidate]);
     React.useEffect(() => { onPhoneSnapshot?.(phoneSnapshot); }, [onPhoneSnapshot, phoneSnapshot]);
     React.useEffect(() => () => { onPhoneSnapshot?.(null); }, [onPhoneSnapshot]);
     if (props.phoneData) return null;

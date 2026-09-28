@@ -1,3 +1,4 @@
+import { PhoneRecentSessionsProvider } from '@/components/sessions/directSessions/browse/PhoneRecentSessionsProvider';
 import { Stack, router } from 'expo-router';
 import 'react-native-reanimated';
 import * as React from 'react';
@@ -213,6 +214,7 @@ const RootLayoutShell = React.memo(function RootLayoutShell(): React.ReactElemen
 
     return (
         <SessionCockpitChromeRegistryProvider>
+          <PhoneRecentSessionsProvider>
             <ActivityBadgeRuntime />
             <ActivityLocalNotificationRuntime />
             <DesktopTrayRuntime />
@@ -665,6 +667,7 @@ const RootLayoutShell = React.memo(function RootLayoutShell(): React.ReactElemen
             />
             </Stack>
             <MobileBottomChromeHost newSessionRendersFloatingComposer={newSessionRendersFloatingComposer} />
+          </PhoneRecentSessionsProvider>
         </SessionCockpitChromeRegistryProvider>
     );
 });

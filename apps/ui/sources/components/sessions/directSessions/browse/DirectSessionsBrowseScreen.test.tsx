@@ -235,6 +235,23 @@ function phoneCandidate(remoteSessionId: string, state: 'running' | 'needs_input
 }
 
 describe('DirectSessionsBrowseScreen', () => {
+    it('exposes current readonly link capability and transcript version through the phone snapshot', async () => {
+        activeScopeState.value = { serverId: 's', accountId: 'a' };
+        candidatesListSpy.mockResolvedValueOnce({ ok: true, capabilities: { deleteCandidate: false, linkWithoutOpening: true }, candidates: [
+            { remoteSessionId: 'versioned', updatedAtMs: 100, transcriptVersion: 'body-v1' },
+        ], nextCursor: null });
+        const { DirectSessionsBrowseScreen } = await directSessionsBrowseScreenModulePromise;
+        const snapshots: import('./phoneBrowseAggregation').PhoneBrowseSnapshot[] = [];
+        const onSnapshot = (value: import('./phoneBrowseAggregation').PhoneBrowseSnapshot | null) => { if (value) snapshots.push(value); };
+        await renderScreen(<DirectSessionsBrowseScreen lockScope={{ machineId: 'machine-1', serverId: 's', providerId: 'codex', source: { kind: 'codexHome', home: 'user' } }}
+            phoneData={{ searchQuery: '', discoveryEnabled: true, observationScope: { isCurrent: () => true },
+                actionPending: false, isActionPending: () => false, onSnapshot }} />);
+        await flushHookEffects();
+        expect(snapshots.at(-1)?.canLinkWithoutOpening).toBe(true);
+        expect(snapshots.at(-1)?.candidates[0]?.transcriptVersion).toBe('body-v1');
+        expect(linkEnsureSpy).not.toHaveBeenCalled();
+    });
+
     it.each(['disconnected', 'connected'] as const)('opens the exact already-read native source immediately while %s, preserving online LINK', async (connection) => {
         await prepareWarmCacheStorage();
         activeScopeState.value = { serverId: 'cached-server', accountId: 'cached-account' };

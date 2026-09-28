@@ -201,6 +201,7 @@ import {
     clearWarmCacheAccountScope,
     clearDirectSessionTranscriptWarmCache,
     loadDirectSessionTranscriptWarmCache,
+    loadDirectSessionTranscriptWarmCacheIndex,
     saveDirectSessionTranscriptWarmCache,
     type DirectSessionTranscriptWarmCache,
     loadMachineDisplayWarmCacheEntries,
@@ -386,6 +387,7 @@ import { getServerFeaturesSnapshot } from '@/sync/api/capabilities/serverFeature
 import { sessionRpcWithPreferredSessionScope } from '@/sync/runtime/orchestration/serverScopedRpc/sessionRpcWithPreferredSessionScope';
 import { sessionRpcWithServerAccountScope } from '@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc';
 import {
+    machineDirectSessionLinkEnsure,
     machineDirectSessionSend,
     machineDirectSessionTranscriptPage,
     machineDirectSessionTranscriptReadAfter,
@@ -969,6 +971,12 @@ type ResumeViaChangesOutcome = Readonly<{
     refreshedByCatchUp: Readonly<{ sessions: boolean; machines: boolean }>;
 }>;
 
+/** 原 Sync 内最近读取的单飞和成功凭据，不承载消息或持久状态。 */
+type PhoneRecentDirectPrefetchRecord = {
+    sourceKey: string; scope: () => boolean; isCurrent: () => boolean; sessionId?: string;
+    version?: string; discoveryObservation?: object; completed: boolean; promise?: Promise<void>;
+};
+
 class Sync {
 
         encryption!: Encryption;
@@ -1022,6 +1030,9 @@ class Sync {
       }>();
       private directTranscriptCacheReceipts = new Map<string, string>();
       private directTranscriptCacheOnlySessionIds = new Set<string>();
+      // 最近集合只记请求完成凭据；正文、游标与持久化仍归原 transcript owner。
+      private phoneRecentDirectPrefetchKeys = new Set<string>();
+      private phoneRecentDirectPrefetch = new Map<string, PhoneRecentDirectPrefetchRecord>();
       // An observed source reset cannot be forgotten: index/offset cursors may become valid
       // again after the replacement source grows, without restoring the accepted history.
       private directSessionTailStateBySessionId = new Map<string, {
@@ -1029,6 +1040,7 @@ class Sync {
           readonly sourceKey: string | null;
           readonly requiresRefresh: boolean;
           lastSourceMessageIds?: readonly string[];
+          acceptedRead?: object;
       }>();
       private sessionViewport = new Map<string, SessionViewportSnapshot>();
       private sessionViewportHydratedStorageKey: string | null = null;
@@ -2082,6 +2094,8 @@ class Sync {
         this.flushSessionMaterializedMaxSeq();
         this.directTranscriptCacheOnlySessionIds.clear();
         this.directTranscriptCacheReceipts.clear();
+        this.phoneRecentDirectPrefetch.clear();
+        this.phoneRecentDirectPrefetchKeys.clear();
         this.clearActiveAccountSettingsScope();
         this.disconnectSocketIntentionally();
         this.activityAccumulator.reset();
@@ -2267,7 +2281,10 @@ class Sync {
     }
 
 
+        /** 会话显示时先恢复当前账号的本地正文，再沿原调度补齐网络消息。 */
         onSessionVisible = (sessionId: string) => {
+            // 元数据已就绪的路由会跳过 hydration；本地阅读不能等待消息同步解除暂停。
+            this.restoreDirectTranscriptWarmCache(sessionId);
             this.ensureSessionViewportHydrated();
             // Opening a session grows the hydrated working set; bound it (coalesced sweep).
             this.sessionTranscriptRetention.scheduleSweep();
@@ -2329,6 +2346,96 @@ class Sync {
             const normalized = String(sessionId ?? '').trim();
             if (!normalized) return;
             await this.getOrCreateMessagesSync(normalized).invalidateAndAwait();
+        }
+
+        /** 全局最近集合批量进入原消息单飞；只读关联不激活页面或桌面任务。 */
+        prefetchPhoneRecentDirectSessions = async (input: Readonly<{
+            serverId: string; accountId: string; isCurrent: () => boolean;
+            requests: readonly Readonly<{
+                link: import('@happier-dev/protocol').DirectSessionLinkEnsureRequest;
+                transcriptVersion?: string;
+                discoveryObservation?: object;
+            }>[];
+        }>): Promise<void> => {
+            const scopeCurrent = this.createServerScopeGuard();
+            const isCurrent = () => scopeCurrent() && input.isCurrent() && this.serverID === input.accountId
+                && areServerProfileIdentifiersEquivalent(input.serverId, getActiveServerSnapshot().serverId);
+            if (!isCurrent()) return;
+            const requested = input.requests.flatMap((request) => {
+                if (!request.link.source) return [];
+                const sourceKey = this.getDirectSessionTranscriptSourceKey({ ...request.link, source: request.link.source, v: 1 });
+                return sourceKey ? [{ ...request, sourceKey, key: stableJsonStringify([input.serverId, input.accountId, sourceKey]) }] : [];
+            });
+            const selected = new Set(requested.map((request) => request.key));
+            this.phoneRecentDirectPrefetchKeys = selected;
+            for (const key of this.phoneRecentDirectPrefetch.keys()) {
+                if (!selected.has(key)) this.phoneRecentDirectPrefetch.delete(key);
+            }
+            let cachedIndex = loadDirectSessionTranscriptWarmCacheIndex(input.serverId, input.accountId);
+            const knownBySource = new Map<string, string>();
+            for (const session of Object.values(storage.getState().sessions)) {
+                const sessionServerId = this.getDirectSessionServerScope(session.id);
+                if (!sessionServerId || !areServerProfileIdentifiersEquivalent(sessionServerId, input.serverId)) continue;
+                const sourceKey = this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(session.metadata));
+                if (sourceKey) knownBySource.set(sourceKey, session.id);
+            }
+            await runTasksWithLimit(requested.map((request) => async () => {
+                const isRequested = () => isCurrent() && this.phoneRecentDirectPrefetchKeys.has(request.key);
+                let previous = this.phoneRecentDirectPrefetch.get(request.key);
+                while (previous?.promise) {
+                    await previous.promise;
+                    if (!isRequested()) return;
+                    cachedIndex = loadDirectSessionTranscriptWarmCacheIndex(input.serverId, input.accountId);
+                    previous = this.phoneRecentDirectPrefetch.get(request.key);
+                }
+                if (!isRequested()) return;
+                const unchanged = request.transcriptVersion !== undefined
+                    ? previous?.version === request.transcriptVersion
+                    : request.discoveryObservation !== undefined && previous?.discoveryObservation === request.discoveryObservation;
+                if (previous?.completed && unchanged && previous.scope === input.isCurrent && previous.sessionId) {
+                    const cached = cachedIndex[previous.sessionId];
+                    if (cached?.sourceKey === request.sourceKey
+                        && this.directSessionTailStateBySessionId.get(previous.sessionId)?.requiresRefresh !== true) return;
+                }
+                const record: PhoneRecentDirectPrefetchRecord = {
+                    sourceKey: request.sourceKey, scope: input.isCurrent, version: request.transcriptVersion, completed: false,
+                    discoveryObservation: request.discoveryObservation,
+                    sessionId: previous?.sessionId ?? knownBySource.get(request.sourceKey),
+                    isCurrent: () => isRequested() && this.phoneRecentDirectPrefetch.get(request.key) === record,
+                };
+                this.phoneRecentDirectPrefetch.set(request.key, record);
+                record.promise = (async () => {
+                    try {
+                        if (!record.sessionId) {
+                            const linked = await machineDirectSessionLinkEnsure({ ...request.link, openExisting: false }, { serverId: input.serverId });
+                            if (!record.isCurrent() || !linked.ok) return;
+                            record.sessionId = linked.sessionId;
+                        }
+                        const sessionId = record.sessionId;
+                        if (!storage.getState().sessions[sessionId]?.metadata || this.isDirectSessionCacheOnly(sessionId)) {
+                            const hydrated = await this.ensureSessionVisibleForMessageRoute(sessionId, { serverId: input.serverId });
+                            if (!record.isCurrent() || hydrated.kind !== 'available') return;
+                        }
+                        const link = readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata);
+                        if (!record.isCurrent() || this.getDirectSessionTranscriptSourceKey(link) !== request.sourceKey) return;
+                        const before = this.directSessionTailStateBySessionId.get(sessionId)?.acceptedRead;
+                        await this.refreshSessionMessages(sessionId);
+                        if (!record.isCurrent()) return;
+                        const accepted = this.directSessionTailStateBySessionId.get(sessionId);
+                        if (!accepted?.acceptedRead || accepted.acceptedRead === before || accepted.requiresRefresh
+                            || this.directSessionLatestSnapshotPendingBySessionId.has(sessionId)
+                            || storage.getState().sessionMessages[sessionId]?.directHistoryAvailability !== 'available') return;
+                        // await void 可能仅延期；只有真实接受过正文且原检查点落盘才确认版本。
+                        this.flushDirectTranscriptWarmCache();
+                        const cached = loadDirectSessionTranscriptWarmCache(input.serverId, input.accountId, sessionId, request.sourceKey);
+                        record.completed = Boolean(cached && !cached.requiresRefresh && cached.tailCursor === accepted.cursor);
+                    } catch {
+                        // 原 messagesSync 保持既有重试；未完成版本留给下一次真实发现重新尝试。
+                    }
+                })();
+                await record.promise;
+                record.promise = undefined;
+            }), this.syncTuning.messageCatchUpConcurrencyLimit).finally(() => this.sessionTranscriptRetention.scheduleSweep());
         }
 
         refreshSessionForSubmit = async (
@@ -5659,16 +5766,20 @@ class Sync {
           const sessionEncryptionMode = session?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
 
           if (directSessionLink) {
+              // 只约束本次后台预取读，不把已完成预取记录变成其他消费者的授权门禁。
+              const prefetch = [...this.phoneRecentDirectPrefetch.values()].find((record) => record.sessionId === sessionId && record.promise);
+              const readCurrent = prefetch && !resolveSessionLiveConsumption(sessionId).isFullContentConsumer
+                  ? () => prefetch.isCurrent() && !resolveSessionLiveConsumption(sessionId).isFullContentConsumer : undefined;
               // Target/sidechain pages can accept source rows before the main
               // initial-load flag. They still need normal handoff/viewport admission.
               const hasAcceptedRows = (storage.getState().sessionMessages[sessionId]?.reducerState.messageIds.size ?? 0) > 0;
               if (!hasLoadedMessages && !hasAcceptedRows && !this.getSessionTargetWindowState(sessionId).isWindowMode) {
-                  await this.fetchDirectSessionMessages(sessionId, directSessionLink);
+                  await this.fetchDirectSessionMessages(sessionId, directSessionLink, { readCurrent });
                   return;
               }
 
               await this.catchUpDirectSessionMessages(sessionId, directSessionLink, {
-                  surfaceCatchUp: hasExplicitTailProbe,
+                  surfaceCatchUp: hasExplicitTailProbe, readCurrent,
               });
               this.explicitSessionTailProbeIds.delete(sessionId);
               return;
@@ -6250,7 +6361,7 @@ class Sync {
       private async fetchDirectSessionMessages(
           sessionId: string,
           directSessionLink: ReturnType<typeof readDirectSessionLink> extends infer T ? Exclude<T, null> : never,
-          options?: Readonly<{ mode: 'replace' | 'merge_latest' }>,
+          options?: Readonly<{ mode?: 'replace' | 'merge_latest'; readCurrent?: () => boolean }>,
       ): Promise<void> {
           const isSourceCurrent = this.createSessionTranscriptSourceGuard(sessionId, directSessionLink);
           // Warm any persisted cursor before capturing the accepted source window. Cache
@@ -6261,9 +6372,10 @@ class Sync {
           const prefixMaterializedMessageIds = options?.mode === 'merge_latest'
               ? storage.getState().sessionMessages[sessionId]?.messageIdsOldestFirst ?? []
               : [];
-          const shouldContinue = () => isSourceCurrent()
+          const shouldContinue = () => isSourceCurrent() && options?.readCurrent?.() !== false
               && this.directSessionTailStateBySessionId.get(sessionId) === acceptedWindow
               && this.getDirectSessionTailCursor(sessionId) === acceptedCursor;
+          if (!shouldContinue()) return;
           const page = await machineDirectSessionTranscriptPage({
               machineId: directSessionLink.machineId,
               providerId: directSessionLink.providerId,
@@ -6294,7 +6406,7 @@ class Sync {
           }
 
           // Keep the accepted transcript and cursors until every replacement read succeeds.
-          if (options && !this.isDirectSessionLiveTail(sessionId)) {
+          if (options?.mode && !this.isDirectSessionLiveTail(sessionId)) {
               storage.getState().setSessionDeferredNewerMessages(sessionId, true);
               return;
           }
@@ -6325,6 +6437,7 @@ class Sync {
               cursor: this.getDirectSessionTailCursor(sessionId), requiresRefresh: false,
               sourceKey: this.getDirectSessionTranscriptSourceKey(directSessionLink),
               lastSourceMessageIds: page.items.length > 0 ? page.items.map((item) => item.id) : acceptedWindow?.lastSourceMessageIds,
+              acceptedRead: {},
           });
           this.directSessionLatestSnapshotPendingBySessionId.delete(sessionId);
           storage.getState().setSessionDeferredNewerMessages(sessionId, false);
@@ -6365,11 +6478,13 @@ class Sync {
       private async catchUpDirectSessionMessages(
           sessionId: string,
           directSessionLink: ReturnType<typeof readDirectSessionLink> extends infer T ? Exclude<T, null> : never,
-          options?: Readonly<{ surfaceCatchUp?: boolean; allowAdjacentPage?: boolean }>,
+          options?: Readonly<{ surfaceCatchUp?: boolean; allowAdjacentPage?: boolean; readCurrent?: () => boolean }>,
       ): Promise<number> {
           const probeAndApply = async (): Promise<number> => {
-              if (this.getSessionTargetWindowState(sessionId).isWindowMode
-                  || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true)) {
+              if (options?.readCurrent?.() === false) return 0;
+              // 隐藏会话同源增量沿原游标落盘；再次可见前不改原历史锚点或目标窗口。
+              if (options?.readCurrent?.() !== true && (this.getSessionTargetWindowState(sessionId).isWindowMode
+                  || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true))) {
                   storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   return 0;
               }
@@ -6385,13 +6500,14 @@ class Sync {
                       await this.withSessionCatchUpNewer(sessionId, () => this.fetchDirectSessionMessages(
                           sessionId, directSessionLink,
                           replacesSource || this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh === true
-                              ? { mode: 'replace' }
-                              : { mode: 'merge_latest' },
+                              ? { mode: 'replace', readCurrent: options?.readCurrent }
+                              : { mode: 'merge_latest', readCurrent: options?.readCurrent },
                       ));
                   }
                   return 0;
               }
-              const shouldContinue = this.createSessionTranscriptSourceGuard(sessionId, directSessionLink);
+              const sourceCurrent = this.createSessionTranscriptSourceGuard(sessionId, directSessionLink);
+              const shouldContinue = () => sourceCurrent() && options?.readCurrent?.() !== false;
               const cursor = this.getDirectSessionTailCursor(sessionId) ?? 'tail';
               const acceptedWindow = this.directSessionTailStateBySessionId.get(sessionId);
               const tail = await machineDirectSessionTranscriptReadAfter({
@@ -6419,7 +6535,7 @@ class Sync {
                   this.requireDirectSessionTranscriptRefresh(sessionId);
                   if (this.isDirectSessionLiveTail(sessionId)) {
                       await this.withSessionCatchUpNewer(sessionId, () => this.fetchDirectSessionMessages(
-                          sessionId, directSessionLink, { mode: 'replace' },
+                          sessionId, directSessionLink, { mode: 'replace', readCurrent: options?.readCurrent },
                       ));
                   }
                   return 0;
@@ -6427,15 +6543,15 @@ class Sync {
               if (directSessionLink.providerId === 'codex' && tail.historyAvailability === 'available'
                   && storage.getState().sessionMessages[sessionId]?.directHistoryAvailability !== 'available') {
                   // 旧端未知状态升级后，同样由可读快照确认恢复，不能只凭空增量清除提示。
-                  await this.fetchDirectSessionMessages(sessionId, directSessionLink, { mode: 'merge_latest' });
+                  await this.fetchDirectSessionMessages(sessionId, directSessionLink, { mode: 'merge_latest', readCurrent: options?.readCurrent });
                   return 0;
               }
               if (continuation === 'page_limit') {
                   this.directSessionLatestSnapshotPendingBySessionId.add(sessionId);
                   storage.getState().setSessionDeferredNewerMessages(sessionId, true);
               }
-              if (this.getSessionTargetWindowState(sessionId).isWindowMode
-                  || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true)) {
+              if (options?.readCurrent?.() !== true && (this.getSessionTargetWindowState(sessionId).isWindowMode
+                  || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true))) {
                   storage.getState().setSessionDeferredNewerMessages(sessionId, true);
                   return 0;
               }
@@ -6446,6 +6562,8 @@ class Sync {
               }
               this.setDirectSessionTailCursor(sessionId, tail.nextCursor ?? null);
               this.recordDirectSessionSourcePage(sessionId, tail.items);
+              const accepted = this.directSessionTailStateBySessionId.get(sessionId);
+              if (accepted) accepted.acceptedRead = {};
               this.queueDirectTranscriptWarmCache(sessionId, tail.items);
               if (continuation === 'complete') storage.getState().setSessionDeferredNewerMessages(sessionId, false);
               return normalizedMessages.length;

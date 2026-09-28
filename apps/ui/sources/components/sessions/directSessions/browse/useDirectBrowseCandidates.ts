@@ -15,6 +15,7 @@ export type DirectBrowseCandidate = Readonly<{
     remoteSessionId: string;
     title?: string;
     updatedAtMs: number;
+    transcriptVersion?: string;
     activity?: DirectSessionActivityV1;
     details?: Record<string, unknown>;
     // 仅由当前 LIST owner 记录手机墙钟和单调时间，不写回协议或持久化；随原页保留。
@@ -58,6 +59,7 @@ function mergeDirectBrowseCandidate(current: DirectBrowseCandidate, next: Direct
         remoteSessionId: current.remoteSessionId,
         title: hasCandidateTitle(latest) ? latest.title : earlier.title,
         updatedAtMs: latest.updatedAtMs,
+        transcriptVersion: latest.transcriptVersion,
         activity: latest.activity ?? earlier.activity,
         // 新响应未提供生命周期时必须未知，不能继承旧事实再贴新接收时间。
         details: details ? { ...details, codexLifecycle: latest.details?.codexLifecycle } : undefined,
@@ -120,6 +122,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
     const [refreshRequired, setRefreshRequired] = React.useState(false);
     const [error, setError] = React.useState<string | null>(null);
     const [canDeleteCandidates, setCanDeleteCandidates] = React.useState(false);
+    const [canLinkWithoutOpening, setCanLinkWithoutOpening] = React.useState(false);
     const [settledVersion, setSettledVersion] = React.useState(0);
     const pagesRef = React.useRef<readonly CandidatePage[]>([]);
     const refreshRequiredRef = React.useRef(false);
@@ -187,6 +190,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
                 } else if (!augmentation) setError(result.error);
                 return null;
             }
+            setCanLinkWithoutOpening(result.capabilities?.linkWithoutOpening === true);
             if (augmentation && result.searchIncomplete && result.candidates.length === 0) return null;
             return { candidates: result.candidates, nextCursor: result.nextCursor ?? null, incomplete: result.searchIncomplete === true };
         };
@@ -327,6 +331,7 @@ export function useDirectBrowseCandidates(params: Readonly<{
         setLoading(false);
         setLoadingMore(false);
         setCanDeleteCandidates(false);
+        setCanLinkWithoutOpening(false);
         if (controlsRef.current.autoRefreshEnabled !== false) {
             void loadCandidates({ automatic: controlsRef.current.autoRefreshEnabled === true });
         }
@@ -342,6 +347,8 @@ export function useDirectBrowseCandidates(params: Readonly<{
         generationRef.current += 1;
         flightRef.current?.release();
         flightRef.current = null;
+        // 只读关联能力必须由恢复后的 LIST 再确认，不能向可能降级的旧组件发送自动 LINK。
+        setCanLinkWithoutOpening(false);
         // 原行、页数和游标保持不变；保留页沿用原观测范围和时间，不能因连接恢复给旧事实续龄。
         setLoading(false);
         setLoadingMore(false);
@@ -381,5 +388,5 @@ export function useDirectBrowseCandidates(params: Readonly<{
     }, [scopeKey]);
 
     return { candidates, nextCursor, loading, loadingMore, searchAugmenting, searchIncomplete, refreshRequired,
-        refresh, error, canDeleteCandidates, loadMore, removeCandidate } as const;
+        refresh, error, canDeleteCandidates, canLinkWithoutOpening, loadMore, removeCandidate } as const;
 }

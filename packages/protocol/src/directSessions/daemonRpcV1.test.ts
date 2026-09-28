@@ -253,3 +253,11 @@ describe('candidate cursor refresh compatibility', () => {
     expect(schema.safeParse({ ...failure, refreshRequired: 'true' }).success).toBe(false);
   });
 });
+
+it('negotiates background reading without inventing a capability on legacy responses', () => {
+  const request = { machineId: 'm', providerId: 'codex', remoteSessionId: 'r', source: { kind: 'codexHome', home: 'user' } };
+  expect(directSessionsRpc.DirectSessionLinkEnsureRequestSchema.safeParse({ ...request, openExisting: 'false' }).success).toBe(false);
+  expect(directSessionsRpc.DirectSessionLinkEnsureRequestSchema.parse(request).openExisting).toBeUndefined();
+  expect(directSessionsRpc.DirectSessionsCandidatesListResponseSchema.parse({ ok: true, candidates: [] })).not.toHaveProperty('capabilities');
+  expect(directSessionsRpc.DirectSessionsCandidatesListResponseSchema.parse({ ok: true, candidates: [], capabilities: { deleteCandidate: false, linkWithoutOpening: true } })).toHaveProperty('capabilities.linkWithoutOpening', true);
+});
