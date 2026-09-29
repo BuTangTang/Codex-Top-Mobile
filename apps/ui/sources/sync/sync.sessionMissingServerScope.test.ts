@@ -288,6 +288,172 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         }
     });
 
+    it('persists later recent conversations while the first transcript keeps failing', async () => {
+        const cache = await import('./domains/state/warmCachePersistence');
+        await cache.prepareWarmCacheStorage();
+        const { sync } = await import('./sync');
+        const internals = sync as any;
+        const owner = upsertServerProfile({ serverUrl: 'https://recent-prefetch-failure.example', name: 'Recent failure isolation' });
+        setActiveServerId(owner.id, { scope: 'device' });
+        const accountId = 'recent-prefetch-failure-account';
+        const sessionIds = ['recent-failing-first', 'recent-healthy-second'];
+        const remoteSessionIds = ['vendor-failing-first', 'vendor-healthy-second'];
+        const previous = {
+            account: internals.serverID, credentials: internals.credentials, pause: internals.pauseController,
+            tuning: internals.syncTuning, activeIds: internals.activeServerSessionIds,
+            hasSnapshot: internals.hasFetchedSessionsSnapshotForActiveServer,
+        };
+        internals.serverID = accountId;
+        internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+        internals.pauseController = new PauseController();
+        internals.pauseController.resume();
+        internals.syncTuning = { ...previous.tuning, messageCatchUpConcurrencyLimit: 1 };
+        resolvePreferredServerIdForSessionIdMock.mockReturnValue(owner.id);
+        const sessions = sessionIds.map((sessionId, index) => {
+            const session = createDirectSession(sessionId);
+            return { ...session, encryptionMode: 'plain' as const, serverId: owner.id, metadata: {
+                ...session.metadata, directSessionV1: { ...readDirectSessionLink(session.metadata)!, remoteSessionId: remoteSessionIds[index]! },
+            } };
+        });
+        storage.getState().applySessions(sessions);
+        internals.activeServerSessionIds = new Set(sessionIds);
+        internals.hasFetchedSessionsSnapshotForActiveServer = true;
+        let current = true;
+        const input = { serverId: owner.id, accountId, isCurrent: () => current, requests: sessions.map((session) => ({
+            link: readDirectSessionLink(session.metadata)!, transcriptVersion: 'first-version', sourceUpdatedAtMs: 100,
+        })) };
+        let activeReads = 0;
+        let maxActiveReads = 0;
+        let failedReads = 0;
+        let firstAvailable = false;
+        machineDirectSessionTranscriptPageMock.mockImplementation(async ({ remoteSessionId }: { remoteSessionId: string }) => {
+            activeReads++;
+            maxActiveReads = Math.max(maxActiveReads, activeReads);
+            try {
+                await Promise.resolve();
+                if (remoteSessionId === remoteSessionIds[0] && !firstAvailable) {
+                    failedReads++;
+                    return { ok: false, error: 'synthetic_transcript_unavailable' };
+                }
+                return { ok: true, historyAvailability: 'available', items: [
+                    { id: remoteSessionId === remoteSessionIds[0] ? 'recovered-first-message' : 'healthy-first-message', createdAtMs: 1,
+                        raw: { role: 'user', content: { type: 'text', text: 'unopened synthetic conversation' } } },
+                ], tailCursor: remoteSessionId === remoteSessionIds[0] ? 'recovered-tail' : 'healthy-tail', nextCursor: null, hasMore: false };
+            } finally {
+                activeReads--;
+            }
+        });
+        for (const sessionId of sessionIds) cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+        vi.useFakeTimers();
+        let batch: Promise<void> | undefined;
+        try {
+            batch = sync.prefetchPhoneRecentDirectSessions(input);
+            // 只推进原重试时钟；不点击会话、不调用第二次预取，也不替换消息单飞 owner。
+            await vi.advanceTimersByTimeAsync(previous.tuning.invalidateSyncBackoffMaxDelayMs * 2);
+            expect(failedReads).toBeGreaterThan(0);
+            expect(maxActiveReads).toBe(1);
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionIds[0]!)).toBeNull();
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionIds[1]!),
+                `healthy cache must progress despite ${failedReads} failed reads of the first conversation`,
+            ).toMatchObject({ tailCursor: 'healthy-tail', items: [{ id: 'healthy-first-message' }] });
+            await batch;
+            // 同一正文版本的下一次真实发现仍须重试失败项；不能被误记为已完成而跳过。
+            firstAvailable = true;
+            await sync.prefetchPhoneRecentDirectSessions({ ...input, requests: input.requests.map((request) => ({
+                ...request, discoveryObservation: {},
+            })) });
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionIds[0]!))
+                .toMatchObject({ tailCursor: 'recovered-tail', items: [{ id: 'recovered-first-message' }] });
+            expect(machineDirectSessionTranscriptPageMock.mock.calls.filter(([request]) => request.remoteSessionId === remoteSessionIds[1])).toHaveLength(1);
+            expect(maxActiveReads).toBe(1);
+            expect(machineDirectSessionLinkEnsureMock).not.toHaveBeenCalled();
+        } finally {
+            current = false;
+            for (const sessionId of sessionIds) internals.messagesSync.get(sessionId)?.stop();
+            await vi.advanceTimersByTimeAsync(previous.tuning.invalidateSyncBackoffMaxDelayMs);
+            await batch;
+            for (const sessionId of sessionIds) {
+                internals.messagesSync.delete(sessionId);
+                cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            }
+            internals.serverID = previous.account;
+            internals.credentials = previous.credentials;
+            internals.pauseController = previous.pause;
+            internals.syncTuning = previous.tuning;
+            internals.activeServerSessionIds = previous.activeIds;
+            internals.hasFetchedSessionsSnapshotForActiveServer = previous.hasSnapshot;
+            vi.useRealTimers();
+        }
+    });
+
+    it.each(['already-visible', 'visible-during-read'] as const)('keeps the original foreground retry when recent prefetch has a full-content consumer: %s', async (variant) => {
+        const cache = await import('./domains/state/warmCachePersistence');
+        await cache.prepareWarmCacheStorage();
+        const { sync } = await import('./sync');
+        const internals = sync as any;
+        const owner = upsertServerProfile({ serverUrl: `https://recent-foreground-${variant}.example`, name: 'Recent foreground retry' });
+        setActiveServerId(owner.id, { scope: 'device' });
+        const accountId = `recent-foreground-${variant}`;
+        const sessionId = `recent-foreground-session-${variant}`;
+        const previous = {
+            account: internals.serverID, credentials: internals.credentials, pause: internals.pauseController,
+            activeIds: internals.activeServerSessionIds, hasSnapshot: internals.hasFetchedSessionsSnapshotForActiveServer,
+        };
+        internals.serverID = accountId;
+        internals.credentials = { token: buildTokenWithSub(accountId), secret: 'synthetic' };
+        internals.pauseController = new PauseController();
+        internals.pauseController.resume();
+        resolvePreferredServerIdForSessionIdMock.mockReturnValue(owner.id);
+        const session = { ...createDirectSession(sessionId), encryptionMode: 'plain' as const, serverId: owner.id };
+        storage.getState().applySessions([session]);
+        internals.activeServerSessionIds = new Set([sessionId]);
+        internals.hasFetchedSessionsSnapshotForActiveServer = true;
+        let current = true;
+        const pendingFailure = createDeferred<{ ok: false; error: string }>();
+        machineDirectSessionTranscriptPageMock.mockReturnValueOnce(pendingFailure.promise).mockResolvedValue({
+            ok: true, historyAvailability: 'available', items: [
+                { id: 'foreground-recovered', createdAtMs: 1, raw: { role: 'user', content: { type: 'text', text: 'foreground retry succeeded' } } },
+            ], tailCursor: 'foreground-tail', nextCursor: null, hasMore: false,
+        });
+        cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+        vi.useFakeTimers();
+        let batch: Promise<void> | undefined;
+        try {
+            if (variant === 'already-visible') markSessionVisible(sessionId, owner.id);
+            batch = sync.prefetchPhoneRecentDirectSessions({ serverId: owner.id, accountId, isCurrent: () => current, requests: [{
+                link: readDirectSessionLink(session.metadata)!, transcriptVersion: 'foreground-version', sourceUpdatedAtMs: 100,
+            }] });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(1);
+            if (variant === 'visible-during-read') markSessionVisible(sessionId, owner.id);
+            // 传输抛错发生在回包准入检查之前；中途变成前台也不能被隐藏预取吞掉。
+            pendingFailure.reject(new Error('synthetic_transport_unavailable'));
+            await vi.advanceTimersByTimeAsync(0);
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId)).toBeNull();
+            // 没有第二次 LIST；真实前台消费者仍须沿原 backoff 完成第二次读取。
+            await vi.advanceTimersByTimeAsync(internals.syncTuning.invalidateSyncBackoffMaxDelayMs);
+            await batch;
+            expect(machineDirectSessionTranscriptPageMock).toHaveBeenCalledTimes(2);
+            expect(cache.loadDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId))
+                .toMatchObject({ tailCursor: 'foreground-tail', items: [{ id: 'foreground-recovered' }] });
+        } finally {
+            current = false;
+            pendingFailure.resolve({ ok: false, error: 'synthetic_transcript_unavailable' });
+            markSessionHidden(sessionId, owner.id);
+            internals.messagesSync.get(sessionId)?.stop();
+            await vi.advanceTimersByTimeAsync(internals.syncTuning.invalidateSyncBackoffMaxDelayMs);
+            await batch;
+            internals.messagesSync.delete(sessionId);
+            internals.serverID = previous.account;
+            internals.credentials = previous.credentials;
+            internals.pauseController = previous.pause;
+            internals.activeServerSessionIds = previous.activeIds;
+            internals.hasFetchedSessionsSnapshotForActiveServer = previous.hasSnapshot;
+            cache.clearDirectSessionTranscriptWarmCache(owner.id, accountId, sessionId);
+            vi.useRealTimers();
+        }
+    });
+
     it('persists the first message of an unopened empty conversation and restores it after memory eviction', async () => {
         const variant = 'empty-to-first';
         const cache = await import('./domains/state/warmCachePersistence');

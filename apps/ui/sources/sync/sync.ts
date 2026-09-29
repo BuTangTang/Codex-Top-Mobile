@@ -2439,7 +2439,7 @@ class Sync {
                         const cached = loadDirectSessionTranscriptWarmCache(input.serverId, input.accountId, sessionId, request.sourceKey);
                         record.completed = Boolean(cached && !cached.requiresRefresh && cached.tailCursor === accepted.cursor);
                     } catch {
-                        // 原 messagesSync 保持既有重试；未完成版本留给下一次真实发现重新尝试。
+                        // 隐藏预取的未完成版本留给下一次真实发现；普通消费者仍保留原消息重试。
                     }
                 })();
                 await record.promise;
@@ -5779,18 +5779,24 @@ class Sync {
               const prefetch = [...this.phoneRecentDirectPrefetch.values()].find((record) => record.sessionId === sessionId && record.promise);
               const readCurrent = prefetch && !resolveSessionLiveConsumption(sessionId).isFullContentConsumer
                   ? () => prefetch.isCurrent() && !resolveSessionLiveConsumption(sessionId).isFullContentConsumer : undefined;
-              // Target/sidechain pages can accept source rows before the main
-              // initial-load flag. They still need normal handoff/viewport admission.
-              const hasAcceptedRows = (storage.getState().sessionMessages[sessionId]?.reducerState.messageIds.size ?? 0) > 0;
-              if (!hasLoadedMessages && !hasAcceptedRows && !this.getSessionTargetWindowState(sessionId).isWindowMode) {
-                  await this.fetchDirectSessionMessages(sessionId, directSessionLink, { readCurrent });
-                  return;
-              }
+              try {
+                  // Target/sidechain pages can accept source rows before the main
+                  // initial-load flag. They still need normal handoff/viewport admission.
+                  const hasAcceptedRows = (storage.getState().sessionMessages[sessionId]?.reducerState.messageIds.size ?? 0) > 0;
+                  if (!hasLoadedMessages && !hasAcceptedRows && !this.getSessionTargetWindowState(sessionId).isWindowMode) {
+                      await this.fetchDirectSessionMessages(sessionId, directSessionLink, { readCurrent });
+                      return;
+                  }
 
-              await this.catchUpDirectSessionMessages(sessionId, directSessionLink, {
-                  surfaceCatchUp: hasExplicitTailProbe, readCurrent,
-              });
-              this.explicitSessionTailProbeIds.delete(sessionId);
+                  await this.catchUpDirectSessionMessages(sessionId, directSessionLink, {
+                      surfaceCatchUp: hasExplicitTailProbe, readCurrent,
+                  });
+                  this.explicitSessionTailProbeIds.delete(sessionId);
+              } catch (error) {
+                  // 隐藏预取失败只让出本批位置；未接受正文的版本仍由下一次 LIST 重试。
+                  // 前台、语音及已失效范围仍沿原异常重试，不把它们当作后台成功。
+                  if (readCurrent?.() !== true) throw error;
+              }
               return;
           }
 
