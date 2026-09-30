@@ -573,6 +573,7 @@ describe('pageCodexTranscript', () => {
     });
 
     expect(JSON.stringify(page.items)).not.toContain('session_media.v1');
+    expect(page.items).toEqual(expect.arrayContaining([expect.objectContaining({ raw: expect.objectContaining({ meta: { happier: { kind: 'attachments.v1', payload: { attachments: [expect.objectContaining({ path: providerImagePath, kind: 'image' })] } } } }) })]));
     await expect(stat(join(root, '.happier', 'uploads', 'generated'))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(providerImagePath, 'utf8')).resolves.toBe('provider image bytes');
   });

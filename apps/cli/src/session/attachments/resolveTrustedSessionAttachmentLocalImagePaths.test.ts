@@ -7,6 +7,7 @@ import { reloadConfiguration } from '@/configuration';
 import {
   SESSION_ATTACHMENT_FILE_EXCEEDS_UPLOAD_LIMIT,
   readTrustedSessionAttachmentLocalImages,
+  resolveTrustedSessionAttachmentLocalPaths,
 } from './resolveTrustedSessionAttachmentLocalImagePaths';
 
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -155,5 +156,21 @@ describe('readTrustedSessionAttachmentLocalImages', () => {
     expect(opened.read).toHaveBeenCalledWith(expect.any(Buffer), 0, bytes.byteLength, 0);
     vi.unstubAllEnvs();
     reloadConfiguration();
+  });
+});
+
+describe('resolveTrustedSessionAttachmentLocalPaths', () => {
+  it('verifies ordinary uploaded files without treating them as images', async () => {
+    const bytes = Buffer.from('attachment file');
+    const path = '/tmp/happier/uploads/scope/messages/message-1/note.txt';
+    const opened = mockOpenedFile(bytes);
+    const metadata = { happier: { kind: 'attachments.v1', payload: { attachments: [{ path, kind: 'file',
+      sizeBytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }] } } };
+    expect(await resolveTrustedSessionAttachmentLocalPaths({ cwd: '/workspace', metadata, maxBytes: 100 })).toEqual(new Set([path]));
+    expect(opened.close).toHaveBeenCalledOnce();
+    metadata.happier.payload.attachments.push({ ...metadata.happier.payload.attachments[0]!, sha256: '0'.repeat(64) });
+    expect(await resolveTrustedSessionAttachmentLocalPaths({ cwd: '/workspace', metadata, maxBytes: 100 })).toEqual(new Set());
+    metadata.happier.payload.attachments = metadata.happier.payload.attachments.slice(1);
+    expect(await resolveTrustedSessionAttachmentLocalPaths({ cwd: '/workspace', metadata, maxBytes: 100 })).toEqual(new Set());
   });
 });

@@ -1,12 +1,18 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readdirSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { execFile } from 'node:child_process';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+// 日志是外部文件输出边界，测试不写实际诊断目录；真实 IPC 行为仍被覆盖。
+vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn() } }));
 
-const environment = vi.hoisted(() => ({ activeServerDir: '' }));
+import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+import { writeProtectedLocalStateFileAtomic } from '@/utils/fs/protectedLocalState';
+
+const environment = vi.hoisted(() => ({ activeServerDir: '', filesUploadMaxFileBytes: 50 * 1024 * 1024 }));
 // 配置是环境边界；内部去重、文件持久化和 IPC 解析都执行真实实现。
 vi.mock('@/configuration', () => ({ configuration: environment }));
 // 只替换操作系统启动边界；owner 发现、元数据校验和快照均执行实际实现。
@@ -670,6 +676,155 @@ describe('Desktop-owned session control', () => {
                     context: { prompt: 'synthetic addition', workspaceRoots: ['/synthetic'], addedFiles: [], fileAttachments: [], imageAttachments: [] } } } });
     });
 
+    // 手机显示过的旧题必须在真正提交前重新绑定；非法或不完整答案不产生原生动作。
+    it('拒绝换轮、题目修订、桌面已答和非法答案，同时允许完整多题原选项提交', async () => {
+        const questions = [
+            { id: 'first', header: '选择', question: '选一个', isOther: false, isSecret: false, options: [{ label: '甲', description: '原选项' }] },
+            { id: 'second', header: '补充', question: '填写', isOther: false, isSecret: true, options: [] },
+        ];
+        const state = { id: input.remoteSessionId, cwd: '/synthetic', threadRuntimeStatus: { type: 'active' },
+            requests: [{ id: '7', method: 'item/tool/requestUserInput', params: { threadId: input.remoteSessionId, turnId: 'turn-1', itemId: 'tool-1', questions } }],
+            turns: [{ turnId: 'turn-1', status: 'inProgress', items: [] as unknown[] }] };
+        onFollow = (request, socket) => { if (request.params.following) respond(socket, controlSnapshotFrame(state)); };
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+            resultType: 'success', handledByClientId: 'owner-synthetic', result: { ok: true } });
+        await startRouter();
+        expect(await getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId })).not.toHaveProperty('questions');
+        expect(await getDesktopSessionControlSnapshot({ codexHome, remoteSessionId: input.remoteSessionId, includeQuestions: true }))
+            .toMatchObject({ questions: [{ kind: 'user_input', requestId: '7', canAnswer: true }] });
+        const projected = readDesktopControlSnapshot(state, input.remoteSessionId, true).questions![0]!;
+        const action = { kind: 'answer' as const, requestKind: 'user_input' as const, machineId: 'machine-1', sessionId: 'linked-1',
+            expectedTurnId: 'turn-1', operationId: 'multi-answer', requestId: '7', itemId: 'tool-1', revision: projected.revision,
+            answers: { second: ['私密合成值'], first: ['甲'] } };
+        const target = { codexHome, remoteSessionId: input.remoteSessionId, accountId: input.accountId };
+        expect(await performDesktopSessionControlAction({ ...target, action: { ...action, expectedTurnId: 'old-turn' } })).toEqual({ status: 'rejected', reason: 'turn_changed' });
+        expect(await performDesktopSessionControlAction({ ...target, action: { ...action, revision: 'old-revision' } })).toEqual({ status: 'rejected', reason: 'request_changed' });
+        const invalidAnswers: Record<string, string[]>[] = [{ first: ['甲'] }, { first: ['自填不被允许'], second: ['私密合成值'] }, { first: ['甲'], second: [' '] },
+            { first: ['甲', '乙'], second: ['私密合成值'] }, { first: ['甲'], second: ['私密合成值'], extra: ['多余'] }];
+        for (const answers of invalidAnswers) {
+            expect(await performDesktopSessionControlAction({ ...target, action: { ...action, answers } })).toEqual({ status: 'rejected', reason: 'invalid_answers' });
+        }
+        state.turns[0]!.items.push({ id: 'response', type: 'userInputResponse', requestId: '7', turnId: 'turn-1', completed: true,
+            questions, answers: { first: ['甲'], second: ['桌面值'] } });
+        expect(await performDesktopSessionControlAction({ ...target, action })).toEqual({ status: 'rejected', reason: 'request_expired' });
+        expect(requests.filter((request) => request.method === 'thread-follower-submit-user-input')).toHaveLength(0);
+        state.turns[0]!.items.pop();
+        expect(await performDesktopSessionControlAction({ ...target, action })).toEqual({ status: 'unknown', reason: 'answer_outcome_unknown' });
+        const delivered = requests.find((request) => request.method === 'thread-follower-submit-user-input')!;
+        expect(delivered.params).toMatchObject({ requestId: '7', response: { answers: { first: { answers: ['甲'] }, second: { answers: ['私密合成值'] } } } });
+        expect(Object.keys((delivered.params.response as { answers: Record<string, unknown> }).answers)).toEqual(['first', 'second']);
+        const intents = await readdir(join(environment.activeServerDir, 'desktop-session-delivery'), { recursive: true });
+        for (const path of intents.filter((path) => path.endsWith('.json')))
+            expect(await readFile(join(environment.activeServerDir, 'desktop-session-delivery', path), 'utf8')).not.toContain('私密合成值');
+    });
+
+    // 原认证 lease 在意图写入后失效：没有发 IPC 时清理自己创建的意图，恢复后原题仍可提交。
+    it('提交前目标失效不会留下未发送意图阻止同题重试', async () => {
+        const state = { id: input.remoteSessionId, cwd: '/synthetic', threadRuntimeStatus: { type: 'active' },
+            turns: [{ turnId: 'turn-1', status: 'inProgress', items: [] }], requests: [{ id: 7, method: 'item/tool/requestUserInput', params: {
+                threadId: input.remoteSessionId, turnId: 'turn-1', itemId: 'tool-1', questions: [{ id: 'q', header: '', question: '输入', options: [] }] } }] };
+        onFollow = (request, socket) => { if (request.params.following) respond(socket, controlSnapshotFrame(state)); };
+        await startRouter();
+        const ipc = await DesktopIpc.open(codexHome);
+        await ipc.discoverOwner(input.remoteSessionId);
+        await ipc.readControlSnapshot(input.remoteSessionId, () => {});
+        const question = readDesktopControlSnapshot(state, input.remoteSessionId, true).questions![0]!;
+        const action = { kind: 'answer' as const, requestKind: 'user_input' as const, machineId: 'machine', sessionId: 'linked',
+            expectedTurnId: 'turn-1', operationId: 'retry-after-revocation', requestId: 7, itemId: 'tool-1', revision: question.revision, answers: { q: ['合成答案'] } };
+        let revokeAfterIntent = true;
+        const directory = join(environment.activeServerDir, 'desktop-session-delivery');
+        const target = { codexHome, remoteSessionId: input.remoteSessionId, accountId: input.accountId, action,
+            getFollowedIpc: () => {
+                // 模拟机器认证生命周期的边界回调，内部 IPC、文件保护和题目逻辑全部执行真实实现。
+                if (revokeAfterIntent && existsSync(directory) && readdirSync(directory, { recursive: true }).filter((name) => typeof name === 'string' && name.endsWith('.intent.json')).length === 2)
+                    throw new DesktopIpcError('owner_changed');
+                return ipc;
+            } };
+        try {
+            expect(await performDesktopSessionControlAction(target)).toEqual({ status: 'rejected', reason: 'owner_changed' });
+            expect(requests.filter((request) => request.method === 'thread-follower-submit-user-input')).toHaveLength(0);
+            revokeAfterIntent = false;
+            expect(await performDesktopSessionControlAction(target)).toEqual({ status: 'unknown', reason: 'answer_outcome_unknown' });
+            expect(requests.filter((request) => request.method === 'thread-follower-submit-user-input')).toHaveLength(1);
+            expect(await performDesktopSessionControlAction(target)).toEqual({ status: 'unknown', reason: 'answer_outcome_unknown' });
+            expect(requests.filter((request) => request.method === 'thread-follower-submit-user-input')).toHaveLength(1);
+        } finally { ipc.close(); }
+    });
+
+    // 原计划动作只认同类型 ID 与原题修订；ACK 后必须核对同轮答案项，且不会重投未知动作。
+    it.each(['recorded', 'ack-only'] as const)('计划回答保持数字请求身份，并将 %s 与执行接受分开', async (outcome) => {
+        const question = { id: 'q-1', header: '方案', question: '选择方案', isOther: true, isSecret: false,
+            options: [{ label: '甲', description: '说明' }] };
+        const state = { id: input.remoteSessionId, cwd: '/synthetic', threadRuntimeStatus: { type: 'active' },
+            turns: [{ turnId: 'turn-1', status: 'inProgress', items: [] }], requests: [{ id: 7, method: 'item/tool/requestUserInput',
+                params: { threadId: input.remoteSessionId, turnId: 'turn-1', itemId: 'tool-1', questions: [question] } }] };
+        onFollow = (request, socket) => { if (request.params.following) respond(socket, controlSnapshotFrame(state)); };
+        onAction = (request, socket) => {
+            if (outcome === 'recorded') respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+                sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: input.remoteSessionId,
+                    change: { type: 'snapshot', revision: 2, conversationState: { ...state, requests: [], turns: [{ ...state.turns[0], items: [
+                        { type: 'userInputResponse', id: 'user-input-response-7', requestId: 7, turnId: 'turn-1', completed: true,
+                            questions: [question], answers: { 'q-1': ['自填内容'] } },
+                    ] }] } } } });
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'success', handledByClientId: 'owner-synthetic', result: { ok: true } });
+        };
+        await startRouter();
+        const projected = readDesktopControlSnapshot(state, input.remoteSessionId, true).questions![0]!;
+        const action = { kind: 'answer' as const, requestKind: 'user_input' as const, machineId: 'machine-1', sessionId: 'linked-1',
+            expectedTurnId: 'turn-1', operationId: 'answer-1', requestId: 7, itemId: 'tool-1', revision: projected.revision,
+            answers: { 'q-1': ['自填内容'] } };
+        const target = { codexHome, remoteSessionId: input.remoteSessionId, accountId: input.accountId };
+        expect(await performDesktopSessionControlAction({ ...target, action: { ...action, requestId: '7' } }))
+            .toEqual({ status: 'rejected', reason: 'request_expired' });
+        expect(await performDesktopSessionControlAction({ ...target, action })).toEqual(outcome === 'recorded'
+            ? { status: 'recorded', turnId: 'turn-1' } : { status: 'unknown', reason: 'answer_outcome_unknown' });
+        expect(await performDesktopSessionControlAction({ ...target, action })).toEqual({ status: 'unknown', reason: 'answer_outcome_unknown' });
+        const deliveries = requests.filter((request) => request.method === 'thread-follower-submit-user-input');
+        expect(deliveries).toHaveLength(1);
+        expect(deliveries[0]).toMatchObject({ version: 1, targetClientId: 'owner-synthetic', params: {
+            conversationId: input.remoteSessionId, requestId: 7, response: { answers: { 'q-1': { answers: ['自填内容'] } } },
+        } });
+    });
+
+    // Q04 的多题封套沿同一 steer 原轮次投递，只有匹配本次操作和目标轮的 accepted 项可确认。
+    it.each(['accepted', 'pending', 'wrong-turn', 'wrong-operation', 'wrong-answer', 'partial'] as const)('异步多题一次投递并核对 %s 回读', async (outcome) => {
+        const card = { type: 'agentMessage', id: 'card-1', questions: [{ title: '选择', options: ['甲', '乙'] }, { title: '补充', options: [] }] };
+        const state = { id: input.remoteSessionId, cwd: '/synthetic', threadRuntimeStatus: { type: 'active' },
+            turns: [{ turnId: 'turn-1', status: 'inProgress', items: [card] as unknown[] }], requests: [] };
+        if (outcome === 'partial') state.turns[0]!.items.push({ type: 'steeringUserMessage', id: 'desktop-first', targetTurnId: 'turn-1', status: 'accepted',
+            input: [{ type: 'text', text: `<send_user_message_question_reply>${JSON.stringify([{ questionItemId: JSON.stringify(['request_user_input_async', 'card-1', 0]), question: '选择', answer: '乙' }])}</send_user_message_question_reply>` }] });
+        onFollow = (request, socket) => { if (request.params.following) respond(socket, controlSnapshotFrame(state)); };
+        onAction = (request, socket) => {
+            respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
+                params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'snapshot', revision: 2,
+                    conversationState: { ...state, turns: [{ ...state.turns[0], items: [card, { type: 'steeringUserMessage',
+                        id: outcome === 'wrong-operation' ? 'other-operation' : request.params.clientUserMessageId,
+                        clientUserMessageId: outcome === 'wrong-operation' ? 'other-operation' : request.params.clientUserMessageId,
+                        status: outcome === 'pending' ? 'pending' : 'accepted', targetTurnId: outcome === 'wrong-turn' ? 'turn-2' : 'turn-1',
+                        input: outcome === 'wrong-answer' ? [{ type: 'text', text: '普通文字不能代答' }] : request.params.input }] }] } } } });
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'success', handledByClientId: 'owner-synthetic', result: { result: { turnId: 'turn-1' } } });
+        };
+        await startRouter();
+        const projected = readDesktopControlSnapshot(state, input.remoteSessionId, true).questions![0]!;
+        const answers = Object.fromEntries(projected.questions.map((question, index) => [question.id, [index ? '补充文字' : '乙']]));
+        const action = { kind: 'answer' as const, requestKind: 'async_questions' as const, machineId: 'machine-1', sessionId: 'linked-1',
+            expectedTurnId: 'turn-1', operationId: 'async-answer-1', requestId: null, itemId: 'card-1', revision: projected.revision, answers };
+        const target = { codexHome, remoteSessionId: input.remoteSessionId, accountId: input.accountId, action };
+        expect(await performDesktopSessionControlAction(target)).toEqual((outcome === 'accepted' || outcome === 'partial')
+            ? { status: 'accepted', turnId: 'turn-1' } : { status: 'unknown', reason: 'answer_outcome_unknown' });
+        expect(await performDesktopSessionControlAction(target)).toEqual({ status: 'unknown', reason: 'answer_outcome_unknown' });
+        const deliveries = requests.filter((request) => request.method === 'thread-follower-steer-turn');
+        expect(deliveries).toHaveLength(1);
+        const text = `<send_user_message_question_reply>\n${JSON.stringify(projected.questions.filter((question) => !projected.answers?.[question.id]).map((question) => ({
+            questionItemId: question.id, question: question.question, answer: answers[question.id]![0],
+        })))}\n</send_user_message_question_reply>`;
+        expect(deliveries[0]).toMatchObject({ params: { input: [{ type: 'text', text, text_elements: [] }], attachments: [],
+            restoreMessage: { context: { turnTrigger: 'send_user_message_async_question' } } } });
+        expect(requests.some((request) => request.method === 'thread-follower-start-turn')).toBe(false);
+    });
+
     it('binds approvals to exact current requests and never treats an ACK as decision success', async () => {
         const state = { id: input.remoteSessionId, threadRuntimeStatus: { type: 'active' }, turns: [{ turnId: 'turn-1', status: 'inProgress', items: [] }],
             requests: [{ id: 7, method: 'item/commandExecution/requestApproval', params: {
@@ -702,6 +857,36 @@ describe('Desktop-owned session control', () => {
         state.turns[0]!.turnId = 'turn-2';
         expect(await performDesktopSessionControlAction({ ...target, action: { ...action, requestId: '8', operationId: 'op-3' } }))
             .toMatchObject({ status: 'rejected', reason: 'turn_changed' });
+    });
+
+    // 四种实际决定穿过真实 IPC 与持久化去重；只在外部桌面边界使用合成请求。
+    it.each([
+        ['command', 'allow_once', 'accept'], ['command', 'deny', 'decline'],
+        ['file', 'allow_once', 'accept'], ['file', 'deny', 'decline'],
+    ] as const)('dispatches %s %s once to the original owner', async (kind, decision, nativeDecision) => {
+        const state = { id: input.remoteSessionId, threadRuntimeStatus: { type: 'active' },
+            turns: [{ turnId: 'turn-1', status: 'inProgress', items: kind === 'file'
+                ? [{ id: 'file-1', type: 'fileChange', changes: [{ path: '/synthetic/sample.txt', kind: { type: 'update' }, diff: '-old\n+new' }] }] : [] }],
+            requests: [{ id: 91, method: kind === 'file' ? 'item/fileChange/requestApproval' : 'item/commandExecution/requestApproval',
+                params: { threadId: input.remoteSessionId, turnId: 'turn-1', itemId: 'file-1', cwd: '/synthetic', command: 'echo synthetic' } }] };
+        onFollow = (request, socket) => {
+            if (request.params.following) respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11,
+                sourceClientId: 'owner-synthetic', params: { hostId: 'local', conversationId: input.remoteSessionId,
+                    change: { type: 'snapshot', revision: 1, conversationState: state } } });
+        };
+        await startRouter();
+        const approval = readDesktopControlSnapshot(state, input.remoteSessionId).requests[0]!;
+        expect(approval.canDecide).toBe(true);
+        const action = { kind: 'approval' as const, machineId: 'machine-1', sessionId: 'linked-1', operationId: 'decision-1',
+            expectedTurnId: 'turn-1', requestId: '91', revision: approval.revision, decision };
+        const target = { codexHome, remoteSessionId: input.remoteSessionId, accountId: input.accountId, action };
+        expect(await performDesktopSessionControlAction(target)).toMatchObject({ status: 'unknown' });
+        // 同按钮再次触发不能把决定重复发送给桌面。
+        expect(await performDesktopSessionControlAction(target)).toMatchObject({ status: 'unknown' });
+        const sent = requests.filter((request) => request.method === `thread-follower-${kind}-approval-decision`);
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).toMatchObject({ targetClientId: 'owner-synthetic', version: 1,
+            params: { conversationId: input.remoteSessionId, requestId: 91, decision: nativeDecision } });
     });
 
     it('discovers the current owner without opening or resuming a thread', async () => {
@@ -883,6 +1068,33 @@ describe('Desktop-owned session control', () => {
             await vi.waitFor(() => expect(observations.at(-1)).toMatchObject({ state: 'completed', turnId: 'turn-1' }));
         }
         ipc.close();
+    });
+
+    it.each(['active', 'inactive'] as const)('delivers verified image/file inputs once on native %s, retaining the local echo identity', async (mode) => {
+        const dir = join(root, 'happier/uploads/scope/messages', input.localId);
+        await mkdir(dir, { recursive: true });
+        const attachments = ([['image', 'image.png', 'png!'], ['file', 'note.txt', 'note']] as const).map(([kind, name, bytes]) => ({
+            name, path: join(dir, name), kind, sizeBytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
+        }));
+        await writeFile(attachments[0]!.path, 'png!'); await writeFile(attachments[1]!.path, 'note');
+        onAction = (request, socket) => respond(socket, mode === 'active'
+            ? { type: 'response', requestId: request.requestId, method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic', result: { result: { turnId: 'native-current-turn' } } }
+            : { type: 'response', requestId: request.requestId, resultType: 'error', error: `Cannot steer conversation ${input.remoteSessionId} because its active turn already ended` });
+        await startRouter();
+        const message = { codexHome, ...input, text: '', textSendProtocol: 'native-auto-v1' as const, attachments, attachmentWorkingDirectory: root };
+        expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'accepted' });
+        const native = requests.find((request) => request.method === 'thread-follower-steer-turn')!;
+        expect(native.params).toMatchObject({ clientUserMessageId: input.localId, attachments: expect.arrayContaining([
+            { label: 'note.txt', path: attachments[1]!.path, fsPath: attachments[1]!.path },
+            { label: 'image.png', path: attachments[0]!.path, fsPath: attachments[0]!.path, isImageAttachment: true },
+        ]), input: [expect.objectContaining({ type: 'text', text: expect.stringContaining('Files mentioned by the user') }), { type: 'localImage', path: attachments[0]!.path }],
+            restoreMessage: { id: input.localId, cwd: root, text: '', context: { prompt: '', imageAttachments: [expect.objectContaining({ localPath: attachments[0]!.path })] } } });
+        if (mode === 'inactive') expect(requests.find((request) => request.method === 'thread-follower-start-turn')?.params).toMatchObject({ turnStart: {
+            request: { clientUserMessageId: input.localId, input: native.params.input }, context: { localTurnMetadata: { fileAttachmentCount: 1 }, attachments: native.params.attachments },
+        } });
+        expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'accepted', deduplicated: true });
+        expect(await sendDesktopSessionUserMessage({ ...message, attachments: attachments.slice(0, 1) })).toMatchObject({ status: 'rejected', reason: 'local_id_conflict' });
+        expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(1);
     });
 
     it('delivers opted-in ordinary text to the native active turn without waiting for history', async () => {
@@ -1240,6 +1452,77 @@ describe('Desktop-owned session control', () => {
             action: { kind: 'steer', machineId: 'machine-1', sessionId: 'linked-1', operationId: 'steer-blocked', expectedTurnId: 'busy-turn', text: 'synthetic' } }))
             .toMatchObject({ status: 'rejected' });
         expect(requests.some((request) => request.method === 'thread-follower-steer-turn')).toBe(false);
+    });
+
+    // 未派发的失败只释放本次意图，用户手动重试仍复用相同身份和正文。
+    it.each(['legacy', 'native'] as const)('allows the same localId after an undispatched %s rejection recovers', async (mode) => {
+        const discover = onDiscover;
+        onDiscover = missingOwner;
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
+            result: { result: { turnId: 'native-current-turn' } } });
+        await startRouter();
+        const message = { codexHome, ...input, ...(mode === 'native' ? { textSendProtocol: 'native-auto-v1' as const } : {}) };
+        expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'rejected', reason: 'owner_unavailable', deduplicated: false });
+        expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+        const files = await readdir(join(environment.activeServerDir, 'desktop-session-delivery'), { recursive: true });
+        expect(files.filter((name) => name.endsWith('.json'))).toEqual([]);
+        onDiscover = discover;
+        const recovered = await sendDesktopSessionUserMessage(message);
+        expect(recovered).toMatchObject({ status: 'accepted', localId: input.localId, deduplicated: false });
+        expect(recovered).not.toHaveProperty('undispatched');
+        expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...recovered, deduplicated: true });
+        expect(requests.filter((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method)))
+            .toHaveLength(1);
+    });
+
+    // request 调用后的明确拒绝与未知都保留原意图；不能仅看 status 为 rejected 就释放。
+    it.each(['unknown', 'rejected'] as const)('keeps the intent and never reissues native text after a dispatched %s outcome', async (status) => {
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            resultType: 'error', error: status === 'unknown' ? 'request-timeout' : 'no-client-found' });
+        await startRouter();
+        const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+        const first = await sendDesktopSessionUserMessage(message);
+        expect(first).toMatchObject({ status });
+        const store = join(environment.activeServerDir, 'desktop-session-delivery');
+        const intent = (await readdir(store, { recursive: true })).find((name) => name.endsWith('.intent.json'))!;
+        const originalIntent = await readFile(join(store, intent), 'utf8');
+        expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...first, deduplicated: true });
+        expect(await readFile(join(store, intent), 'utf8')).toBe(originalIntent);
+        expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(1);
+    });
+
+    // EEXIST 不得清理正在发送的意图；失败清理也必须重新匹配本次 requestId。
+    it('preserves another request intent and does not overwrite its receipt after an undispatched rejection', async () => {
+        let discovery: { request: Request; socket: Socket } | undefined;
+        onDiscover = (request, socket) => { discovery = { request, socket }; };
+        await startRouter();
+        const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+        const pending = sendDesktopSessionUserMessage(message);
+        try {
+            await vi.waitFor(() => expect(discovery).toBeDefined());
+            const store = join(environment.activeServerDir, 'desktop-session-delivery');
+            const intent = (await readdir(store, { recursive: true })).find((name) => name.endsWith('.intent.json'))!;
+            const path = join(store, intent);
+            const originalIntent = await readFile(path, 'utf8');
+            expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'unknown', deduplicated: true });
+            expect(await readFile(path, 'utf8')).toBe(originalIntent);
+            const replacement = { ...JSON.parse(originalIntent), requestId: 'another-request' };
+            await writeProtectedLocalStateFileAtomic(path, JSON.stringify(replacement));
+            const receiptPath = path.replace('.intent.json', '.receipt.json');
+            const receipt = { ...input, status: 'unknown', reason: 'delivery_outcome_unknown', requestId: replacement.requestId };
+            await writeProtectedLocalStateFileAtomic(receiptPath, JSON.stringify(receipt));
+            missingOwner(discovery!.request, discovery!.socket);
+            expect(await pending).toMatchObject({ status: 'rejected', reason: 'owner_unavailable' });
+            expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(replacement);
+            expect(JSON.parse(await readFile(receiptPath, 'utf8'))).toEqual(receipt);
+            expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'unknown', requestId: 'another-request', deduplicated: true });
+            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+            expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+        } finally {
+            for (const socket of sockets) socket.destroy();
+            await pending;
+        }
     });
 
     // 写成功后断线仍是未知；重复请求不能造成第二次执行。

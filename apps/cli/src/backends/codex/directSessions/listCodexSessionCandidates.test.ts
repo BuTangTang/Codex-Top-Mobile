@@ -39,6 +39,38 @@ describe('listCodexSessionCandidates', () => {
     vi.unmock('node:fs/promises');
   });
 
+  /** 最近窗口满50条后重新发现新会话，移出最旧项但不删除其原记录。 */
+  it('refreshes a full recent window when a new conversation arrives', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-recent-window-'));
+    const home = join(root, 'codex');
+    const dir = join(home, 'sessions');
+    const params = { source: { kind: 'codexHome' as const, home: 'user' as const }, activeServerDir: join(root, 'server'), env: createDirectSessionsEnv(home), limit: 50, searchMode: 'fast' as const };
+    const paths: string[] = [];
+    try {
+      await mkdir(dir, { recursive: true });
+      for (let i = 0; i < 51; i++) {
+        const id = `recent-${String(i).padStart(2, '0')}`;
+        const file = join(dir, `rollout-2026-01-01T00-00-00-${id}.jsonl`);
+        paths.push(file);
+        await writeFile(file, sessionMetaLine({ id, source: 'cli', cwd: '/synthetic' }));
+        const time = new Date(Date.UTC(2026, 0, 1) + i * 1000);
+        await utimes(file, time, time);
+        if (i === 49) {
+          const before = await listCodexSessionCandidates(params);
+          expect(before.candidates).toHaveLength(50);
+          expect(before.candidates[0]?.remoteSessionId).toBe('recent-49');
+          expect(before.candidates[49]?.remoteSessionId).toBe('recent-00');
+        }
+      }
+      const after = await listCodexSessionCandidates(params);
+      expect(after.candidates).toHaveLength(50);
+      expect(after.candidates[0]?.remoteSessionId).toBe('recent-50');
+      expect(after.candidates[49]?.remoteSessionId).toBe('recent-01');
+      expect(await readFile(paths[0], 'utf8')).toContain('recent-00');
+      expect(after.nextCursor).not.toBeNull();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it('versions all rollout files without treating timestamps as message versions', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-transcript-version-'));
     const home = join(root, 'codex');
@@ -75,9 +107,10 @@ describe('listCodexSessionCandidates', () => {
     const params = { source: { kind: 'codexHome' as const, home: 'user' as const }, activeServerDir: join(root, 'server'), env: createDirectSessionsEnv(home), limit: 50, searchMode: 'fast' as const };
     try {
       await mkdir(join(home, 'sessions'), { recursive: true });
-      for (const [body, state] of [
+      for (const [body, state, kind] of [
         [start, 'running'],
-        [start + event({ type: 'request_user_input', call_id: 'question' }), 'needs_input'],
+        [start + event({ type: 'request_user_input', call_id: 'question' }), 'needs_input', 'user_action_request'],
+        [start + event({ type: 'exec_approval_request', call_id: 'approval' }), 'needs_input', 'permission_request'],
         [start + event({ type: 'task_complete', turn_id: 'turn-1' }), 'completed'],
         [event({ type: 'task_started', turn_id: 'turn-1' }, now - 901_000), 'unknown'],
         [start + event({ type: 'task_complete', turn_id: 'turn-1' }) + '{"type":', 'unknown'],
@@ -86,6 +119,11 @@ describe('listCodexSessionCandidates', () => {
         const result = await listCodexSessionCandidates(params);
         expect(result.candidates).toHaveLength(1);
         expect(result.candidates[0]?.details?.codexLifecycle).toMatchObject({ v: 1, state, eventAtMs: state === 'unknown' ? null : now - 1000, checkedAtMs: expect.any(Number) });
+        // 未关联、未打开详情也保留同一次读取的真实轮次及待办种类，不靠逐行控制查询补齐。
+        expect(result.candidates[0]?.details?.codexObservation).toMatchObject(state === 'unknown'
+          ? { v: 1, state: 'unknown' }
+          : { v: 1, source: 'rollout', turnId: 'turn-1', state,
+            ...(kind ? { requests: [{ requestId: kind === 'user_action_request' ? 'question' : 'approval', kind }] } : {}) });
       }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -131,6 +169,7 @@ describe('listCodexSessionCandidates', () => {
       expect(result.candidates[0]?.title).toBe('Selected home');
       expect(result.candidates[0]?.details?.source).toMatchObject({ connectedServiceProfileId: 'profile-b' });
       expect(result.candidates[0]?.details?.codexLifecycle).toMatchObject({ state: 'unknown', eventAtMs: null });
+      expect(result.candidates[0]?.details?.codexObservation).toMatchObject({ state: 'unknown' });
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -150,6 +189,7 @@ describe('listCodexSessionCandidates', () => {
       const merged = await listCodexSessionCandidates({ ...params, env: createCodexAppServerProcessEnv(binary, { CODEX_HOME: homes[0] }) });
       expect(merged.candidates).toHaveLength(1);
       expect(merged.candidates[0]?.details?.codexLifecycle).toMatchObject({ state: 'unknown', eventAtMs: null });
+      expect(merged.candidates[0]?.details?.codexObservation).toMatchObject({ state: 'unknown' });
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

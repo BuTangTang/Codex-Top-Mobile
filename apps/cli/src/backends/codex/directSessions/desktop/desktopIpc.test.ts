@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// 日志是外部文件输出边界，测试不写实际诊断目录；真实 IPC 行为仍被覆盖。
+vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn() } }));
+
 const transport = vi.hoisted(() => ({ socket: null as SyntheticSocket | null }));
 // 仅替换操作系统的 socket/文件属性边界，真实分帧、请求关联和失败传播保持不变。
 vi.mock('node:net', () => ({ connect: () => {
@@ -177,6 +180,22 @@ describe('Desktop IPC frame buffering', () => {
         })), request.timeoutMs ?? 10_000);
         socket.emit('data', frame(snapshot(10)));
         await vi.advanceTimersByTimeAsync(9440);
+        clearTimeout(routerDeadline);
+        acknowledgeHistory(10);
+        await expect(outcome).resolves.toMatchObject({ state: { id: 'thread-synthetic' } });
+    });
+
+    it('allows the background history budget past thirty seconds without changing the control default', async () => {
+        await discover();
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const outcome = ipc.readControlSnapshot('thread-synthetic', undefined, undefined, 305_000)
+            .then((state) => ({ state }), (error: Error) => ({ error: error.message }));
+        const request = socket.lastRequest!;
+        const routerDeadline = setTimeout(() => socket.emit('data', frame({
+            type: 'response', requestId: request.requestId, resultType: 'error', error: 'request-timeout',
+        })), request.timeoutMs!);
+        socket.emit('data', frame(snapshot(10)));
+        await vi.advanceTimersByTimeAsync(31_000);
         clearTimeout(routerDeadline);
         acknowledgeHistory(10);
         await expect(outcome).resolves.toMatchObject({ state: { id: 'thread-synthetic' } });

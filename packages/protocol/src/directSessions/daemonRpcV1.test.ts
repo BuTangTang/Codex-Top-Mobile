@@ -64,6 +64,18 @@ describe('DirectSessionSendRequestSchema', () => {
     meta: {},
   };
 
+  it('allows an empty direct caption only with complete uploaded attachment metadata', () => {
+    const attachment = { name: 'note.txt', path: '/tmp/happier/uploads/scope/messages/mobile-message-a/note.txt',
+      kind: 'file', sizeBytes: 3, sha256: 'a'.repeat(64) };
+    const meta = { desktopTextSendProtocol: 'native-auto-v1', happier: { kind: 'attachments.v1', payload: { attachments: [attachment] } } };
+    expect(directSessionsRpc.DirectSessionSendRequestSchema.safeParse({ ...request, text: '', meta }).success).toBe(true);
+    for (const attachments of [[], [{ ...attachment, path: 'content://phone/file' }], [{ ...attachment, sha256: '' }], [{ ...attachment, sizeBytes: -1 }], [{ ...attachment, availability: 'unavailable', reason: 'failed' }]]) {
+      expect(directSessionsRpc.DirectSessionSendRequestSchema.safeParse({ ...request, text: '', meta: { ...meta,
+        happier: { kind: 'attachments.v1', payload: { attachments } } } }).success).toBe(false);
+    }
+    expect(directSessionsRpc.DirectSessionSendRequestSchema.safeParse({ ...request, text: '' }).success).toBe(false);
+  });
+
   // 已关联会话确定电脑端目标；客户端不能夹带本机路径或替换原生会话身份。
   it('accepts a linked-session message and rejects client-selected native targets', () => {
     expect(directSessionsRpc.DirectSessionSendRequestSchema.parse(request)).toEqual(request);
@@ -260,4 +272,13 @@ it('negotiates background reading without inventing a capability on legacy respo
   expect(directSessionsRpc.DirectSessionLinkEnsureRequestSchema.parse(request).openExisting).toBeUndefined();
   expect(directSessionsRpc.DirectSessionsCandidatesListResponseSchema.parse({ ok: true, candidates: [] })).not.toHaveProperty('capabilities');
   expect(directSessionsRpc.DirectSessionsCandidatesListResponseSchema.parse({ ok: true, candidates: [], capabilities: { deleteCandidate: false, linkWithoutOpening: true } })).toHaveProperty('capabilities.linkWithoutOpening', true);
+});
+
+describe('Direct attachment availability', () => {
+  it('requires a real path unless a received attachment is explicitly unavailable', () => {
+    const base = { name: '生成图片', kind: 'image' };
+    expect(directSessionsRpc.DirectSessionAttachmentV1Schema.safeParse(base).success).toBe(false);
+    expect(directSessionsRpc.DirectSessionAttachmentV1Schema.safeParse({ ...base, availability: 'unavailable', reason: 'unsupported_reference' }).success).toBe(true);
+    expect(directSessionsRpc.DirectSessionAttachmentV1Schema.safeParse({ ...base, availability: 'unavailable' }).success).toBe(false);
+  });
 });

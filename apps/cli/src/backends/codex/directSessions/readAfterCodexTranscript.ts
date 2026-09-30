@@ -1,6 +1,7 @@
-import type { DirectSessionsSource } from '@happier-dev/protocol';
+import type { DirectSessionObservationV1, DirectSessionsSource } from '@happier-dev/protocol';
 import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
+import { readCodexLifecycleObservation } from './readCodexCandidateLifecycle';
 import { resolveCodexHomesForDirectSessionsSource } from './resolveCodexHomesForDirectSessionsSource';
 import { decodeCodexDirectForwardCursor, encodeCodexDirectForwardCursor } from './codexDirectForwardCursor';
 import { collectCodexSessionRolloutFiles, type CodexRolloutFile } from './collectCodexSessionRolloutFiles';
@@ -31,6 +32,7 @@ function selectBestCodexHomeWithFiles(
   return bestHome ? { home: bestHome, files: bestFiles } : null;
 }
 
+/** 沿既有来源读取增量；观察订阅可同时读取同一来源的当前生命周期，不改变正文游标。 */
 export async function readAfterCodexTranscript(params: Readonly<{
   source: DirectSessionsSource;
   activeServerDir: string;
@@ -39,7 +41,10 @@ export async function readAfterCodexTranscript(params: Readonly<{
   cursor: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<DirectSessionTranscriptReadAfter> {
+  projection?: 'conversation_text';
+  scanMaxBytes?: number;
+  includeLifecycleObservation?: boolean;
+}>): Promise<DirectSessionTranscriptReadAfter & { lifecycleObservation?: DirectSessionObservationV1 }> {
   const env = params.env ?? process.env;
   const homes = await resolveCodexHomesForDirectSessionsSource({
     source: params.source,
@@ -102,9 +107,16 @@ export async function readAfterCodexTranscript(params: Readonly<{
       cursor: params.cursor,
       maxBytes: params.maxBytes,
       maxItems: params.maxItems,
+      projection: params.projection,
+      scanMaxBytes: params.scanMaxBytes,
       initialRolloutFiles: bestHome.files,
     });
-    return { ...page, historyAvailability: 'available' };
+    // 文件选择沿原 transcript 来源；多个文件仍需原前向连续性证明，不能凭修改时间判当前轮。
+    const lifecycleObservation: DirectSessionObservationV1 | undefined = !params.includeLifecycleObservation ? undefined
+      : bestHome.files.length === 1
+        ? await readCodexLifecycleObservation({ filePath: bestHome.files[0]!.filePath, remoteSessionId: params.remoteSessionId })
+        : { v: 1, state: 'unknown', reason: 'not_observed' };
+    return { ...page, historyAvailability: 'available', ...(lifecycleObservation ? { lifecycleObservation } : {}) };
   } catch {
     // 保留输入进度；本次失败不授权任何客户端推进已接受的历史边界。
     return { items: [], nextCursor: params.cursor === 'tail' ? null : params.cursor, truncated: false, historyAvailability: 'unavailable' };

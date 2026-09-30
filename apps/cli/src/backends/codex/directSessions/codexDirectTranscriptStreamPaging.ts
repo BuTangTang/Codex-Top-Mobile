@@ -1,11 +1,13 @@
 import { stat } from 'node:fs/promises';
 
-import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import { projectDirectTranscriptItems, type DirectSessionAttachmentV1, type DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
 import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
 import { readJsonlFileBackwardPage } from '@/api/directSessions/filePaging/jsonlBackwardPager';
 import { readJsonlFileForward } from '@/api/directSessions/filePaging/jsonlForwardReader';
+import { materializeDirectGeneratedMedia, resolveDirectGeneratedMediaMaxBytes } from '@/transfers/targets/materializeDirectGeneratedMedia';
 
+import { extractCodexGeneratedMedia } from '../media/extractCodexGeneratedMedia';
 import { readCodexSessionMetaFromRollout } from '../localControl/rolloutDiscovery';
 import type { CodexRolloutHistoryMode } from '../localControl/rolloutMapper';
 import { createCodexRolloutSemanticTracker } from '../rollout/createCodexRolloutSemanticTracker';
@@ -34,11 +36,36 @@ import {
   type CodexDirectTranscriptRolloutStream,
   type CodexProjectedTranscriptRecord,
   type CodexStreamProgress,
+  isCodexCompactedLinePrefix,
 } from './codexDirectTranscriptProjection';
 
 async function statFileSize(filePath: string): Promise<number> {
   // 读取失败必须由上层报告不可用，不能伪装成长度为零的正常历史。
   return stat(filePath).then((s) => Math.max(0, Math.trunc(s.size)));
+}
+
+/** 图片编码沿既有文件大小上限读取，额外保留原先的 8 MiB JSON 记录预算。 */
+function generatedMediaLineBudget(): number {
+  return Math.ceil(resolveDirectGeneratedMediaMaxBytes() / 3) * 4 + 8 * 1024 * 1024;
+}
+
+/** 只在异步读取边界物化图片，纯投影及子任务发现扫描不写文件。 */
+async function materializeGeneratedAttachments(lineValue: unknown, sourceId: string): Promise<readonly DirectSessionAttachmentV1[] | undefined> {
+  if (!lineValue || typeof lineValue !== 'object' || Array.isArray(lineValue)) return undefined;
+  const line = lineValue as Record<string, unknown>;
+  if (line.type !== 'response_item' || !line.payload || typeof line.payload !== 'object' || Array.isArray(line.payload)) return undefined;
+  const payload = line.payload as Record<string, unknown>;
+  if (payload.type !== 'image_generation_call') return undefined;
+  if ([payload.saved_path, payload.savedPath].some((value) => typeof value === 'string' && value.trim())) return undefined;
+  const encoded = [payload.result, payload.image, payload.image_b64].find((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+  if (!encoded) return undefined;
+  // 现有提取器会解码辨识类型，因此必须在调用它之前应用同一传输大小边界。
+  if (encoded.trim().length > Math.ceil(resolveDirectGeneratedMediaMaxBytes() / 3) * 4) {
+    return [{ name: '生成图片', kind: 'image', availability: 'unavailable', reason: 'file_too_large' }];
+  }
+  const media = extractCodexGeneratedMedia(payload).find((source) => source.kind === 'base64');
+  if (!media || media.kind !== 'base64') return undefined;
+  return [await materializeDirectGeneratedMedia({ sourceId, eventId: media.origin.generationId ?? media.dedupeKey ?? '', data: media.data })];
 }
 
 /** 读取决定 direct 用户消息权威来源的原生历史格式。 */
@@ -187,6 +214,7 @@ async function collectReadAfterRecords(params: Readonly<{
   historicalUnknownStreamIds: ReadonlySet<string>;
   maxBytes: number;
   maxItems: number;
+  projection?: 'conversation_text';
 }>): Promise<Readonly<{
   streams: readonly CodexDirectTranscriptRolloutStream[];
   records: readonly CodexProjectedTranscriptRecord[];
@@ -233,6 +261,9 @@ async function collectReadAfterRecords(params: Readonly<{
       offsetBytes,
       maxBytes: Math.max(params.maxBytes, 1),
       maxItems: Math.max(params.maxItems * 2, 1),
+      maxOversizeLineBytes: generatedMediaLineBudget(),
+      // 文字投影明确排除压缩事件；正文与含子任务发现的工具结果仍完整解析。
+      skipLine: params.projection === 'conversation_text' ? isCodexCompactedLinePrefix : undefined,
     });
     pageLimited = pageLimited || page.hitPageLimit;
     if (page.truncated || !(await codexRolloutFileBoundaryMatches(stream.filePath, expectedBoundary))) {
@@ -254,6 +285,9 @@ async function collectReadAfterRecords(params: Readonly<{
         lineStartOffsetBytes: line.startOffsetBytes,
         lineNextOffsetBytes: Math.min(fileSize, line.endOffsetBytes + 1),
         lineValue: line.value,
+        // 手机文字投影排除子任务，避免为不展示的图片解码和写入缓存。
+        generatedAttachments: params.projection === 'conversation_text' && stream.sidechainId ? []
+          : await materializeGeneratedAttachments(line.value, JSON.stringify([params.codexHome, stream.threadId])),
         historyMode,
         semanticTracker,
       });
@@ -314,12 +348,15 @@ async function collectReadAfterRecords(params: Readonly<{
   };
 }
 
+/** 读取各流新增记录，图片先进入产品缓存后再以轻量描述投影。 */
 export async function readAfterCodexRolloutStreams(params: Readonly<{
   codexHome: string;
   remoteSessionId: string;
   cursor: string;
   maxBytes: number;
   maxItems: number;
+  projection?: 'conversation_text';
+  scanMaxBytes?: number;
   initialRolloutFiles?: readonly CodexRolloutFile[];
 }>): Promise<DirectSessionTranscriptReadAfter> {
   const streams = await collectCodexDirectTranscriptRolloutStreams({
@@ -382,8 +419,9 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
     expectedBoundaryByStreamId,
     readableStreamIds,
     historicalUnknownStreamIds,
-    maxBytes: params.maxBytes,
+    maxBytes: params.scanMaxBytes ?? params.maxBytes,
     maxItems: params.maxItems,
+    projection: params.projection,
   });
 
   const maxBytes = Math.max(1, Math.trunc(params.maxBytes));
@@ -398,12 +436,13 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
 
   for (let index = 0; index < collected.records.length; index += 1) {
     const record = collected.records[index]!;
-    const itemBytes = measureDirectTranscriptItemBytes(record.item);
-    if (items.length > 0 && (items.length >= maxItems || usedBytes + itemBytes > maxBytes)) {
+    const visible = projectDirectTranscriptItems([record.item], params.projection).length > 0;
+    const itemBytes = visible ? measureDirectTranscriptItemBytes(record.item) : 0;
+    if (visible && items.length > 0 && (items.length >= maxItems || usedBytes + itemBytes > maxBytes)) {
       truncated = true;
       break;
     }
-    items.push(record.item);
+    if (visible) items.push(record.item);
     usedBytes += itemBytes;
     progressByStreamId.set(record.streamId, record.subIndex + 1 >= record.lineRecordCount
       ? {
@@ -441,6 +480,8 @@ export async function pageCodexRolloutStreams(params: Readonly<{
   cursor?: string;
   maxBytes: number;
   maxItems: number;
+  projection?: 'conversation_text';
+  scanMaxBytes?: number;
   initialRolloutFiles?: readonly CodexRolloutFile[];
 }>): Promise<Readonly<{
   items: DirectTranscriptRawMessageV1[];
@@ -525,20 +566,36 @@ export async function pageCodexRolloutStreams(params: Readonly<{
   const initialEndByStreamId = new Map<string, number>();
   const pageNextEndByStreamId = new Map<string, number>();
   const hasLoadedCandidateByStreamId = new Map<string, boolean>();
+  const tailEntries: CodexDurableStreamForwardProgress[] = [];
 
   for (let streamIndex = 0; streamIndex < streams.length; streamIndex += 1) {
     const stream = streams[streamIndex]!;
     const fileSize = await statFileSize(stream.filePath);
+    // 历史页和追尾必须共享读取前边界，不能在分页结束时采用已越过新消息的 EOF。
+    const initialTail = await captureCodexRolloutFileBoundary(stream.filePath, fileSize);
+    if (!initialTail) throw new Error('Transcript source changed before paging');
     const endOffsetBytes = Math.min(fileSize, Math.max(0, Math.trunc(endByStreamId.get(stream.fileRelPath) ?? fileSize)));
     initialEndByStreamId.set(stream.fileRelPath, endOffsetBytes);
-    if (endOffsetBytes <= 0) continue;
+    if (endOffsetBytes <= 0) {
+      tailEntries.push({ fileRelPath: stream.fileRelPath, nextOffsetBytes: fileSize, subIndex: 0, ...initialTail.boundary });
+      continue;
+    }
     const page = await readJsonlFileBackwardPage({
       strictRead: true,
       filePath: stream.filePath,
       endOffsetBytes,
-      maxBytes,
+      maxBytes: params.scanMaxBytes ?? maxBytes,
       maxItems: maxItems * 2,
+      maxOversizeLineBytes: generatedMediaLineBudget(),
     });
+    const tailOffsetBytes = endOffsetBytes === fileSize ? page.tailOffsetBytes : fileSize;
+    if (tailOffsetBytes === null) throw new Error('Transcript terminal line boundary is unavailable');
+    const tailBoundary = tailOffsetBytes === fileSize ? initialTail
+      : await captureCodexRolloutFileBoundary(stream.filePath, tailOffsetBytes);
+    if (!tailBoundary || !(await codexRolloutFileBoundaryMatches(stream.filePath, initialTail.boundary))) {
+      throw new Error('Transcript source changed while paging');
+    }
+    tailEntries.push({ fileRelPath: stream.fileRelPath, nextOffsetBytes: tailOffsetBytes, subIndex: 0, ...tailBoundary.boundary });
     reachedStartByStreamId.set(stream.fileRelPath, page.reachedStart);
     pageNextEndByStreamId.set(stream.fileRelPath, page.nextEndOffsetBytes);
     const semanticTracker = createCodexRolloutSemanticTracker();
@@ -549,13 +606,17 @@ export async function pageCodexRolloutStreams(params: Readonly<{
         lineStartOffsetBytes: line.startOffsetBytes,
         lineNextOffsetBytes: Math.min(fileSize, line.endOffsetBytes + 1),
         lineValue: line.value,
+        // 手机文字投影排除子任务，避免为不展示的图片解码和写入缓存。
+        generatedAttachments: params.projection === 'conversation_text' && stream.sidechainId ? []
+          : await materializeGeneratedAttachments(line.value, JSON.stringify([params.codexHome, stream.threadId])),
         historyMode,
         semanticTracker,
       });
-      if (projected.records.length > 0) {
+      const visibleRecords = projected.records.filter((record) => projectDirectTranscriptItems([record.item], params.projection).length > 0);
+      if (visibleRecords.length > 0) {
         hasLoadedCandidateByStreamId.set(stream.fileRelPath, true);
       }
-      candidateRecords.push(...projected.records);
+      candidateRecords.push(...visibleRecords);
       for (const childThreadId of projected.discoveredChildThreadIds) {
         if (discoveredThreadIds.has(childThreadId)) continue;
         discoveredThreadIds.add(childThreadId);
@@ -585,7 +646,8 @@ export async function pageCodexRolloutStreams(params: Readonly<{
     || left.mtimeMs - right.mtimeMs
     || left.fileRelPath.localeCompare(right.fileRelPath),
   );
-  const tailCursor = await buildCodexStreamVectorTailCursor(streams);
+  const tailCursor = encodeCodexDirectForwardCursor({ v: 7, kind: 'codexForwardStreamVector',
+    streams: tailEntries.sort((left, right) => left.fileRelPath.localeCompare(right.fileRelPath)) });
 
   candidateRecords.sort(compareCodexProjectedRecordsOldestFirst);
   const selectedReversed: CodexProjectedTranscriptRecord[] = [];

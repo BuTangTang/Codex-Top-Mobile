@@ -1,3 +1,4 @@
+import { DirectSessionUploadedAttachmentsEnvelopeV1Schema } from '@happier-dev/protocol';
 import { resolveServerHttpBaseUrl } from '@/session/transport/http/serverHttpBaseUrl';
 import { configuration } from '@/configuration';
 import { buildCodexSpawnRuntimeAffinityCompatFields } from '@happier-dev/agents';
@@ -49,10 +50,10 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     return readDesktopProjects(homes[0]!.codexHome);
   },
   /** 沿规范来源找到唯一 Codex home；聚合来源不能作为控制目标。 */
-  readControl: async ({ source, remoteSessionId, getFollowLease }) => {
+  readControl: async ({ source, remoteSessionId, getFollowLease, includeQuestions }) => {
     const homes = await resolveCodexHomeEntriesForDirectSessionsSource({ source, activeServerDir: configuration.activeServerDir, env: process.env });
     if (homes.length !== 1) throw new DirectSessionsProviderUnavailableError('source_unavailable');
-    return getDesktopSessionControlSnapshot({ codexHome: homes[0]!.codexHome, remoteSessionId, getFollowedIpc: followedIpc(getFollowLease) });
+    return getDesktopSessionControlSnapshot({ codexHome: homes[0]!.codexHome, remoteSessionId, includeQuestions, getFollowedIpc: followedIpc(getFollowLease) });
   },
   /** 保留账号和原生任务身份，不通过 spawn 或 resume 降级执行。 */
   control: async ({ source, remoteSessionId, accountId, action, getFollowLease }) => {
@@ -91,22 +92,28 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     return control.available ? { canSend: true, textSendProtocol: 'native-auto-v1' }
       : { canSend: false, unavailableReason: control.reason };
   },
-  /** 纯文本向现有 Desktop owner 投递；不支持的输入必须拒绝，不能静默丢弃。 */
+  /** 文本与已上传附件共用原 Desktop owner；不支持的输入明确拒绝。 */
   send: async ({ source, remoteSessionId, text, localId, meta, accountId, getFollowLease }) => {
     // 复用原 meta 透传，只接受明确 opt-in；旧客户端缺字段仍保持 start 契约。
     const nativeAutoText = meta.desktopTextSendProtocol === 'native-auto-v1';
+    const envelope = meta.happier === undefined ? null : DirectSessionUploadedAttachmentsEnvelopeV1Schema.safeParse(meta.happier);
+    if (envelope && (!envelope.success || !nativeAutoText)) return { status: 'rejected', reason: 'unsupported_input' };
     if (Object.keys(meta).some((key) => !DESKTOP_TEXT_TRACKING_META_KEYS.has(key)
-      && !(key === 'desktopTextSendProtocol' && nativeAutoText))) {
+      && !(key === 'desktopTextSendProtocol' && nativeAutoText) && !(key === 'happier' && envelope?.success))) {
       return { status: 'rejected', reason: 'unsupported_input' };
     }
     const homes = await resolveCodexHomeEntriesForDirectSessionsSource({
       source, activeServerDir: configuration.activeServerDir, env: process.env,
     });
     if (homes.length !== 1) return { status: 'rejected', reason: 'source_unavailable' };
+    const attachments = envelope?.success ? envelope.data.payload.attachments : undefined;
+    const cwd = attachments ? await getCodexDirectSessionWorkingDirectory({ source, activeServerDir: configuration.activeServerDir, remoteSessionId }) : null;
+    if (attachments && !cwd) return { status: 'rejected', reason: 'missing_working_directory' };
     return sendDesktopSessionUserMessage({ codexHome: homes[0]!.codexHome, remoteSessionId, text, localId, accountId,
+      ...(attachments ? { attachments, attachmentWorkingDirectory: cwd! } : {}),
       ...(nativeAutoText ? { textSendProtocol: 'native-auto-v1' as const } : {}), getFollowedIpc: followedIpc(getFollowLease) });
   },
-  pageTranscript: async ({ source, remoteSessionId, direction, cursor, maxBytes, maxItems }) => {
+  pageTranscript: async ({ source, remoteSessionId, direction, cursor, maxBytes, maxItems, projection, scanMaxBytes }) => {
     const res = await pageCodexTranscript({
       source,
       activeServerDir: configuration.activeServerDir,
@@ -115,6 +122,8 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
       cursor,
       maxBytes,
       maxItems,
+      projection,
+      scanMaxBytes,
     });
     return {
       items: res.items,
@@ -126,7 +135,7 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
       ...(res.truncationReason ? { truncationReason: res.truncationReason } : {}),
     };
   },
-  readAfterTranscript: async ({ source, remoteSessionId, cursor, maxBytes, maxItems }) => {
+  readAfterTranscript: async ({ source, remoteSessionId, cursor, maxBytes, maxItems, projection, scanMaxBytes }) => {
     const res = await readAfterCodexTranscript({
       source,
       activeServerDir: configuration.activeServerDir,
@@ -134,6 +143,8 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
       cursor,
       maxBytes,
       maxItems,
+      projection,
+      scanMaxBytes,
     });
     return { ...res, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
     },

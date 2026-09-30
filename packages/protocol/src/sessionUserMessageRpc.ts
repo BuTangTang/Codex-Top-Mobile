@@ -34,7 +34,8 @@ function hasUploadedAttachmentProvenance(value: unknown): boolean {
   return asRecord(value)?.kind === SESSION_ATTACHMENT_UPLOAD_STRUCTURED_INPUT_PROVENANCE_KIND;
 }
 
-function normalizeSessionAttachmentUploadPath(value: unknown): string | null {
+/** 统一校验既有上传目录引用，供图片和普通文件共用。 */
+export function normalizeSessionAttachmentUploadPath(value: unknown): string | null {
   const path = readString(value);
   if (!path || path.includes('\0')) return null;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return null;

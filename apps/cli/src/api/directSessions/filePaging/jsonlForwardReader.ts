@@ -6,7 +6,7 @@ import type { JsonlParsedLine } from './jsonlBackwardPager';
 const DEFAULT_CHUNK_BYTES = 64 * 1024;
 const DEFAULT_MAX_OVERSIZE_LINE_BYTES = 8 * 1024 * 1024;
 
-/** 按完整 JSONL 行前进；超长行只扫描新块，保留既有预算与偏移语义。 */
+/** 按完整 JSONL 行前进；已确认无投影的行只扫描新块，其余保留解析预算与偏移语义。 */
 export async function readJsonlFileForward(params: Readonly<{
   filePath: string;
   offsetBytes: number;
@@ -16,6 +16,8 @@ export async function readJsonlFileForward(params: Readonly<{
   maxOversizeLineBytes?: number;
   /** 严格调用方必须区分读取失败与正常空页；默认兼容其他 provider。 */
   strictRead?: boolean;
+  /** 仅由提供方确认首块前缀不含所需记录；流式越过整行并以 null 保留已消费边界。 */
+  skipLine?: (prefix: Buffer) => boolean;
 }>): Promise<Readonly<{
   items: readonly JsonlParsedLine[];
   nextOffsetBytes: number;
@@ -54,6 +56,15 @@ export async function readJsonlFileForward(params: Readonly<{
   let carryBytes = 0;
   let carryStartOffset = offsetBytes;
   let nextReadOffset = offsetBytes;
+  let skippingLine = false;
+  /** 首段跨块时只拼接一个块大小的前缀；一旦确认忽略，释放此前保留的所有分片。 */
+  const considerSkipping = (segment: Buffer): void => {
+    if (skippingLine || !params.skipLine || carryBytes >= chunkBytes) return;
+    const prefix = carryBytes > 0
+      ? Buffer.concat([...carryParts, segment.subarray(0, chunkBytes - carryBytes)], Math.min(chunkBytes, carryBytes + segment.length))
+      : segment;
+    if (params.skipLine(prefix)) { skippingLine = true; carryParts = []; }
+  };
 
   try {
     while (nextReadOffset < fileSize && items.length < maxItems) {
@@ -62,11 +73,12 @@ export async function readJsonlFileForward(params: Readonly<{
         remainingBytes <= 0 &&
         items.length === 0 &&
         carryBytes > 0 &&
-        carryBytes < maxOversizeLineBytes;
+        (skippingLine || carryBytes < maxOversizeLineBytes);
       if (remainingBytes <= 0 && !canContinueOversizeFirstLine) break;
 
       const oversizeRemainingBytes = maxOversizeLineBytes - carryBytes;
-      const readBudget = canContinueOversizeFirstLine ? oversizeRemainingBytes : remainingBytes;
+      // 忽略行不缓存正文，允许用固定块读完当前行；总扫描仍止于本次 stat 的文件尾。
+      const readBudget = canContinueOversizeFirstLine ? (skippingLine ? chunkBytes : oversizeRemainingBytes) : remainingBytes;
       const readSize = Math.min(chunkBytes, fileSize - nextReadOffset, readBudget);
       if (readSize <= 0) break;
 
@@ -83,13 +95,20 @@ export async function readJsonlFileForward(params: Readonly<{
       for (let i = 0; i < chunk.length && items.length < maxItems; i++) {
         if (chunk[i] !== 0x0a) continue;
         const segment = chunk.subarray(lineStartIndex, i);
-        const line = carryBytes > 0
-          ? Buffer.concat([...carryParts, segment], carryBytes + segment.length)
-          : segment;
-        const parsed = tryParseJsonlLine(line);
-        if (parsed !== null) {
-          items.push({ value: parsed, startOffsetBytes: carryStartOffset, endOffsetBytes: chunkStartOffset + i });
+        considerSkipping(segment);
+        if (skippingLine) {
+          // 只在换行已落盘时提交忽略行；null 不会投影正文，但让来源游标跨过完整记录。
+          items.push({ value: null, startOffsetBytes: carryStartOffset, endOffsetBytes: chunkStartOffset + i });
+        } else {
+          const line = carryBytes > 0
+            ? Buffer.concat([...carryParts, segment], carryBytes + segment.length)
+            : segment;
+          const parsed = tryParseJsonlLine(line);
+          if (parsed !== null) {
+            items.push({ value: parsed, startOffsetBytes: carryStartOffset, endOffsetBytes: chunkStartOffset + i });
+          }
         }
+        skippingLine = false;
         carryParts = [];
         carryBytes = 0;
         lineStartIndex = i + 1;
@@ -98,14 +117,15 @@ export async function readJsonlFileForward(params: Readonly<{
       // 达到条数上限后的剩余数据仍属于未消费区，下一页从完整行边界重新读取。
       if (lineStartIndex < chunk.length) {
         const remainder = chunk.subarray(lineStartIndex);
-        carryParts.push(remainder);
+        considerSkipping(remainder);
+        if (!skippingLine) carryParts.push(remainder);
         carryBytes += remainder.length;
       }
     }
 
     // Best-effort: parse a trailing line without newline if it appears valid.
     // This helps for completed transcripts that don't end in \n.
-    if (items.length < maxItems && nextReadOffset >= fileSize && carryBytes > 0) {
+    if (!skippingLine && items.length < maxItems && nextReadOffset >= fileSize && carryBytes > 0) {
       const trailingLine = carryParts.length === 1 ? carryParts[0]! : Buffer.concat(carryParts, carryBytes);
       const parsed = tryParseJsonlLine(trailingLine);
       if (parsed !== null) {

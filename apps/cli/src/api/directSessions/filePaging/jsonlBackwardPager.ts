@@ -11,6 +11,7 @@ export type JsonlParsedLine = Readonly<{
   endOffsetBytes: number;
 }>;
 
+/** 逆向逐块定位完整行，只有到达行边界时才拼接，保留原字节游标语义。 */
 export async function readJsonlFileBackwardPage(params: Readonly<{
   filePath: string;
   endOffsetBytes: number | null;
@@ -61,7 +62,9 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
   const collectedNewestFirst: JsonlParsedLine[] = [];
   let bytesReadTotal = 0;
   let end = initialEnd;
-  let carry = Buffer.alloc(0);
+  // 分片按从新到旧的顺序保留；已扫描分片不再参与下一块的扫描或复制。
+  let carryParts: Buffer[] = [];
+  let carryBytes = 0;
   let tailOffsetBytes: number | null = null;
   let oldestConsumedStartOffsetBytes: number | null = null;
 
@@ -72,11 +75,11 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
       const canContinueOversizeFirstLine =
         remainingBytes <= 0 &&
         collectedNewestFirst.length === 0 &&
-        carry.length > 0 &&
-        carry.length < maxOversizeLineBytes;
+        carryBytes > 0 &&
+        carryBytes < maxOversizeLineBytes;
       if (remainingBytes <= 0 && !canContinueOversizeFirstLine) break;
 
-      const oversizeRemainingBytes = maxOversizeLineBytes - carry.length;
+      const oversizeRemainingBytes = maxOversizeLineBytes - carryBytes;
       const readBudget = canContinueOversizeFirstLine ? oversizeRemainingBytes : remainingBytes;
       const readSize = Math.min(chunkBytes, end, readBudget);
       if (readSize <= 0) break;
@@ -88,22 +91,18 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
       const chunk = readRes.bytesRead > 0 ? buffer.subarray(0, readRes.bytesRead) : Buffer.alloc(0);
       bytesReadTotal += chunk.length;
 
-      const combined = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      const combinedStartOffset = start;
-      const carryStartOffset = end;
-
-      let segmentEndIndex = combined.length;
-      for (let i = combined.length - 1; i >= 0 && collectedNewestFirst.length < maxItems; i--) {
-        if (combined[i] !== 0x0a) continue; // '\n'
+      let segmentEndIndex = chunk.length;
+      for (let i = chunk.length - 1; i >= 0 && collectedNewestFirst.length < maxItems; i--) {
+        if (chunk[i] !== 0x0a) continue; // '\n'
         const segmentStartIndex = i + 1;
-        const segmentEndIndexExclusive = segmentEndIndex;
-        const segment = combined.slice(segmentStartIndex, segmentEndIndexExclusive);
+        const endOffsetAbs = start + segmentEndIndex + carryBytes;
+        const head = chunk.subarray(segmentStartIndex, segmentEndIndex);
+        const segment = carryBytes > 0 ? Buffer.concat([head, ...carryParts.reverse()], head.length + carryBytes) : head;
+        carryParts = [];
+        carryBytes = 0;
         segmentEndIndex = i;
 
-        const startOffsetAbs =
-          segmentStartIndex < chunk.length
-            ? combinedStartOffset + segmentStartIndex
-            : carryStartOffset + (segmentStartIndex - chunk.length);
+        const startOffsetAbs = start + segmentStartIndex;
         const parsed = tryParseJsonlLine(segment);
         oldestConsumedStartOffsetBytes = oldestConsumedStartOffsetBytes === null
           ? startOffsetAbs
@@ -113,24 +112,24 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
         }
         if (parsed === null) continue;
 
-        const endOffsetAbs =
-          segmentEndIndexExclusive < chunk.length
-            ? combinedStartOffset + segmentEndIndexExclusive
-            : carryStartOffset + (segmentEndIndexExclusive - chunk.length);
-
         collectedNewestFirst.push({ value: parsed, startOffsetBytes: startOffsetAbs, endOffsetBytes: endOffsetAbs });
       }
 
-      carry = combined.slice(0, segmentEndIndex);
+      if (segmentEndIndex > 0) {
+        carryParts.push(chunk.subarray(0, segmentEndIndex));
+        carryBytes += segmentEndIndex;
+      }
       end = start;
 
-      if (end === 0 && carry.length > 0 && collectedNewestFirst.length < maxItems) {
-        const parsed = tryParseJsonlLine(carry);
+      if (end === 0 && carryBytes > 0 && collectedNewestFirst.length < maxItems) {
+        const line = carryParts.length === 1 ? carryParts[0]! : Buffer.concat(carryParts.reverse(), carryBytes);
+        const parsed = tryParseJsonlLine(line);
         oldestConsumedStartOffsetBytes = 0;
         if (tailOffsetBytes === null) tailOffsetBytes = parsed !== null ? initialEnd : 0;
         if (parsed !== null) {
-          collectedNewestFirst.push({ value: parsed, startOffsetBytes: 0, endOffsetBytes: carry.length });
-          carry = Buffer.alloc(0);
+          collectedNewestFirst.push({ value: parsed, startOffsetBytes: 0, endOffsetBytes: carryBytes });
+          carryParts = [];
+          carryBytes = 0;
         }
       }
     }

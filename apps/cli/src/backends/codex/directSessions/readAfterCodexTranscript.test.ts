@@ -11,6 +11,7 @@ import {
 } from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
 import { decodeCodexDirectForwardCursor } from './codexDirectForwardCursor';
 import { readAfterCodexTranscript } from './readAfterCodexTranscript';
+import { isCodexCompactedLinePrefix } from './codexDirectTranscriptProjection';
 
 function sessionMetaLine(payload: Record<string, unknown>): string {
   return `${JSON.stringify({ type: 'session_meta', payload })}\n`;
@@ -21,6 +22,49 @@ function responseItemLine(params: { timestamp: string; payload: Record<string, u
 }
 
 describe('readAfterCodexTranscript', () => {
+  it('only ignores native compacted envelope prefixes, never nested or quoted message content', () => {
+    expect(isCodexCompactedLinePrefix(Buffer.from('{"type":"compacted","payload":'))).toBe(true);
+    expect(isCodexCompactedLinePrefix(Buffer.from('{"timestamp":"2026-01-02T00:00:00Z","type":"compacted","payload":'))).toBe(true);
+    expect(isCodexCompactedLinePrefix(Buffer.from('{"timestamp":"2026-01-02T00:00:00Z","ordinal":123,"type":"compacted","payload":'))).toBe(true);
+    for (const value of [
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: '{"type":"compacted",' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'text', text: 'x'.repeat(9 * 1024 * 1024) }] } },
+      { payload: { type: 'compacted' }, type: 'response_item' },
+      { type: 'response_item', payload: { type: 'function_call_output', output: '{"agent_id":"child"}' } },
+    ]) expect(isCodexCompactedLinePrefix(Buffer.from(JSON.stringify(value)))).toBe(false);
+  });
+
+  it('continues text follow after a compacted row larger than the parser cap without losing adjacent text', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-large-compacted-'));
+    const codexHome = join(root, 'codex-home');
+    await mkdir(join(codexHome, 'sessions'), { recursive: true });
+    const sessionId = 'large-compacted-text';
+    const filePath = join(codexHome, 'sessions', `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`);
+    await writeFile(filePath, sessionMetaLine({ id: sessionId }));
+    const params = { source: { kind: 'codexHome', home: 'user' } as const, env: { CODEX_HOME: codexHome },
+      activeServerDir: root, remoteSessionId: sessionId, maxBytes: 64 * 1024, maxItems: 2,
+      projection: 'conversation_text' as const };
+    const initial = await readAfterCodexTranscript({ ...params, cursor: 'tail' });
+    const compacted = `${JSON.stringify({ timestamp: '2026-01-02T00:00:01.000Z', ordinal: 123, type: 'compacted',
+      payload: { message: 'synthetic', replacement_history: ['x'.repeat(9 * 1024 * 1024)] } })}\n`;
+    const text = (role: string, value: string) => responseItemLine({ timestamp: '2026-01-02T00:00:02.000Z',
+      payload: { type: 'message', role, content: [{ type: 'text', text: value }] } });
+    await appendFile(filePath, compacted + text('user', 'user after compacted') + text('assistant', 'assistant after compacted'));
+    let cursor = initial.nextCursor!;
+    const items = [];
+    for (let page = 0; page < 4; page += 1) {
+      const next = await readAfterCodexTranscript({ ...params, cursor });
+      items.push(...next.items);
+      if (!next.truncated) break;
+      expect(next.truncationReason).toBe('page_limit');
+      expect(next.nextCursor).not.toBe(cursor);
+      cursor = next.nextCursor!;
+    }
+    expect(items).toHaveLength(2);
+    expect(items.map(item => item.raw.role)).toEqual(['user', 'agent']);
+    expect(JSON.stringify(items)).toContain('assistant after compacted');
+  });
+
   it('retains an accepted cursor when neither a rollout nor preview exists', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-history-unavailable-'));
     const codexHome = join(root, 'codex-home');

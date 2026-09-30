@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { realpath, unlink } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 
 import { configuration } from '@/configuration';
@@ -7,19 +7,22 @@ import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
 import {
     createProtectedLocalStateFileExclusive,
     readProtectedLocalStateFile,
+    removeProtectedLocalStateFile,
     writeProtectedLocalStateFileAtomic,
 } from '@/utils/fs/protectedLocalState';
 
 import { DesktopIpc, DesktopIpcError, assertDesktopPlatform, desktopResponseFailure, ipcRecord, ipcString } from './desktopIpc';
-import type { DirectSessionControlActionRequest, DirectSessionControlResult, DesktopControlSnapshotV1 } from '@happier-dev/protocol';
+import type { DirectSessionControlActionRequest, DirectSessionControlResult, DesktopControlSnapshotV1, DesktopQuestionRequestV1, DirectSessionUploadedAttachmentV1 } from '@happier-dev/protocol';
 import { readDesktopControlSnapshot, readNativeApprovalRequestId } from './desktopControlSnapshot';
+import { prepareDesktopAttachmentMessage } from './desktopAttachments';
+import { readDesktopAsyncQuestionReplies, readDesktopCurrentTurn } from './desktopQuestions';
 
 /** 从固定原 owner 读取当前轮次和可审查的待决定详情。 */
-export async function getDesktopSessionControlSnapshot(params: DesktopSessionTarget): Promise<DesktopControlSnapshotV1> {
+export async function getDesktopSessionControlSnapshot(params: DesktopSessionTarget & { includeQuestions?: boolean }): Promise<DesktopControlSnapshotV1> {
     assertDesktopPlatform();
     const control = await acquireDesktopControl(params);
     try {
-        return readDesktopControlSnapshot(control.read(), params.remoteSessionId);
+        return readDesktopControlSnapshot(control.read(), params.remoteSessionId, params.includeQuestions);
     } finally { control.close(); }
 }
 
@@ -77,6 +80,131 @@ async function steerDesktopSession(params: DesktopSessionTarget & { accountId: s
     } finally { control?.close(); }
 }
 
+type AnswerAction = Extract<DirectSessionControlActionRequest, { kind: 'answer' }>;
+
+/** 每题单选或原题允许的自填必须完整提交；保留原题顺序和原选项文字。 */
+function questionAnswers(request: DesktopQuestionRequestV1, action: AnswerAction): Record<string, string[]> {
+    if (Object.keys(action.answers).length !== request.questions.length) throw new DesktopIpcError('invalid_answers');
+    const entries = request.questions.map((question): [string, string[]] => {
+        const answer = Object.hasOwn(action.answers, question.id) ? action.answers[question.id] : undefined;
+        if (!answer || answer.length !== 1 || !ipcString(answer[0])
+            || question.options.length > 0 && !question.isOther && !question.options.some((option) => option.label === answer[0]))
+            throw new DesktopIpcError('invalid_answers');
+        // 桌面可能已逐题回答；同卡剩余题仍可提交，但不能改写已接受的答案。
+        if (request.answers?.[question.id] && JSON.stringify(request.answers[question.id]) !== JSON.stringify(answer))
+            throw new DesktopIpcError('request_changed');
+        return [question.id, [...answer]];
+    });
+    return Object.fromEntries(entries);
+}
+
+/** 提交前从连续原 owner 投影中重新校验轮次、请求类型、题目修订与未答状态。 */
+function pendingQuestion(raw: unknown, conversationId: string, action: AnswerAction): DesktopQuestionRequestV1 {
+    const snapshot = readDesktopControlSnapshot(raw, conversationId, true);
+    if (snapshot.turnId !== action.expectedTurnId) throw new DesktopIpcError('turn_changed');
+    if (snapshot.state !== 'running') throw new DesktopIpcError('turn_not_running');
+    const question = snapshot.questions?.find((request) => request.kind === action.requestKind && request.requestId === action.requestId && request.itemId === action.itemId);
+    if (!question || question.status !== 'pending') throw new DesktopIpcError('request_expired');
+    if (question.revision !== action.revision) throw new DesktopIpcError('request_changed');
+    if (!question.canAnswer) throw new DesktopIpcError('unsupported_request');
+    return question;
+}
+
+/** 回答只沿原生提问动作提交一次；ACK、桌面记录与异步接受分别表达，未知结果不重投。 */
+async function answerDesktopQuestions(params: DesktopSessionTarget & { accountId: string; action: AnswerAction }): Promise<DirectSessionControlResult> {
+    let control: Awaited<ReturnType<typeof acquireDesktopControl>> | undefined;
+    let dispatched = false;
+    const createdIntents: string[] = [];
+    try {
+        const home = await resolveHome(params.codexHome), action = params.action;
+        const identity = [home, params.remoteSessionId, action.expectedTurnId, action.requestKind, action.requestId, action.itemId, action.revision];
+        const intentPath = join(receiptDirectory(params.accountId), `${digest(JSON.stringify(['answer', ...identity]))}.intent.json`);
+        // 同一题即使换 operationId 也不能绕过未明结果；仅保存摘要，不落盘用户答案。
+        try {
+            await readProtectedLocalStateFile(intentPath);
+            return { status: 'unknown', reason: 'answer_outcome_unknown' };
+        } catch (error) { if (ipcRecord(error)?.code !== 'ENOENT') return { status: 'unknown', reason: 'answer_outcome_unknown' }; }
+        control = await acquireDesktopControl({ ...params, codexHome: home }, true);
+        let request = pendingQuestion(control.read(), params.remoteSessionId, action);
+        const answers = questionAnswers(request, action);
+        const payloadHash = digest(JSON.stringify([...identity, answers]));
+        const operationPath = join(receiptDirectory(params.accountId), `${digest(JSON.stringify(['answer-operation', home, params.remoteSessionId, action.operationId]))}.intent.json`);
+        try {
+            await createProtectedLocalStateFileExclusive(operationPath, JSON.stringify({ version: 1, payloadHash }));
+            createdIntents.push(operationPath);
+        }
+        catch (error) {
+            if (ipcRecord(error)?.code !== 'EEXIST') throw error;
+            const previous = ipcRecord(JSON.parse(await readProtectedLocalStateFile(operationPath)));
+            return previous?.payloadHash !== payloadHash ? { status: 'rejected', reason: 'local_id_conflict' }
+                : { status: 'unknown', reason: 'answer_outcome_unknown' };
+        }
+        try {
+            await createProtectedLocalStateFileExclusive(intentPath, JSON.stringify({ version: 1, payloadHash }));
+            createdIntents.push(intentPath);
+        }
+        catch (error) {
+            if (ipcRecord(error)?.code !== 'EEXIST') throw error;
+            return { status: 'unknown', reason: 'answer_outcome_unknown' };
+        }
+        // 落盘 await 期间桌面可抢先回答或换轮；发送前再次读取原连续订阅。
+        request = pendingQuestion(control.read(), params.remoteSessionId, action);
+        questionAnswers(request, action);
+        const owner = control.ownerClientId;
+        let method: string, nativeParams: Record<string, unknown>;
+        if (request.kind === 'user_input') {
+            method = 'thread-follower-submit-user-input';
+            nativeParams = { conversationId: params.remoteSessionId, requestId: request.requestId,
+                response: { answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, { answers: values }])) } };
+        } else {
+            method = 'thread-follower-steer-turn';
+            const replies = request.questions.filter((question) => !request.answers?.[question.id]).map((question) => ({
+                questionItemId: question.id, question: question.question, answer: answers[question.id]![0]!,
+            }));
+            const text = `<send_user_message_question_reply>\n${JSON.stringify(replies)}\n</send_user_message_question_reply>`;
+            const cwd = ipcRecord(control.read())?.cwd;
+            nativeParams = { conversationId: params.remoteSessionId, clientUserMessageId: action.operationId,
+                input: [{ type: 'text', text, text_elements: [] }], attachments: [],
+                restoreMessage: { id: action.operationId, text, createdAt: Date.now(), ...(ipcString(cwd) ? { cwd } : {}),
+                    context: { prompt: text, addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [],
+                        ...(ipcString(cwd) ? { workspaceRoots: [cwd] } : {}), turnTrigger: 'send_user_message_async_question' } } };
+        }
+        dispatched = true;
+        const response = await control.ipc.request(method, 1, nativeParams, randomUUID(), owner);
+        if (response.resultType !== 'success' || response.method !== method || response.handledByClientId !== owner)
+            return { status: 'unknown', reason: 'answer_outcome_unknown' };
+        const raw = control.read();
+        const snapshot = readDesktopControlSnapshot(raw, params.remoteSessionId, true);
+        if (snapshot.turnId !== action.expectedTurnId) return { status: 'unknown', reason: 'answer_outcome_unknown' };
+        if (request.kind === 'user_input') {
+            // 已答计划题删除原请求后不保留原 itemId，因此按同类型 requestId 与 turnId 核对。
+            const recorded = snapshot.questions?.find((item) => item.kind === 'user_input' && item.requestId === request.requestId && item.turnId === request.turnId);
+            if (recorded?.status === 'answered'
+                && JSON.stringify(recorded.questions.map(({ isOther, isSecret, ...question }) => question)) === JSON.stringify(request.questions.map(({ isOther, isSecret, ...question }) => question))
+                && request.questions.every((question) => JSON.stringify(recorded.answers?.[question.id]) === JSON.stringify(answers[question.id])))
+                return { status: 'recorded', turnId: request.turnId };
+        } else {
+            const result = ipcRecord(ipcRecord(response.result)?.result);
+            const turn = readDesktopCurrentTurn(ipcRecord(raw)!);
+            const item = Array.isArray(turn?.items) ? turn.items.map(ipcRecord).find((item) => item?.type === 'steeringUserMessage'
+                && (item.id === action.operationId || item.clientUserMessageId === action.operationId) && item.targetTurnId === action.expectedTurnId && item.status === 'accepted') : undefined;
+            const replies = readDesktopAsyncQuestionReplies(item);
+            if (result?.turnId === action.expectedTurnId && request.questions.every((question) => request.answers?.[question.id]
+                || replies.some((reply) => reply.questionItemId === question.id && reply.question === question.question && reply.answer === answers[question.id]![0])))
+                return { status: 'accepted', turnId: action.expectedTurnId };
+        }
+        return { status: 'unknown', reason: 'answer_outcome_unknown' };
+    } catch (error) {
+        return { status: dispatched ? 'unknown' : 'rejected', reason: dispatched ? 'answer_outcome_unknown' : reasonFor(error) };
+    } finally {
+        control?.close();
+        // 只有本调用成功独占创建且未外发的意图可移除；EEXIST 与已发未知结果都必须保留。
+        if (!dispatched) for (const path of createdIntents) {
+            try { await unlink(path); } catch { /* 删除失败保留原意图，下一次继续如实报告未知。 */ }
+        }
+    }
+}
+
 /** 精确审批只提交一次；ACK 或请求随后消失均不能证明本次决定胜出。 */
 export async function performDesktopSessionControlAction(params: DesktopSessionTarget & { accountId: string; action: DirectSessionControlActionRequest }): Promise<DirectSessionControlResult> {
     let ipc: DesktopIpc | undefined;
@@ -86,6 +214,7 @@ export async function performDesktopSessionControlAction(params: DesktopSessionT
         const home = await resolveHome(params.codexHome);
         const action = params.action;
         if (action.kind === 'steer') return steerDesktopSession({ ...params, action });
+        if (action.kind === 'answer') return answerDesktopQuestions({ ...params, action });
         // 请求级锁不包含 operationId 或决定，晚到的相反决定也不能绕过重投保护。
         const key = digest(JSON.stringify(['approval', home, params.remoteSessionId, action.expectedTurnId, action.requestId]));
         const intentPath = join(receiptDirectory(params.accountId), `${key}.intent.json`);
@@ -160,6 +289,8 @@ export type DesktopSessionMessage = DesktopSessionTarget & Readonly<{
     text: string; localId: string; accountId: string;
     /** 已协商的普通文本协议；缺省保持已发布客户端的 start 语义。 */
     textSendProtocol?: 'native-auto-v1';
+    attachments?: readonly DirectSessionUploadedAttachmentV1[];
+    attachmentWorkingDirectory?: string;
 }>;
 
 /** 只规范本机路径，不创建或修改 Codex 的任何文件。 */
@@ -190,16 +321,22 @@ function borrowDesktopControl(params: DesktopSessionTarget) {
 }
 
 /** 缺少当前控制锚时沿原短连接读取；热能力查询和投递共用同一借用校验。 */
-async function acquireDesktopControl(params: DesktopSessionTarget) {
+async function acquireDesktopControl(params: DesktopSessionTarget, retainUpdates = false) {
     const followed = borrowDesktopControl(params);
     if (followed) return followed;
     const ipc = await DesktopIpc.open(await resolveHome(params.codexHome));
     try {
         const ownerClientId = await ipc.discoverOwner(params.remoteSessionId);
-        const raw = await ipc.readControlSnapshot(params.remoteSessionId);
+        const raw = await ipc.readControlSnapshot(params.remoteSessionId, retainUpdates ? () => {} : undefined);
         return { ipc, ownerClientId,
             /** 冷读取等待期间也可能撤销 RPC 身份；只复核原 getter，不借另一连接替换本次快照。 */
-            read: () => { params.getFollowedIpc?.(); return raw; },
+            read: () => {
+                params.getFollowedIpc?.();
+                if (!retainUpdates) return raw;
+                const current = ipc.getControlSnapshot(params.remoteSessionId);
+                if (!current || current.ownerClientId !== ownerClientId) throw new DesktopIpcError('owner_changed');
+                return current.state;
+            },
             /** 独占短连接仍由本次操作结束时关闭。 */
             close: () => ipc.close(),
         };
@@ -278,6 +415,18 @@ async function replayIntent(intentPath: string, receiptPath: string, payloadHash
     return { ...duplicate, status: 'unknown', reason: 'delivery_outcome_unknown', ...(requestId ? { requestId } : {}) };
 }
 
+/** 只释放本次独占创建且从未派发的匹配意图；清理失败也不覆盖其他请求的回执。 */
+async function releaseUndispatchedIntent(intentPath: string, payloadHash: string, requestId: string): Promise<void> {
+    try {
+        const intent = ipcRecord(JSON.parse(await readProtectedLocalStateFile(intentPath)));
+        if (intent?.version === 1 && intent.payloadHash === payloadHash && intent.requestId === requestId) {
+            await removeProtectedLocalStateFile(intentPath);
+        }
+    } catch {
+        // 无法重新证明归属或删除未完成时保持现状；后续调用仍经过原有独占/回放边界。
+    }
+}
+
 /**
  * 普通文本由原生决定当前轮次；仅明确未接受的 inactive 拒绝允许再 start 一次。
  * Desktop 26.924.22138 / CLI 0.158.0-alpha.2.1：原生 JS 把 NoActiveTurn 拒绝变为下方精确文案。
@@ -294,14 +443,20 @@ function isNativeInactiveRejection(response: Record<string, unknown>, conversati
 
 /** 复用同一持久化意图；仅匹配原 owner 的成功应答和 turn ID 才算接受。 */
 async function submitOnce(codexHome: string, message: DesktopSessionMessage, requestId: string,
-    identity: SendIdentity): Promise<DesktopSessionSendResult> {
+    identity: SendIdentity): Promise<Readonly<{ result: DesktopSessionSendResult; undispatched: boolean }>> {
     let control: Awaited<ReturnType<typeof acquireDesktopControl>> | undefined;
     let textIpc: DesktopIpc | undefined;
     let ownerClientId: string | undefined;
     let dispatched = false;
+    /** 未派发证明只来自本次调用过程，不能由公开状态或错误原因反推。 */
+    const finish = (result: DesktopSessionSendResult) => ({ result, undispatched: !dispatched });
     try {
         let ipc: DesktopIpc;
         const nativeAuto = message.textSendProtocol === 'native-auto-v1';
+        if (message.attachments?.length && !nativeAuto) throw new DesktopIpcError('unsupported_input');
+        const attachmentMessage = message.attachments?.length ? await prepareDesktopAttachmentMessage({
+            cwd: message.attachmentWorkingDirectory ?? '', text: message.text, localId: message.localId, attachments: message.attachments,
+        }) : null;
         if (nativeAuto) {
             // 只借当前 reader 的连续 owner 证明；正文仍留在原连接，发送不排在完整历史大帧之后。
             control = borrowDesktopControl(message) ?? undefined;
@@ -317,9 +472,10 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
             dispatched = true;
             const response = await ipc.request('thread-follower-steer-turn', 1, {
                 conversationId: message.remoteSessionId, clientUserMessageId: message.localId,
-                input: [{ type: 'text', text: message.text, text_elements: [] }], attachments: [],
+                input: attachmentMessage?.input ?? [{ type: 'text', text: message.text, text_elements: [] }],
+                attachments: attachmentMessage?.attachments ?? [],
                 // cwd/workspaceRoots 由原生当前会话继承；保留原生恢复编辑框所需的完整正文/context 形状。
-                restoreMessage: { id: message.localId, text: message.text, createdAt: Date.now(),
+                restoreMessage: attachmentMessage?.restoreMessage ?? { id: message.localId, text: message.text, createdAt: Date.now(),
                     context: { prompt: message.text, addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [] } },
             }, requestId, ownerClientId);
             message.getFollowedIpc?.();
@@ -327,15 +483,15 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
             if (!isNativeInactiveRejection(response, message.remoteSessionId, ownerClientId)) {
                 if (response.resultType === 'error') {
                     const reason = desktopResponseFailure(response);
-                    return { ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',
-                        reason, ownerClientId, requestId };
+                    return finish({ ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',
+                        reason, ownerClientId, requestId });
                 }
                 const result = ipcRecord(ipcRecord(response.result)?.result);
                 if (response.resultType !== 'success' || response.method !== 'thread-follower-steer-turn'
                     || response.handledByClientId !== ownerClientId || !ipcString(result?.turnId)) {
-                    return { ...identity, status: 'unknown', reason: 'invalid_response', ownerClientId, requestId };
+                    return finish({ ...identity, status: 'unknown', reason: 'invalid_response', ownerClientId, requestId });
                 }
-                return { ...identity, status: 'accepted', ownerClientId, requestId, turnId: result.turnId, receiptPersisted: false };
+                return finish({ ...identity, status: 'accepted', ownerClientId, requestId, turnId: result.turnId, receiptPersisted: false });
             }
         } else {
             // 已发布客户端仍复核 start 证明；固定旧轮的显式 steer/审批也继续使用原控制锚。
@@ -351,37 +507,37 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
             conversationId: message.remoteSessionId,
             turnStart: {
                 request: { threadId: message.remoteSessionId, clientUserMessageId: message.localId,
-                    input: [{ type: 'text', text: message.text, text_elements: [] }] },
-                context: { inheritThreadSettings: true },
+                    input: attachmentMessage?.input ?? [{ type: 'text', text: message.text, text_elements: [] }] },
+                context: attachmentMessage?.startContext ?? { inheritThreadSettings: true },
             },
         }, nativeAuto ? randomUUID() : requestId, ownerClientId);
         if (nativeAuto) { message.getFollowedIpc?.(); control?.read(); }
         if (response.resultType === 'error') {
             const reason = desktopResponseFailure(response);
-            return { ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',
-                reason, ownerClientId, requestId };
+            return finish({ ...identity, status: reason === 'owner_unavailable' || reason === 'incompatible_protocol' ? 'rejected' : 'unknown',
+                reason, ownerClientId, requestId });
         }
         const turn = ipcRecord(ipcRecord(ipcRecord(response.result)?.result)?.turn);
         if (response.resultType !== 'success' || response.method !== 'thread-follower-start-turn'
             || response.handledByClientId !== ownerClientId || !ipcString(turn?.id)) {
             // 忙时排队/其他未验证形状不能假装拒绝，更不能换 localId 自动重试。
-            return { ...identity, status: 'unknown', reason: 'invalid_response', ownerClientId, requestId };
+            return finish({ ...identity, status: 'unknown', reason: 'invalid_response', ownerClientId, requestId });
         }
-        return { ...identity, status: 'accepted', ownerClientId, requestId, turnId: turn.id, receiptPersisted: false };
+        return finish({ ...identity, status: 'accepted', ownerClientId, requestId, turnId: turn.id, receiptPersisted: false });
     } catch (error) {
-        return { ...identity, status: dispatched ? 'unknown' : 'rejected', reason: reasonFor(error), requestId,
-            ...(ownerClientId ? { ownerClientId } : {}) };
+        return finish({ ...identity, status: dispatched ? 'unknown' : 'rejected', reason: reasonFor(error), requestId,
+            ...(ownerClientId ? { ownerClientId } : {}) });
     } finally { control?.close(); textIpc?.close(); }
 }
 
 /**
- * 先持久化独占意图，再向原 Desktop owner 提交。相同 localId 的重复/冲突不再发送。
+ * 先持久化独占意图，再向原 Desktop owner 提交；仅本次明确未派发的失败可释放意图供手动重试。
  * 意图落盘后崩溃会牺牲自动重试，保留 unknown；不能证明跨重启 exactly-once。
  * 不创建 router、app-server 或会话；新普通文本协议仅在原生明确拒绝 steer 后 start，未知结果不重投。
  */
 export async function sendDesktopSessionUserMessage(params: DesktopSessionMessage): Promise<DesktopSessionSendResult> {
     const identity: SendIdentity = { localId: params.localId, remoteSessionId: params.remoteSessionId, deduplicated: false };
-    if (!ipcString(params.localId) || !ipcString(params.remoteSessionId) || !ipcString(params.text)) {
+    if (!ipcString(params.localId) || !ipcString(params.remoteSessionId) || typeof params.text !== 'string' || (!ipcString(params.text) && !params.attachments?.length)) {
         return { ...identity, status: 'rejected', reason: 'invalid_request' };
     }
     try {
@@ -391,7 +547,8 @@ export async function sendDesktopSessionUserMessage(params: DesktopSessionMessag
         const key = digest(JSON.stringify([codexHome, params.remoteSessionId, params.localId]));
         const intentPath = join(directory, `${key}.intent.json`);
         const receiptPath = join(directory, `${key}.receipt.json`);
-        const payloadHash = digest(params.text);
+        // 旧文本摘要保持兼容；附件名称、路径、大小与摘要均绑定同一 localId。
+        const payloadHash = digest(params.attachments?.length ? JSON.stringify([params.text, params.attachments]) : params.text);
         const requestId = randomUUID();
         try {
             // 跨进程由既有 O_EXCL + fsync 工具保证只有一个提交者，不依赖内存 map。
@@ -400,7 +557,12 @@ export async function sendDesktopSessionUserMessage(params: DesktopSessionMessag
             if (ipcRecord(error)?.code === 'EEXIST') return replayIntent(intentPath, receiptPath, payloadHash, identity);
             throw error;
         }
-        const result = await submitOnce(codexHome, params, requestId, identity);
+        const { result, undispatched } = await submitOnce(codexHome, params, requestId, identity);
+        if (undispatched && result.status === 'rejected') {
+            await releaseUndispatchedIntent(intentPath, payloadHash, requestId);
+            // 释放后可能已有新请求进入；无论清理成败，都不再写本次永久拒绝回执。
+            return result;
+        }
         try {
             const persisted = result.status === 'accepted' ? { ...result, receiptPersisted: true } : result;
             await writeProtectedLocalStateFileAtomic(receiptPath, JSON.stringify(persisted));

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { appendFile, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { createServer as createSocketServer, type Socket } from 'node:net';
@@ -49,6 +50,7 @@ vi.mock('@/configuration', async () => {
       happyHomeDir: '/tmp/happier-test-home',
       logsDir: await mkdtemp(join(tmpdir(), 'codextop-rpc-logs-')),
       isDaemonProcess: false,
+      filesUploadMaxFileBytes: 50 * 1024 * 1024,
     },
   };
 });
@@ -109,6 +111,7 @@ async function withDesktopRpcFixture(
     publishTurnsPatch: (revision: number, turns: Array<{ turnId: string; status: string }>) => void;
     setOwnerAvailable: (available: boolean) => void;
     getActiveFollowerCount: () => number;
+    waitForFollowersClosed: () => Promise<void>;
     disconnectFollowers: () => void;
     holdHistoryResponses: () => void;
     releaseFollowDiscovery: () => void;
@@ -248,6 +251,9 @@ async function withDesktopRpcFixture(
     await run({ handlers, requests, rawSession, source, spawnSession, stopSession, credentials, invokeTransport, lifecycle,
       setOwnerAvailable: (available) => { ownerAvailable = available; },
       getActiveFollowerCount: () => followers.size,
+      waitForFollowersClosed: async () => {
+        await Promise.all([...followers].map((socket) => new Promise<void>((resolve) => socket.once('close', () => resolve()))));
+      },
       /** 只关闭合成 router 的既有连接，触发真实 DesktopIpc 的断线回调。 */
       disconnectFollowers: () => { for (const socket of followers) socket.destroy(); },
       holdHistoryResponses: () => { holdHistory = true; },
@@ -481,28 +487,47 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
   });
 
   it.each(['detached', 'relinked', 'revision_gap'] as const)('falls back to owner discovery for status after the viewer is %s', async (change) => {
-    await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishTurnsPatch, getActiveFollowerCount }) => {
-      const target = { machineId: request.machineId, sessionId: request.sessionId,
-        providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
-      const status = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!;
-      await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, leaseId: 'viewer', ttlMs: 45_000 });
-      await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'completed' } }));
-      const discoveries = requests.filter((entry) => entry.method === 'thread-owner-discovery').length;
-      if (change === 'detached') {
-        await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_DETACH)!({ ...target, leaseId: 'viewer' });
-      } else if (change === 'relinked') {
-        const metadata = JSON.parse(rawSession.metadata);
-        metadata.directSessionV1.linkedAtMs += 1;
-        rawSession.metadata = JSON.stringify(metadata);
-      } else {
-        publishTurnsPatch(3, [{ turnId: 'new-turn', status: 'inProgress' }]);
-        await vi.waitFor(() => expect(getActiveFollowerCount()).toBe(0));
-      }
-      await expect(status(target)).resolves.toMatchObject({ ok: true, externalControl: { canSend: true },
-        observation: { state: 'unknown' } });
-      expect(requests.filter((entry) => entry.method === 'thread-owner-discovery')).toHaveLength(discoveries + 1);
-      expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
-    });
+    // 冻结恢复计时器，socket仍真实：本例只验证下一次周期恢复之前的按需发现。
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const options: { initialRuntime: 'idle' | 'active' } = { initialRuntime: 'idle' };
+    try {
+      await withDesktopRpcFixture('accepted', async ({ handlers, request, source, requests, rawSession, publishTurnsPatch, getActiveFollowerCount, waitForFollowersClosed }) => {
+        const target = { machineId: request.machineId, sessionId: request.sessionId,
+          providerId: 'codex', remoteSessionId: 'native-linked-thread', source };
+        const status = handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_STATUS_GET)!;
+        await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_ATTACH)!({ ...target, leaseId: 'viewer', ttlMs: 45_000 });
+        await vi.waitFor(async () => expect(await status(target)).toMatchObject({ observation: { state: 'completed' } }));
+        const discoveries = requests.filter((entry) => entry.method === 'thread-owner-discovery').length;
+        if (change === 'detached') {
+          await handlers.get(RPC_METHODS.DAEMON_DIRECT_SESSION_DETACH)!({ ...target, leaseId: 'viewer' });
+        } else if (change === 'relinked') {
+          const metadata = JSON.parse(rawSession.metadata);
+          metadata.directSessionV1.linkedAtMs += 1;
+          rawSession.metadata = JSON.stringify(metadata);
+        } else {
+          options.initialRuntime = 'active';
+          const closed = waitForFollowersClosed();
+          publishTurnsPatch(3, [{ turnId: 'new-turn', status: 'inProgress' }]);
+          await closed;
+          expect(getActiveFollowerCount()).toBe(0);
+        }
+        if (change === 'revision_gap') {
+          // 恢复可在首次查询前后完成；旧completed绝不能冒充新的运行状态。
+          const first = await status(target) as { observation: { state: string } };
+          expect(first).toMatchObject({ ok: true, externalControl: { canSend: true } });
+          expect(first.observation.state).not.toBe('completed');
+          await vi.waitFor(async () => expect(await status(target)).toMatchObject({
+            observation: { state: 'running', turnId: 'observed-active-turn' },
+          }));
+          expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(2);
+        } else {
+          await expect(status(target)).resolves.toMatchObject({ ok: true, externalControl: { canSend: true },
+            observation: { state: 'unknown' } });
+          expect(requests.filter((entry) => entry.method === 'thread-owner-discovery')).toHaveLength(discoveries + 1);
+          expect(requests.filter((entry) => entry.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+        }
+      }, options);
+    } finally { vi.useRealTimers(); }
   });
 
   it('does not discover another status owner after suspension during provider path resolution', async () => {
@@ -787,6 +812,31 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
             input: [{ type: 'text', text: request.text, text_elements: [] }] },
             context: { inheritThreadSettings: true } },
         } });
+      });
+    });
+
+    it.each(['verified', 'corrupt'] as const)('passes attachment-only sends through the linked RPC/provider boundary: %s', async (mode) => {
+      await withDesktopRpcFixture('accepted', async ({ request, source, requests, invokeTransport }) => {
+        const path = join(source.homePath, 'happier/uploads/scope/messages', request.localId, 'note.txt');
+        await mkdir(join(path, '..'), { recursive: true });
+        await writeFile(path, 'attachment-content');
+        const attachment = { path, name: 'note.txt', kind: 'file', sizeBytes: 18,
+          sha256: mode === 'verified' ? createHash('sha256').update('attachment-content').digest('hex') : '0'.repeat(64) };
+        const result = await invokeTransport(RPC_METHODS.DAEMON_DIRECT_SESSION_SEND, { ...request, text: '', meta: {
+          ...request.meta, desktopTextSendProtocol: 'native-auto-v1', happier: { kind: 'attachments.v1', payload: { attachments: [attachment] } },
+        } });
+        const deliveries = requests.filter((entry) => entry.method === 'thread-follower-steer-turn');
+        if (mode === 'verified') {
+          expect(result).toEqual({ ok: true });
+          expect(deliveries).toHaveLength(1);
+          expect(deliveries[0]).toMatchObject({ targetClientId: 'original-desktop-owner', params: { conversationId: 'native-linked-thread',
+            clientUserMessageId: request.localId, attachments: [{ label: 'note.txt', path, fsPath: path }],
+            restoreMessage: { text: '', context: { fileAttachments: [{ label: 'note.txt', path, fsPath: path }] } },
+          } });
+        } else {
+          expect(result).toMatchObject({ ok: false, errorCode: 'attachment_unavailable' });
+          expect(deliveries).toEqual([]);
+        }
       });
     });
 
@@ -1529,7 +1579,37 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
     expect(res.items.length).toBeGreaterThanOrEqual(2);
     expect(res.items[0].raw.role).toBe('user');
     expect(res.tailCursor).toBeTruthy();
+    // 手机明确选择文字投影；默认响应仍完整，游标及完整性字段不能被过滤修改。
+    const textPage = await handler!({
+      machineId: 'm1', providerId: 'claude', remoteSessionId: 'sess-1',
+      source: { kind: 'claudeConfig', configDir, projectId: 'proj-a' },
+      direction: 'older', maxItems: 10, maxBytes: 1024 * 1024,
+      projection: 'conversation_text',
+    });
+    expect(textPage.items).toEqual([res.items[0]]);
+    expect({ ...textPage, items: [] }).toEqual({ ...res, items: [] });
     const readAfter = registered.get(RPC_METHODS.DAEMON_DIRECT_SESSION_TRANSCRIPT_READ_AFTER);
+    await appendFile(sessionFile, jsonlLine({ type: 'assistant', uuid: 'tool-only', message: {
+      model: 'm', content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { path: 'synthetic.txt' } }],
+    } }));
+    const toolTailRequest = {
+      machineId: 'm1', providerId: 'claude', remoteSessionId: 'sess-1',
+      source: { kind: 'claudeConfig', configDir, projectId: 'proj-a' }, cursor: res.tailCursor,
+    };
+    const toolTail = await readAfter!(toolTailRequest);
+    const textToolTail = await readAfter!({ ...toolTailRequest, projection: 'conversation_text' });
+    expect(toolTail.items.length).toBeGreaterThan(0);
+    expect(textToolTail.items).toEqual([]);
+    expect(textToolTail.nextCursor).not.toBe(res.tailCursor);
+    expect({ ...textToolTail, items: [] }).toEqual({ ...toolTail, items: [] });
+    const tailRequest = {
+      machineId: 'm1', providerId: 'claude', remoteSessionId: 'sess-1',
+      source: { kind: 'claudeConfig', configDir, projectId: 'proj-a' }, cursor: 'invalid-cursor',
+    };
+    const fullTail = await readAfter!(tailRequest);
+    const textTail = await readAfter!({ ...tailRequest, projection: 'conversation_text' });
+    expect(textTail.items).toEqual(fullTail.items.filter((item: any) => item.raw.role === 'user'));
+    expect({ ...textTail, items: [] }).toEqual({ ...fullTail, items: [] });
     expect(await readAfter!({
       machineId: 'm1', providerId: 'claude', remoteSessionId: 'sess-1',
       source: { kind: 'claudeConfig', configDir, projectId: 'proj-a' }, cursor: 'invalid-cursor',

@@ -1,6 +1,7 @@
-import type { DirectTranscriptRawMessageV1, DirectSessionObservationV1 } from '@happier-dev/protocol';
+import type { DirectTranscriptRawMessageV1, DirectSessionObservationV1, DirectSessionAttachmentV1 } from '@happier-dev/protocol';
 
 import type { CodexRolloutAction } from '../localControl/rolloutMapper';
+import { readCodexUserAttachments, readCodexMarkdownAttachments, readCodexGeneratedAttachments, codexAttachmentMeta } from './codexDirectAttachments';
 import { projectCodexRolloutActions } from '../rollout/projectCodexRolloutActions';
 
 function shouldFilterHarnessBlob(text: string): boolean {
@@ -39,6 +40,7 @@ export function mapCodexRolloutLineToDirectMessages(params: Readonly<{
   lineValue: unknown;
   actions: ReadonlyArray<CodexRolloutAction>;
   sidechainId?: string | null;
+  generatedAttachments?: readonly DirectSessionAttachmentV1[];
 }>): DirectTranscriptRawMessageV1[] {
   const createdAtMs = extractEnvelopeTimestampMs(params.lineValue);
   // Direct transcript rendering should include "debug-only" tool calls (e.g., Codex-internal read/write tools),
@@ -56,6 +58,7 @@ export function mapCodexRolloutLineToDirectMessages(params: Readonly<{
 
     if (action.type === 'user-text') {
       if (shouldFilterHarnessBlob(action.text)) continue;
+      const attachmentMessage = readCodexUserAttachments(action.text);
       out.push({
         id: stableId,
         // 回显关联只使用明确的原生客户端 ID；缺失时沿用位置身份，不按正文猜配。
@@ -63,7 +66,8 @@ export function mapCodexRolloutLineToDirectMessages(params: Readonly<{
         createdAtMs,
         raw: {
           role: 'user',
-          content: { type: 'text', text: action.text },
+          content: { type: 'text', text: attachmentMessage.text },
+          ...codexAttachmentMeta(attachmentMessage.attachments),
         },
       });
       continue;
@@ -76,6 +80,7 @@ export function mapCodexRolloutLineToDirectMessages(params: Readonly<{
         createdAtMs,
         raw: {
           role: 'agent',
+          ...codexAttachmentMeta(readCodexMarkdownAttachments(action.text)),
           content: {
             type: 'codex',
             data: {
@@ -159,6 +164,15 @@ export function mapCodexRolloutLineToDirectMessages(params: Readonly<{
       });
       continue;
     }
+  }
+
+  const generated = readCodexGeneratedAttachments(params.lineValue, params.generatedAttachments);
+  if (generated.length) {
+    const stableId = stableOffsetId(`codex:${params.fileRelPath}`, params.lineStartOffsetBytes, projected.length);
+    out.push({ id: stableId, localId: stableId, createdAtMs, raw: { role: 'agent',
+      content: { type: 'codex', data: { type: 'message', message: '', ...(params.sidechainId ? { sidechainId: params.sidechainId } : {}) } },
+      ...codexAttachmentMeta(generated),
+    } });
   }
 
   // 生命周期在共享文字投影之前被明确解析；子任务不能结束主会话，也不用文本补完成。

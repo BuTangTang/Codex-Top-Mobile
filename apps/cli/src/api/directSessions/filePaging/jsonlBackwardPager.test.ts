@@ -1,8 +1,8 @@
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { readJsonlFileBackwardPage } from './jsonlBackwardPager';
 
@@ -105,5 +105,45 @@ describe('readJsonlFileBackwardPage', () => {
     });
     expect(page2.items.map((x) => (x.value as any).i)).toEqual([2]);
     expect(page2.nextEndOffsetBytes).toBeLessThan(page1.nextEndOffsetBytes);
+  });
+
+  it('copies a multibyte oversized row only at its boundary and preserves order, offsets and incomplete tail', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-jsonl-backward-fragments-'));
+    const filePath = join(dir, 't.jsonl');
+    const values = [{ i: 1 }, { i: 2, text: '图🙂'.repeat(12 * 1024) }, { i: 3 }];
+    const rows = values.map((value) => `${JSON.stringify(value)}\n`);
+    const complete = rows.join('');
+    const bytes = Buffer.from(complete);
+    await writeFile(filePath, complete + '{"unfinished":');
+    let copiedBytes = 0;
+    const concat = Buffer.concat;
+    const spy = vi.spyOn(Buffer, 'concat').mockImplementation((list, length) => {
+      copiedBytes += length ?? list.reduce((sum, value) => sum + value.length, 0);
+      return concat(list, length);
+    });
+    try {
+      const found = [];
+      let endOffsetBytes: number | null = null;
+      for (let pageIndex = 0; pageIndex < values.length; pageIndex++) {
+        const page = await readJsonlFileBackwardPage({ filePath, endOffsetBytes, maxBytes: 1024, maxItems: 1, chunkBytes: 1024 });
+        if (pageIndex === 0) expect(page.tailOffsetBytes).toBe(bytes.length);
+        found.unshift(...page.items);
+        endOffsetBytes = page.nextEndOffsetBytes;
+      }
+      expect(found.map((line) => line.value)).toEqual(values);
+      expect(endOffsetBytes).toBe(0);
+      let start = 0;
+      for (let index = 0; index < rows.length; index++) {
+        const length = Buffer.byteLength(rows[index]!);
+        expect(found[index]).toMatchObject({ startOffsetBytes: start, endOffsetBytes: start + length - 1 });
+        expect(JSON.parse(bytes.subarray(start, start + length - 1).toString('utf8'))).toEqual(values[index]);
+        start += length;
+      }
+      // 在真实 Buffer 分配边界测量复制量，避免用易受机器负载影响的毫秒阈值。
+      expect(copiedBytes).toBeLessThan(bytes.length * 3);
+    } finally {
+      spy.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

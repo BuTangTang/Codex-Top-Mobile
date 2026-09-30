@@ -4,10 +4,12 @@ import { mapCodexRolloutEventToActions } from '../localControl/rolloutMapper';
 import { createCodexRolloutSemanticTracker } from '../rollout/createCodexRolloutSemanticTracker';
 import { collectCodexSessionRolloutFiles, type CodexRolloutFile } from './collectCodexSessionRolloutFiles';
 import type { CodexDirectTranscriptRolloutStream } from './codexDirectTranscriptProjection';
+import { isCodexCompactedLinePrefix } from './codexDirectTranscriptProjection';
 
 const CHILD_DISCOVERY_MAX_BYTES = 1024 * 1024;
 const CHILD_DISCOVERY_MAX_ITEMS = 512;
 
+/** 仅发现实际子任务事件；压缩快照不产生新子任务，按完整行边界跳过以免载入整份替换历史。 */
 async function discoverSpawnedThreadIdsFromFilesBounded(files: readonly CodexRolloutFile[]): Promise<readonly string[]> {
   const discovered = new Set<string>();
   const semanticTracker = createCodexRolloutSemanticTracker();
@@ -21,6 +23,7 @@ async function discoverSpawnedThreadIdsFromFilesBounded(files: readonly CodexRol
         offsetBytes,
         maxBytes: Math.min(128 * 1024, CHILD_DISCOVERY_MAX_BYTES - scannedBytes),
         maxItems: Math.min(64, CHILD_DISCOVERY_MAX_ITEMS - scannedItems),
+        skipLine: isCodexCompactedLinePrefix,
       });
       for (const line of page.items) {
         const normalizedActions = mapCodexRolloutEventToActions(line.value, { debug: true })

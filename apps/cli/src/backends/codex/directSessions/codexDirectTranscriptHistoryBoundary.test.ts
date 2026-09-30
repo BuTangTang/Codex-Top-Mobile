@@ -7,11 +7,20 @@ import { describe, expect, it, vi } from 'vitest';
 import { decodeCodexDirectForwardCursor, encodeCodexDirectForwardCursor } from './codexDirectForwardCursor';
 import { readAfterCodexTranscript } from './readAfterCodexTranscript';
 import { pageCodexTranscript } from './pageCodexTranscript';
+import { pageCodexRolloutStreams, readAfterCodexRolloutStreams } from './codexDirectTranscriptStreamPaging';
 
 const readFailure = vi.hoisted(() => ({ path: '', code: '' }));
+const appendRace = vi.hoisted(() => ({ path: '', line: '', statReads: 0 }));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
-  return { ...actual, open: async (...args: Parameters<typeof actual.open>) => {
+  return { ...actual, stat: async (...args: Parameters<typeof actual.stat>) => {
+    const result = await actual.stat(...args);
+    // 两次来源大小读取后，让历史页自己的 OS stat 与已固定的页尾之间发生真实追加。
+    if (String(args[0]) === appendRace.path && ++appendRace.statReads === 3) {
+      await actual.appendFile(appendRace.path, appendRace.line);
+    }
+    return result;
+  }, open: async (...args: Parameters<typeof actual.open>) => {
     if (String(args[0]) !== readFailure.path) return actual.open(...args);
     const error = Object.assign(new Error('Synthetic file read failure'), { code: readFailure.code });
     if (readFailure.code !== 'EIO' && readFailure.code !== 'SHORT_READ') throw error;
@@ -26,6 +35,35 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 describe('Codex direct history read availability', () => {
+  it('keeps an initially empty stream in the snapshot cursor for its first append', async () => {
+    const fixture = await createFixture('empty-history-append');
+    await writeFile(fixture.filePath, '');
+    const params = { source: { kind: 'codexHome', home: 'user' } as const, env: { CODEX_HOME: fixture.codexHome },
+      activeServerDir: fixture.root, remoteSessionId: 'empty-history-append', maxBytes: 4096, maxItems: 10 };
+    const first = await pageCodexTranscript({ ...params, direction: 'older' });
+    await appendFile(fixture.filePath, assistantLine('first append'));
+    const next = await readAfterCodexTranscript({ ...params, cursor: first.tailCursor! });
+    expect(next.truncated).toBe(false);
+    expect(next.items).toHaveLength(1);
+  });
+
+  it('retains messages appended while the first history page is being read', async () => {
+    const fixture = await createFixture('history-page-append');
+    await writeFile(fixture.filePath, sessionMetaLine('history-page-append') + assistantLine('before snapshot'));
+    const params = { codexHome: fixture.codexHome, remoteSessionId: 'history-page-append', maxBytes: 4096, maxItems: 10,
+      initialRolloutFiles: [{ filePath: fixture.filePath, fileRelPath: `sessions/rollout-2026-01-02T00-00-00-history-page-append.jsonl`, sortMs: 0, mtimeMs: 0 }] };
+    appendRace.path = fixture.filePath;
+    appendRace.line = assistantLine('during snapshot', '2026-01-02T00:00:02.000Z');
+    appendRace.statReads = 0;
+    try {
+      const first = await pageCodexRolloutStreams({ ...params, direction: 'older' });
+      expect(appendRace.statReads).toBeGreaterThanOrEqual(3);
+      const followed = await readAfterCodexRolloutStreams({ ...params, cursor: first.tailCursor! });
+      expect(JSON.stringify([...first.items, ...followed.items])).toContain('during snapshot');
+      expect([...first.items, ...followed.items]).toHaveLength(2);
+    } finally { appendRace.path = ''; }
+  });
+
   it.each(['ENOENT', 'EACCES', 'EIO', 'SHORT_READ'] as const)('does not accept empty history when the OS reports %s after discovery', async (code) => {
     const fixture = await createFixture(`availability-${code}`);
     await writeFile(fixture.filePath, sessionMetaLine(`availability-${code}`) + assistantLine('retained history'));

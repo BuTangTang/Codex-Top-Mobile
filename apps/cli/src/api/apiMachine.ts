@@ -53,6 +53,8 @@ import type { DaemonToServerEvents, ServerToDaemonEvents } from './machine/socke
 import { authorizeMachineRpcRequest } from './machine/machineRpcAuthorization';
 import { projectMachineRpcTransportAcknowledgement } from './machine/projectMachineRpcTransportAcknowledgement';
 import { registerMachineRpcHandlers, type MachineRpcHandlerDeps, type MachineRpcHandlers } from './machine/rpcHandlers';
+import { registerCodexAccountUsageRpcHandlers } from './machine/rpcHandlers.codexAccountUsage';
+import { decodeJwtPayload } from '@/cloud/decodeJwtPayload';
 import { resolveMachineRpcWorkingDirectory } from './machine/resolveMachineRpcWorkingDirectory';
 import type { Socket } from 'socket.io-client';
 import {
@@ -360,6 +362,15 @@ export class ApiMachineClient {
             },
             authorizeRequest: authorizeMachineRpcRequest,
             projectTransportAcknowledgement: projectMachineRpcTransportAcknowledgement,
+        });
+
+        // 当前机器额度仅通过已认证的机器RPC开放，实际读取仍由Codex来源owner负责。
+        const quotaAccountId = decodeJwtPayload(this.token)?.sub;
+        registerCodexAccountUsageRpcHandlers({
+            rpcHandlerManager: this.rpcHandlerManager,
+            machineId: this.machine.id,
+            accountId: typeof quotaAccountId === 'string' ? quotaAccountId : null,
+            activeServerDir: configuration.activeServerDir,
         });
 
         const machineRpcWorkingDirectory = resolveMachineRpcWorkingDirectory();

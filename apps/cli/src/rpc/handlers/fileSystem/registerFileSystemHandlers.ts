@@ -8,6 +8,7 @@ import { registerPathMutationHandlers } from './pathMutationHandlers';
 import { registerSessionTransferRpcHandlers } from '@/transfers/rpc/registerSessionTransferRpcHandlers';
 import { resolveSessionRpcTransferMaxBytes } from '@/transfers/policy/sessionRpcTransferPolicy';
 import { createTransferPathAllowanceRegistry } from '@/transfers/targets/createTransferPathAllowanceRegistry';
+import { resolveDirectGeneratedMediaDirectory } from '@/transfers/targets/materializeDirectGeneratedMedia';
 import { TransferSessionStore } from '@/transfers/core/transferSessionStore';
 import {
   type FilesystemAccessPolicy,
@@ -21,6 +22,7 @@ function normalizeAllowedDirectories(getDirectories?: () => ReadonlyArray<string
     : [];
 }
 
+/** 注册现有机器文件能力；生成图片只追加产品自有缓存的读取权限。 */
 export function registerFileSystemHandlers(
   rpcHandlerManager: RpcHandlerRegistrar,
   workingDirectory: string,
@@ -38,7 +40,10 @@ export function registerFileSystemHandlers(
     defaultDirectory: workingDirectory,
     accessPolicy,
   });
-  const getAdditionalAllowedReadDirs = opts?.getAdditionalAllowedReadDirs;
+  const getAdditionalAllowedReadDirs = () => [
+    ...normalizeAllowedDirectories(opts?.getAdditionalAllowedReadDirs),
+    resolveDirectGeneratedMediaDirectory(),
+  ];
   const getAdditionalAllowedWriteDirs = opts?.getAdditionalAllowedWriteDirs;
   const pathAllowanceRegistry = createTransferPathAllowanceRegistry({
     onReadDirsChange: () => {},

@@ -5,7 +5,7 @@ import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { readAfterCodexTranscript } from './readAfterCodexTranscript';
 import { resolveCodexHomeEntriesForDirectSessionsSource } from './resolveCodexHomeEntriesForDirectSessionsSource';
-import { CONTROL_READ_TIMEOUT_MS, DesktopIpc, DesktopIpcError } from './desktop/desktopIpc';
+import { BACKGROUND_HISTORY_TIMEOUT_MS, CONTROL_READ_TIMEOUT_MS, DesktopIpc, DesktopIpcError } from './desktop/desktopIpc';
 import { readDesktopConversationObservation } from './desktop/desktopConversationObservation';
 import { readDesktopControlSnapshot } from './desktop/desktopControlSnapshot';
 
@@ -22,6 +22,7 @@ export async function createCodexDirectSessionFollowLease(params: {
   let baselineAttempts = 0;
   let baselineRetryAt: number | null = null;
   let baselineSelected = false;
+  let usesLocalLifecycle = false;
   let baselineInvalidated = false;
   let anchoredConnection: DesktopIpc | null = null;
   let observation: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
@@ -84,7 +85,7 @@ export async function createCodexDirectSessionFollowLease(params: {
   const follow = (opened: DesktopIpc) => {
     opened.followConversation(params.remoteSessionId, (next, continuity) => observeConnection(opened, next, continuity));
   };
-  /** 首次暂时失败立即补试，后续失败按原读取预算暂停；新事实仍优先于迟到基线。 */
+  /** 历史超时即暂停；其他首次连接失败可补试，新事实仍优先于迟到基线。 */
   const initializeBaseline = async (opened: DesktopIpc) => {
     baselineStarted = true;
     baselineAttempts += 1;
@@ -93,7 +94,7 @@ export async function createCodexDirectSessionFollowLease(params: {
     try {
       const raw = await opened.readControlSnapshot(params.remoteSessionId,
         (next, continuity) => observeConnection(opened, next, continuity),
-        (state) => { readDesktopControlSnapshot(state, params.remoteSessionId); });
+        (state) => { readDesktopControlSnapshot(state, params.remoteSessionId); }, BACKGROUND_HISTORY_TIMEOUT_MS);
       // 复用控制 owner 的 runtime/当前尾轮校验，再用唯一观察投影器生成状态。
       if (!released && ipc === opened) anchoredConnection = opened;
       const next = readDesktopConversationObservation(raw, params.remoteSessionId);
@@ -107,7 +108,7 @@ export async function createCodexDirectSessionFollowLease(params: {
         && !released && ipc === opened && !baselineInvalidated && observation.state === 'unknown') {
         // 清掉本次失败订阅，由同一按需 poller 验证来源后重新发现 owner；不添加定时器或后台循环。
         opened.close(); ipc = null;
-        if (baselineAttempts === 1) baselineStarted = false;
+        if (baselineAttempts === 1 && error.reason !== 'timeout') baselineStarted = false;
         // 完整历史可能很大；失败后至少让出一个完整读取预算，不能每个 poll 都重新水合。
         else {
           baselineRetryAt = performance.now() + CONTROL_READ_TIMEOUT_MS;
@@ -126,9 +127,12 @@ export async function createCodexDirectSessionFollowLease(params: {
       if (observation.state === 'unknown' || observation.source !== 'rollout') markSourceUnavailable();
     }
   };
-  /** 失效控制锚由原 poller 的有效来源边界恢复；旧 producer 或恢复暂停时仍保留观察订阅。 */
+  /** 失效控制锚由原 poller 的有效来源边界恢复；恢复暂停期间不重建全量订阅。 */
   const connect = async () => {
     if (ipc || released || homes.length !== 1) return;
+    // 普通 following 也会传完整快照；恢复等待期必须连订阅一起暂停。
+    // rollout 仍由原 poller 读取，不影响前向事实或来源失效检查。
+    if (baselineRetryAt !== null) return;
     let opened: DesktopIpc | null = null;
     try {
       opened = await DesktopIpc.open(homes[0]!.codexHome);
@@ -148,8 +152,7 @@ export async function createCodexDirectSessionFollowLease(params: {
     readAfterTranscript: ({ cursor, maxBytes, maxItems }) => {
       const reading = (async () => {
         const recoveringBaseline = !baselineStarted && baseline !== null;
-        if (!recoveringBaseline) await connect();
-        const result = await readAfterCodexTranscript({ ...params, activeServerDir: configuration.activeServerDir, cursor, maxBytes, maxItems }).catch((error) => {
+        const result = await readAfterCodexTranscript({ ...params, activeServerDir: configuration.activeServerDir, cursor, maxBytes, maxItems, includeLifecycleObservation: true }).catch((error) => {
           // 文件读取失败只撤销依赖 rollout 的状态，已确认的 Desktop 来源仍独立有效。
           if (!hasUsableDesktopObservation()) markSourceUnavailable();
           throw error;
@@ -158,13 +161,23 @@ export async function createCodexDirectSessionFollowLease(params: {
           || resolveDirectTranscriptContinuation(result) === 'source_discontinuity';
         if (!hasUsableDesktopObservation() && rolloutUnavailable) markSourceUnavailable();
         // 断点变化批次不能作为新轮事件；只有同一来源的前向显式记录能恢复已知状态。
-        if (!released && !hasUsableDesktopObservation() && !rolloutUnavailable) for (const item of result.items) {
+        if (!released && !usesLocalLifecycle && !hasUsableDesktopObservation() && !rolloutUnavailable) for (const item of result.items) {
           const fact = DirectSessionObservationV1Schema.safeParse(item.raw.directSessionObservationV1);
           if (!fact.success) continue;
           if (observation.state !== 'unknown' && fact.data.state !== 'unknown'
               && observation.turnId === fact.data.turnId && isTerminal(observation)) continue;
           publish(fact.data, 'event');
         }
+        // 当前只读生命周期覆盖历史分页中的旧事件；明确状态无需触发桌面全量快照。
+        const local = result.lifecycleObservation;
+        if (!released && !hasUsableDesktopObservation() && !rolloutUnavailable && local) {
+          if (local.state !== 'unknown' || usesLocalLifecycle) {
+            // 完整本地投影一旦建立，后续失效也由它撤销；旧格式仅保留原连续前向观察。
+            usesLocalLifecycle = true;
+            if (JSON.stringify(local) !== JSON.stringify(observation)) publish(local, 'snapshot');
+          }
+        }
+        if (!recoveringBaseline && !usesLocalLifecycle) await connect();
         // 到期仍须由本轮来源与 unknown 事实准入；撤销旧观察订阅后复用原连接／基线流程。
         if (!released && !rolloutUnavailable && observation.state === 'unknown'
           && baselineRetryAt !== null && performance.now() >= baselineRetryAt) {
@@ -174,7 +187,7 @@ export async function createCodexDirectSessionFollowLease(params: {
         // 恢复前先确认本批来源仍连续可用；失效来源和已释放租约不能启动恢复连接。
         if (!baselineStarted && baseline !== null && !released && !rolloutUnavailable) await connect();
         // 不 await 水合请求，原轮询继续接收等待期间的新轮和来源失效事实。
-        if (!released && ipc && !baselineStarted && !rolloutUnavailable) baseline = initializeBaseline(ipc);
+        if (!released && ipc && !baselineStarted && !rolloutUnavailable && !usesLocalLifecycle) baseline = initializeBaseline(ipc);
         return { ...result, observations: pending.splice(0) };
       })();
       // 读取进度仍属于原 poller；控制等待同一轮，不另开文件读取。
@@ -187,18 +200,29 @@ export async function createCodexDirectSessionFollowLease(params: {
     getProviderControl: () => !released && ipc?.getControlSnapshot(params.remoteSessionId) ? ipc : null,
     /** 已成功连接的恢复加入原 poll；活 lease 缺锚仍可冷读，释放或等待期间换连接才撤权。 */
     waitForProviderControl: async () => {
-      if (!baselineStarted && baseline !== null && baselineAttempts === 0) {
-        const previousRead = sourceRead;
-        await polling.pollNow();
-        // 若仅确认了断线前的旧批次，再由原 poller 读取；不能跳过 ACK 或提前推进游标。
-        if (!released && !baselineStarted && sourceRead === previousRead) await polling.pollNow();
-      }
-      if (!baselineStarted) await sourceRead;
-      const opened = ipc;
-      await baseline;
-      if (released || ipc !== opened) {
-        throw new DesktopIpcError('owner_unavailable');
-      }
+      // 暂停期不能把空连接当作等待完成，交给 provider 再冷读整份历史。
+      if (baselineRetryAt !== null) throw new DesktopIpcError('owner_unavailable');
+      // 控制调用不能随后台历史等待数分钟；超时只退出调用者，后台只读仍可更新状态。
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiting = (async () => {
+        if (!baselineStarted && baseline !== null && baselineAttempts === 0) {
+          const previousRead = sourceRead;
+          await polling.pollNow();
+          // 若仅确认了断线前的旧批次，再由原 poller 读取；不能跳过 ACK 或提前推进游标。
+          if (!released && !baselineStarted && sourceRead === previousRead) await polling.pollNow();
+        }
+        if (!baselineStarted) await sourceRead;
+        const opened = ipc;
+        await baseline;
+        if (released || ipc !== opened) {
+          throw new DesktopIpcError('owner_unavailable');
+        }
+      })();
+      try {
+        await Promise.race([waiting, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new DesktopIpcError('timeout')), CONTROL_READ_TIMEOUT_MS);
+        })]);
+      } finally { if (timer) clearTimeout(timer); }
     },
     /** 只返回当前已选择来源的事实，释放后的旧引用一律未知。 */
     getObservation: () => released ? { v: 1, state: 'unknown', reason: 'connection_closed' } : observation,

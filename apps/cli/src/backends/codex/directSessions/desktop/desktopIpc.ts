@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { logger } from '@/ui/logger';
 import { randomUUID } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
@@ -18,6 +19,9 @@ enablePatches();
 const REQUEST_TIMEOUT_MS = 5_000;
 // 真实长会话的关联回执在 9.4 秒到达；只读水合的本地与 router 等待均为 15 秒，其余请求仍为 5 秒。
 export const CONTROL_READ_TIMEOUT_MS = 15_000;
+// 安装版 app-initial-51da50e6c6e3.js 的完整历史请求预算 Zvt=305e3。
+// 仅后台只读基线使用；前台控制等待和动作请求仍沿原短期限。
+export const BACKGROUND_HISTORY_TIMEOUT_MS = 305_000;
 const MAX_FRAME_BYTES = 268_435_456;
 
 export type DesktopIpcResponse = Record<string, unknown>;
@@ -231,7 +235,7 @@ export class DesktopIpc {
 
     /** 关联当前完整历史；提供 listener 时让既有 lease 保留同一个连续订阅，不再另起基线。 */
     async readControlSnapshot(conversationId: string, listener?: NonNullable<DesktopIpc['observation']>['listener'],
-        validateRetainedSnapshot?: (state: unknown) => void): Promise<unknown> {
+        validateRetainedSnapshot?: (state: unknown) => void, timeoutMs = CONTROL_READ_TIMEOUT_MS): Promise<unknown> {
         // 先拒绝并发读取，避免失败的新调用覆盖或清理仍在等待的原 listener。
         const existingSubscription = this.observation;
         if (this.controlSnapshotListener || existingSubscription) throw new DesktopIpcError('owner_unavailable');
@@ -240,13 +244,13 @@ export class DesktopIpc {
         let retained = false;
         try {
             const ready = new Promise<void>((resolve, reject) => {
-                timer = setTimeout(() => reject(new DesktopIpcError('timeout')), CONTROL_READ_TIMEOUT_MS);
+                timer = setTimeout(() => reject(new DesktopIpcError('timeout')), timeoutMs);
                 this.controlSnapshotReject = reject;
                 this.controlSnapshotListener = () => {
                     if (this.controlSnapshotAnchored && !this.snapshotAnchor) resolve();
                 };
                 stop = this.followConversation(conversationId, () => {});
-                this.beginSnapshotAnchor();
+                this.beginSnapshotAnchor(timeoutMs);
             });
             const subscribed = this.observation;
             await ready;
@@ -278,14 +282,14 @@ export class DesktopIpc {
     }
 
     /** 请求固定 owner 返回历史水合 revision；不把首包、最大编号或现存终态视为新事实。 */
-    private beginSnapshotAnchor(): void {
+    private beginSnapshotAnchor(timeoutMs = CONTROL_READ_TIMEOUT_MS): void {
         const subscription = this.observation;
         if (!subscription || this.snapshotAnchor || !this.ownerClientId) return;
         const anchor = { subscription, frames: [] as Record<string, unknown>[], bytes: 0, revision: null as number | null,
-            discardedRevisions: new Set<number>(), timer: setTimeout(() => this.fail('timeout'), CONTROL_READ_TIMEOUT_MS) };
+            discardedRevisions: new Set<number>(), timer: setTimeout(() => this.fail('timeout'), timeoutMs) };
         this.snapshotAnchor = anchor;
         void this.request('thread-follower-load-complete-history', 1, { conversationId: subscription.conversationId },
-            randomUUID(), this.ownerClientId).then((response) => {
+            randomUUID(), this.ownerClientId, timeoutMs).then((response) => {
             if (this.snapshotAnchor !== anchor || this.observation !== subscription || this.failure) return;
             if (response.resultType === 'error') { this.fail(desktopResponseFailure(response)); return; }
             const result = ipcRecord(response.result);
@@ -484,12 +488,15 @@ export class DesktopIpc {
 
     /** 发出带唯一 transport ID 的请求；只有匹配响应才能结束等待。 */
     async request(method: string, version: number, params: Record<string, unknown>,
-        requestId: string = randomUUID(), targetClientId?: string): Promise<DesktopIpcResponse> {
+        requestId: string = randomUUID(), targetClientId?: string,
+        timeoutMs = method === 'thread-follower-load-complete-history' ? CONTROL_READ_TIMEOUT_MS : REQUEST_TIMEOUT_MS): Promise<DesktopIpcResponse> {
         if (this.failure) throw this.failure;
         if (this.socket.destroyed || !this.socket.writable) throw new DesktopIpcError('connection_closed');
+        // 调试仅记录协议方法和耗时，不输出参数、任务身份或正文；用于区分 IPC 往返与上游等待。
+        const started = performance.now();
+        logger.debug('[desktop-ipc] request-start', { method, requestId });
         // router 会按线上期限主动回 request-timeout，必须与本地同属这次请求的等待期限。
-        const timeoutMs = method === 'thread-follower-load-complete-history' ? CONTROL_READ_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
-        return new Promise((resolve, reject) => {
+        return new Promise<DesktopIpcResponse>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(requestId);
                 reject(new DesktopIpcError('timeout'));
@@ -502,6 +509,9 @@ export class DesktopIpc {
             } catch {
                 this.fail('connection_closed');
             }
+        }).finally(() => {
+            // 完成包括成功与失败，不将该计时当作消息已落入原对话的证明。
+            logger.debug('[desktop-ipc] request-end', { method, requestId, elapsedMs: Math.round(performance.now() - started) });
         });
     }
 
@@ -537,10 +547,17 @@ export class DesktopIpc {
             const body = this.frameBody;
             this.frameBody = null;
             this.frameBodyBytes = 0;
+            const started = performance.now();
             try {
                 const message = ipcRecord(JSON.parse(body.toString('utf8')));
+                const parsedAt = performance.now();
                 if (!message) { this.fail('invalid_response'); return; }
                 this.handleMessage(message, body.length);
+                // 只采样大帧的体积及解析/归约耗时，避免每条小通知刷日志或泄露状态内容。
+                if (body.length >= 1024 * 1024) logger.debug('[desktop-ipc] large-frame', {
+                    bytes: body.length, parseMs: Math.round(parsedAt - started),
+                    handleMs: Math.round(performance.now() - parsedAt),
+                });
             } catch { this.fail('invalid_response'); }
         }
     }

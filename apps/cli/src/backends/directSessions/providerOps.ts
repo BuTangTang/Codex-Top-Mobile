@@ -113,7 +113,7 @@ export type DirectSessionProviderOps = Readonly<{
     getFollowLease?: () => DirectSessionFollowLease | undefined;
   }>) => Promise<DirectSessionExternalControl>;
   /** 只读原 owner 当前请求，关联与账号归属由机器 RPC 固定。 */
-  readControl?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string;
+  readControl?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string; includeQuestions?: boolean;
     getFollowLease?: () => DirectSessionFollowLease | undefined }>) => Promise<DesktopControlSnapshotV1>;
   /** 浏览真实桌面项目配置，不承诺原生创建入口已经可用。 */
   listProjects?: (params: Readonly<{ source: DirectSessionsSource }>) => Promise<DesktopProjectV1[]>;
@@ -139,6 +139,8 @@ export type DirectSessionProviderOps = Readonly<{
     cursor?: string;
     maxBytes: number;
     maxItems: number;
+    projection?: 'conversation_text';
+    scanMaxBytes?: number;
   }>) => Promise<DirectSessionTranscriptPage>;
   readAfterTranscript?: (params: Readonly<{
     source: DirectSessionsSource;
@@ -146,6 +148,8 @@ export type DirectSessionProviderOps = Readonly<{
     cursor: string;
     maxBytes: number;
     maxItems: number;
+    projection?: 'conversation_text';
+    scanMaxBytes?: number;
   }>) => Promise<DirectSessionTranscriptReadAfter>;
   acquireFollowLease?: (params: Readonly<{
     source: DirectSessionsSource;

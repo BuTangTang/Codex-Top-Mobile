@@ -14,7 +14,7 @@ import { readCodexSessionIndexTitles } from './readCodexSessionIndexTitles';
 import { readCodexSessionTitleFromRollout } from './readCodexSessionTitleFromRollout';
 import type { CodexDirectSessionHomeEntry } from './resolveCodexHomeEntriesForDirectSessionsSource';
 import { resolveCodexHomeEntriesForDirectSessionsSource } from './resolveCodexHomeEntriesForDirectSessionsSource';
-import { readCodexCandidateLifecycle } from './readCodexCandidateLifecycle';
+import { readCodexCandidateFacts } from './readCodexCandidateLifecycle';
 
 type RolloutCandidateGroup = Readonly<{
   lifecycleConflict: boolean;
@@ -156,6 +156,10 @@ async function buildRolloutCandidate(params: Readonly<{
     if (Number.isFinite(ts) && ts >= 0) return Math.trunc(ts);
     return Math.trunc(params.group.earliestMtimeMs);
   })();
+  // 列表和详情观察共享本次完整投影；保留原 lifecycle 形状，使旧消费者继续兼容。
+  const facts = params.group.lifecycleConflict
+    ? { lifecycle: unknownCodexLifecycleV1(Date.now()), observation: { v: 1, state: 'unknown', reason: 'not_observed' } }
+    : await readCodexCandidateFacts({ filePath: params.group.latestFilePath, remoteSessionId: params.remoteSessionId });
 
   return {
     remoteSessionId: params.remoteSessionId,
@@ -168,9 +172,8 @@ async function buildRolloutCandidate(params: Readonly<{
     details: {
       ...(cwd ? { cwd } : {}),
       source: params.source,
-      codexLifecycle: params.group.lifecycleConflict
-        ? unknownCodexLifecycleV1(Date.now())
-        : await readCodexCandidateLifecycle({ filePath: params.group.latestFilePath, remoteSessionId: params.remoteSessionId }),
+      codexLifecycle: facts.lifecycle,
+      codexObservation: facts.observation,
     },
   };
 }

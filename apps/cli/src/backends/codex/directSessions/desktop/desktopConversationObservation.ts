@@ -1,4 +1,5 @@
 import type { DirectSessionObservationV1 } from '@happier-dev/protocol';
+import { readDesktopQuestions } from './desktopQuestions';
 
 /** 收窄不受信任的 Desktop 快照，不保留正文和路径。 */
 function record(value: unknown): Record<string, unknown> | null {
@@ -29,6 +30,7 @@ export function readDesktopConversationObservation(value: unknown, conversationI
     if (turn.status === 'completed' || turn.status === 'failed') return { ...base, state: turn.status };
     if (turn.status === 'interrupted') return { ...base, state: 'cancelled' };
     if (turn.status !== 'inProgress') return unknown('invalid_snapshot');
+    const questions = readDesktopQuestions(state, turn);
     const requests: Array<{ requestId: string; kind: 'permission_request' | 'user_action_request' }> = [];
     for (const raw of state.requests) {
         const request = record(raw);
@@ -38,7 +40,10 @@ export function readDesktopConversationObservation(value: unknown, conversationI
         const requestId = typeof request.id === 'string' && request.id.trim() ? request.id
             : typeof request.id === 'number' && Number.isSafeInteger(request.id) ? String(request.id) : null;
         if (!requestId) return unknown('unsupported_request');
-        if (request.method === 'item/tool/requestUserInput') requests.push({ requestId, kind: 'user_action_request' });
+        if (request.method === 'item/tool/requestUserInput') {
+            if (!questions.some((question) => question.kind === 'user_input' && question.requestId === request.id && question.status === 'answered'))
+                requests.push({ requestId, kind: 'user_action_request' });
+        }
         else if (request.method === 'item/commandExecution/requestApproval' || request.method === 'item/permissions/requestApproval') {
             requests.push({ requestId, kind: 'permission_request' });
         } else if (request.method === 'item/fileChange/requestApproval') {
@@ -46,6 +51,11 @@ export function readDesktopConversationObservation(value: unknown, conversationI
             if (!item || !Array.isArray(item.changes)) return unknown('unsupported_request');
             if (item.changes.some((change) => record(record(change)?.kind)?.type !== 'delete')) requests.push({ requestId, kind: 'permission_request' });
         } else return unknown('unsupported_request');
+    }
+    // 异步题不在原 requests 中；复用控制投影，只提示未答，不改变普通文本追加能力。
+    for (const question of questions) {
+        if (question.kind === 'async_questions' && question.status === 'pending')
+            for (const item of question.questions) if (!question.answers?.[item.id]) requests.push({ requestId: item.id, kind: 'user_action_request' });
     }
     return requests.length > 0 ? { ...base, state: 'needs_input', requests } : { ...base, state: 'running' };
 }

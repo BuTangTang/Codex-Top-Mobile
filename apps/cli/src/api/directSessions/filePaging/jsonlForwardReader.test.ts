@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +13,43 @@ function buildJsonl(lines: unknown[], opts?: { trailingNewline?: boolean }): str
 }
 
 describe('readJsonlFileForward', () => {
+  it('streams a confirmed ignored row past the parser cap without assembling its payload', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-jsonl-ignored-'));
+    const filePath = join(dir, 'synthetic.jsonl');
+    const ignored = JSON.stringify({ ignore: true, data: 'x'.repeat(9 * 1024 * 1024) }) + '\n';
+    await writeFile(filePath, ignored + buildJsonl([{ text: 'retained' }]));
+    const concat = vi.spyOn(Buffer, 'concat');
+    try {
+      const first = await readJsonlFileForward({ filePath, offsetBytes: 0, maxBytes: 64 * 1024, maxItems: 1,
+        skipLine: prefix => prefix.subarray(0, 16).toString().startsWith('{"ignore":true,') });
+      const assembledBytes = concat.mock.results.reduce((sum, result) =>
+        sum + (result.type === 'return' && Buffer.isBuffer(result.value) ? result.value.length : 0), 0);
+      expect(first.items).toEqual([{ value: null, startOffsetBytes: 0, endOffsetBytes: Buffer.byteLength(ignored) - 1 }]);
+      expect(first.nextOffsetBytes).toBe(Buffer.byteLength(ignored));
+      expect(first.hitPageLimit).toBe(true);
+      expect(assembledBytes).toBeLessThanOrEqual(64 * 1024);
+      const next = await readJsonlFileForward({ filePath, offsetBytes: first.nextOffsetBytes, maxBytes: 1024, maxItems: 2 });
+      expect(next.items.map(item => item.value)).toEqual([{ text: 'retained' }]);
+    } finally { concat.mockRestore(); await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('does not commit a streamed ignored row until its newline arrives', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-jsonl-ignored-partial-'));
+    const filePath = join(dir, 'synthetic.jsonl');
+    const ignored = JSON.stringify({ ignore: true, data: 'x'.repeat(5000) });
+    await writeFile(filePath, ignored);
+    const params = { filePath, offsetBytes: 0, maxBytes: 1024, maxItems: 2, maxOversizeLineBytes: 2048,
+      skipLine: (prefix: Buffer) => prefix.toString().startsWith('{"ignore":true,') };
+    try {
+      const partial = await readJsonlFileForward(params);
+      expect(partial).toMatchObject({ items: [], nextOffsetBytes: 0, hitPageLimit: false });
+      await appendFile(filePath, '\n');
+      const complete = await readJsonlFileForward(params);
+      expect(complete.nextOffsetBytes).toBe(Buffer.byteLength(ignored) + 1);
+      expect(complete.reachedEnd).toBe(true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
   it('reports missing files in strict reads while preserving legacy default behavior', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-jsonl-missing-'));
     const params = { filePath: join(root, 'missing.jsonl'), offsetBytes: 0, maxBytes: 1024, maxItems: 2 };

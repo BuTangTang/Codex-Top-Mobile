@@ -1,6 +1,7 @@
 import { DirectSessionsCandidateCursorError } from '@/backends/directSessions/providerOps';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import {
+  projectDirectTranscriptItems,
   DirectSessionAttachRequestSchema,
   DirectSessionCandidateDeleteRequestSchema,
   DirectSessionDetachRequestSchema,
@@ -712,7 +713,7 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         return { ok: true, result: await provider.control({ ...target, accountId: identity.identity.accountId, action: action.data }) };
       }
       if (!provider.readControl) return err('provider_unavailable');
-      return { ok: true, snapshot: await provider.readControl(target) };
+      return { ok: true, snapshot: await provider.readControl({ ...target, ...('includeQuestions' in parsed.data && parsed.data.includeQuestions ? { includeQuestions: true } : {}) }) };
     } catch {
       return submissionStarted ? { ok: true, result: { status: 'unknown', reason: 'delivery_outcome_unknown' } } : err('provider_unavailable', 'desktop_control_unavailable');
     }
@@ -898,10 +899,13 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         cursor,
         maxBytes,
         maxItems,
+        projection: parsed.data.projection,
+        // 文字输出预算不再缩小电脑既有默认扫描页；不引入无界扫描。
+        ...(parsed.data.projection ? { scanMaxBytes: Math.max(maxBytes, resolveDefaultMaxBytes()) } : {}),
       });
       return {
         ok: true,
-        items: res.items,
+        items: projectDirectTranscriptItems(res.items, parsed.data.projection),
         nextCursor: res.nextCursor,
         tailCursor: res.tailCursor,
         hasMore: res.hasMore,
@@ -939,8 +943,11 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         cursor,
         maxBytes,
         maxItems,
+        projection: parsed.data.projection,
+        // 文字输出预算不再缩小电脑既有默认扫描页；不引入无界扫描。
+        ...(parsed.data.projection ? { scanMaxBytes: Math.max(maxBytes, resolveDefaultMaxBytes()) } : {}),
       });
-      return { ok: true, ...res } satisfies DirectTranscriptReadAfterResponse;
+      return { ok: true, ...res, items: projectDirectTranscriptItems(res.items, parsed.data.projection) } satisfies DirectTranscriptReadAfterResponse;
     } catch (error) {
       return errFromProviderFailure(error) satisfies DirectTranscriptReadAfterResponse;
     }

@@ -13,6 +13,24 @@ export const DesktopApprovalV1Schema = z.object({
 }).strict();
 export type DesktopApprovalV1 = z.infer<typeof DesktopApprovalV1Schema>;
 
+/** 提问沿原请求和题目身份传递；历史答案投影缺失的输入标记不补造。 */
+export const DesktopQuestionRequestV1Schema = z.object({
+    kind: z.enum(['user_input', 'async_questions']),
+    requestId: z.union([z.string().min(1), z.number().int().safe(), z.null()]),
+    itemId: z.string().min(1),
+    turnId: z.string().min(1),
+    revision: z.string().min(1),
+    status: z.enum(['pending', 'answered', 'expired']),
+    canAnswer: z.boolean(),
+    questions: z.array(z.object({
+        id: z.string().min(1), header: z.string(), question: z.string(),
+        isOther: z.boolean().optional(), isSecret: z.boolean().optional(),
+        options: z.array(z.object({ label: z.string(), description: z.string() }).strict()),
+    }).strict()),
+    answers: z.record(z.string(), z.array(z.string())).optional(),
+}).strict();
+export type DesktopQuestionRequestV1 = z.infer<typeof DesktopQuestionRequestV1Schema>;
+
 /** 快照只用于当前原任务控制；不将历史记录时间或手机缓存当作活跃轮次。 */
 export const DesktopControlSnapshotV1Schema = z.object({
     v: z.literal(1),
@@ -22,19 +40,28 @@ export const DesktopControlSnapshotV1Schema = z.object({
     textSendMode: z.enum(['start', 'steer']).optional(),
     cwd: z.string().optional(),
     requests: z.array(DesktopApprovalV1Schema),
+    // 只在读取者明确请求时提供；旧审批客户端继续接收原来的严格对象。
+    questions: z.array(DesktopQuestionRequestV1Schema).optional(),
 }).strict();
 export type DesktopControlSnapshotV1 = z.infer<typeof DesktopControlSnapshotV1Schema>;
 
 const target = z.object({ machineId: z.string().min(1), sessionId: z.string().min(1) });
-export const DirectSessionControlReadRequestSchema = target.strict();
+export const DirectSessionControlReadRequestSchema = target.extend({ includeQuestions: z.literal(true).optional() }).strict();
 export const DirectSessionControlActionRequestSchema = z.discriminatedUnion('kind', [
     target.extend({ kind: z.literal('approval'), operationId: z.string().min(1), expectedTurnId: z.string().min(1), requestId: z.string().min(1), revision: z.string().min(1), decision: z.enum(['allow_once', 'deny']) }).strict(),
     target.extend({ kind: z.literal('steer'), operationId: z.string().min(1), expectedTurnId: z.string().min(1), text: z.string().min(1) }).strict(),
+    target.extend({ kind: z.literal('answer'), operationId: z.string().min(1), expectedTurnId: z.string().min(1),
+        requestKind: z.enum(['user_input', 'async_questions']),
+        requestId: z.union([z.string().min(1), z.number().int().safe(), z.null()]), itemId: z.string().min(1), revision: z.string().min(1),
+        answers: z.record(z.string(), z.array(z.string().min(1)).length(1)),
+    }).strict(),
 ]);
 export type DirectSessionControlActionRequest = z.infer<typeof DirectSessionControlActionRequestSchema>;
 /** 审批 ACK 不证明决定实际生效，返回未知并由客户端读取当前请求状态核对。 */
 export const DirectSessionControlResultSchema = z.discriminatedUnion('status', [
     z.object({ status: z.literal('accepted'), turnId: z.string().min(1) }).strict(),
+    // 原桌面已记入答案，但不能据此声明执行端已接受或继续。
+    z.object({ status: z.literal('recorded'), turnId: z.string().min(1) }).strict(),
     z.object({ status: z.literal('unknown'), reason: z.string().min(1) }).strict(),
     z.object({ status: z.literal('rejected'), reason: z.string().min(1) }).strict(),
 ]);

@@ -5,7 +5,7 @@ import { CODEX_BACKEND_MODES } from '../providers/codex/backendMode.js';
 import { AgentProviderIdV1Schema } from '../providers/agentProviderIdsV1.js';
 import { SessionMessageRoleSchema } from '../sessionMessages/sessionMessageRole.js';
 import { PendingLocalIdSchema } from '../sessionMessages/pendingLocalId.js';
-import { SessionUserMessageSendRequestSchema } from '../sessionUserMessageRpc.js';
+import { SessionUserMessageSendRequestSchema, normalizeSessionAttachmentUploadPath } from '../sessionUserMessageRpc.js';
 import { DirectSessionObservationV1Schema, DirectSessionNotificationsV1Schema } from './observationV1.js';
 
 export const DirectSessionsProviderIdSchema = AgentProviderIdV1Schema;
@@ -312,12 +312,40 @@ export const DirectSessionFollowPolicySetResponseSchema = z.union([
 ]);
 export type DirectSessionFollowPolicySetResponse = z.infer<typeof DirectSessionFollowPolicySetResponseSchema>;
 
+/** 附件描述沿既有 attachments.v1 元数据传递，正文与文件字节分开。 */
+const DirectSessionLocalAttachmentV1Schema = z.object({
+  name: z.string().min(1), path: z.string().min(1), kind: z.enum(['image', 'file']),
+  mimeType: z.string().min(1).optional(), sizeBytes: z.number().int().nonnegative().optional(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/i).optional(),
+}).passthrough();
+export const DirectSessionAttachmentV1Schema = z.union([
+  DirectSessionLocalAttachmentV1Schema.extend({ availability: z.undefined().optional() }),
+  DirectSessionLocalAttachmentV1Schema.extend({ path: z.string().min(1).optional(), availability: z.literal('unavailable'), reason: z.string().min(1).max(100) }),
+]);
+export type DirectSessionAttachmentV1 = z.infer<typeof DirectSessionAttachmentV1Schema>;
+export const DirectSessionUploadedAttachmentV1Schema = DirectSessionLocalAttachmentV1Schema.extend({
+  availability: z.undefined().optional(),
+  path: z.string().refine((path) => normalizeSessionAttachmentUploadPath(path) !== null),
+  sizeBytes: z.number().int().nonnegative(), sha256: z.string().regex(/^[a-f0-9]{64}$/i),
+});
+export type DirectSessionUploadedAttachmentV1 = z.infer<typeof DirectSessionUploadedAttachmentV1Schema>;
+export const DirectSessionAttachmentsEnvelopeV1Schema = z.object({
+  kind: z.literal('attachments.v1'), payload: z.object({ attachments: z.array(DirectSessionAttachmentV1Schema).min(1) }).passthrough(),
+}).passthrough();
+export const DirectSessionUploadedAttachmentsEnvelopeV1Schema = DirectSessionAttachmentsEnvelopeV1Schema.extend({
+  payload: z.object({ attachments: z.array(DirectSessionUploadedAttachmentV1Schema).min(1) }).passthrough(),
+});
+
 /** 复用普通消息契约；原生目标由已关联会话确定，拒绝客户端指定路径或原生会话。 */
 export const DirectSessionSendRequestSchema = SessionUserMessageSendRequestSchema.extend({
   machineId: z.string().min(1),
   sessionId: z.string().min(1),
   localId: PendingLocalIdSchema,
-}).strict();
+  text: z.string(),
+}).strict().refine((request) => request.text.trim().length > 0
+  || request.meta.desktopTextSendProtocol === 'native-auto-v1'
+    && DirectSessionUploadedAttachmentsEnvelopeV1Schema.safeParse(request.meta.happier).success,
+  { message: 'A direct message requires text or uploaded attachments' });
 export type DirectSessionSendRequest = z.infer<typeof DirectSessionSendRequestSchema>;
 
 export const DirectSessionStatusGetResponseSchema = z.union([
@@ -364,6 +392,27 @@ export const DirectTranscriptRawMessageV1Schema = z
   .passthrough();
 export type DirectTranscriptRawMessageV1 = z.infer<typeof DirectTranscriptRawMessageV1Schema>;
 
+// Opt-in projection for text-only clients. Pagination still describes the source stream.
+export function projectDirectTranscriptItems(
+  items: DirectTranscriptRawMessageV1[],
+  projection?: 'conversation_text',
+): DirectTranscriptRawMessageV1[] {
+  if (projection !== 'conversation_text') return items;
+  return items.filter(({ raw }) => {
+    if (raw.role !== 'user' && raw.role !== 'agent') return false;
+    const content = raw.content;
+    if (!content || typeof content !== 'object') return false;
+    const value = content as Record<string, unknown>;
+    const meta = raw.meta && typeof raw.meta === 'object' ? raw.meta as Record<string, unknown> : null;
+    const hasAttachments = DirectSessionAttachmentsEnvelopeV1Schema.safeParse(meta?.happier).success;
+    if (value.type === 'text') return typeof value.text === 'string' && (value.text.trim().length > 0 || hasAttachments);
+    if (raw.role !== 'agent' || value.type !== 'codex' || !value.data || typeof value.data !== 'object') return false;
+    const data = value.data as Record<string, unknown>;
+    return data.type === 'message' && typeof data.sidechainId !== 'string'
+      && typeof data.message === 'string' && (data.message.trim().length > 0 || hasAttachments);
+  });
+}
+
 export const DirectTranscriptPageRequestSchema = z
   .object({
     machineId: z.string().min(1),
@@ -374,6 +423,7 @@ export const DirectTranscriptPageRequestSchema = z
     cursor: z.string().min(1).optional(),
     maxBytes: z.number().int().min(1).max(10 * 1024 * 1024).optional(),
     maxItems: z.number().int().min(1).max(5000).optional(),
+    projection: z.literal('conversation_text').optional(),
   })
   .passthrough();
 export type DirectTranscriptPageRequest = z.infer<typeof DirectTranscriptPageRequestSchema>;
@@ -427,6 +477,7 @@ export const DirectTranscriptReadAfterRequestSchema = z
     cursor: z.string().min(1),
     maxBytes: z.number().int().min(1).max(10 * 1024 * 1024).optional(),
     maxItems: z.number().int().min(1).max(5000).optional(),
+    projection: z.literal('conversation_text').optional(),
   })
   .passthrough();
 export type DirectTranscriptReadAfterRequest = z.infer<typeof DirectTranscriptReadAfterRequestSchema>;

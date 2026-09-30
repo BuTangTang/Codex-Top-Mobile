@@ -3,7 +3,7 @@ import { constants as bufferConstants } from 'node:buffer';
 import { open } from 'node:fs/promises';
 import path from 'node:path';
 
-import { readAttachmentEnvelopeLocalImagePaths } from '@happier-dev/protocol';
+import { readAttachmentEnvelopeLocalImagePaths, normalizeSessionAttachmentUploadPath } from '@happier-dev/protocol';
 import { configuration } from '@/configuration';
 
 export const SESSION_ATTACHMENT_FILE_EXCEEDS_UPLOAD_LIMIT = 'SESSION_ATTACHMENT_FILE_EXCEEDS_UPLOAD_LIMIT';
@@ -141,4 +141,26 @@ export async function resolveTrustedSessionAttachmentLocalImagePaths(params: Rea
   metadata: unknown;
 }>): Promise<ReadonlySet<string>> {
   return new Set((await readTrustedSessionAttachmentLocalImages(params)).keys());
+}
+
+/** 图片和普通文件共用同一上传字节校验；逐个验证后只保留路径，避免缓存大文件内容。 */
+export async function resolveTrustedSessionAttachmentLocalPaths(params: Readonly<{
+  cwd: string; metadata: unknown; maxBytes?: number;
+}>): Promise<ReadonlySet<string>> {
+  const metadata = asRecord(params.metadata);
+  const trusted = new Set<string>();
+  const rejected = new Set<string>();
+  if (!metadata) return trusted;
+  const maxBytes = Math.min(params.maxBytes ?? configuration.filesUploadMaxFileBytes, bufferConstants.MAX_LENGTH - 1);
+  for (const attachment of readAttachmentEnvelope(metadata)) {
+    const uploadPath = normalizeSessionAttachmentUploadPath(attachment.path);
+    const sha256 = readSha256(attachment.sha256);
+    const sizeBytes = readSizeBytes(attachment.sizeBytes);
+    if (!uploadPath || rejected.has(uploadPath)) continue;
+    if (!sha256 || sizeBytes === null) { trusted.delete(uploadPath); rejected.add(uploadPath); continue; }
+    const bytes = await readMatchingDeclaredUpload({ cwd: params.cwd, uploadPath, sha256, sizeBytes, maxBytes });
+    if (bytes) trusted.add(uploadPath);
+    else { trusted.delete(uploadPath); rejected.add(uploadPath); }
+  }
+  return trusted;
 }

@@ -39,6 +39,8 @@ export async function pageCodexTranscript(params: Readonly<{
   cursor?: string;
   maxBytes: number;
   maxItems: number;
+  projection?: 'conversation_text';
+  scanMaxBytes?: number;
 }>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; tailCursor: string | null; hasMore: boolean; truncated?: boolean; truncationReason?: DirectTranscriptTruncationReason; historyAvailability: DirectTranscriptHistoryAvailability }>> {
   const env = params.env ?? process.env;
   const homes = await resolveCodexHomesForDirectSessionsSource({
@@ -80,6 +82,8 @@ export async function pageCodexTranscript(params: Readonly<{
       cursor: params.cursor,
       maxBytes: params.maxBytes,
       maxItems: params.maxItems,
+      projection: params.projection,
+      scanMaxBytes: params.scanMaxBytes,
       initialRolloutFiles: bestHome.files,
     });
     return { ...page, historyAvailability: 'available' };

@@ -12,6 +12,7 @@ const environment = await vi.hoisted(async () => {
 });
 // 配置为环境边界；来源解析、真实文件轮询、socket 分帧和 lease 均使用正式实现。
 vi.mock('@/configuration', () => ({ configuration: environment }));
+import { CONTROL_READ_TIMEOUT_MS } from './desktop/desktopIpc';
 import { createCodexDirectSessionFollowLease } from './createCodexDirectSessionFollowLease';
 import type { DirectSessionTranscriptUpdate } from '@/api/directSessions/backgroundFollow/createManagedDirectSessionFollowLease';
 
@@ -20,7 +21,7 @@ afterAll(() => rm(environment.logsDir, { recursive: true, force: true }));
 
 /** 使用真正的第三方 socket 帧与独立 rollout；只替换配置边界，不 mock 内部状态归约。 */
 async function createFallbackHarness(options: { baseline?: { turnId: string; status: string; runtime?: string }; holdBaseline?: boolean;
-  missingSource?: boolean; initialCursor?: string; holdUpdates?: boolean; pollMs?: string } = {}) {
+  rolloutBaseline?: boolean; missingSource?: boolean; initialCursor?: string; holdUpdates?: boolean; pollMs?: string } = {}) {
   const root = await mkdtemp('/tmp/hcf-fallback-');
   environment.activeServerDir = join(root, 'state');
   const remoteSessionId = '33333333-3333-3333-3333-333333333333';
@@ -30,6 +31,11 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
   const meta = `${JSON.stringify({ type: 'session_meta', payload: { id: remoteSessionId } })}\n`;
   // 订阅前已有的历史终态必须留在初始 tail 之前。
   await writeFile(path, meta + `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'historical' } })}\n`);
+  if (options.rolloutBaseline) {
+    const timestamp = new Date().toISOString();
+    await writeFile(path, meta + ['task_started', 'task_complete'].map((type) =>
+      JSON.stringify({ type: 'event_msg', timestamp, payload: { type, turn_id: 'local-current' } }) + '\n').join(''));
+  }
   if (options.missingSource) await rm(path);
   vi.stubEnv('HAPPIER_DIRECT_SESSIONS_FOLLOW_POLL_MS', options.pollMs ?? '10');
   const sockets = new Set<Socket>();
@@ -108,7 +114,7 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
     if (!options.missingSource) await vi.waitFor(() => expect(lease.getTailCursor?.()).toEqual(expect.any(String)));
   }
   await openLease(options.initialCursor);
-  if (!options.missingSource && !options.initialCursor) await vi.waitFor(() => expect(followers).toHaveLength(1));
+  if (!options.rolloutBaseline && !options.missingSource && !options.initialCursor) await vi.waitFor(() => expect(followers).toHaveLength(1));
   // 首份 snapshot 的确认也会推进初始游标；等待它完成后才开始测试前向追加。
   if (!options.missingSource) await vi.waitFor(() => expect(lease.getTailCursor?.()).toEqual(expect.any(String)));
   /** 通过真实前向游标确认一条完整行已被轮询消费，不使用固定等待时长。 */
@@ -163,22 +169,46 @@ it('waits for the existing source read before sharing a resumed lease baseline',
   } finally { await harness.close(); }
 });
 
-/** 首次真实超时后由原 poller 恢复一次；没有新正文事件也能取得已关联的当前终态。 */
-it('recovers a timed-out initial baseline once without waiting for a new rollout event', async () => {
+it('ends a control waiter while the same background history continues to a later valid state', async () => {
   const harness = await createFallbackHarness({ holdBaseline: true });
   try {
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
-    const before = harness.lease.getObservation?.();
-    expect(before).toMatchObject({ state: 'unknown' });
-    // 首请求完全不应答，经过正式 DesktopIpc 的 15 秒只读期限后仅恢复一次。
-    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2), { timeout: 17_000 });
-    expect(harness.historyRequests[0]!.socket).not.toBe(harness.historyRequests[1]!.socket);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const outcome = harness.lease.waitForProviderControl!().then(() => 'ready', (error: Error) => error.message);
+    await vi.advanceTimersByTimeAsync(CONTROL_READ_TIMEOUT_MS);
+    await expect(outcome).resolves.toBe('timeout');
+    expect(harness.historyRequests[0]!.socket.destroyed).toBe(false);
+    expect(harness.historyRequests).toHaveLength(1);
+    vi.useRealTimers();
+    harness.replyBaseline({ turnId: 'late-valid', status: 'completed' });
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', turnId: 'late-valid' }));
+    expect(harness.historyRequests).toHaveLength(1);
+  } finally { vi.useRealTimers(); await harness.close(); }
+});
+
+/** 首次完整历史超时也等待原预算，不立即重复读取；静止来源仍可恢复。 */
+it('pauses the first history timeout before recovering without a new rollout event', async () => {
+  let now = performance.now();
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const harness = await createFallbackHarness({ holdBaseline: true });
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    harness.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(harness.historyRequests[0]!.socket.destroyed).toBe(true));
+    for (let index = 0; index < 20; index += 1) await harness.poll();
+    const budget = CONTROL_READ_TIMEOUT_MS;
+    now += budget - 1;
+    await harness.poll();
+    expect(harness.historyRequests).toHaveLength(1);
+    expect(harness.followers).toHaveLength(1);
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    now += 1;
+    await harness.poll();
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     harness.replyBaseline({ turnId: 'recovered-idle', status: 'completed' });
     await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ state: 'completed', source: 'desktop', turnId: 'recovered-idle' }));
-    await vi.waitFor(() => expect(harness.updates.flatMap((update) => update.observations ?? []).some((fact) =>
-      fact.continuity === 'snapshot' && fact.observation.state === 'completed')).toBe(true));
-    expect(harness.historyRequests).toHaveLength(2);
-  } finally { await harness.close(); }
+    expect(harness.lease.getProviderControl?.()).toBeTruthy();
+  } finally { await harness.close(); clock.mockRestore(); }
 });
 
 /** 后续暂时失败按原 history 预算暂停；静止来源恢复后无需新事件或重建 lease。 */
@@ -190,18 +220,19 @@ it('pauses repeated transient baseline failures for the history budget and recov
     const lease = harness.lease;
     const originalBytes = await readFile(harness.path);
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
-    const readBudgetMs = harness.historyRequests[0]!.timeoutMs!;
-    expect(readBudgetMs).toBe(15_000);
-    harness.rejectBaseline('request-timeout');
+    const readBudgetMs = CONTROL_READ_TIMEOUT_MS;
+    expect(harness.historyRequests[0]!.timeoutMs).toBe(305_000);
+    harness.rejectBaseline('client-disconnected');
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     harness.rejectBaseline('request-timeout');
-    await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
+    await vi.waitFor(() => expect(harness.historyRequests.at(-1)!.socket.destroyed).toBe(true));
     for (let index = 0; index < 20; index += 1) await harness.poll();
-    await lease.waitForProviderControl?.();
+    await expect(lease.waitForProviderControl!()).rejects.toThrow('owner_unavailable');
     now += readBudgetMs - 1;
     await harness.poll();
-    await harness.roundTrip();
     expect(harness.historyRequests).toHaveLength(2);
+    // following 自身会传完整快照；等待期不能通过普通订阅绕过退避。
+    expect(harness.followers).toHaveLength(2);
     expect(lease.getObservation?.()).toMatchObject({ state: 'unknown' });
     expect(lease.getProviderControl?.()).toBeNull();
     now += 1;
@@ -209,11 +240,11 @@ it('pauses repeated transient baseline failures for the history budget and recov
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(3));
     // 第三次仍失败也必须重新暂停，不能重置为首次立即补试。
     harness.rejectBaseline('request-timeout');
-    await vi.waitFor(() => expect(harness.followers).toHaveLength(5));
+    await vi.waitFor(() => expect(harness.historyRequests.at(-1)!.socket.destroyed).toBe(true));
     now += readBudgetMs - 1;
     await harness.poll();
-    await harness.roundTrip();
     expect(harness.historyRequests).toHaveLength(3);
+    expect(harness.followers).toHaveLength(3);
     now += 1;
     await harness.poll();
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(4));
@@ -234,14 +265,14 @@ it.each(['release', 'source', 'forward'] as const)('does not restart a paused ba
   const harness = await createFallbackHarness({ holdBaseline: true });
   try {
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
-    harness.rejectBaseline('request-timeout');
+    harness.rejectBaseline('client-disconnected');
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     harness.rejectBaseline('request-timeout');
-    await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
+    await vi.waitFor(() => expect(harness.historyRequests.at(-1)!.socket.destroyed).toBe(true));
     if (change === 'release') await harness.lease.release();
     else if (change === 'source') await rm(harness.path);
     else await harness.append('task_started', 'new-forward');
-    now += harness.historyRequests[0]!.timeoutMs!;
+    now += CONTROL_READ_TIMEOUT_MS;
     await harness.poll();
     expect(harness.historyRequests).toHaveLength(2);
     expect(harness.lease.getProviderControl?.()).toBeNull();
@@ -261,10 +292,10 @@ it('waits for the pending transcript batch before restarting a paused baseline',
   let unsubscribe = () => {};
   try {
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
-    harness.rejectBaseline('request-timeout');
+    harness.rejectBaseline('client-disconnected');
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     harness.rejectBaseline('request-timeout');
-    await vi.waitFor(() => expect(harness.followers).toHaveLength(3));
+    await vi.waitFor(() => expect(harness.historyRequests.at(-1)!.socket.destroyed).toBe(true));
     unsubscribe = harness.lease.subscribeToTranscriptUpdates!(async (update) => {
       if (Array.from(update.items).length) await acknowledgement;
     });
@@ -274,7 +305,7 @@ it('waits for the pending transcript batch before restarting a paused baseline',
     } })}\n`);
     const pendingPoll = harness.poll();
     await vi.waitFor(() => expect(harness.updates.flatMap((update) => Array.from(update.items))).toHaveLength(1));
-    now += harness.historyRequests[0]!.timeoutMs!;
+    now += CONTROL_READ_TIMEOUT_MS;
     let joined = false;
     const joinedPoll = harness.poll().then(() => { joined = true; });
     await Promise.resolve();
@@ -315,7 +346,7 @@ it.each(['forward', 'source', 'release'])('does not publish a recovery baseline 
   const harness = await createFallbackHarness({ holdBaseline: true });
   try {
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
-    harness.rejectBaseline('request-timeout');
+    harness.rejectBaseline('client-disconnected');
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
     if (change === 'forward') await harness.append('task_started', 'new-running');
     else if (change === 'source') {
@@ -623,12 +654,13 @@ it('keeps reconnect hydration recovery bounded after an established control conn
     options.holdBaseline = true;
     harness.followers[0]!.destroy();
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(2));
-    harness.rejectBaseline('request-timeout');
+    harness.rejectBaseline('client-disconnected');
     await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(3));
     harness.rejectBaseline('request-timeout');
-    await vi.waitFor(() => expect(harness.followers).toHaveLength(4));
+    await vi.waitFor(() => expect(harness.historyRequests.at(-1)!.socket.destroyed).toBe(true));
     await harness.append('agent_message');
-    await harness.roundTrip();
+    await harness.poll();
+    expect(harness.followers).toHaveLength(3);
     expect(harness.historyRequests).toHaveLength(3);
     expect(harness.lease.getProviderControl?.()).toBeNull();
     expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
@@ -822,4 +854,31 @@ it('invalidates the live getter on disconnect and release, and reconfirms after 
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
+});
+
+/** 明确本地生命周期应直接成为观察基线，不为展示状态水合整份桌面历史。 */
+it('observes an anchored local lifecycle without desktop full-history hydration', async () => {
+  const harness = await createFallbackHarness({ rolloutBaseline: true, holdBaseline: true, pollMs: '60000' });
+  try {
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toEqual({
+      v: 1, source: 'rollout', turnId: 'local-current', state: 'completed',
+    }));
+    expect(harness.historyRequests).toHaveLength(0);
+    expect(harness.followers).toHaveLength(0);
+    expect(harness.lease.getProviderControl?.()).toBeNull();
+    await appendFile(harness.path, JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(),
+      payload: { type: 'task_started', turn_id: 'local-next' } }) + '\n');
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'running', turnId: 'local-next' });
+    expect(harness.historyRequests).toHaveLength(0);
+    // 源文件重写撤销原状态，恢复后的明确轮可由原轮询重新建立，不复活旧终态。
+    await writeFile(harness.path, harness.meta);
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'unknown' });
+    await appendFile(harness.path, JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(),
+      payload: { type: 'task_started', turn_id: 'after-rewrite' } }) + '\n');
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({ state: 'running', turnId: 'after-rewrite' });
+    expect(harness.historyRequests).toHaveLength(0);
+  } finally { await harness.close(); }
 });

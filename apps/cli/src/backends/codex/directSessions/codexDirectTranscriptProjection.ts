@@ -1,9 +1,15 @@
-import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectTranscriptRawMessageV1, DirectSessionAttachmentV1 } from '@happier-dev/protocol';
 
 import { mapCodexRolloutEventToActions, type CodexRolloutHistoryMode } from '../localControl/rolloutMapper';
 import { createCodexRolloutSemanticTracker } from '../rollout/createCodexRolloutSemanticTracker';
 import type { CodexRolloutFile } from './collectCodexSessionRolloutFiles';
 import { mapCodexRolloutLineToDirectMessages } from './mapCodexRolloutLineToDirectMessages';
+
+/** 只认原生 envelope 开头的顶层 compacted；不在 payload 或正文内搜索相同文字。 */
+export function isCodexCompactedLinePrefix(prefix: Buffer): boolean {
+  // 原生序列化的 timestamp、ordinal 可在 type 前；只跨过这两个已知标量，不能进入 payload 或正文。
+  return /^\s*\{\s*(?:(?:"timestamp"\s*:\s*"[^"\\]*"|"ordinal"\s*:\s*\d+)\s*,\s*)*"type"\s*:\s*"compacted"\s*,/.test(prefix.subarray(0, 1024).toString('utf8'));
+}
 
 export type CodexDirectTranscriptRolloutStream = CodexRolloutFile & Readonly<{
   threadId: string;
@@ -46,6 +52,7 @@ export function projectCodexRolloutLineToTranscriptRecords(params: Readonly<{
   lineStartOffsetBytes: number;
   lineNextOffsetBytes: number;
   lineValue: unknown;
+  generatedAttachments?: readonly DirectSessionAttachmentV1[];
   historyMode?: CodexRolloutHistoryMode;
   semanticTracker: ReturnType<typeof createCodexRolloutSemanticTracker>;
 }>): Readonly<{ records: readonly CodexProjectedTranscriptRecord[]; discoveredChildThreadIds: readonly string[] }> {
@@ -64,6 +71,7 @@ export function projectCodexRolloutLineToTranscriptRecords(params: Readonly<{
     lineValue: params.lineValue,
     actions: normalizedActions,
     sidechainId: params.stream.sidechainId,
+    generatedAttachments: params.generatedAttachments,
   });
   return {
     discoveredChildThreadIds: [...discoveredChildThreadIds],

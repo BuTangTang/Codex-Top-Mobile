@@ -214,7 +214,8 @@ export async function listCodexSessionCandidates(params: Readonly<{
     merged.set(candidate.remoteSessionId, {
       remoteSessionId: candidate.remoteSessionId, updatedAtMs: candidate.updatedAtMs,
       source: sourceIdentity(candidate.details!.source as DirectSessionsSource), readCandidate: async () => ({
-        ...candidate, details: { ...candidate.details, codexLifecycle: unknownCodexLifecycleV1(Date.now()) },
+        ...candidate, details: { ...candidate.details, codexLifecycle: unknownCodexLifecycleV1(Date.now()),
+          codexObservation: { v: 1, state: 'unknown', reason: 'not_observed' } },
       }),
     });
   }
@@ -239,7 +240,8 @@ export async function listCodexSessionCandidates(params: Readonly<{
     const candidate = await entry.readCandidate();
     // 合并前保留全部来源证据；最后胜出的同home不能掩盖先前已发现的冲突。
     return sourceConflicts.has(entry.remoteSessionId)
-      ? { ...candidate, details: { ...candidate.details, codexLifecycle: unknownCodexLifecycleV1(Date.now()) } }
+      ? { ...candidate, details: { ...candidate.details, codexLifecycle: unknownCodexLifecycleV1(Date.now()),
+        codexObservation: { v: 1, state: 'unknown', reason: 'not_observed' } } }
       : candidate;
   });
   const nextOffset = offset + candidates.length;

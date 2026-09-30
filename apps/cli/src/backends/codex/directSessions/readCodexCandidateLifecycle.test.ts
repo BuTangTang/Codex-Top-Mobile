@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { readCodexCandidateLifecycle } from './readCodexCandidateLifecycle';
+import { readCodexCandidateLifecycle, readCodexLifecycleObservation } from './readCodexCandidateLifecycle';
 
 const checkedAtMs = Date.parse('2026-09-24T08:00:00Z');
 const at = checkedAtMs - 1000;
@@ -536,6 +536,29 @@ describe('readCodexCandidateLifecycle', () => {
   it('does not resolve approval using another turn UserMessage', async () => {
     expect((await read(start + event('exec_approval_request', { call_id: 'approval' })
       + event('item_completed', { thread_id: 'root', turn_id: 'other', item: { type: 'UserMessage' } }))).state).toBe('unknown');
+  });
+
+  /** 状态观察复用同一文件投影，保留明确轮次及真实待处理身份。 */
+  it('projects current rollout lifecycle into an observation without changing the candidate contract', async () => {
+    await read(start + question('question-id'));
+    const params = { filePath, remoteSessionId: 'root', checkedAtMs };
+    expect(await readCodexLifecycleObservation(params)).toEqual({ v: 1, source: 'rollout',
+      turnId: 'turn', state: 'needs_input', requests: [{ requestId: 'question-id', kind: 'user_action_request' }] });
+    await fs.appendFile(filePath, answer('question-id') + complete);
+    expect(await readCodexLifecycleObservation(params)).toEqual({ v: 1, source: 'rollout', turnId: 'turn', state: 'completed' });
+    expect(Object.keys(await readCodexCandidateLifecycle(params)).sort()).toEqual(['checkedAtMs', 'eventAtMs', 'state', 'v']);
+    await fs.appendFile(filePath, event('task_started', { turn_id: 'next' }));
+    expect(await readCodexLifecycleObservation(params)).toEqual({ v: 1, source: 'rollout', turnId: 'next', state: 'running' });
+  });
+
+  /** 无请求标识的等待可在候选列表显示，但不能捏造可关联的观察身份。 */
+  it('keeps missing request identities and stale execution unknown', async () => {
+    await read(start + row('response_item', { type: 'function_call', name: 'request_user_input' }));
+    expect(await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs })).toMatchObject({ state: 'unknown' });
+    await read(event('task_started', { turn_id: 'old' }, new Date(checkedAtMs - 900001).toISOString()));
+    expect(await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs })).toMatchObject({ state: 'unknown' });
+    await fs.unlink(filePath);
+    expect(await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs })).toMatchObject({ state: 'unknown' });
   });
 
 });

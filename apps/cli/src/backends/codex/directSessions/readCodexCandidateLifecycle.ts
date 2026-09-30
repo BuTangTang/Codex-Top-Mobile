@@ -4,7 +4,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { lstat, open } from 'node:fs/promises';
 
-import { unknownCodexLifecycleV1, type CodexLifecycleV1 } from '@happier-dev/protocol';
+import { unknownCodexLifecycleV1, type CodexLifecycleV1, type DirectSessionObservationV1 } from '@happier-dev/protocol';
 
 import { tryParseJsonlLine } from '@/api/directSessions/filePaging/jsonlParse';
 import type { JsonlParsedLine } from '@/api/directSessions/filePaging/jsonlBackwardPager';
@@ -410,17 +410,47 @@ async function readLifecycle(params: Readonly<{ filePath: string; remoteSessionI
   return unknownCodexLifecycleV1(params.checkedAtMs);
 }
 
-/** 同一来源只允许一个读取提交缓存；并发调用明确未知，不能排队积压或返回陈旧状态。 */
-export async function readCodexCandidateLifecycle(params: Readonly<{
+type LifecycleReadParams = Readonly<{
   filePath: string;
   remoteSessionId: string;
   checkedAtMs?: number;
-}>): Promise<CodexLifecycleV1> {
+}>;
+
+/** 在同一读取锁内投影列表状态与观察事实，候选和状态调用者共享读取，不能为每种投影再读历史。 */
+export async function readCodexCandidateFacts(params: LifecycleReadParams): Promise<{
+  lifecycle: CodexLifecycleV1;
+  observation: DirectSessionObservationV1;
+}> {
   const key = JSON.stringify([resolve(params.filePath), params.remoteSessionId]);
   const checkedAtMs = params.checkedAtMs ?? Date.now();
-  if (inFlight.has(key) || inFlight.size >= CACHE_ENTRIES) return unknownCodexLifecycleV1(checkedAtMs);
+  const unknown: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
+  const unavailable = { lifecycle: unknownCodexLifecycleV1(checkedAtMs), observation: unknown };
+  if (inFlight.has(key) || inFlight.size >= CACHE_ENTRIES) return unavailable;
   inFlight.add(key);
-  try { return await readLifecycle({ ...params, checkedAtMs }, key); }
-  catch { lifecycleCache.delete(key); return unknownCodexLifecycleV1(checkedAtMs); }
+  try {
+    const lifecycle = await readLifecycle({ ...params, checkedAtMs }, key);
+    const projection = lifecycleCache.get(key)?.projection;
+    // 仅使用本次验证完整且未过期的投影；残留缓存不能使未知状态重新变为已知。
+    if (lifecycle.state === 'unknown' || !projection?.turnId) return { lifecycle, observation: unknown };
+    const common = { v: 1 as const, source: 'rollout' as const, turnId: projection.turnId };
+    if (lifecycle.state !== 'needs_input') return { lifecycle, observation: { ...common, state: lifecycle.state } };
+    const requests = [...projection.pending].map(([requestId, request]) => ({
+      requestId,
+      kind: request.kind === 'approval' ? 'permission_request' as const : 'user_action_request' as const,
+    }));
+    // 不为缺失身份的待处理事件制造请求编号，也不因此授予桌面操作能力。
+    return { lifecycle, observation: requests.length > 0 && requests.every((request) => request.requestId.trim())
+      ? { ...common, state: 'needs_input', requests } : unknown };
+  } catch { lifecycleCache.delete(key); return unavailable; }
   finally { inFlight.delete(key); }
+}
+
+/** 保留原生命周期读取契约，派生字段仍由同一事实 owner 生成。 */
+export async function readCodexCandidateLifecycle(params: LifecycleReadParams): Promise<CodexLifecycleV1> {
+  return (await readCodexCandidateFacts(params)).lifecycle;
+}
+
+/** 从同一只读生命周期解析结果保留轮次及请求身份，供状态观察使用。 */
+export async function readCodexLifecycleObservation(params: LifecycleReadParams): Promise<DirectSessionObservationV1> {
+  return (await readCodexCandidateFacts(params)).observation;
 }
