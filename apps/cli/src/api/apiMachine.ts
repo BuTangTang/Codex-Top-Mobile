@@ -197,6 +197,7 @@ export class ApiMachineClient {
     private readonly rpcLifecycleRegistrations: RpcLifecycleRegistration[] = [];
     private readonly machineRpcWorkingDirectory: string;
     private readonly filesystemAccessPolicy: FilesystemAccessPolicy;
+    private readonly attachmentUploadMaxBytes?: number;
     private readonly ownershipMetadata: Readonly<{
         runtimeId?: string;
         cliVersion?: string;
@@ -388,11 +389,14 @@ export class ApiMachineClient {
                 additionalAllowedWriteDirs = dirs;
             },
         }));
-        this.rpcLifecycleRegistrations.push(registerFileSystemHandlers(this.rpcHandlerManager, machineRpcWorkingDirectory, {
+        const fileSystemRegistration = registerFileSystemHandlers(this.rpcHandlerManager, machineRpcWorkingDirectory, {
             accessPolicy: filesystemAccessPolicy,
             getAdditionalAllowedReadDirs: () => additionalAllowedReadDirs,
             getAdditionalAllowedWriteDirs: () => additionalAllowedWriteDirs,
-        }));
+        });
+        this.rpcLifecycleRegistrations.push(fileSystemRegistration);
+        // 只保留实际文件传输注册的容量；候选列表不得用外部 deps 或默认值替代。
+        this.attachmentUploadMaxBytes = fileSystemRegistration.attachmentUploadMaxBytes;
         registerWorkspaceAnchorHandlers(this.rpcHandlerManager, {
             defaultDirectory: machineRpcWorkingDirectory,
             accessPolicy: filesystemAccessPolicy,
@@ -448,6 +452,7 @@ export class ApiMachineClient {
                 directSessionNotifications: deps?.directSessionNotifications ?? this.directSessionNotifications,
                 machineRpcWorkingDirectory: this.machineRpcWorkingDirectory,
                 filesystemAccessPolicy: this.filesystemAccessPolicy,
+                attachmentUploadMaxBytes: this.attachmentUploadMaxBytes,
                 emitDirectSessionTranscriptUpdate:
                     deps?.emitDirectSessionTranscriptUpdate
                     ?? ((payload) => this.emitDirectSessionTranscriptUpdate(payload)),

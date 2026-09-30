@@ -176,6 +176,7 @@ export type DirectSessionsRpcLifecycle = Readonly<{
 /** 注册 direct-session 操作；外部发送独立认证关联目标并保持原 owner。 */
 export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
   rpcHandlerManager: RpcHandlerRegistrar;
+  attachmentUploadMaxBytes?: number;
   spawnSession?: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   stopSession?: (sessionId: string) => Promise<boolean>;
   getDaemonIdentity?: () => Promise<DirectSessionDaemonIdentity>;
@@ -183,6 +184,10 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
   notifications?: DirectSessionNotificationsRuntime;
 }>): DirectSessionsRpcLifecycle {
   const { rpcHandlerManager, emitDirectSessionTranscriptUpdate } = params;
+  // 旧注册及畸形内部值只省略能力，不影响列表或补造默认上限。
+  const attachmentUploadMaxBytes = typeof params.attachmentUploadMaxBytes === 'number'
+    && Number.isSafeInteger(params.attachmentUploadMaxBytes) && params.attachmentUploadMaxBytes > 0
+    ? params.attachmentUploadMaxBytes : undefined;
   const followLeaseManager = createDirectSessionFollowLeaseManager();
 
   const boundServerUrl = resolveServerHttpBaseUrl();
@@ -477,12 +482,16 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
         heapDeltaBytes: process.memoryUsage().heapUsed - startMemory.heapUsed,
         rssBytes: process.memoryUsage().rss,
       });
+      // provider 只拥有浏览能力，不能覆盖或伪造本机传输注册的实际容量。
+      const { attachmentUploadMaxBytes: _providerUploadMaxBytes, ...providerCapabilities } = (res.capabilities ?? {}) as
+        Partial<NonNullable<typeof res.capabilities>> & { attachmentUploadMaxBytes?: unknown };
       return {
         ok: true,
         candidates: res.candidates,
         nextCursor: res.nextCursor,
         ...(res.searchIncomplete ? { searchIncomplete: true } : {}),
-        capabilities: { deleteCandidate: false, ...res.capabilities, linkWithoutOpening: true as const },
+        capabilities: { deleteCandidate: false, ...providerCapabilities, linkWithoutOpening: true as const,
+          ...(attachmentUploadMaxBytes === undefined ? {} : { attachmentUploadMaxBytes }) },
       } satisfies DirectSessionsCandidatesListResponse;
     } catch (error) {
       if (error instanceof DirectSessionsCandidateCursorError) {

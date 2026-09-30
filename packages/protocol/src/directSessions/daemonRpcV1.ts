@@ -126,6 +126,8 @@ export const DirectSessionsCandidatesListResponseSchema = z.union([
       capabilities: z.object({
         deleteCandidate: z.boolean(),
         linkWithoutOpening: z.literal(true).optional(),
+        // 本机既有传输 owner 的单文件实际上限；旧响应缺失时不得推定默认值。
+        attachmentUploadMaxBytes: z.number().int().positive().safe().optional(),
       }).optional(),
     })
     .passthrough(),

@@ -33,6 +33,7 @@ export function registerFileSystemHandlers(
   }>,
 ): Readonly<{
   transferSessionStore: TransferSessionStore;
+  attachmentUploadMaxBytes?: number;
   dispose: () => Promise<void>;
 }> {
   const accessPolicy: FilesystemAccessPolicy = opts?.accessPolicy ?? { kind: 'osUser' };
@@ -73,13 +74,19 @@ export function registerFileSystemHandlers(
     getAdditionalAllowedReadDirs: () => normalizeAllowedDirectories(getAdditionalAllowedReadDirs),
     getAdditionalAllowedWriteDirs: () => normalizeAllowedDirectories(getAdditionalAllowedWriteDirs),
   });
+  // 公布同一传输注册快照的单文件上限，不另读环境或替换原上传拒绝顺序。
+  const sessionRpcTransferMaxBytes = resolveSessionRpcTransferMaxBytes();
+  const attachmentUploadMaxBytes = Math.min(
+    configuration.filesUploadMaxFileBytes,
+    sessionRpcTransferMaxBytes ?? configuration.filesUploadMaxFileBytes,
+  );
   registerSessionTransferRpcHandlers(rpcHandlerManager, {
     workingDirectory: effectiveWorkingDirectory,
     accessPolicy,
     store: transferSessionStore,
     getAdditionalAllowedReadDirs,
     getAdditionalAllowedWriteDirs,
-    sessionRpcTransferMaxBytes: resolveSessionRpcTransferMaxBytes(),
+    sessionRpcTransferMaxBytes,
     attachmentUpload: {
       pathAllowanceRegistry,
     },
@@ -87,6 +94,7 @@ export function registerFileSystemHandlers(
 
   return {
     transferSessionStore,
+    ...(Number.isSafeInteger(attachmentUploadMaxBytes) && attachmentUploadMaxBytes > 0 ? { attachmentUploadMaxBytes } : {}),
     dispose: () => transferSessionStore.dispose(),
   };
 }

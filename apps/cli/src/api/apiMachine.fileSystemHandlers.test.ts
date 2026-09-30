@@ -2,7 +2,7 @@ import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { Machine } from '@/api/types';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
@@ -28,6 +28,41 @@ async function expectPathMissing(path: string): Promise<void> {
 }
 
 describe('ApiMachineClient filesystem handlers', () => {
+  // 从真实机器注册一直读取候选响应，外部 deps 不得覆盖本机传输 owner 的上限。
+  it('publishes the actual attachment upload limit through machine candidates', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'happier-machine-upload-capability-'));
+    vi.stubEnv('HAPPIER_FEATURE_MACHINES_TRANSFER_SERVER_ROUTED__MAX_BYTES', '2048');
+    vi.stubEnv('HAPPIER_PRODUCT_MODE', '');
+    vi.stubEnv('HAPPIER_CLAUDE_CONFIG_DIR', workspace);
+    const client = new ApiMachineClient('token', createMachine());
+    try {
+      await mkdir(join(workspace, 'projects', 'fixture'), { recursive: true });
+      await writeFile(join(workspace, 'projects', 'fixture', 'fixture.jsonl'), JSON.stringify({
+        type: 'assistant', uuid: 'a1', message: { model: 'm', content: [] },
+      }) + '\n');
+      client.setRPCHandlers({
+        spawnSession: async () => ({ type: 'success', sessionId: 'unused' }),
+        stopSession: async () => true,
+        requestShutdown: () => {},
+      }, { attachmentUploadMaxBytes: 999999 });
+      const rpc = (client as any).rpcHandlerManager;
+      vi.stubEnv('HAPPIER_FEATURE_MACHINES_TRANSFER_SERVER_ROUTED__MAX_BYTES', '1');
+      const candidates = await rpc.invokeLocal(RPC_METHODS.DAEMON_DIRECT_SESSIONS_CANDIDATES_LIST, {
+        machineId: 'machine-test', providerId: 'claude',
+        source: { kind: 'claudeConfig', configDir: workspace, projectId: null }, limit: 10,
+      });
+      expect(candidates).toMatchObject({ ok: true, capabilities: { attachmentUploadMaxBytes: 2048 } });
+      expect(candidates.candidates).toHaveLength(1);
+      await expect(rpc.invokeLocal(RPC_METHODS.DAEMON_BULK_TRANSFER_UPLOAD_INIT, {
+        t: 'session_file_upload_v1', path: join(workspace, 'too-large.txt'), sizeBytes: 2049,
+      })).resolves.toEqual({ success: false, error: 'File exceeds the server-routed transfer size limit' });
+    } finally {
+      await client.shutdown();
+      vi.unstubAllEnvs();
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('registers filesystem RPCs as machine-scoped handlers', () => {
     const client = new ApiMachineClient('token', createMachine());
     const rpc = (client as any).rpcHandlerManager as {

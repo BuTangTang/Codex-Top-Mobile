@@ -1485,6 +1485,34 @@ describe('registerMachineDirectSessionsRpcHandlers', () => {
       .resolves.toEqual({ ok: false, errorCode: 'invalid_request', error: 'direct_sessions_list_refresh_required', refreshRequired: true });
   });
 
+  // 旧注册不补默认上限；畸形内部数字不得污染正常候选列表或变成可用能力。
+  it.each([undefined, 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '2048', 2048])(
+    'publishes only an explicit safe attachment upload limit (%s)', async (attachmentUploadMaxBytes) => {
+      const root = await mkdtemp(join(tmpdir(), 'happier-direct-upload-capability-'));
+      vi.stubEnv('HAPPIER_CLAUDE_CONFIG_DIR', root);
+      vi.stubEnv('HAPPIER_PRODUCT_MODE', '');
+      const registered = new Map<string, (request: unknown) => Promise<unknown>>();
+      const lifecycle = registerMachineDirectSessionsRpcHandlers({
+        rpcHandlerManager: { registerHandler: (method, handler) => {
+          registered.set(method, async (request) => handler(request as Parameters<typeof handler>[0]));
+        } },
+        ...(attachmentUploadMaxBytes === undefined ? {} : { attachmentUploadMaxBytes: attachmentUploadMaxBytes as number }),
+      });
+      try {
+        const result = await registered.get(RPC_METHODS.DAEMON_DIRECT_SESSIONS_CANDIDATES_LIST)!({
+          machineId: 'm1', providerId: 'claude', source: { kind: 'claudeConfig', configDir: root, projectId: null }, limit: 10,
+        }) as { ok: boolean; candidates: unknown[]; capabilities: Record<string, unknown> };
+        expect(result.ok).toBe(true);
+        expect(result.candidates).toEqual([]);
+        if (attachmentUploadMaxBytes === 2048) expect(result.capabilities.attachmentUploadMaxBytes).toBe(2048);
+        else expect(result.capabilities).not.toHaveProperty('attachmentUploadMaxBytes');
+      } finally {
+        await lifecycle.dispose();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('dispatches candidates.list to the claude adapter', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-directSessions-rpc-'));
     const configDir = join(root, '.claude');

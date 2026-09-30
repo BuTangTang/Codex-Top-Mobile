@@ -9,6 +9,26 @@ import {
   resolveDirectTranscriptContinuation,
 } from './daemonRpcV1';
 
+describe('Direct session attachment upload limit capability', () => {
+  const page = { ok: true, candidates: [], capabilities: { deleteCandidate: false, linkWithoutOpening: true } };
+
+  // 缺字段的已发布列表继续可读，不为旧机器补造默认容量。
+  it('preserves an explicit safe byte limit and the old response without a limit', () => {
+    const schema = directSessionsRpc.DirectSessionsCandidatesListResponseSchema;
+    expect(schema.parse(page)).toEqual(page);
+    expect(schema.parse({ ...page, capabilities: { ...page.capabilities, attachmentUploadMaxBytes: 2048 } }))
+      .toEqual({ ...page, capabilities: { ...page.capabilities, attachmentUploadMaxBytes: 2048 } });
+  });
+
+  it.each([null, 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '2048'])(
+    'rejects an invalid published attachment upload limit (%s)', (attachmentUploadMaxBytes) => {
+      expect(directSessionsRpc.DirectSessionsCandidatesListResponseSchema.safeParse({
+        ...page, capabilities: { ...page.capabilities, attachmentUploadMaxBytes },
+      }).success).toBe(false);
+    },
+  );
+});
+
 describe('Direct session external-owner control capability', () => {
   const status = {
     ok: true,

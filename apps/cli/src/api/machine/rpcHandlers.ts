@@ -256,6 +256,8 @@ export type MachineRpcHandlers = {
 };
 
 export type MachineRpcHandlerDeps = Readonly<{
+  /** 仅由本机文件传输注册提供；缺失时不公布猜测的容量。 */
+  attachmentUploadMaxBytes?: number;
   directSessionNotifications?: import('./rpcHandlers.directSessions').DirectSessionNotificationsRuntime;
   runReplaySummaryForDialog?: typeof runReplaySummaryForDialog;
   promptAssetsHomedir?: () => string;
@@ -1169,6 +1171,7 @@ export function registerMachineRpcHandlers(params: Readonly<{
   });
   const directSessions = registerMachineDirectSessionsRpcHandlers({
     rpcHandlerManager,
+    attachmentUploadMaxBytes: params.deps?.attachmentUploadMaxBytes,
     spawnSession,
     stopSession: stopSessionConfirmed,
     // 复用 ApiMachineClient 绑定的账号/机器身份，不能由 RPC 正文指定接收 daemon。
