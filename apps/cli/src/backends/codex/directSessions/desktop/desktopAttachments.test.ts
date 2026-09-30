@@ -28,8 +28,33 @@ describe('prepareDesktopAttachmentMessage', () => {
       imageAttachments: [{ src: image.path, localPath: image.path, filename: 'screen.png' }], workspaceRoots: [root],
     } });
     expect(result.attachments).toHaveLength(2);
+    const textInput = result.input[0]!;
+    if (!('text' in textInput)) throw new Error('The native attachment prompt must include text');
+    const echo = mapCodexRolloutLineToDirectMessages({ fileRelPath: 'sessions/synthetic.jsonl', lineStartOffsetBytes: 0,
+      lineValue: { timestamp: '2026-01-02T00:00:01Z' },
+      actions: [{ type: 'user-text', text: textInput.text, clientId: 'local-message' }] });
+    expect(echo[0]).toMatchObject({ localId: 'local-message', raw: { meta: { happier: { payload: {
+      attachments: [{ name: 'screen.png', kind: 'image' }, { name: 'note.txt', kind: 'file' }],
+    } } } } });
     await writeFile(file.path, 'bad!');
     await expect(prepareDesktopAttachmentMessage({ cwd: root, localId: 'local-message', text: '', attachments: [image, file] })).rejects.toMatchObject({ reason: 'attachment_unavailable' });
+  });
+  it('keeps the original image name when the upload owner prefixes the remote file path', async () => {
+    const dir = join(root, 'happier/uploads/scope/messages/local-message');
+    await mkdir(dir, { recursive: true });
+    const image = { name: 'screen.png', path: join(dir, 'a1b2c3d4-screen.png'), kind: 'image' as const,
+      sizeBytes: 4, sha256: createHash('sha256').update('png!').digest('hex') };
+    await writeFile(image.path, 'png!');
+    const result = await prepareDesktopAttachmentMessage({ cwd: root, localId: 'local-message', text: '', attachments: [image] });
+    const textInput = result.input[0]!;
+    if (!('text' in textInput)) throw new Error('The native attachment prompt must include text');
+    const echo = mapCodexRolloutLineToDirectMessages({ fileRelPath: 'sessions/synthetic.jsonl', lineStartOffsetBytes: 0,
+      lineValue: { timestamp: '2026-01-02T00:00:01Z' },
+      actions: [{ type: 'user-text', text: textInput.text, clientId: 'local-message' }] });
+    expect(echo[0]).toMatchObject({ raw: { meta: { happier: { payload: {
+      attachments: [{ name: 'screen.png', path: image.path, kind: 'image' }],
+    } } } } });
+    expect(result.input[1]).toEqual({ type: 'localImage', path: image.path });
   });
   it('keeps multiline file names on one native display line without changing metadata or file bytes', async () => {
     const dir = join(root, 'happier/uploads/scope/messages/local-message');
