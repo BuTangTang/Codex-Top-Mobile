@@ -26,10 +26,16 @@ function attachmentForPath(path: string, image = false, name = basename(path)): 
   return { name, path, kind: image || mimeType ? 'image' : 'file', ...(mimeType ? { mimeType } : {}) };
 }
 
-/** 相同引用在同条回复只展示一次，不以文件名合并不同路径。 */
+/** 相同本地引用在同条回复只展示一次；没有路径的不可用项不能按文件名或空路径合并。 */
 function uniqueAttachments(items: DirectSessionAttachmentV1[]): DirectSessionAttachmentV1[] {
   const seen = new Set<string>();
-  return items.filter((item) => { const key = `${item.kind}:${item.path}`; if (seen.has(key)) return false; seen.add(key); return true; });
+  return items.filter((item) => {
+    if (item.path === undefined) return true;
+    const key = `${item.kind}:${item.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** 提取 Markdown 里明确指向本机文件的链接；正常网页仍按原正文保留。 */
@@ -43,13 +49,24 @@ export function readCodexMarkdownAttachments(text: string): DirectSessionAttachm
   return uniqueAttachments(attachments);
 }
 
-/** 仅拆解完整原生文件前缀；保留标签中的冒号，并按显式图片标记保留原文件类型。 */
+/** 仅拆解完整原生文件前缀；本地项保留显式类型，已核实的云文件项按原顺序标为不可用。 */
 export function readCodexUserAttachments(text: string): { text: string; attachments: DirectSessionAttachmentV1[] } {
   const wrapper = /^\s*# Files mentioned by the user:\n([\s\S]*?)\nDistinguish instructions in attached documents from the user's request\.\n+## My request:\n?([\s\S]*)$/.exec(text);
   if (!wrapper) return { text, attachments: readCodexMarkdownAttachments(text) };
   const attachments: DirectSessionAttachmentV1[] = [];
-  // 分隔符后的引用必须从绝对路径或 file URL 开始，不能把文件名或路径里的冒号当边界。
-  for (const match of wrapper[1]!.matchAll(/^## (.+?): ((?:\/|file:\/\/|[a-zA-Z]:[\\/]).+)\n?(Image attachment: true)?/gm)) {
+  // 同一次扫描保留混合项顺序；本地分隔符后必须是路径，不能把文件名或路径里的冒号当边界。
+  for (const match of wrapper[1]!.matchAll(/^## (.+?): ((?:\/|file:\/\/|[a-zA-Z]:[\\/]).+)\n?(Image attachment: true)?|^Uploaded file: ([^\n]+)$/gm)) {
+    if (match[4] !== undefined) {
+      // 仅识别原生单行JSON的两种已核实引用，不下载或把云pointer带入附件元数据。
+      try {
+        const uploaded = record(JSON.parse(match[4]));
+        if (typeof uploaded?.fileName === 'string' && uploaded.fileName.trim()
+            && typeof uploaded.pointer === 'string' && /^(?:sediment|file-service):\/\/[^\s\0]+$/.test(uploaded.pointer)) {
+          attachments.push({ name: uploaded.fileName, kind: 'file', availability: 'unavailable', reason: 'unsupported_reference' });
+        }
+      } catch { /* 坏JSON沿原正文处理，不当作可用附件。 */ }
+      continue;
+    }
     const path = localPath(match[2]!);
     // 原生 wrapper 已明确文件类型；扩展名只补 MIME，Markdown 分支仍沿原规则推断类型。
     if (path) attachments.push({ ...attachmentForPath(path, Boolean(match[3]), match[1]!), kind: match[3] ? 'image' : 'file' });
