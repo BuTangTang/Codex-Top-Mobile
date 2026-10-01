@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import * as directSessionsRpc from './daemonRpcV1';
 import {
+  DirectSessionStatusGetRequestSchema,
   DirectSessionsSourceSchema,
   DirectTranscriptRawMessageV1Schema,
   DirectTranscriptPageResponseSchema,
@@ -72,6 +73,36 @@ describe('Direct session external-owner control capability', () => {
         ...status, externalControl: { canSend: true, textSendProtocol },
       }).success).toBe(false);
     }
+  });
+
+  // 旧状态没有 goal 键；显式 opt-in 才接受三态旁路，不能放进 strict observation。
+  it('keeps a legacy status without a goal and accepts only an opted-in sibling', () => {
+    const request = {
+      machineId: 'machine-a', sessionId: 'linked', providerId: 'codex', remoteSessionId: 'thread-synthetic',
+      source: { kind: 'codexHome', home: 'user' },
+    };
+    expect(DirectSessionStatusGetRequestSchema.parse(request)).toEqual(request);
+    expect(DirectSessionStatusGetRequestSchema.parse({ ...request, includeGoal: true })).toEqual({ ...request, includeGoal: true });
+    expect(DirectSessionStatusGetRequestSchema.safeParse({ ...request, includeGoal: false }).success).toBe(false);
+    const legacy = directSessionsRpc.DirectSessionStatusGetResponseSchema.parse(status);
+    expect(legacy).not.toHaveProperty('goal');
+    const goal = {
+      availability: 'available', source: 'desktop', threadId: 'thread-synthetic', objective: '完成接入',
+      status: 'paused', tokenBudget: null, tokensUsed: 4, timeUsedSeconds: 5, updatedAt: 9,
+    };
+    expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.parse({ ...status, goal })).toMatchObject({ goal });
+    expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.parse({
+      ...status, goal: { availability: 'none', source: 'desktop' },
+    })).toMatchObject({ goal: { availability: 'none', source: 'desktop' } });
+    expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.parse({
+      ...status, goal: { availability: 'unknown' },
+    })).toMatchObject({ goal: { availability: 'unknown' } });
+    expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.safeParse({
+      ...status, observation: { v: 1, source: 'desktop', state: 'completed', turnId: 'turn', goal },
+    }).success).toBe(false);
+    expect(directSessionsRpc.DirectSessionStatusGetResponseSchema.safeParse({
+      ...status, goal: { availability: 'available', source: 'desktop', status: 'running' },
+    }).success).toBe(false);
   });
 });
 

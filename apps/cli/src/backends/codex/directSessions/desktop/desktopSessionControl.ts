@@ -14,6 +14,7 @@ import {
 } from '@/utils/fs/protectedLocalState';
 
 import { DesktopIpc, DesktopIpcError, assertDesktopPlatform, desktopResponseFailure, ipcRecord, ipcString } from './desktopIpc';
+import { readDesktopGoal, type DesktopGoalReadV1 } from './desktopGoal';
 import type { DirectSessionControlActionRequest, DirectSessionControlResult, DesktopControlSnapshotV1, DesktopQuestionRequestV1, DirectSessionUploadedAttachmentV1 } from '@happier-dev/protocol';
 import { readDesktopControlSnapshot, readNativeApprovalRequestId } from './desktopControlSnapshot';
 import { prepareDesktopAttachmentMessage } from './desktopAttachments';
@@ -273,8 +274,8 @@ export async function performDesktopSessionControlAction(params: DesktopSessionT
 }
 
 export type DesktopSessionControl =
-    | Readonly<{ available: true; ownerClientId: string; protocolVersion: 2 }>
-    | Readonly<{ available: false; reason: string }>;
+    | Readonly<{ available: true; ownerClientId: string; protocolVersion: 2; goal?: DesktopGoalReadV1 }>
+    | Readonly<{ available: false; reason: string; goal?: DesktopGoalReadV1 }>;
 
 type SendIdentity = Readonly<{ localId: string; remoteSessionId: string; deduplicated: boolean }>;
 export type DesktopSessionSendResult = SendIdentity & (
@@ -287,6 +288,8 @@ export type DesktopSessionTarget = Readonly<{
     remoteSessionId: string;
     /** 仅由认证目标的现有 lease 提供；每次使用仍核对原连接的连续控制锚。 */
     getFollowedIpc?: () => DesktopIpc | null;
+    /** 为真时在同一次 owner 连接上读取原始 threadGoal；缺省不增加历史读取。 */
+    includeGoal?: boolean;
 }>;
 export type DesktopSessionMessage = DesktopSessionTarget & Readonly<{
     text: string; localId: string; accountId: string;
@@ -351,8 +354,20 @@ function reasonFor(error: unknown): string {
     return error instanceof DesktopIpcError ? error.reason : 'receipt_unavailable';
 }
 
+/** 调用方用这个错误表示原 lease 已释放或被替换；不能把它当成没有 lease 再冷开一条连接。 */
+function isLeaseRevocation(error: unknown): boolean {
+    return error instanceof Error && error.message === 'source_unavailable';
+}
+
+const UNKNOWN_GOAL: DesktopGoalReadV1 = { availability: 'unknown' };
+// 只限制冷路径新增的目标快照等待。手机状态 RPC 是 20 秒，生命周期新鲜度是 15 秒；
+// 初始化与发现仍用原 5 秒期限。这里不把文件系统或整次 RPC 说成有全局上限。
+const COLD_GOAL_LOCAL_BUDGET_MS = 15_000;
+const COLD_GOAL_READ_LIMIT_MS = 2_000;
+
 /** 查询当前 Desktop 的既有 owner；此结果不承诺稍后的发送仍可接受。 */
 export async function getDesktopSessionControl(params: DesktopSessionTarget): Promise<DesktopSessionControl> {
+    const goalStartedAt = params.includeGoal ? performance.now() : 0;
     let ipc: DesktopIpc | undefined;
     try {
         assertDesktopPlatform();
@@ -360,16 +375,34 @@ export async function getDesktopSessionControl(params: DesktopSessionTarget): Pr
         const home = await resolveHome(params.codexHome);
         const followed = borrowDesktopControl(params);
         if (followed) {
-            followed.read();
-            return { available: true, ownerClientId: followed.ownerClientId, protocolVersion: 2 };
+            const raw = followed.read();
+            return { available: true, ownerClientId: followed.ownerClientId, protocolVersion: 2,
+                ...(params.includeGoal ? { goal: readDesktopGoal(raw, params.remoteSessionId) } : {}) };
         }
         ipc = await DesktopIpc.open(home);
         const ownerClientId = await ipc.discoverOwner(params.remoteSessionId);
         // 冷发现等待期间也可能撤销认证目标；只复核生命周期，不借用新的状态。
         params.getFollowedIpc?.();
-        return { available: true, ownerClientId, protocolVersion: 2 };
+        if (!params.includeGoal) return { available: true, ownerClientId, protocolVersion: 2 };
+        const goalTimeoutMs = Math.min(COLD_GOAL_READ_LIMIT_MS, COLD_GOAL_LOCAL_BUDGET_MS - (performance.now() - goalStartedAt));
+        if (!(goalTimeoutMs > 0)) return { available: true, ownerClientId, protocolVersion: 2, goal: UNKNOWN_GOAL };
+        let goal = UNKNOWN_GOAL;
+        try {
+            // 原始会话状态先于控制投影；缺轮次不能把缺失目标收成 none。超时只放弃这次目标读取。
+            const raw = await ipc.readControlSnapshot(params.remoteSessionId, undefined, undefined, goalTimeoutMs);
+            params.getFollowedIpc?.();
+            goal = readDesktopGoal(raw, params.remoteSessionId);
+        } catch (error) {
+            if (isLeaseRevocation(error)) throw error;
+            try { params.getFollowedIpc?.(); } catch (revocation) {
+                if (isLeaseRevocation(revocation)) throw revocation;
+            }
+            goal = UNKNOWN_GOAL;
+        }
+        return { available: true, ownerClientId, protocolVersion: 2, goal };
     } catch (error) {
-        return { available: false, reason: reasonFor(error) };
+        if (params.includeGoal && isLeaseRevocation(error)) throw error;
+        return { available: false, reason: reasonFor(error), ...(params.includeGoal ? { goal: UNKNOWN_GOAL } : {}) };
     } finally { ipc?.close(); }
 }
 

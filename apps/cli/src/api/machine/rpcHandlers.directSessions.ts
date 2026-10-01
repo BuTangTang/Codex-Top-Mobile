@@ -796,6 +796,8 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
 
     let canTakeOverPersist = true;
     let externalControl: DirectSessionExternalControl | undefined;
+    let goal: NonNullable<DirectSessionExternalControl['goal']> | undefined;
+    const includeGoal = 'includeGoal' in parsed.data && parsed.data.includeGoal === true;
     try {
       const credentials = await readCredentials().catch(() => null);
       if (!credentials) {
@@ -830,14 +832,30 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
                     }) };
                     await followLeaseManager.invalidateMismatchedTarget(target);
                     if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable');
+                    const followedLease = includeGoal ? followLeaseManager.getFollowLease(target) : undefined;
+                    /** 目标读取沿用发送入口的原 lease 身份；释放或替换是撤销，不是改走冷发现。 */
+                    const getFollowLease = () => {
+                      if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
+                      const current = followLeaseManager.getFollowLease(target);
+                      if (includeGoal && followedLease && current !== followedLease) throw new Error('source_unavailable');
+                      return current;
+                    };
+                    if (includeGoal) getFollowLease();
                     try {
-                      externalControl = await provider.getExternalControl({ source: linkedSource.source,
+                      const read = await provider.getExternalControl({ source: linkedSource.source,
                         requestedSource: validatedSource.source, remoteSessionId: linked.session.remoteSessionId,
-                        getFollowLease: () => {
-                          if (!isCurrentLifecycle(currentEpoch)) throw new Error('source_unavailable');
-                          return followLeaseManager.getFollowLease(target);
-                        } });
-                    } catch { /* 能力探测失败不覆盖另一条仍有效的只读观察。 */ }
+                        ...(includeGoal ? { includeGoal: true } : {}),
+                        getFollowLease });
+                      if (includeGoal) goal = read.goal ?? { availability: 'unknown' };
+                      externalControl = includeGoal ? {
+                        canSend: read.canSend,
+                        ...(read.unavailableReason ? { unavailableReason: read.unavailableReason } : {}),
+                        ...(read.textSendProtocol ? { textSendProtocol: read.textSendProtocol } : {}),
+                      } : read;
+                    } catch {
+                      // 能力探测失败不覆盖另一条仍有效的只读观察。目标失败只留下未知，不改写已得到的发送能力。
+                      if (includeGoal) goal = { availability: 'unknown' };
+                    }
                     if (isCurrentLifecycle(currentEpoch)
                         && externalControl.unavailableReason !== 'source_mismatch' && externalControl.unavailableReason !== 'source_unavailable') {
                       observation = followLeaseManager.getObservation(target);
@@ -867,7 +885,7 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
     }
 
     if (!isCurrentLifecycle(currentEpoch)) return err('provider_unavailable', 'source_unavailable');
-    return {
+    const response = {
       ok: true,
       machineOnline: true,
       runnerActive,
@@ -881,6 +899,8 @@ export function registerMachineDirectSessionsRpcHandlers(params: Readonly<{
       ...(externalControl ? { externalControl } : {}),
       ...(lastKnownActivityAtMs !== undefined ? { lastKnownActivityAtMs } : {}),
     } satisfies DirectSessionStatusGetResponse;
+    // 目标只在显式请求时出现；缺省响应保持原来的字段集合。
+    return includeGoal ? { ...response, goal: goal ?? { availability: 'unknown' as const } } : response;
   });
 
   registerHandler(RPC_METHODS.DAEMON_DIRECT_SESSION_TRANSCRIPT_PAGE, async (raw: unknown) => {

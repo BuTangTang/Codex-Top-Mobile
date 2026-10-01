@@ -6,6 +6,7 @@ import { AgentProviderIdV1Schema } from '../providers/agentProviderIdsV1.js';
 import { SessionMessageRoleSchema } from '../sessionMessages/sessionMessageRole.js';
 import { PendingLocalIdSchema } from '../sessionMessages/pendingLocalId.js';
 import { SessionUserMessageSendRequestSchema, normalizeSessionAttachmentUploadPath } from '../sessionUserMessageRpc.js';
+import { DesktopGoalV1Schema } from './desktopGoalV1.js';
 import { DirectSessionObservationV1Schema, DirectSessionNotificationsV1Schema } from './observationV1.js';
 
 export const DirectSessionsProviderIdSchema = AgentProviderIdV1Schema;
@@ -220,6 +221,8 @@ export const DirectSessionStatusGetRequestSchema = z
     providerId: DirectSessionsProviderIdSchema,
     remoteSessionId: z.string().min(1).max(2000),
     source: DirectSessionsSourceSchema,
+    // 只有显式 true 才读取目标；缺省保持旧请求，false 不能当成静默关闭。
+    includeGoal: z.literal(true).optional(),
   })
   .passthrough();
 export type DirectSessionStatusGetRequest = z.infer<typeof DirectSessionStatusGetRequestSchema>;
@@ -369,6 +372,8 @@ export const DirectSessionStatusGetResponseSchema = z.union([
         // 只有明确协商的新普通文本入口可跳过手机控制快照，缺失时保留旧选路。
         textSendProtocol: z.literal('native-auto-v1').optional(),
       }).optional(),
+      // 只读目标是状态旁路。旧响应没有该键；不能放进 strict observation。
+      goal: DesktopGoalV1Schema.optional(),
       trustedPid: z.number().int().min(1).nullish(),
       lastKnownActivityAtMs: z.number().int().min(0).optional(),
     })

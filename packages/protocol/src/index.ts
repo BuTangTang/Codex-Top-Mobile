@@ -3578,5 +3578,6 @@ export * from './directSessions/observationV1.js';
 export * from './directSessions/desktopControlV1.js';
 export * from './directSessions/desktopProjectsV1.js';
 export * from './directSessions/codexLifecycleV1.js';
+export * from './directSessions/desktopGoalV1.js';
 
 export * from "./auth/passwordAuth.js";

@@ -38,6 +38,8 @@ export type DirectSessionExternalControl = Readonly<{
   canSend: boolean;
   unavailableReason?: string;
   textSendProtocol?: 'native-auto-v1';
+  /** 仅 includeGoal 时由同一次 owner 读取填充；响应层把它拆成旁路，不放进 externalControl。 */
+  goal?: Readonly<{ availability: 'unknown' | 'none' | 'available' }>;
 }>;
 
 /** 已接收、明确拒绝与结果未知必须分别保留，调用方不得据此自动接管重试。 */
@@ -111,6 +113,7 @@ export type DirectSessionProviderOps = Readonly<{
     requestedSource: DirectSessionsSource;
     remoteSessionId: string;
     getFollowLease?: () => DirectSessionFollowLease | undefined;
+    includeGoal?: boolean;
   }>) => Promise<DirectSessionExternalControl>;
   /** 只读原 owner 当前请求，关联与账号归属由机器 RPC 固定。 */
   readControl?: (params: Readonly<{ source: DirectSessionsSource; remoteSessionId: string; includeQuestions?: boolean;

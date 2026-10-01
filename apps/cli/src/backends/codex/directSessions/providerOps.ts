@@ -73,7 +73,7 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     };
   },
   /** 用既有 home resolver 消除默认值与等价路径差异，只有同一精确目标才能展示能力。 */
-  getExternalControl: async ({ source, requestedSource, remoteSessionId, getFollowLease }) => {
+  getExternalControl: async ({ source, requestedSource, remoteSessionId, getFollowLease, includeGoal }) => {
     const [linkedHomes, requestedHomes] = await Promise.all([source, requestedSource].map((candidate) =>
       resolveCodexHomeEntriesForDirectSessionsSource({ source: candidate, activeServerDir: configuration.activeServerDir, env: process.env })));
     if (linkedHomes.length !== 1 || requestedHomes.length !== 1) {
@@ -86,11 +86,14 @@ export const codexDirectSessionProviderOps: DirectSessionProviderOps = {
     ]);
     const identityKeys = ['kind', 'home', 'connectedServiceId', 'connectedServiceProfileId', 'connectedServiceGroupId'] as const;
     if (!linkedPath || linkedPath !== requestedPath || identityKeys.some((key) => linked.source[key] !== requested.source[key])) {
-      return { canSend: false, unavailableReason: 'source_mismatch' };
+      return { canSend: false, unavailableReason: 'source_mismatch', ...(includeGoal ? { goal: { availability: 'unknown' as const } } : {}) };
     }
-    const control = await getDesktopSessionControl({ codexHome: linked.codexHome, remoteSessionId, getFollowedIpc: followedIpc(getFollowLease) });
-    return control.available ? { canSend: true, textSendProtocol: 'native-auto-v1' }
-      : { canSend: false, unavailableReason: control.reason };
+    const control = await getDesktopSessionControl({ codexHome: linked.codexHome, remoteSessionId, getFollowedIpc: followedIpc(getFollowLease),
+      ...(includeGoal ? { includeGoal: true } : {}) });
+    const goal = includeGoal ? control.goal ?? { availability: 'unknown' as const } : undefined;
+    return control.available
+      ? { canSend: true, textSendProtocol: 'native-auto-v1' as const, ...(goal ? { goal } : {}) }
+      : { canSend: false, unavailableReason: control.reason, ...(goal ? { goal } : {}) };
   },
   /** 文本与已上传附件共用原 Desktop owner；不支持的输入明确拒绝。 */
   send: async ({ source, remoteSessionId, text, localId, meta, accountId, getFollowLease }) => {
