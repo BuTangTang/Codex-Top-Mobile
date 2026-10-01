@@ -21,7 +21,7 @@ afterAll(() => rm(environment.logsDir, { recursive: true, force: true }));
 
 /** 使用真正的第三方 socket 帧与独立 rollout；只替换配置边界，不 mock 内部状态归约。 */
 async function createFallbackHarness(options: { baseline?: { turnId: string; status: string; runtime?: string }; holdBaseline?: boolean;
-  rolloutBaseline?: boolean; missingSource?: boolean; initialCursor?: string; holdUpdates?: boolean; pollMs?: string } = {}) {
+  rolloutBaseline?: boolean; asyncRollout?: boolean; cleanSource?: boolean; missingSource?: boolean; initialCursor?: string; holdUpdates?: boolean; pollMs?: string } = {}) {
   const root = await mkdtemp('/tmp/hcf-fallback-');
   environment.activeServerDir = join(root, 'state');
   const remoteSessionId = '33333333-3333-3333-3333-333333333333';
@@ -30,11 +30,17 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
   const path = join(root, 'sessions', `rollout-2026-09-23-${remoteSessionId}.jsonl`);
   const meta = `${JSON.stringify({ type: 'session_meta', payload: { id: remoteSessionId } })}\n`;
   // 订阅前已有的历史终态必须留在初始 tail 之前。
-  await writeFile(path, meta + `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'historical' } })}\n`);
+  await writeFile(path, meta + (options.cleanSource ? '' : `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'historical' } })}\n`));
   if (options.rolloutBaseline) {
     const timestamp = new Date().toISOString();
     await writeFile(path, meta + ['task_started', 'task_complete'].map((type) =>
       JSON.stringify({ type: 'event_msg', timestamp, payload: { type, turn_id: 'local-current' } }) + '\n').join(''));
+  }
+  if (options.asyncRollout) {
+    const timestamp = new Date(Date.now() - 1000).toISOString();
+    await writeFile(path, meta + JSON.stringify({ type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: 'current' } }) + '\n'
+      + JSON.stringify({ type: 'response_item', timestamp, payload: { type: 'function_call', name: 'request_user_input_async', call_id: 'call-A',
+        arguments: JSON.stringify({ questions: [{ title: '选择', options: ['甲', '乙'] }, { title: '补充' }] }) } }) + '\n');
   }
   if (options.missingSource) await rm(path);
   vi.stubEnv('HAPPIER_DIRECT_SESSIONS_FOLLOW_POLL_MS', options.pollMs ?? '10');
@@ -53,22 +59,26 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
   }
   /** 发布已知旧基线后的完整合成状态，由正式 DesktopIpc 决定是否确认。 */
   function snapshot(socket: Socket, revision: number, turnId?: string, status = 'inProgress', requests: unknown[] = [],
-    precedingTurns = [{ turnId: 'base', status: 'completed' }]) {
+    precedingTurns = [{ turnId: 'base', status: 'completed' }], items: unknown[] = []) {
     send(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner',
       params: { hostId: 'local', conversationId: remoteSessionId, change: { type: 'snapshot', revision,
         conversationState: { id: remoteSessionId, requests, threadRuntimeStatus: { type: turnId && status === 'inProgress' ? 'active' : 'idle' },
-          turns: [...precedingTurns.map((turn) => ({ ...turn, items: [] })), ...(turnId ? [{ turnId, status, items: [] }] : [])] } } } });
+          turns: [...precedingTurns.map((turn) => ({ ...turn, items: [] })), ...(turnId ? [{ turnId, status, items }] : [])] } } } });
   }
   /** 返回本次请求关联的原 owner 快照；没有指定基线时模拟缺失当前轮，保留原 fallback 用例。 */
-  function replyBaseline(state = options.baseline, index = historyRequests.length - 1) {
+  function replyBaseline(state = options.baseline, index = historyRequests.length - 1, detail: { items?: unknown[]; revision?: number; responseRevision?: number; owner?: string; sourceClientId?: string; conflict?: boolean } = {}) {
     const request = historyRequests[index]!;
     if (request.socket.destroyed) return;
-    send(request.socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner',
-      params: { hostId: 'local', conversationId: remoteSessionId, change: { type: 'snapshot', revision: 7,
+    const revision = detail.revision ?? 7;
+    const owner = detail.owner ?? 'owner';
+    const frame = (turnId: string | undefined, items: unknown[]) => send(request.socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: detail.sourceClientId ?? owner,
+      params: { hostId: 'local', conversationId: remoteSessionId, change: { type: 'snapshot', revision,
         conversationState: { id: remoteSessionId, requests: [], threadRuntimeStatus: { type: state?.runtime ?? (state?.status === 'inProgress' ? 'active' : 'idle') },
-          turns: state ? [{ turnId: state.turnId, status: state.status, items: [] }] : [] } } } });
+          turns: turnId ? [{ turnId, status: state?.status ?? 'completed', items }] : [] } } } });
+    if (detail.conflict) frame('conflict-turn', []);
+    frame(state?.turnId, detail.items ?? []);
     send(request.socket, { type: 'response', requestId: request.requestId, method: 'thread-follower-load-complete-history',
-      resultType: 'success', handledByClientId: 'owner', result: { revision: 7 } });
+      resultType: 'success', handledByClientId: owner, result: { revision: detail.responseRevision ?? revision } });
   }
   /** 模拟原 owner 的明确协议拒绝或暂时超时，保留正式失败与重连路径。 */
   function rejectBaseline(error = 'no-handler-for-request') {
@@ -114,7 +124,7 @@ async function createFallbackHarness(options: { baseline?: { turnId: string; sta
     if (!options.missingSource) await vi.waitFor(() => expect(lease.getTailCursor?.()).toEqual(expect.any(String)));
   }
   await openLease(options.initialCursor);
-  if (!options.rolloutBaseline && !options.missingSource && !options.initialCursor) await vi.waitFor(() => expect(followers).toHaveLength(1));
+  if (!options.rolloutBaseline && !options.asyncRollout && !options.missingSource && !options.initialCursor) await vi.waitFor(() => expect(followers).toHaveLength(1));
   // 首份 snapshot 的确认也会推进初始游标；等待它完成后才开始测试前向追加。
   if (!options.missingSource) await vi.waitFor(() => expect(lease.getTailCursor?.()).toEqual(expect.any(String)));
   /** 通过真实前向游标确认一条完整行已被轮询消费，不使用固定等待时长。 */
@@ -880,5 +890,141 @@ it('observes an anchored local lifecycle without desktop full-history hydration'
     await harness.poll();
     expect(harness.lease.getObservation?.()).toMatchObject({ state: 'running', turnId: 'after-rewrite' });
     expect(harness.historyRequests).toHaveLength(0);
+  } finally { await harness.close(); }
+});
+
+const asyncQuestionId = (index: number) => JSON.stringify(['request_user_input_async', 'card-1', index]);
+const asyncCard = { id: 'card-1', type: 'agentMessage', questions: [{ title: '选择', options: ['甲', '乙'] }, { title: '补充', options: [] }] };
+/** 桌面逐题封套；身份是消息 item id，故意不等于 rollout 的 call-A。 */
+function asyncReply(index: number, answer: string) {
+  const question = index === 0 ? '选择' : '补充';
+  return { type: 'steeringUserMessage', id: `reply-${index}`, status: 'accepted', targetTurnId: 'current',
+    input: [{ type: 'text', text: `<send_user_message_question_reply>\n${JSON.stringify([{ questionItemId: asyncQuestionId(index), question, answer }])}\n</send_user_message_question_reply>` }] };
+}
+
+/** 未答异步题才水合既有桌面基线；item id 与 call id 不同，整份观察按 2→1→running 替换。 */
+it('adopts same-turn desktop async replies when the tool call id differs from the message item id', async () => {
+  const harness = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1));
+    expect(harness.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'needs_input', turnId: 'current', requests: [{ requestId: 'call-A' }] });
+    harness.replyBaseline({ turnId: 'current', status: 'inProgress' }, 0, { items: [asyncCard] });
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ source: 'desktop', state: 'needs_input', turnId: 'current',
+      requests: [{ requestId: asyncQuestionId(0) }, { requestId: asyncQuestionId(1) }] }));
+    harness.snapshot(harness.historyRequests[0]!.socket, 8, 'current', 'inProgress', [], [{ turnId: 'base', status: 'completed' }], [asyncCard, asyncReply(0, '甲')]);
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ source: 'desktop', state: 'needs_input',
+      requests: [{ requestId: asyncQuestionId(1) }] }));
+    harness.snapshot(harness.historyRequests[0]!.socket, 9, 'current', 'inProgress', [], [{ turnId: 'base', status: 'completed' }], [asyncCard, asyncReply(0, '甲'), asyncReply(1, '补充答案')]);
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ source: 'desktop', state: 'running', turnId: 'current' }));
+    expect(harness.lease.getObservation?.()).not.toMatchObject({ requests: expect.anything() });
+  } finally { await harness.close(); }
+});
+
+/** 错轮、错修订、错 owner、超时、释放和来源中断都不能把未验证的桌面快照当成已答。 */
+it('keeps local async pending when the desktop baseline is the wrong turn, revision, or owner', async () => {
+  const wrongTurn = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'other', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(wrongTurn.historyRequests).toHaveLength(1));
+    wrongTurn.replyBaseline();
+    await wrongTurn.poll();
+    expect(wrongTurn.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'needs_input', requests: [{ requestId: 'call-A' }] });
+  } finally { await wrongTurn.close(); }
+  const wrongRevision = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(wrongRevision.historyRequests).toHaveLength(1));
+    wrongRevision.replyBaseline(undefined, 0, { items: [asyncCard], conflict: true });
+    await vi.waitFor(() => expect(wrongRevision.historyRequests[0]!.socket.destroyed).toBe(true));
+    await wrongRevision.poll();
+    expect(wrongRevision.historyRequests).toHaveLength(1);
+    expect(wrongRevision.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'needs_input', requests: [{ requestId: 'call-A' }] });
+  } finally { await wrongRevision.close(); }
+  const wrongOwner = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(wrongOwner.historyRequests).toHaveLength(1));
+    wrongOwner.replyBaseline(undefined, 0, { items: [asyncCard], owner: 'stranger' });
+    await vi.waitFor(() => expect(wrongOwner.historyRequests[0]!.socket.destroyed).toBe(true));
+    await wrongOwner.poll();
+    expect(wrongOwner.historyRequests).toHaveLength(1);
+    expect(wrongOwner.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'needs_input' });
+  } finally { await wrongOwner.close(); }
+});
+
+it('does not apply a late desktop reply after a new turn, release, timeout, or source discontinuity', async () => {
+  const late = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(late.historyRequests).toHaveLength(1));
+    await appendFile(late.path, `${JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload: { type: 'task_started', turn_id: 'next' } })}\n`);
+    await vi.waitFor(() => expect(late.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'running', turnId: 'next' }));
+    late.replyBaseline(undefined, 0, { items: [asyncCard] });
+    await late.poll();
+    expect(late.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'running', turnId: 'next' });
+  } finally { await late.close(); }
+  const released = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(released.historyRequests).toHaveLength(1));
+    const releasing = released.lease.release();
+    expect(released.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'connection_closed' });
+    released.replyBaseline(undefined, 0, { items: [asyncCard] });
+    await releasing;
+    expect(released.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'connection_closed' });
+  } finally { await released.close(); }
+  let now = performance.now();
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const timedOut = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(timedOut.historyRequests).toHaveLength(1));
+    timedOut.rejectBaseline('request-timeout');
+    await vi.waitFor(() => expect(timedOut.historyRequests[0]!.socket.destroyed).toBe(true));
+    await timedOut.poll();
+    expect(timedOut.historyRequests).toHaveLength(1);
+    expect(timedOut.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'needs_input', requests: [{ requestId: 'call-A' }] });
+    now += CONTROL_READ_TIMEOUT_MS;
+    await timedOut.poll();
+    await vi.waitFor(() => expect(timedOut.historyRequests).toHaveLength(2));
+  } finally { await timedOut.close(); clock.mockRestore(); }
+  const broken = await createFallbackHarness({ asyncRollout: true, holdBaseline: true, baseline: { turnId: 'current', status: 'inProgress' }, pollMs: '20' });
+  try {
+    await vi.waitFor(() => expect(broken.historyRequests).toHaveLength(1));
+    await rm(broken.path);
+    await vi.waitFor(() => expect(broken.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'source_unavailable' }));
+    broken.replyBaseline(undefined, 0, { items: [asyncCard, asyncReply(0, '甲'), asyncReply(1, '补充答案')] });
+    await broken.poll();
+    expect(broken.lease.getObservation?.()).toMatchObject({ state: 'unknown', reason: 'source_unavailable' });
+  } finally { await broken.close(); }
+});
+
+/** 先采用明确本地运行后，同一租约追加未答异步题必须重新打开既有基线，不能被旧 latch 永久跳过。 */
+it('starts one desktop baseline after local running gains an async request in the same lease', async () => {
+  const harness = await createFallbackHarness({ rolloutBaseline: true, holdBaseline: true, pollMs: '60000' });
+  try {
+    await appendFile(harness.path, JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload: { type: 'task_started', turn_id: 'current' } }) + '\n');
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'running', turnId: 'current' });
+    expect(harness.historyRequests).toHaveLength(0);
+    await appendFile(harness.path, JSON.stringify({ type: 'response_item', timestamp: new Date().toISOString(), payload: {
+      type: 'function_call', name: 'request_user_input_async', call_id: 'new-call',
+      arguments: JSON.stringify({ questions: [{ title: '题面', options: ['甲', '乙'] }] }),
+    } }) + '\n');
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'needs_input', turnId: 'current' });
+    await vi.waitFor(() => expect(harness.historyRequests).toHaveLength(1), { timeout: 1200 });
+  } finally { await harness.close(); }
+});
+
+/** 已验证的同轮桌面审批在下一次没有新来源事件的本地轮询后仍然有效。 */
+it('retains a verified same-turn desktop approval across the next local poll', async () => {
+  const harness = await createFallbackHarness({ cleanSource: true, pollMs: '60000' });
+  try {
+    await appendFile(harness.path, JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload: { type: 'task_started', turn_id: 'current' } }) + '\n');
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({ source: 'rollout', state: 'running', turnId: 'current' });
+    harness.snapshot(harness.followers[0]!, 2, 'current', 'inProgress', [{
+      id: 'approval-id', method: 'item/commandExecution/requestApproval', params: { threadId: harness.remoteSessionId, turnId: 'current' },
+    }]);
+    await vi.waitFor(() => expect(harness.lease.getObservation?.()).toMatchObject({ source: 'desktop', state: 'needs_input', turnId: 'current' }));
+    await harness.poll();
+    expect(harness.lease.getObservation?.()).toMatchObject({
+      source: 'desktop', state: 'needs_input', turnId: 'current', requests: [{ requestId: 'approval-id' }],
+    });
   } finally { await harness.close(); }
 });

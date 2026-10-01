@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { readCodexCandidateLifecycle, readCodexLifecycleObservation } from './readCodexCandidateLifecycle';
+import { readCodexCandidateFacts, readCodexCandidateLifecycle, readCodexLifecycleObservation } from './readCodexCandidateLifecycle';
 
 const checkedAtMs = Date.parse('2026-09-24T08:00:00Z');
 const at = checkedAtMs - 1000;
@@ -499,12 +499,12 @@ describe('readCodexCandidateLifecycle', () => {
       + row('response_item', { type: 'message', role: 'user', content: [] }))).state).toBe('needs_input');
   });
 
-  /** 精确复现原生追加输入事件：桌面同任务同轮接受输入后继续执行，后续活动应可续龄。 */
-  it('resumes an input wait after raw user, same-turn native UserMessage and modern activity', async () => {
+  /** 空的同轮用户项只解除同步输入；未答异步题和其后的活动仍保持待回复。 */
+  it('does not clear an unanswered async question on an empty same-turn UserMessage', async () => {
     const nativeUser = event('item_completed', { thread_id: 'root', turn_id: 'turn', item: { type: 'UserMessage' } });
     const activity = event('item_completed', { thread_id: 'root', turn_id: 'turn', item: { type: 'Reasoning' } });
     expect((await read(start + question('q', 'request_user_input_async')
-      + row('response_item', { type: 'message', role: 'user', content: [] }) + nativeUser + activity)).state).toBe('running');
+      + row('response_item', { type: 'message', role: 'user', content: [] }) + nativeUser + activity)).state).toBe('needs_input');
   });
 
   /** 同轮用户输入只结束普通输入等待，执行审批必须继续等待明确批准结果。 */
@@ -538,6 +538,116 @@ describe('readCodexCandidateLifecycle', () => {
       + event('item_completed', { thread_id: 'root', turn_id: 'other', item: { type: 'UserMessage' } }))).state).toBe('unknown');
   });
 
+  /** 同步提问仍由同轮用户项解除；没有标题的旧异步样例不会被它清掉。 */
+  it('still clears a synchronous input wait on a same-turn UserMessage', async () => {
+    const nativeUser = event('item_completed', { thread_id: 'root', turn_id: 'turn', item: { type: 'UserMessage' } });
+    expect((await read(start + question('q') + nativeUser)).state).toBe('running');
+  });
+
+  const pixel = [{ title: '选择像素风', options: ['像素风1', '像素风2', '像素风3'] }];
+  const pair = [{ title: '选择', options: ['甲', '乙'] }, { title: '补充' }];
+  const asyncCall = (callId: string, questions: readonly { title: string; options?: string[] }[]) => row('response_item', {
+    type: 'function_call', name: 'request_user_input_async', call_id: callId, arguments: JSON.stringify({ questions }),
+  });
+  const asyncCard = (itemId: string, questions: readonly { title: string; options?: string[] }[]) => event('item_completed', {
+    thread_id: 'root', turn_id: 'turn', item: { type: 'AgentMessage', id: itemId, questions },
+  });
+  const questionIdentity = (ownerId: string, index: number) => JSON.stringify(['request_user_input_async', ownerId, index]);
+  const envelope = (replies: readonly { questionItemId: string; question: string; answer: string }[] | string, turnId = 'turn') => {
+    const text = typeof replies === 'string' ? replies
+      : `<send_user_message_question_reply>\n${JSON.stringify(replies)}\n</send_user_message_question_reply>`;
+    return event('item_completed', { thread_id: 'root', turn_id: turnId, item: { type: 'UserMessage', content: [{ type: 'text', text }] } });
+  };
+  const answered = (ownerId: string, questions: readonly { title: string }[], indexes = questions.map((_, index) => index), turnId = 'turn') => envelope(indexes.map((index) => ({
+    questionItemId: questionIdentity(ownerId, index), question: questions[index]!.title, answer: '已选',
+  })), turnId);
+
+  /** 官方异步题没有题 id；空追加、部分回答和错身份都不能解除，完整封套只解除对应调用。 */
+  it('keeps an official no-id async question pending until its own complete reply', async () => {
+    const registered = start + asyncCall('call-pixel', pixel)
+      + row('response_item', { type: 'function_call_output', call_id: 'call-pixel', output: '{"accepted":true}' });
+    expect((await read(registered)).state).toBe('needs_input');
+    expect(await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs })).toMatchObject({
+      state: 'needs_input', requests: [{ requestId: 'call-pixel', kind: 'user_action_request' }],
+    });
+    const ordinary = row('response_item', { type: 'message', role: 'user', content: [{ type: 'text', text: '继续做' }] });
+    expect((await read(registered + ordinary + envelope('我选像素风1'))).state).toBe('needs_input');
+    expect((await read(registered + envelope([{ questionItemId: questionIdentity('call-other', 0), question: '选择像素风', answer: '像素风1' }]))).state).toBe('needs_input');
+    expect((await read(registered + envelope([{ questionItemId: questionIdentity('call-pixel', 1), question: '选择像素风', answer: '像素风2' }]))).state).toBe('needs_input');
+    expect((await read(registered + envelope([{ questionItemId: questionIdentity('call-pixel', 0), question: '另一题', answer: '像素风1' }]))).state).toBe('needs_input');
+    expect((await read(registered + envelope('<send_user_message_question_reply>{"questionItemId":"x"}'))).state).toBe('needs_input');
+    expect((await read(registered + answered('call-pixel', pixel))).state).toBe('running');
+    await fs.appendFile(filePath, answered('call-pixel', pixel));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('running');
+  });
+
+  /** 没有独立关联字段时，代理消息 item id 不能接管另一个工具 call。 */
+  it('does not let an unmatched agent-message id answer a different tool call', async () => {
+    const opened = start + asyncCall('call-1', pair) + asyncCard('card-1', pair);
+    expect((await read(opened + answered('card-1', pair))).state).toBe('needs_input');
+    expect(await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs })).toMatchObject({
+      state: 'needs_input', requests: [{ requestId: 'call-1', kind: 'user_action_request' }],
+    });
+    expect((await read(opened + answered('call-1', pair))).state).toBe('running');
+  });
+
+  /** 同题面的两次工具调用各自保留身份；答 A 不能清 B，分次封套只在原组全答后解除。 */
+  it('keeps same-face calls distinct and accumulates partial replies per call', async () => {
+    const sameFace = start + asyncCall('call-a', pair) + asyncCall('call-b', pair);
+    expect((await read(sameFace)).state).toBe('needs_input');
+    let observation = await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs });
+    if (observation.state !== 'needs_input') throw new Error('expected both calls pending');
+    expect(observation.requests.map((request) => request.requestId).sort()).toEqual(['call-a', 'call-b']);
+    expect((await read(sameFace + answered('call-a', pair))).state).toBe('needs_input');
+    observation = await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs });
+    if (observation.state !== 'needs_input') throw new Error('answering A cleared B');
+    expect(observation.requests.map((request) => request.requestId)).toEqual(['call-b']);
+    const partial = start + asyncCall('call-a', pair);
+    expect((await read(partial + answered('call-a', pair, [0]))).state).toBe('needs_input');
+    expect((await read(partial + answered('call-a', pair, [0]) + answered('call-a', pair, [0]))).state).toBe('needs_input');
+    expect((await read(partial + answered('call-a', pair, [0]) + answered('call-a', pair, [1]))).state).toBe('running');
+    expect((await read(partial + answered('call-a', pair, [0]) + event('task_started', { turn_id: 'next' }) + asyncCall('call-a', pair) + answered('call-a', pair, [1], 'next'))).state).toBe('needs_input');
+  });
+
+  /** 另一调用、审批和未完成的同轮都保持各自等待；新轮才替换旧的异步题。 */
+  it('preserves other pending work when one async card is fully answered', async () => {
+    const pending = start + asyncCall('call-a', pixel) + asyncCall('call-b', pair)
+      + event('exec_approval_request', { call_id: 'approval' }) + asyncCard('card-a', pixel);
+    expect((await read(pending + answered('call-a', pixel))).state).toBe('needs_input');
+    let observation = await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs });
+    expect(observation).toMatchObject({ state: 'needs_input' });
+    if (observation.state !== 'needs_input') throw new Error('expected pending observation');
+    expect(observation.requests.map((request) => request.requestId).sort()).toEqual(['approval', 'call-b']);
+    expect((await read(pending + answered('call-a', pixel) + complete)).state).toBe('needs_input');
+    expect((await read(pending + answered('card-a', pixel))).state).toBe('needs_input');
+    observation = await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs });
+    if (observation.state !== 'needs_input') throw new Error('unlinked card cleared a call');
+    expect(observation.requests.map((request) => request.requestId).sort()).toEqual(['approval', 'call-a', 'call-b']);
+    expect((await read(start + asyncCall('call-pixel', pixel) + asyncCard('card-pixel', pixel) + complete)).state).toBe('needs_input');
+    expect((await read(start + asyncCall('call-pixel', pixel) + asyncCard('card-pixel', pixel) + answered('call-pixel', pixel) + complete)).state).toBe('completed');
+    expect((await read(start + asyncCall('call-pixel', pixel) + event('task_started', { turn_id: 'next' }))).state).toBe('running');
+    expect(await readCodexLifecycleObservation({ filePath, remoteSessionId: 'root', checkedAtMs })).toMatchObject({ turnId: 'next', state: 'running' });
+  });
+
+  /** 先读到未答题，再追加完整封套；缓存续读必须清掉原等待且不复活已结束轮。 */
+  it('clears one async card on an incremental reply without reviving a finished turn', async () => {
+    expect((await read(start + asyncCall('call-pixel', pair))).state).toBe('needs_input');
+    await fs.appendFile(filePath, answered('call-pixel', pair, [0]));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('needs_input');
+    await fs.appendFile(filePath, answered('call-pixel', pair, [0]));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('needs_input');
+    await fs.appendFile(filePath, answered('call-pixel', pair, [1]));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('running');
+    await fs.appendFile(filePath, event('task_started', { turn_id: 'next' }) + asyncCall('call-pixel', pair) + answered('call-pixel', pair, [1], 'next'));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('needs_input');
+    await fs.appendFile(filePath, answered('call-pixel', pair, [0], 'next'));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('running');
+    await fs.appendFile(filePath, event('task_complete', { turn_id: 'next' }));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('completed');
+    await fs.appendFile(filePath, answered('call-pixel', pair, [0, 1], 'next'));
+    expect((await readCodexCandidateLifecycle({ filePath, remoteSessionId: 'root', checkedAtMs })).state).toBe('unknown');
+  });
+
   /** 状态观察复用同一文件投影，保留明确轮次及真实待处理身份。 */
   it('projects current rollout lifecycle into an observation without changing the candidate contract', async () => {
     await read(start + question('question-id'));
@@ -549,6 +659,16 @@ describe('readCodexCandidateLifecycle', () => {
     expect(Object.keys(await readCodexCandidateLifecycle(params)).sort()).toEqual(['checkedAtMs', 'eventAtMs', 'state', 'v']);
     await fs.appendFile(filePath, event('task_started', { turn_id: 'next' }));
     expect(await readCodexLifecycleObservation(params)).toEqual({ v: 1, source: 'rollout', turnId: 'next', state: 'running' });
+  });
+
+  /** 同一次读取给出未答异步提示，不把 call id 改写成消息 item id。 */
+  it('reports unresolved async from the same lifecycle read', async () => {
+    await read(start + asyncCall('call-a', pair) + asyncCall('call-b', pair));
+    const asyncFacts = await readCodexCandidateFacts({ filePath, remoteSessionId: 'root', checkedAtMs });
+    expect(asyncFacts.pendingAsync).toBe(true);
+    expect(asyncFacts.observation).toMatchObject({ state: 'needs_input', requests: [{ requestId: 'call-a' }, { requestId: 'call-b' }] });
+    await read(start + complete);
+    expect((await readCodexCandidateFacts({ filePath, remoteSessionId: 'root', checkedAtMs })).pendingAsync).toBe(false);
   });
 
   /** 无请求标识的等待可在候选列表显示，但不能捏造可关联的观察身份。 */

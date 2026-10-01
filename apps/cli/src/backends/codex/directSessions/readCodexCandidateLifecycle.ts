@@ -10,6 +10,7 @@ import { tryParseJsonlLine } from '@/api/directSessions/filePaging/jsonlParse';
 import type { JsonlParsedLine } from '@/api/directSessions/filePaging/jsonlBackwardPager';
 import { isSubagentRollout } from '../localControl/rolloutDiscovery';
 import { mapCodexRolloutEventToActions } from '../localControl/rolloutMapper';
+import { readDesktopAsyncQuestionReplies } from './desktop/desktopQuestions';
 
 // 与原生 IncrementalRollout 冷读和现有 JSONL reader 的块大小相同；首行和尾段各有此预算。
 const READ_BYTES = 64 * 1024;
@@ -21,6 +22,8 @@ const FINGERPRINT_BYTES = 4096;
 const CACHE_ENTRIES = 128;
 const MAX_PENDING = 64;
 
+type AsyncQuestion = { id: string; title: string; options: string[]; answered?: boolean };
+type PendingRequest = { kind: 'async' | 'input' | 'approval'; questionIds: string[] | null; asyncQuestions?: AsyncQuestion[] };
 type Projection = {
   terminalAnchorAllowed: boolean;
   unanchoredTurnId: string | null;
@@ -33,7 +36,7 @@ type Projection = {
   terminalAtMs: number | null;
   terminalOffset: number | null;
   anchorOffset: number | null;
-  pending: Map<string, { kind: 'async' | 'input' | 'approval'; questionIds: string[] | null }>;
+  pending: Map<string, PendingRequest>;
   observedTurns: Set<string>;
   invalid: boolean;
 };
@@ -85,7 +88,73 @@ function questionIds(payload: Record<string, unknown>): string[] | null {
   return ids.every((value): value is string => value !== null && value.length <= 256) && new Set(ids).size === ids.length ? ids : null;
 }
 
-/** 只消费完整主轮事件元数据；正文和工具输出内容不能决定完成、失败或等待。 */
+/** 官方异步题以标题和字符串选项为准；回复身份沿桌面题号，不用题目自带 id。 */
+function officialAsyncQuestions(value: unknown, ownerId: string): AsyncQuestion[] | null {
+  if (!ownerId || !Array.isArray(value) || !value.length || value.length > 32) return null;
+  const questions: AsyncQuestion[] = [];
+  for (const [index, raw] of value.entries()) {
+    const question = record(raw);
+    if (typeof question?.title !== 'string' || !question.title) return null;
+    if (question.options != null && (!Array.isArray(question.options) || question.options.some((option) => typeof option !== 'string'))) return null;
+    questions.push({ id: JSON.stringify(['request_user_input_async', ownerId, index]), title: question.title,
+      options: [...(question.options as string[] | undefined ?? [])] });
+  }
+  return questions;
+}
+
+/** 工具参数里的异步题只挂在本次 call id 上，不按题面改写身份。 */
+function asyncQuestionsFromPayload(payload: Record<string, unknown>, ownerId: string): AsyncQuestion[] | null {
+  return officialAsyncQuestions(jsonRecord(payload.arguments)?.questions ?? payload.questions, ownerId);
+}
+
+/** 每次工具调用只保留自己的 call id。题面相同也不能并入或覆盖另一次调用。 */
+function rememberAsyncCall(pending: Map<string, PendingRequest>, callId: string, questions: AsyncQuestion[] | null): void {
+  const existing = pending.get(callId);
+  const answered = new Set((existing?.kind === 'async' ? existing.asyncQuestions ?? [] : [])
+    .filter((question) => question.answered).map((question) => question.id));
+  pending.set(callId, { kind: 'async', questionIds: questions?.map((question) => question.id) ?? null,
+    ...(questions ? { asyncQuestions: questions.map((question) => ({ ...question, answered: answered.has(question.id) })) } : {}) });
+}
+
+/** 把 rollout 用户项交给既有封套解析；不在这里放宽完整性和字段要求。 */
+function rolloutReplyItem(payload: Record<string, unknown>, isEvent: boolean, type: unknown): unknown {
+  if (!isEvent && type === 'message' && payload.role === 'user') {
+    return { type: 'userMessage', content: typeof payload.content === 'string' ? [{ type: 'text', text: payload.content }] : payload.content };
+  }
+  if (isEvent && type === 'user_message' && typeof payload.message === 'string') {
+    return { type: 'userMessage', content: [{ type: 'text', text: payload.message }] };
+  }
+  const item = record(payload.item);
+  if (isEvent && type === 'item_completed' && item?.type === 'UserMessage') {
+    return { type: 'userMessage', content: typeof item.content === 'string' ? [{ type: 'text', text: item.content }] : item.content };
+  }
+  return null;
+}
+
+/** 合法封套按题号累计已答；只有原组全部答中才移除，错身份和错题面不计入。 */
+function resolveAsyncReplies(pending: Map<string, PendingRequest>, payload: Record<string, unknown>, isEvent: boolean, type: unknown): boolean {
+  const replies = readDesktopAsyncQuestionReplies(rolloutReplyItem(payload, isEvent, type));
+  if (!replies.length) return false;
+  let cleared = false;
+  for (const [key, request] of [...pending.entries()]) {
+    if (request.kind !== 'async' || !request.asyncQuestions?.length) continue;
+    let matched = false;
+    const next = request.asyncQuestions.map((question) => {
+      if (question.answered) return question;
+      if (!replies.some((reply) => reply.questionItemId === question.id && reply.question === question.title)) return question;
+      matched = true;
+      return { ...question, answered: true };
+    });
+    if (!matched) continue;
+    if (next.every((question) => question.answered)) {
+      pending.delete(key);
+      cleared = true;
+    } else pending.set(key, { ...request, asyncQuestions: next });
+  }
+  return cleared;
+}
+
+/** 只消费完整主轮事件元数据；除异步题的完整回复封套外，正文和工具输出不能决定完成、失败或等待。 */
 function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: string, checkedAtMs: number, projection: Projection): CodexLifecycleV1 {
   /** 不可兼容的协议证据使本次投影失效，不能跨刷新保留旧状态。 */
   const unknown = () => { projection.invalid = true; return unknownCodexLifecycleV1(checkedAtMs); };
@@ -185,15 +254,22 @@ function projectLifecycle(lines: readonly JsonlParsedLine[], remoteSessionId: st
       } else if (request || question) {
         if (terminal || pending.size >= MAX_PENDING) return unknown();
         // 无标识请求仍可显示等待；后续无法匹配的工具结果绝不能把它清掉。
-        pending.set(callId ?? '', { kind: toolName === 'request_user_input_async' ? 'async'
-          : type === 'exec_approval_request' || type === 'apply_patch_approval_request' ? 'approval' : 'input', questionIds: questionIds(payload) });
+        if (toolName === 'request_user_input_async') {
+          if (callId) rememberAsyncCall(pending, callId, asyncQuestionsFromPayload(payload, callId));
+          else pending.set('', { kind: 'async', questionIds: null });
+        } else pending.set(callId ?? '', { kind: type === 'exec_approval_request' || type === 'apply_patch_approval_request' ? 'approval' : 'input',
+          questionIds: questionIds(payload) });
         state = 'needs_input'; eventAtMs = at;
       } else if (user) {
-        // 原生同任务同轮接受输入是明确的继续事件，只解除普通输入等待，审批仍须匹配批准结果。
+        // 同轮用户项只解除同步输入。异步题只在完整封套答中自己的题身份后移除，审批仍须匹配批准结果。
         const nativeContinuation = isEvent && type === 'item_completed' && threadId === remoteSessionId
           && turnId !== null && eventTurnId === turnId && !terminal;
         if (nativeContinuation) {
-          for (const [pendingId, request] of pending) if (request.kind !== 'approval') pending.delete(pendingId);
+          for (const [pendingId, request] of pending) if (request.kind === 'input') pending.delete(pendingId);
+        }
+        const scopedReply = !isEvent || eventTurnId === turnId;
+        const clearedAsync = !terminal && turnId !== null && scopedReply && resolveAsyncReplies(pending, payload, isEvent, type);
+        if (nativeContinuation || clearedAsync) {
           state = pending.size ? 'needs_input' : 'running'; eventAtMs = at;
         } else if (terminal || !turnId) {
           // 已结束轮不能被用户消息复活；普通追加输入保留当前轮锚和等待，不解析其正文。
@@ -416,31 +492,40 @@ type LifecycleReadParams = Readonly<{
   checkedAtMs?: number;
 }>;
 
+/** 同一次投影里是否仍有未解除的异步题；不把题面或 call id 换成消息 item id。 */
+function hasPendingAsync(projection: Projection | undefined): boolean {
+  if (!projection) return false;
+  for (const request of projection.pending.values()) if (request.kind === 'async') return true;
+  return false;
+}
+
 /** 在同一读取锁内投影列表状态与观察事实，候选和状态调用者共享读取，不能为每种投影再读历史。 */
 export async function readCodexCandidateFacts(params: LifecycleReadParams): Promise<{
   lifecycle: CodexLifecycleV1;
   observation: DirectSessionObservationV1;
+  pendingAsync: boolean;
 }> {
   const key = JSON.stringify([resolve(params.filePath), params.remoteSessionId]);
   const checkedAtMs = params.checkedAtMs ?? Date.now();
   const unknown: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
-  const unavailable = { lifecycle: unknownCodexLifecycleV1(checkedAtMs), observation: unknown };
+  const unavailable = { lifecycle: unknownCodexLifecycleV1(checkedAtMs), observation: unknown, pendingAsync: false };
   if (inFlight.has(key) || inFlight.size >= CACHE_ENTRIES) return unavailable;
   inFlight.add(key);
   try {
     const lifecycle = await readLifecycle({ ...params, checkedAtMs }, key);
     const projection = lifecycleCache.get(key)?.projection;
     // 仅使用本次验证完整且未过期的投影；残留缓存不能使未知状态重新变为已知。
-    if (lifecycle.state === 'unknown' || !projection?.turnId) return { lifecycle, observation: unknown };
+    if (lifecycle.state === 'unknown' || !projection?.turnId) return { lifecycle, observation: unknown, pendingAsync: false };
     const common = { v: 1 as const, source: 'rollout' as const, turnId: projection.turnId };
-    if (lifecycle.state !== 'needs_input') return { lifecycle, observation: { ...common, state: lifecycle.state } };
+    const pendingAsync = lifecycle.state === 'needs_input' && hasPendingAsync(projection);
+    if (lifecycle.state !== 'needs_input') return { lifecycle, observation: { ...common, state: lifecycle.state }, pendingAsync: false };
     const requests = [...projection.pending].map(([requestId, request]) => ({
       requestId,
       kind: request.kind === 'approval' ? 'permission_request' as const : 'user_action_request' as const,
     }));
     // 不为缺失身份的待处理事件制造请求编号，也不因此授予桌面操作能力。
     return { lifecycle, observation: requests.length > 0 && requests.every((request) => request.requestId.trim())
-      ? { ...common, state: 'needs_input', requests } : unknown };
+      ? { ...common, state: 'needs_input', requests } : unknown, pendingAsync };
   } catch { lifecycleCache.delete(key); return unavailable; }
   finally { inFlight.delete(key); }
 }

@@ -1,7 +1,7 @@
 import type { DirectSessionObservationV1, DirectSessionsSource } from '@happier-dev/protocol';
 import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
-import { readCodexLifecycleObservation } from './readCodexCandidateLifecycle';
+import { readCodexCandidateFacts } from './readCodexCandidateLifecycle';
 import { resolveCodexHomesForDirectSessionsSource } from './resolveCodexHomesForDirectSessionsSource';
 import { decodeCodexDirectForwardCursor, encodeCodexDirectForwardCursor } from './codexDirectForwardCursor';
 import { collectCodexSessionRolloutFiles, type CodexRolloutFile } from './collectCodexSessionRolloutFiles';
@@ -44,7 +44,7 @@ export async function readAfterCodexTranscript(params: Readonly<{
   projection?: 'conversation_text';
   scanMaxBytes?: number;
   includeLifecycleObservation?: boolean;
-}>): Promise<DirectSessionTranscriptReadAfter & { lifecycleObservation?: DirectSessionObservationV1 }> {
+}>): Promise<DirectSessionTranscriptReadAfter & { lifecycleObservation?: DirectSessionObservationV1; pendingAsync?: true }> {
   const env = params.env ?? process.env;
   const homes = await resolveCodexHomesForDirectSessionsSource({
     source: params.source,
@@ -112,11 +112,18 @@ export async function readAfterCodexTranscript(params: Readonly<{
       initialRolloutFiles: bestHome.files,
     });
     // 文件选择沿原 transcript 来源；多个文件仍需原前向连续性证明，不能凭修改时间判当前轮。
-    const lifecycleObservation: DirectSessionObservationV1 | undefined = !params.includeLifecycleObservation ? undefined
-      : bestHome.files.length === 1
-        ? await readCodexLifecycleObservation({ filePath: bestHome.files[0]!.filePath, remoteSessionId: params.remoteSessionId })
-        : { v: 1, state: 'unknown', reason: 'not_observed' };
-    return { ...page, historyAvailability: 'available', ...(lifecycleObservation ? { lifecycleObservation } : {}) };
+    // 列表候选不走 follow lease，因此不会因 pendingAsync 水合桌面；未打开会话仍只有 rollout。
+    let lifecycleObservation: DirectSessionObservationV1 | undefined;
+    let pendingAsync = false;
+    if (params.includeLifecycleObservation) {
+      if (bestHome.files.length === 1) {
+        const facts = await readCodexCandidateFacts({ filePath: bestHome.files[0]!.filePath, remoteSessionId: params.remoteSessionId });
+        lifecycleObservation = facts.observation;
+        pendingAsync = facts.pendingAsync;
+      } else lifecycleObservation = { v: 1, state: 'unknown', reason: 'not_observed' };
+    }
+    return { ...page, historyAvailability: 'available', ...(lifecycleObservation ? { lifecycleObservation } : {}),
+      ...(pendingAsync ? { pendingAsync: true as const } : {}) };
   } catch {
     // 保留输入进度；本次失败不授权任何客户端推进已接受的历史边界。
     return { items: [], nextCursor: params.cursor === 'tail' ? null : params.cursor, truncated: false, historyAvailability: 'unavailable' };

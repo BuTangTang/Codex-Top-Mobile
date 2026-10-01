@@ -791,4 +791,37 @@ describe('readAfterCodexTranscript', () => {
       ]),
     );
   });
+
+  it('forwards an unresolved async hint from the same lifecycle read and omits it after completion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-async-hint-'));
+    const codexHome = join(root, 'codex-home');
+    await mkdir(join(codexHome, 'sessions'), { recursive: true });
+    const sessionId = '44444444-4444-4444-4444-444444444444';
+    const filePath = join(codexHome, 'sessions', `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`);
+    const timestamp = '2026-01-02T00:00:01.000Z';
+    const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+    await writeFile(filePath, line({ type: 'session_meta', payload: { id: sessionId } })
+      + line({ type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: 'turn' } })
+      + line({ type: 'response_item', timestamp, payload: { type: 'function_call', name: 'request_user_input_async', call_id: 'call-A',
+        arguments: JSON.stringify({ questions: [{ title: '选择', options: ['甲'] }] }) } }));
+    const params = { source: { kind: 'codexHome', home: 'user' } as const, env: { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      activeServerDir: join(root, 'servers'), remoteSessionId: sessionId, cursor: 'tail', maxBytes: 1024 * 1024, maxItems: 20, includeLifecycleObservation: true };
+    const pending = await readAfterCodexTranscript(params);
+    expect(pending.pendingAsync).toBe(true);
+    expect(pending.lifecycleObservation).toMatchObject({ state: 'needs_input', source: 'rollout', requests: [{ requestId: 'call-A' }] });
+    await appendFile(filePath, line({ type: 'event_msg', timestamp, payload: { type: 'task_complete', turn_id: 'turn' } }));
+    // 异步题在终态仍未答时提示保留；普通完成没有异步题时不带这个提示。
+    const stillPending = await readAfterCodexTranscript({ ...params, cursor: pending.nextCursor! });
+    expect(stillPending.pendingAsync).toBe(true);
+    const rootDone = await mkdtemp(join(tmpdir(), 'happier-codex-async-hint-done-'));
+    const doneHome = join(rootDone, 'codex-home');
+    await mkdir(join(doneHome, 'sessions'), { recursive: true });
+    const donePath = join(doneHome, 'sessions', `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`);
+    await writeFile(donePath, line({ type: 'session_meta', payload: { id: sessionId } })
+      + line({ type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: 'turn' } })
+      + line({ type: 'event_msg', timestamp, payload: { type: 'task_complete', turn_id: 'turn' } }));
+    const done = await readAfterCodexTranscript({ ...params, env: { CODEX_HOME: doneHome } as NodeJS.ProcessEnv, activeServerDir: join(rootDone, 'servers') });
+    expect(done.pendingAsync).toBeUndefined();
+    expect(done.lifecycleObservation).toMatchObject({ state: 'completed' });
+  });
 });

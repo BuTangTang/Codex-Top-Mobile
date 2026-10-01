@@ -9,6 +9,10 @@ import { BACKGROUND_HISTORY_TIMEOUT_MS, CONTROL_READ_TIMEOUT_MS, DesktopIpc, Des
 import { readDesktopConversationObservation } from './desktop/desktopConversationObservation';
 import { readDesktopControlSnapshot } from './desktop/desktopControlSnapshot';
 
+function knownObservation(value: DirectSessionObservationV1): value is Exclude<DirectSessionObservationV1, { state: 'unknown' }> {
+  return value.state !== 'unknown';
+}
+
 /** 在既有轮询 lease 中选择只读事实；Desktop 未提供可采用状态时接收连续前向 rollout 事件。 */
 export async function createCodexDirectSessionFollowLease(params: {
   source: DirectSessionsSource; remoteSessionId: string; initialCursor?: string;
@@ -27,6 +31,8 @@ export async function createCodexDirectSessionFollowLease(params: {
   let anchoredConnection: DesktopIpc | null = null;
   let observation: DirectSessionObservationV1 = { v: 1, state: 'unknown', reason: 'not_observed' };
   let desktopObservation: DirectSessionObservationV1 = observation;
+  let asyncOptIn = false;
+  let acceptedLocal: DirectSessionObservationV1 | undefined;
   const pending: DirectSessionObservationFact[] = [];
   /** 终态只属于已证明的同一轮，后来的重复运行事实不能将它重新激活。 */
   const isTerminal = (value: DirectSessionObservationV1): boolean =>
@@ -48,6 +54,9 @@ export async function createCodexDirectSessionFollowLease(params: {
       publish({ v: 1, state: 'unknown', reason: 'source_unavailable' }, 'snapshot');
     }
   };
+  /** needs_input 的请求列表变化也是事实；相同状态不能吞掉 2→1 的未答题。 */
+  const needsInputRequests = (value: DirectSessionObservationV1): string =>
+    value.state === 'needs_input' ? JSON.stringify(value.requests) : '';
   /** Desktop 未知不否定有效 rollout；跨来源换轮没有顺序证明，同轮更完整的 Desktop 状态才可接替。 */
   const observeDesktop = (next: DirectSessionObservationV1, continuity: DirectSessionObservationFact['continuity']) => {
     if (released) return;
@@ -56,15 +65,19 @@ export async function createCodexDirectSessionFollowLease(params: {
       // 新长订阅首包尚未确认不是失联；它也不能给独立已关联基线增加永久优先级。
       if (next.state === 'unknown' && next.reason === 'not_observed') return;
       if (next.state !== 'unknown') {
-        if (next.turnId === observation.turnId && next.state === observation.state) return;
+        if (next.turnId === observation.turnId && next.state === observation.state
+            && needsInputRequests(next) === needsInputRequests(observation)) return;
         // 不同轮只能由 canonical 当前尾岛证明基线在前，不能把别的 scope 自身 confirmed 当证明。
         if (next.turnId !== observation.turnId
             && !ipc?.confirmsFollowingTurn(params.remoteSessionId, observation.turnId, next)) return;
       }
     }
     if (observation.state !== 'unknown' && observation.source === 'rollout') {
-      if (next.state === 'unknown' || next.turnId !== observation.turnId
-          || isTerminal(observation) || next.state === observation.state) return;
+      if (next.state === 'unknown' || next.turnId !== observation.turnId || isTerminal(observation)) return;
+      if (next.state === observation.state && needsInputRequests(next) === needsInputRequests(observation)) return;
+      // 只整份采用已校验的桌面观察，不用题面把 call id 猜成 item id。
+      if (next.source !== 'desktop') return;
+      if (observation.state === 'needs_input' && next.state !== 'needs_input' && next.state !== 'running') return;
     }
     if (observation.state !== 'unknown' && next.state !== 'unknown'
         && next.turnId === observation.turnId && isTerminal(observation)) return;
@@ -98,21 +111,30 @@ export async function createCodexDirectSessionFollowLease(params: {
       // 复用控制 owner 的 runtime/当前尾轮校验，再用唯一观察投影器生成状态。
       if (!released && ipc === opened) anchoredConnection = opened;
       const next = readDesktopConversationObservation(raw, params.remoteSessionId);
-      if (!released && ipc === opened && !baselineInvalidated && before.state === 'unknown' && observation === before && next.state !== 'unknown') {
+      const adoptAsync = knownObservation(before) && before.state === 'needs_input' && before.source === 'rollout' && asyncOptIn
+        && knownObservation(next) && next.source === 'desktop' && next.turnId === before.turnId
+        && (next.state === 'needs_input' || next.state === 'running');
+      if (!released && ipc === opened && !baselineInvalidated && observation === before && next.state !== 'unknown'
+          && (before.state === 'unknown' || adoptAsync)) {
+        desktopObservation = next;
         publish(next, 'snapshot');
-        baselineSelected = true;
+        if (before.state === 'unknown') baselineSelected = true;
       }
     } catch (error) {
       // 基线不可证时保持现有未知或前向事实，不能把历史首包降级为当前状态。
-      if (error instanceof DesktopIpcError && ['timeout', 'connection_closed', 'owner_changed', 'owner_unavailable'].includes(error.reason)
-        && !released && ipc === opened && !baselineInvalidated && observation.state === 'unknown') {
+      const reason = error instanceof DesktopIpcError ? error.reason : '';
+      const unknownRetry = observation.state === 'unknown'
+        && ['timeout', 'connection_closed', 'owner_changed', 'owner_unavailable'].includes(reason);
+      const asyncRetry = asyncOptIn && observation.state === 'needs_input' && observation.source === 'rollout'
+        && ['timeout', 'connection_closed', 'owner_changed', 'owner_unavailable', 'invalid_snapshot', 'invalid_response', 'revision_gap'].includes(reason);
+      if (error instanceof DesktopIpcError && !released && ipc === opened && !baselineInvalidated && (unknownRetry || asyncRetry)) {
         // 清掉本次失败订阅，由同一按需 poller 验证来源后重新发现 owner；不添加定时器或后台循环。
         opened.close(); ipc = null;
-        if (baselineAttempts === 1 && error.reason !== 'timeout') baselineStarted = false;
+        if (unknownRetry && baselineAttempts === 1 && reason !== 'timeout') baselineStarted = false;
         // 完整历史可能很大；失败后至少让出一个完整读取预算，不能每个 poll 都重新水合。
         else {
           baselineRetryAt = performance.now() + CONTROL_READ_TIMEOUT_MS;
-          logger.infoFile('[directSessions] Codex baseline recovery paused', { reason: error.reason, retryAfterMs: CONTROL_READ_TIMEOUT_MS });
+          logger.infoFile('[directSessions] Codex baseline recovery paused', { reason, retryAfterMs: CONTROL_READ_TIMEOUT_MS });
         }
         return;
       }
@@ -168,19 +190,29 @@ export async function createCodexDirectSessionFollowLease(params: {
               && observation.turnId === fact.data.turnId && isTerminal(observation)) continue;
           publish(fact.data, 'event');
         }
-        // 当前只读生命周期覆盖历史分页中的旧事件；明确状态无需触发桌面全量快照。
+        // 当前只读生命周期覆盖历史分页中的旧事件。未答异步题才进入既有桌面订阅；普通运行和完成仍不水合。
         const local = result.lifecycleObservation;
-        if (!released && !hasUsableDesktopObservation() && !rolloutUnavailable && local) {
-          if (local.state !== 'unknown' || usesLocalLifecycle) {
-            // 完整本地投影一旦建立，后续失效也由它撤销；旧格式仅保留原连续前向观察。
-            usesLocalLifecycle = true;
+        const pendingAsync = !!local && knownObservation(local) && result.pendingAsync === true
+          && local.state === 'needs_input' && local.source === 'rollout';
+        asyncOptIn = pendingAsync;
+        if (!released && !rolloutUnavailable && local && (knownObservation(local) || usesLocalLifecycle)) {
+          // 水合资格只看当前未答异步事实。普通明确状态保持不水合；这里不改原重连预算。
+          if (pendingAsync) usesLocalLifecycle = false;
+          else usesLocalLifecycle = true;
+          const desktopHeld = hasUsableDesktopObservation();
+          const newerLocalTurn = desktopHeld && knownObservation(local) && knownObservation(observation)
+            && local.turnId !== observation.turnId;
+          const localUnchanged = acceptedLocal !== undefined && JSON.stringify(acceptedLocal) === JSON.stringify(local);
+          // 已成立的桌面观察只在本地事实未变时保留；新轮仍可撤销它。不按题面猜测请求身份。
+          if (!(desktopHeld && !newerLocalTurn && (localUnchanged || !knownObservation(local)))) {
             if (JSON.stringify(local) !== JSON.stringify(observation)) publish(local, 'snapshot');
           }
+          if (knownObservation(local)) acceptedLocal = local;
         }
         if (!recoveringBaseline && !usesLocalLifecycle) await connect();
         // 到期仍须由本轮来源与 unknown 事实准入；撤销旧观察订阅后复用原连接／基线流程。
-        if (!released && !rolloutUnavailable && observation.state === 'unknown'
-          && baselineRetryAt !== null && performance.now() >= baselineRetryAt) {
+        if (!released && !rolloutUnavailable && baselineRetryAt !== null && performance.now() >= baselineRetryAt
+          && (observation.state === 'unknown' || (asyncOptIn && observation.state === 'needs_input' && observation.source === 'rollout'))) {
           baselineRetryAt = null; baselineStarted = false;
           ipc?.close(); ipc = null;
         }
