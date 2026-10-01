@@ -3,6 +3,8 @@ import { realpath, unlink } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 
 import { configuration } from '@/configuration';
+import { DirectSessionsProviderUnavailableError } from '@/backends/directSessions/providerOps';
+import { logger } from '@/ui/logger';
 import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
 import {
     createProtectedLocalStateFileExclusive,
@@ -16,6 +18,7 @@ import type { DirectSessionControlActionRequest, DirectSessionControlResult, Des
 import { readDesktopControlSnapshot, readNativeApprovalRequestId } from './desktopControlSnapshot';
 import { prepareDesktopAttachmentMessage } from './desktopAttachments';
 import { readDesktopAsyncQuestionReplies, readDesktopCurrentTurn } from './desktopQuestions';
+import { openDesktopSession } from './openDesktopSession';
 
 /** 从固定原 owner 读取当前轮次和可审查的待决定详情。 */
 export async function getDesktopSessionControlSnapshot(params: DesktopSessionTarget & { includeQuestions?: boolean }): Promise<DesktopControlSnapshotV1> {
@@ -443,13 +446,15 @@ function isNativeInactiveRejection(response: Record<string, unknown>, conversati
 
 /** 复用同一持久化意图；仅匹配原 owner 的成功应答和 turn ID 才算接受。 */
 async function submitOnce(codexHome: string, message: DesktopSessionMessage, requestId: string,
-    identity: SendIdentity): Promise<Readonly<{ result: DesktopSessionSendResult; undispatched: boolean }>> {
+    identity: SendIdentity, recoveryDispatchDeadline: number): Promise<Readonly<{ result: DesktopSessionSendResult; unsubmitted: boolean }>> {
     let control: Awaited<ReturnType<typeof acquireDesktopControl>> | undefined;
     let textIpc: DesktopIpc | undefined;
     let ownerClientId: string | undefined;
     let dispatched = false;
-    /** 未派发证明只来自本次调用过程，不能由公开状态或错误原因反推。 */
-    const finish = (result: DesktopSessionSendResult) => ({ result, undispatched: !dispatched });
+    let recovered = false;
+    const recoveryActionDeadline = recoveryDispatchDeadline + 5_000;
+    /** 未提交证明只来自本次调用过程，不能由公开状态或错误原因反推。 */
+    const finish = (result: DesktopSessionSendResult) => ({ result, unsubmitted: !dispatched });
     try {
         let ipc: DesktopIpc;
         const nativeAuto = message.textSendProtocol === 'native-auto-v1';
@@ -466,9 +471,40 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
                 // 初始化期间可能撤销租约、owner 或修订链；只验证原 reader，不转借后继连接。
                 control.read();
                 ownerClientId = textIpc.bindControlOwner(control.ipc, message.remoteSessionId);
-            } else ownerClientId = await textIpc.discoverOwner(message.remoteSessionId);
+            } else {
+                try { ownerClientId = await textIpc.discoverOwner(message.remoteSessionId); }
+                catch (error) {
+                    // 仅未派发的 macOS 普通文字允许一次官方唤起；其他发现失败不改变原发送边界。
+                    if (process.platform !== 'darwin' || message.attachments?.length || !(error instanceof DesktopIpcError)
+                        || !['timeout', 'owner_unavailable'].includes(error.reason)) throw error;
+                    recovered = true;
+                    message.getFollowedIpc?.();
+                    logger.infoFile('[desktop-session-control] cold-native-owner-recovery', { reason: error.reason });
+                    try {
+                        await openDesktopSession({ codexHome, remoteSessionId: message.remoteSessionId, waitForOwner: false,
+                            // 沿原认证及 lease getter 复核，不能以唤起入口延长或更换身份。
+                            isCurrent: () => { message.getFollowedIpc?.(); return true; } });
+                    } catch (openError) {
+                        // 官方入口包装底层错误后仍优先保留原身份撤销原因。
+                        message.getFollowedIpc?.();
+                        if (openError instanceof DirectSessionsProviderUnavailableError) throw new DesktopIpcError(openError.message);
+                        throw openError;
+                    }
+                    message.getFollowedIpc?.();
+                    // 唤起只加载同一已有任务；原文字连接仍需重新发现并绑定 owner，不重投消息。
+                    ownerClientId = await textIpc.discoverOwner(message.remoteSessionId);
+                    message.getFollowedIpc?.();
+                }
+            }
             message.getFollowedIpc?.();
             ipc = textIpc;
+            let steerTimeoutMs: number | undefined;
+            if (recovered) {
+                const now = performance.now();
+                // 仅恢复路径限制预派发时间；原 request 期限同时受动作总预算约束。
+                if (now >= recoveryDispatchDeadline) throw new DesktopIpcError('timeout');
+                steerTimeoutMs = Math.min(5_000, recoveryActionDeadline - now);
+            }
             dispatched = true;
             const response = await ipc.request('thread-follower-steer-turn', 1, {
                 conversationId: message.remoteSessionId, clientUserMessageId: message.localId,
@@ -477,7 +513,7 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
                 // cwd/workspaceRoots 由原生当前会话继承；保留原生恢复编辑框所需的完整正文/context 形状。
                 restoreMessage: attachmentMessage?.restoreMessage ?? { id: message.localId, text: message.text, createdAt: Date.now(),
                     context: { prompt: message.text, addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [] } },
-            }, requestId, ownerClientId);
+            }, requestId, ownerClientId, steerTimeoutMs);
             message.getFollowedIpc?.();
             control?.read();
             if (!isNativeInactiveRejection(response, message.remoteSessionId, ownerClientId)) {
@@ -502,6 +538,11 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
             ipc = control.ipc;
         }
         if (nativeAuto) { message.getFollowedIpc?.(); control?.read(); }
+        const startTimeoutMs = recovered ? Math.min(5_000, recoveryActionDeadline - performance.now()) : undefined;
+        if (startTimeoutMs !== undefined && startTimeoutMs <= 0) {
+            // 这里只可能在原 owner 精确拒绝 inactive steer 后到达，且 start 尚未派发。
+            return { result: { ...identity, status: 'rejected', reason: 'timeout', ownerClientId, requestId }, unsubmitted: true };
+        }
         dispatched = true;
         const response = await ipc.request('thread-follower-start-turn', 2, {
             conversationId: message.remoteSessionId,
@@ -510,7 +551,7 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
                     input: attachmentMessage?.input ?? [{ type: 'text', text: message.text, text_elements: [] }] },
                 context: attachmentMessage?.startContext ?? { inheritThreadSettings: true },
             },
-        }, nativeAuto ? randomUUID() : requestId, ownerClientId);
+        }, nativeAuto ? randomUUID() : requestId, ownerClientId, startTimeoutMs);
         if (nativeAuto) { message.getFollowedIpc?.(); control?.read(); }
         if (response.resultType === 'error') {
             const reason = desktopResponseFailure(response);
@@ -531,11 +572,13 @@ async function submitOnce(codexHome: string, message: DesktopSessionMessage, req
 }
 
 /**
- * 先持久化独占意图，再向原 Desktop owner 提交；仅本次明确未派发的失败可释放意图供手动重试。
+ * 先持久化独占意图，再向原 Desktop owner 提交；仅本次证明未提交的失败可释放意图供手动重试。
  * 意图落盘后崩溃会牺牲自动重试，保留 unknown；不能证明跨重启 exactly-once。
  * 不创建 router、app-server 或会话；新普通文本协议仅在原生明确拒绝 steer 后 start，未知结果不重投。
  */
 export async function sendDesktopSessionUserMessage(params: DesktopSessionMessage): Promise<DesktopSessionSendResult> {
+    // 单调预算从本方法入口计时；不覆盖 provider 调入前的认证 HTTP 与传输等待。
+    const recoveryDispatchDeadline = performance.now() + 10_000;
     const identity: SendIdentity = { localId: params.localId, remoteSessionId: params.remoteSessionId, deduplicated: false };
     if (!ipcString(params.localId) || !ipcString(params.remoteSessionId) || typeof params.text !== 'string' || (!ipcString(params.text) && !params.attachments?.length)) {
         return { ...identity, status: 'rejected', reason: 'invalid_request' };
@@ -557,8 +600,8 @@ export async function sendDesktopSessionUserMessage(params: DesktopSessionMessag
             if (ipcRecord(error)?.code === 'EEXIST') return replayIntent(intentPath, receiptPath, payloadHash, identity);
             throw error;
         }
-        const { result, undispatched } = await submitOnce(codexHome, params, requestId, identity);
-        if (undispatched && result.status === 'rejected') {
+        const { result, unsubmitted } = await submitOnce(codexHome, params, requestId, identity, recoveryDispatchDeadline);
+        if (unsubmitted && result.status === 'rejected') {
             await releaseUndispatchedIntent(intentPath, payloadHash, requestId);
             // 释放后可能已有新请求进入；无论清理成败，都不再写本次永久拒绝回执。
             return result;

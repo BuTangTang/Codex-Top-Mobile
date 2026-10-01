@@ -7,7 +7,7 @@ import { collectCodexSessionRolloutFiles } from '../collectCodexSessionRolloutFi
 import { readCodexSessionMetaFromRollout } from '../../localControl/rolloutDiscovery';
 import { DesktopIpc, DesktopIpcError } from './desktopIpc';
 
-type OpenTarget = Readonly<{ codexHome: string; remoteSessionId: string; isCurrent: () => boolean }>;
+type OpenTarget = Readonly<{ codexHome: string; remoteSessionId: string; isCurrent: () => boolean; waitForOwner?: boolean }>;
 const pendingOpens = new Map<string, Promise<void>>();
 
 /** 原生已有任务入口仅接受 UUID，不允许把任意页面、查询参数或新任务请求拼入 URL。 */
@@ -39,11 +39,16 @@ async function launchTask(id: string): Promise<void> {
 
 /** owner 可发现不代表任务已加载；明确打开时调用一次官方入口，原 CONTROL 仍自行关联快照 revision。 */
 async function openSelectedTask(target: OpenTarget): Promise<void> {
-    const ipc = await DesktopIpc.open(target.codexHome);
+    // 发送恢复只唤起已有任务，owner 由原文字连接发现，避免新增初始化与重复等待。
+    const ipc = target.waitForOwner === false ? null : await DesktopIpc.open(target.codexHome);
     try {
         await assertExistingTask(target);
         if (!target.isCurrent()) throw new DirectSessionsProviderUnavailableError('source_unavailable');
         await launchTask(target.remoteSessionId);
+        if (!ipc) {
+            if (!target.isCurrent()) throw new DirectSessionsProviderUnavailableError('source_unavailable');
+            return;
+        }
         // 与原 30 秒机器 RPC 配合：复用已初始化连接，最多两次原 5 秒发现；没有后台定时循环。
         for (let attempt = 0; attempt < 2; attempt++) {
             if (!target.isCurrent()) throw new DirectSessionsProviderUnavailableError('source_unavailable');
@@ -56,10 +61,10 @@ async function openSelectedTask(target: OpenTarget): Promise<void> {
                 await new Promise<void>((resolve) => setTimeout(resolve, 250));
             }
         }
-    } finally { ipc.close(); }
+    } finally { ipc?.close(); }
 }
 
-/** 仅供手机明确打开已有任务时等待原桌面 owner，不参与后台刷新。 */
+/** 明确打开默认等待原 owner；发送恢复仅唤起同一已有任务，不参与后台刷新。 */
 export async function openDesktopSession(params: OpenTarget): Promise<void> {
     if (process.platform !== 'darwin') return;
     validateTaskId(params.remoteSessionId);
@@ -67,7 +72,8 @@ export async function openDesktopSession(params: OpenTarget): Promise<void> {
     if (!isAbsolute(expanded)) throw new DirectSessionsProviderUnavailableError('source_unavailable');
     const codexHome = await realpath(expanded).catch(() => { throw new DirectSessionsProviderUnavailableError('source_unavailable'); });
     if (!params.isCurrent()) throw new DirectSessionsProviderUnavailableError('source_unavailable');
-    const key = JSON.stringify([codexHome, params.remoteSessionId]);
+    // 两种入口各自合并并发调用，发送恢复不能被另一个等待 owner 的调用拖住。
+    const key = JSON.stringify([codexHome, params.remoteSessionId, params.waitForOwner !== false]);
     const existing = pendingOpens.get(key);
     if (existing) return existing;
     // 并发点击共享同一稳定错误，不能让其中一个调用泄漏底层异常。

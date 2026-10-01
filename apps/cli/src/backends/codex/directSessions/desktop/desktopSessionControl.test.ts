@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // 日志是外部文件输出边界，测试不写实际诊断目录；真实 IPC 行为仍被覆盖。
-vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn() } }));
+vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), infoFile: vi.fn() } }));
 
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { writeProtectedLocalStateFileAtomic } from '@/utils/fs/protectedLocalState';
@@ -33,6 +33,7 @@ type Request = {
     sourceClientId: string;
     targetClientId?: string;
     hostId?: string;
+    timeoutMs?: number;
     params: Record<string, unknown>;
 };
 
@@ -388,6 +389,46 @@ describe('Desktop-owned session control', () => {
         expect(execFile).toHaveBeenCalledWith('/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${openId}?hostId=local`],
             expect.objectContaining({ timeout: 2_000 }), expect.any(Function));
         await expect(getDesktopSessionControlSnapshot(target)).resolves.toMatchObject({ state: 'completed', textSendMode: 'start', requests: [] });
+    });
+
+    it('validates and launches an existing task without an IPC connection in launch-only mode', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        await expect(openDesktopSession({ codexHome, remoteSessionId: openId, isCurrent: () => true, waitForOwner: false }))
+            .resolves.toBeUndefined();
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(requests).toHaveLength(0);
+        expect(existsSync(join(codexHome, 'ipc'))).toBe(false);
+    });
+
+    it('does not make launch-only recovery await a concurrent explicit owner wait', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        let discovery: { request: Request; socket: Socket } | undefined;
+        const loaded = onDiscover;
+        onDiscover = (request, socket) => { discovery = { request, socket }; };
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        const target = { codexHome, remoteSessionId: openId, isCurrent: () => true };
+        const waiting = openDesktopSession(target);
+        await vi.waitFor(() => expect(discovery).toBeDefined());
+        let launched = false;
+        const launchOnly = openDesktopSession({ ...target, waitForOwner: false }).then(() => { launched = true; });
+        try {
+            await vi.waitFor(() => expect(launched).toBe(true), { timeout: 500 });
+            expect(execFile).toHaveBeenCalledTimes(2);
+            expect(requests.filter((request) => request.method === 'initialize')).toHaveLength(1);
+        } finally {
+            loaded(discovery!.request, discovery!.socket);
+            await Promise.all([waiting, launchOnly]);
+        }
     });
 
     it.each(['../new?prompt=unexpected', 'new', `${openId}?prompt=unexpected`])('rejects a non-task URL target before a launch (%s)', async (remoteSessionId) => {
@@ -1118,10 +1159,306 @@ describe('Desktop-owned session control', () => {
                     addedFiles: [], fileAttachments: [], ideContext: null, imageAttachments: [] } },
             } });
             expect(requests.at(-1)?.params.restoreMessage).not.toHaveProperty('cwd');
+            expect(execFile).not.toHaveBeenCalled();
         } finally {
             for (const socket of sockets) socket.destroy();
             await result;
         }
+    });
+
+    it.each(['timeout', 'owner_unavailable'] as const)('opens the same existing task once after undispatched cold native discovery %s', async (reason) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        let opened = false;
+        // timeout 保留真实五秒无回应；官方入口之后仍经原 socket 协议发现 owner。
+        onDiscover = (request, socket) => {
+            if (opened) loaded(request, socket);
+            else if (reason === 'owner_unavailable') missingOwner(request, socket);
+        };
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            opened = true;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
+            result: { result: { turnId: 'native-current-turn' } } });
+        await startRouter();
+        const message = { codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' as const };
+        const result = await sendDesktopSessionUserMessage(message);
+        expect(result).toMatchObject({ status: 'accepted', localId: input.localId, remoteSessionId: openId,
+            turnId: 'native-current-turn', deduplicated: false, receiptPersisted: true });
+        expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...result, deduplicated: true });
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(execFile).toHaveBeenCalledWith('/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${openId}?hostId=local`],
+            expect.objectContaining({ timeout: 2_000 }), expect.any(Function));
+        const discoveries = requests.filter((request) => request.method === 'thread-owner-discovery');
+        expect(discoveries).toHaveLength(2);
+        expect(requests.filter((request) => request.method === 'initialize')).toHaveLength(1);
+        expect(discoveries.every((request) => request.params.conversationId === openId)).toBe(true);
+        const deliveries = requests.filter((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method));
+        expect(deliveries).toHaveLength(1);
+        expect(deliveries[0]).toMatchObject({ method: 'thread-follower-steer-turn', timeoutMs: 5_000, targetClientId: 'owner-synthetic', params: {
+            conversationId: openId, clientUserMessageId: input.localId,
+            input: [{ type: 'text', text: input.text, text_elements: [] }], attachments: [],
+        } });
+        expect(requests.some((request) => request.method === 'thread-follower-load-complete-history')).toBe(false);
+    });
+
+    it('does not launch after the initial cold failure revokes the caller identity', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        let revoked = false;
+        onDiscover = (request, socket) => { revoked = true; missingOwner(request, socket); };
+        await startRouter();
+        expect(await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId,
+            textSendProtocol: 'native-auto-v1', getFollowedIpc: () => {
+                if (revoked) throw new DesktopIpcError('owner_changed');
+                return null;
+            } })).toMatchObject({ status: 'rejected', reason: 'owner_changed' });
+        expect(execFile).not.toHaveBeenCalled();
+        expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+    });
+
+    it.each(['initialization', 'launch', 'final-discovery'] as const)('rejects undispatched recovery when %s reaches the ten-second monotonic budget', async (stage) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        let opened = false;
+        let now = 0;
+        const initialized = onInitialize;
+        onInitialize = (request, socket) => {
+            if (stage === 'initialization') now = 10_000;
+            initialized(request, socket);
+        };
+        onDiscover = (request, socket) => {
+            if (!opened) missingOwner(request, socket);
+            else {
+                if (stage === 'final-discovery') now = 10_000;
+                loaded(request, socket);
+            }
+        };
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            opened = true;
+            if (stage === 'launch') now = 10_000;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
+            result: { result: { turnId: 'native-current-turn' } } });
+        await startRouter();
+        // 单调时钟属于系统边界；推进时间无需让真实测试等待十秒。
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+        try {
+            expect(await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' }))
+                .toMatchObject({ status: 'rejected', reason: 'timeout', deduplicated: false });
+            expect(execFile).toHaveBeenCalledTimes(1);
+            expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+            const files = await readdir(join(environment.activeServerDir, 'desktop-session-delivery'), { recursive: true });
+            expect(files.filter((name) => name.endsWith('.json'))).toEqual([]);
+        } finally { clock.mockRestore(); }
+    });
+
+    it('releases the recovered intent only after an exact inactive rejection exhausts the action budget before start', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        let opened = false;
+        let now = 0;
+        onDiscover = (request, socket) => opened ? loaded(request, socket) : missingOwner(request, socket);
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            opened = true;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        onAction = (request, socket) => {
+            now = 15_000;
+            respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
+                resultType: 'error', handledByClientId: 'owner-synthetic',
+                error: `Cannot steer conversation ${openId} because its active turn already ended` });
+        };
+        await startRouter();
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+        try {
+            const message = { codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' as const };
+            expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'rejected', reason: 'timeout', deduplicated: false });
+            expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(0);
+            const files = await readdir(join(environment.activeServerDir, 'desktop-session-delivery'), { recursive: true });
+            expect(files.filter((name) => name.endsWith('.json'))).toEqual([]);
+            // 再次明确提交仍使用原 localId；已有 owner 的原快路径不套用恢复预算。
+            now = 0;
+            expect(await sendDesktopSessionUserMessage(message)).toMatchObject({ status: 'accepted', localId: input.localId, deduplicated: false });
+            expect(execFile).toHaveBeenCalledTimes(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(2);
+            expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(1);
+        } finally { clock.mockRestore(); }
+    });
+
+    it('caps the recovered start response to the remaining action budget and retains its unknown intent', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        let opened = false;
+        let now = 0;
+        onDiscover = (request, socket) => opened ? loaded(request, socket) : missingOwner(request, socket);
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            opened = true;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        onAction = (request, socket) => {
+            now = 14_975;
+            respond(socket, { type: 'response', requestId: request.requestId, resultType: 'error',
+                error: `Cannot steer conversation ${openId} because its active turn already ended` });
+        };
+        // 原 start 已发但无应答，真实请求 timer 必须按剩余 25 毫秒收敛为 unknown。
+        onStart = () => {};
+        await startRouter();
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+        try {
+            const message = { codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' as const };
+            const first = await sendDesktopSessionUserMessage(message);
+            expect(first).toMatchObject({ status: 'unknown', reason: 'timeout' });
+            expect(requests.find((request) => request.method === 'thread-follower-steer-turn')?.timeoutMs).toBe(5_000);
+            expect(requests.find((request) => request.method === 'thread-follower-start-turn')?.timeoutMs).toBe(25);
+            expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...first, deduplicated: true });
+            expect(execFile).toHaveBeenCalledTimes(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(1);
+            expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(1);
+        } finally { clock.mockRestore(); }
+    });
+
+    it.each(['inactive', 'start-ack'] as const)('keeps the recovered two-action identity boundary when revoked at %s', async (stage) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        let opened = false;
+        let revoked = false;
+        onDiscover = (request, socket) => opened ? loaded(request, socket) : missingOwner(request, socket);
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            opened = true;
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        onAction = (request, socket) => {
+            revoked = stage === 'inactive';
+            respond(socket, { type: 'response', requestId: request.requestId, resultType: 'error',
+                error: `Cannot steer conversation ${openId} because its active turn already ended` });
+        };
+        onStart = (request, socket) => { revoked = true; accepted(request, socket); };
+        await startRouter();
+        const message = { codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' as const,
+            getFollowedIpc: () => {
+                if (revoked) throw new DesktopIpcError('owner_changed');
+                return null;
+            } };
+        const first = await sendDesktopSessionUserMessage(message);
+        expect(first).toMatchObject({ status: 'unknown', reason: 'owner_changed' });
+        expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...first, deduplicated: true });
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(1);
+        expect(requests.filter((request) => request.method === 'thread-follower-start-turn')).toHaveLength(stage === 'inactive' ? 0 : 1);
+    });
+
+    it.each(['launch', 'discovery'] as const)('rejects undispatched native text when identity is revoked during the official task open (%s)', async (stage) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        const loaded = onDiscover;
+        let revoked = false;
+        let opened = false;
+        onDiscover = (request, socket) => {
+            if (!opened) missingOwner(request, socket);
+            else {
+                revoked = true;
+                loaded(request, socket);
+            }
+        };
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            opened = true;
+            revoked = stage === 'launch';
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        const result = await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId,
+            textSendProtocol: 'native-auto-v1', getFollowedIpc: () => {
+                if (revoked) throw new DesktopIpcError('owner_changed');
+                return null;
+            } });
+        expect(result).toMatchObject({ status: 'rejected', reason: 'owner_changed', localId: input.localId });
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(stage === 'launch' ? 1 : 2);
+        expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+        const files = await readdir(join(environment.activeServerDir, 'desktop-session-delivery'), { recursive: true });
+        expect(files.filter((name) => name.endsWith('.json'))).toEqual([]);
+    });
+
+    it('returns the official open failure without dispatching or retaining an undispatched native intent', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        onDiscover = missingOwner;
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(new Error('synthetic launch failure'));
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        const result = await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' });
+        expect(result).toMatchObject({ status: 'rejected', reason: 'desktop_open_failed' });
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+        expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+        const files = await readdir(join(environment.activeServerDir, 'desktop-session-delivery'), { recursive: true });
+        expect(files.filter((name) => name.endsWith('.json'))).toEqual([]);
+    });
+
+    it('does not reopen or dispatch when the final recovery discovery still fails', async () => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        let discoveries = 0;
+        onDiscover = (request, socket) => {
+            discoveries++;
+            missingOwner(request, socket);
+        };
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
+        await startRouter();
+        expect(await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' }))
+            .toMatchObject({ status: 'rejected', reason: 'owner_unavailable' });
+        expect(execFile).toHaveBeenCalledTimes(1);
+        expect(discoveries).toBe(2);
+        expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
+    });
+
+    it.each(['client-disconnected', 'request-version-mismatch'] as const)('does not open the task for a different cold discovery error (%s)', async (error) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        onDiscover = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
+            method: request.method, resultType: 'error', error });
+        await startRouter();
+        expect(await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' }))
+            .toMatchObject({ status: 'rejected', reason: error === 'client-disconnected' ? 'owner_changed' : 'incompatible_protocol' });
+        expect(execFile).not.toHaveBeenCalled();
+        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+    });
+
+    it.each(['linux', 'attachment'] as const)('keeps the existing cold rejection outside macOS ordinary text (%s)', async (mode) => {
+        Object.defineProperty(process, 'platform', { value: mode === 'linux' ? 'linux' : 'darwin' });
+        onDiscover = missingOwner;
+        const dir = join(root, 'happier/uploads/scope/messages', input.localId);
+        await mkdir(dir, { recursive: true });
+        const path = join(dir, 'note.txt');
+        await writeFile(path, 'note');
+        await startRouter();
+        const attachments = mode === 'attachment' ? [{ name: 'note.txt', path, kind: 'file' as const, sizeBytes: 4,
+            sha256: createHash('sha256').update('note').digest('hex') }] : undefined;
+        expect(await sendDesktopSessionUserMessage({ codexHome, ...input, remoteSessionId: openId,
+            textSendProtocol: 'native-auto-v1', attachments, attachmentWorkingDirectory: root }))
+            .toMatchObject({ status: 'rejected', reason: 'owner_unavailable' });
+        expect(execFile).not.toHaveBeenCalled();
+        expect(requests.some((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method))).toBe(false);
     });
 
     it.each(['active', 'inactive'] as const)('uses the confirmed reader owner on a separate text connection when fresh discovery stalls (%s)', async (mode) => {
@@ -1456,6 +1793,8 @@ describe('Desktop-owned session control', () => {
 
     // 未派发的失败只释放本次意图，用户手动重试仍复用相同身份和正文。
     it.each(['legacy', 'native'] as const)('allows the same localId after an undispatched %s rejection recovers', async (mode) => {
+        // 非 macOS 不唤起官方任务入口，仍覆盖原手动重试释放意图的契约。
+        Object.defineProperty(process, 'platform', { value: 'linux' });
         const discover = onDiscover;
         onDiscover = missingOwner;
         onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
@@ -1474,14 +1813,21 @@ describe('Desktop-owned session control', () => {
         expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...recovered, deduplicated: true });
         expect(requests.filter((request) => ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(request.method)))
             .toHaveLength(1);
+        expect(execFile).not.toHaveBeenCalled();
     });
 
     // request 调用后的明确拒绝与未知都保留原意图；不能仅看 status 为 rejected 就释放。
     it.each(['unknown', 'rejected'] as const)('keeps the intent and never reissues native text after a dispatched %s outcome', async (status) => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        await writeOpenTarget();
+        vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+            (args[3] as (error: Error | null) => void)(null);
+            return {} as ReturnType<typeof execFile>;
+        });
         onAction = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
             resultType: 'error', error: status === 'unknown' ? 'request-timeout' : 'no-client-found' });
         await startRouter();
-        const message = { codexHome, ...input, textSendProtocol: 'native-auto-v1' as const };
+        const message = { codexHome, ...input, remoteSessionId: openId, textSendProtocol: 'native-auto-v1' as const };
         const first = await sendDesktopSessionUserMessage(message);
         expect(first).toMatchObject({ status });
         const store = join(environment.activeServerDir, 'desktop-session-delivery');
@@ -1490,10 +1836,13 @@ describe('Desktop-owned session control', () => {
         expect(await sendDesktopSessionUserMessage(message)).toEqual({ ...first, deduplicated: true });
         expect(await readFile(join(store, intent), 'utf8')).toBe(originalIntent);
         expect(requests.filter((request) => request.method === 'thread-follower-steer-turn')).toHaveLength(1);
+        expect(execFile).not.toHaveBeenCalled();
     });
 
     // EEXIST 不得清理正在发送的意图；失败清理也必须重新匹配本次 requestId。
     it('preserves another request intent and does not overwrite its receipt after an undispatched rejection', async () => {
+        // 固定非 macOS，使合成的非 UUID 任务继续验证独占意图本身，不触发官方入口。
+        Object.defineProperty(process, 'platform', { value: 'linux' });
         let discovery: { request: Request; socket: Socket } | undefined;
         onDiscover = (request, socket) => { discovery = { request, socket }; };
         await startRouter();
