@@ -277,6 +277,19 @@ opt-out restores previews; users can disable them again from an updated client. 
 the flag and retain their existing reduced hints. There is no new server operation,
 migration, duplicate settings owner, or client-update requirement.
 
+### Desktop goal reads (development)
+
+The optional `includeGoal` status request and the existing available/none/unknown response shape
+remain unchanged. On macOS, goal reads may use the official persisted goal table only after the
+running Desktop process, source router, sole local app-server, and open database file identity match.
+Unproven sources, missing/unsupported stores, process changes, and failed reads remain unknown.
+The official store is opened read-only and is never created or migrated by this reader.
+
+Linux keeps its existing owner snapshot read and bounded cold wait. Clients that omit `includeGoal`
+do not probe goal storage. The macOS read avoids complete-history hydration, adds no network method,
+cache, polling loop, or goal edit/delete authority, and continues to recheck the original lease and
+connection after asynchronous work. No server/client coordinated upgrade or data migration is needed.
+
 ## Migration history
 
 Migration source has a stricter authoring boundary than ordinary internal code:

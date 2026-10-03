@@ -15,6 +15,7 @@ import {
 
 import { DesktopIpc, DesktopIpcError, assertDesktopPlatform, desktopResponseFailure, ipcRecord, ipcString } from './desktopIpc';
 import { readDesktopGoal, type DesktopGoalReadV1 } from './desktopGoal';
+import { readPersistedDesktopGoal } from './desktopGoalStore';
 import type { DirectSessionControlActionRequest, DirectSessionControlResult, DesktopControlSnapshotV1, DesktopQuestionRequestV1, DirectSessionUploadedAttachmentV1 } from '@happier-dev/protocol';
 import { readDesktopControlSnapshot, readNativeApprovalRequestId } from './desktopControlSnapshot';
 import { prepareDesktopAttachmentMessage } from './desktopAttachments';
@@ -360,11 +361,9 @@ function isLeaseRevocation(error: unknown): boolean {
 }
 
 const UNKNOWN_GOAL: DesktopGoalReadV1 = { availability: 'unknown' };
-// 只限制冷路径新增的目标快照等待。手机状态 RPC 是 20 秒，生命周期新鲜度是 15 秒；
-// 初始化与发现仍用原 5 秒期限。这里不把文件系统或整次 RPC 说成有全局上限。
+// Linux keeps the existing follower contract until an equivalent process proof is available.
 const COLD_GOAL_LOCAL_BUDGET_MS = 15_000;
 const COLD_GOAL_READ_LIMIT_MS = 2_000;
-
 /** 查询当前 Desktop 的既有 owner；此结果不承诺稍后的发送仍可接受。 */
 export async function getDesktopSessionControl(params: DesktopSessionTarget): Promise<DesktopSessionControl> {
     const goalStartedAt = params.includeGoal ? performance.now() : 0;
@@ -376,29 +375,29 @@ export async function getDesktopSessionControl(params: DesktopSessionTarget): Pr
         const followed = borrowDesktopControl(params);
         if (followed) {
             const raw = followed.read();
+            const goal = params.includeGoal ? process.platform === 'darwin'
+                ? await readPersistedDesktopGoal(home, params.remoteSessionId)
+                : readDesktopGoal(raw, params.remoteSessionId) : undefined;
+            if (params.includeGoal) followed.read(); // Persistence I/O must not outlive the original authenticated lease.
             return { available: true, ownerClientId: followed.ownerClientId, protocolVersion: 2,
-                ...(params.includeGoal ? { goal: readDesktopGoal(raw, params.remoteSessionId) } : {}) };
+                ...(goal ? { goal } : {}) };
         }
         ipc = await DesktopIpc.open(home);
         const ownerClientId = await ipc.discoverOwner(params.remoteSessionId);
         // 冷发现等待期间也可能撤销认证目标；只复核生命周期，不借用新的状态。
         params.getFollowedIpc?.();
         if (!params.includeGoal) return { available: true, ownerClientId, protocolVersion: 2 };
-        const goalTimeoutMs = Math.min(COLD_GOAL_READ_LIMIT_MS, COLD_GOAL_LOCAL_BUDGET_MS - (performance.now() - goalStartedAt));
-        if (!(goalTimeoutMs > 0)) return { available: true, ownerClientId, protocolVersion: 2, goal: UNKNOWN_GOAL };
         let goal = UNKNOWN_GOAL;
-        try {
-            // 原始会话状态先于控制投影；缺轮次不能把缺失目标收成 none。超时只放弃这次目标读取。
-            const raw = await ipc.readControlSnapshot(params.remoteSessionId, undefined, undefined, goalTimeoutMs);
-            params.getFollowedIpc?.();
-            goal = readDesktopGoal(raw, params.remoteSessionId);
-        } catch (error) {
-            if (isLeaseRevocation(error)) throw error;
-            try { params.getFollowedIpc?.(); } catch (revocation) {
-                if (isLeaseRevocation(revocation)) throw revocation;
+        if (process.platform === 'darwin') goal = await readPersistedDesktopGoal(home, params.remoteSessionId);
+        else {
+            const timeoutMs = Math.min(COLD_GOAL_READ_LIMIT_MS, COLD_GOAL_LOCAL_BUDGET_MS - (performance.now() - goalStartedAt));
+            if (timeoutMs > 0) {
+                try { goal = readDesktopGoal(await ipc.readControlSnapshot(params.remoteSessionId, undefined, undefined, timeoutMs), params.remoteSessionId); }
+                catch (error) { if (isLeaseRevocation(error)) throw error; }
             }
-            goal = UNKNOWN_GOAL;
         }
+        params.getFollowedIpc?.();
+        if (ipc.isClosed()) throw new DesktopIpcError('owner_changed');
         return { available: true, ownerClientId, protocolVersion: 2, goal };
     } catch (error) {
         if (params.includeGoal && isLeaseRevocation(error)) throw error;

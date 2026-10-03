@@ -16,7 +16,7 @@ function isBunRuntime(): boolean {
   return typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
 }
 
-export function openSqliteDatabaseSync(filePath: string): SqliteDatabaseSync {
+export function openSqliteDatabaseSync(filePath: string, options?: Readonly<{ readOnly?: boolean }>): SqliteDatabaseSync {
   const require = createRequire(import.meta.url);
   const moduleName = isBunRuntime() ? 'bun:sqlite' : 'node:sqlite';
 
@@ -33,5 +33,9 @@ export function openSqliteDatabaseSync(filePath: string): SqliteDatabaseSync {
     throw new Error(`Failed to resolve sqlite Database constructor from ${moduleName}`);
   }
 
-  return new (ctor as new (path: string) => SqliteDatabaseSync)(filePath);
+  const nativeOptions = options?.readOnly
+    ? (isBunRuntime() ? { readonly: true, create: false } : { readOnly: true })
+    : undefined;
+  const Database = ctor as new (path: string, options?: object) => SqliteDatabaseSync;
+  return nativeOptions ? new Database(filePath, nativeOptions) : new Database(filePath);
 }

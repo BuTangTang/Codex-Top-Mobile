@@ -2,14 +2,26 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // 日志是外部文件输出边界，测试不写实际诊断目录；真实 IPC 行为仍被覆盖。
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), infoFile: vi.fn() } }));
 
+const systemFileReads = vi.hoisted(() => ({ afterStat: null as ((path: unknown) => Promise<void>) | null }));
+// Delay only the external filesystem return boundary; provider, process proof and SQLite stay real.
+vi.mock('node:fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:fs/promises')>();
+    return { ...actual, lstat: async (...args: Parameters<typeof actual.lstat>) => {
+        const value = await Reflect.apply(actual.lstat, actual, args);
+        await systemFileReads.afterStat?.(args[0]);
+        return value;
+    } };
+});
+
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+import { openSqliteDatabaseSync } from '@/utils/sqlite/sqliteSync';
 import { writeProtectedLocalStateFileAtomic } from '@/utils/fs/protectedLocalState';
 
 const environment = vi.hoisted(() => ({ activeServerDir: '', filesUploadMaxFileBytes: 50 * 1024 * 1024 }));
@@ -24,6 +36,7 @@ import { getDesktopSessionControl, getDesktopSessionControlSnapshot, sendDesktop
 import { readDesktopControlSnapshot } from './desktopControlSnapshot';
 import { DesktopIpc, DesktopIpcError } from './desktopIpc';
 import { openDesktopSession } from './openDesktopSession';
+import { createDesktopGoalStoreIdentityExecFileMock } from './desktopGoalStoreIdentity.testFixtures';
 
 type Request = {
     type: string;
@@ -153,13 +166,15 @@ describe('Desktop-owned session control', () => {
 
     /** 每例隔离 Happier 意图文件和 Codex 模拟目录。 */
     beforeEach(async () => {
-        root = await createTempDir('hcd-');
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        root = await realpath(await createTempDir('hcd-'));
         codexHome = join(root, 'codex');
         environment.activeServerDir = join(root, 'happier');
         requests = [];
         onInitialize = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
             resultType: 'success', handledByClientId: 'follower-synthetic', result: { clientId: 'follower-synthetic' } });
         vi.mocked(execFile).mockReset();
+        vi.mocked(execFile).mockImplementation(createDesktopGoalStoreIdentityExecFileMock({ resolvedHome: codexHome }));
         snapshotRevisions.clear();
         onHistory = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId,
             method: request.method, resultType: 'success', handledByClientId: 'owner-synthetic',
@@ -197,152 +212,107 @@ describe('Desktop-owned session control', () => {
         expect(requests.some((request) => request.method === method)).toBe(true);
     }
 
-    it('bounds opted-in cold history after slow initialize and discovery', async () => {
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-        let clock = 0;
-        const now = vi.spyOn(performance, 'now').mockImplementation(() => clock);
-        const accept = (request: Request, socket: Socket, clientId: string, delay: number) => {
-            setTimeout(() => {
-                clock += delay;
-                respond(socket, { type: 'response', requestId: request.requestId, method: request.method, resultType: 'success',
-                    handledByClientId: clientId, result: request.method === 'initialize' ? { clientId } : { supportsUntrustedAppInput: true } });
-            }, delay);
-        };
-        onInitialize = (request, socket) => accept(request, socket, 'follower-synthetic', 4999);
-        onDiscover = (request, socket) => accept(request, socket, 'owner-synthetic', 4999);
-        onHistory = () => {};
-        onFollow = (request, socket) => {
-            if (request.params.following) respond(socket, controlSnapshotFrame({ ...idleControlState(), threadGoal: {
-                threadId: input.remoteSessionId, objective: '完成接入', status: 'active', tokenBudget: null, tokensUsed: 4, timeUsedSeconds: 5, updatedAt: 9,
-            } }));
-        };
+    async function writeGoal(status = 'blocked') {
+        await mkdir(codexHome, { recursive: true });
+        const db = openSqliteDatabaseSync(join(codexHome, 'goals_1.sqlite'));
         try {
-            await startRouter();
-            let settled = false;
-            const pending = getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true })
-                .finally(() => { settled = true; });
-            await waitForMethod('initialize');
-            await vi.advanceTimersByTimeAsync(4999);
-            await waitForMethod('thread-owner-discovery');
-            await vi.advanceTimersByTimeAsync(4999);
-            await waitForMethod('thread-follower-load-complete-history');
-            const history = requests.filter((request) => request.method === 'thread-follower-load-complete-history');
-            expect(history).toHaveLength(1);
-            expect(history[0]?.timeoutMs).toBeLessThanOrEqual(2000);
-            expect(clock).toBe(9998);
-            await vi.advanceTimersByTimeAsync(1999);
-            expect(settled).toBe(false);
-            await vi.advanceTimersByTimeAsync(1);
-            expect(settled).toBe(true);
-            await expect(pending).resolves.toMatchObject({ available: true, ownerClientId: 'owner-synthetic', goal: { availability: 'unknown' } });
-            const lateSocket = [...sockets][0];
-            if (lateSocket) respond(lateSocket, controlSnapshotFrame({ ...idleControlState(), threadGoal: {
-                threadId: input.remoteSessionId, objective: '迟到', status: 'active', tokenBudget: null, tokensUsed: 1, timeUsedSeconds: 1, updatedAt: 2,
-            } }));
-            await expect(pending).resolves.toMatchObject({ goal: { availability: 'unknown' } });
-            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
-        } finally { now.mockRestore(); vi.useRealTimers(); }
-    });
+            db.exec('CREATE TABLE IF NOT EXISTS thread_goals (thread_id TEXT PRIMARY KEY, objective TEXT, status TEXT, token_budget INTEGER, tokens_used INTEGER, time_used_seconds INTEGER, updated_at_ms INTEGER)');
+            db.prepare('INSERT OR REPLACE INTO thread_goals VALUES (?,?,?,?,?,?,?)').run(input.remoteSessionId, 'Synthetic current goal', status, null, 4, 5, 1790989070221);
+        } finally { db.close(); }
+    }
 
-    it('skips opted-in history when discovery completion has already used the local budget', async () => {
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-        let clock = 0;
-        const now = vi.spyOn(performance, 'now').mockImplementation(() => clock);
-        onInitialize = (request, socket) => { setTimeout(() => { clock += 4999; respond(socket, { type: 'response', requestId: request.requestId,
-            method: 'initialize', resultType: 'success', handledByClientId: 'follower-synthetic', result: { clientId: 'follower-synthetic' } }); }, 4999); };
-        onDiscover = (request, socket) => { setTimeout(() => { clock = 15_000; respond(socket, { type: 'response', requestId: request.requestId,
-            method: 'thread-owner-discovery', resultType: 'success', handledByClientId: 'owner-synthetic', result: { supportsUntrustedAppInput: true } }); }, 4999); };
+    it('reads the opted-in persisted goal without hydrating history, while old callers omit goal', async () => {
+        await writeGoal();
         onHistory = () => {};
-        try {
-            await startRouter();
-            const pending = getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true });
-            await waitForMethod('initialize');
-            await vi.advanceTimersByTimeAsync(4999);
-            await waitForMethod('thread-owner-discovery');
-            await vi.advanceTimersByTimeAsync(4999);
-            await flushSocket();
-            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(0);
-            await expect(pending).resolves.toMatchObject({ available: true, ownerClientId: 'owner-synthetic', goal: { availability: 'unknown' } });
-            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
-        } finally { now.mockRestore(); vi.useRealTimers(); }
-    });
-
-    it('reads an opted-in cold goal once on the discovery connection and omits it otherwise', async () => {
-        onFollow = (request, socket) => {
-            if (request.params.following) respond(socket, controlSnapshotFrame({ ...idleControlState(), threadGoal: {
-                threadId: input.remoteSessionId, objective: '完成接入', status: 'active', tokenBudget: null,
-                tokensUsed: 4, timeUsedSeconds: 5, updatedAt: 9,
-            } }));
-        };
         await startRouter();
-        const plain = await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId });
-        expect(plain).toEqual({ available: true, ownerClientId: 'owner-synthetic', protocolVersion: 2 });
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
-        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(0);
-        const goal = await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true });
-        expect(goal).toMatchObject({ available: true, ownerClientId: 'owner-synthetic', goal: {
-            availability: 'available', source: 'desktop', threadId: input.remoteSessionId, objective: '完成接入',
-            status: 'active', tokenBudget: null, tokensUsed: 4, timeUsedSeconds: 5, updatedAt: 9,
-        } });
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(2);
-        expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+        expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId }))
+            .toEqual({ available: true, ownerClientId: 'owner-synthetic', protocolVersion: 2 });
+        expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true }))
+            .toMatchObject({ available: true, goal: { availability: 'available', status: 'blocked', objective: 'Synthetic current goal', updatedAt: 1790989070 } });
+        expect(requests.filter((r) => r.method === 'thread-follower-load-complete-history' || r.method === 'thread-stream-following-changed')).toHaveLength(0);
         await vi.waitFor(() => expect(sockets.size).toBe(0));
     });
 
-    it('projects a hot completed raw goal revision without another discovery', async () => {
+    it.each([false, true])('preserves the Linux follower goal contract (hot=%s)', async (hot) => {
+        Object.defineProperty(process, 'platform', { value: 'linux' });
+        onFollow = (request, socket) => {
+            if (request.params.following) respond(socket, controlSnapshotFrame({ ...idleControlState(), threadGoal: {
+                threadId: input.remoteSessionId, objective: 'Synthetic Linux goal', status: 'active', updatedAt: 1790989070,
+            } }));
+        };
+        await startRouter();
+        const followed = hot ? await DesktopIpc.open(codexHome) : undefined;
+        try {
+            if (followed) {
+                await followed.discoverOwner(input.remoteSessionId);
+                await followed.readControlSnapshot(input.remoteSessionId, () => {});
+                requests.length = 0;
+            }
+            expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true,
+                ...(followed ? { getFollowedIpc: () => followed } : {}) }))
+                .toMatchObject({ available: true, goal: { availability: 'available', status: 'active', objective: 'Synthetic Linux goal' } });
+            expect(execFile).not.toHaveBeenCalled();
+            expect(requests.filter((r) => r.method === 'thread-follower-load-complete-history')).toHaveLength(hot ? 0 : 1);
+        } finally { followed?.close(); }
+    });
+
+    it('rejects a cold owner that disconnects during the persisted goal read', async () => {
+        await writeGoal();
+        const resolvedGoalPath = await realpath(join(codexHome, 'goals_1.sqlite'));
+        let gateCalls = 0;
+        let socketClosedDuringRead = false;
+        await startRouter();
+        systemFileReads.afterStat = async (path) => {
+            if (String(path) !== resolvedGoalPath || gateCalls !== 0) return;
+            gateCalls += 1;
+            // The actual synthetic file was inspected; delay its delivery until the real socket sees owner loss.
+            expect(sockets.size).toBe(1);
+            const socket = [...sockets][0]!;
+            expect(socket.destroyed).toBe(false);
+            respond(socket, { type: 'broadcast', method: 'client-status-changed', version: 1,
+                sourceClientId: 'router-synthetic', params: { clientId: 'owner-synthetic', status: 'disconnected' } });
+            await vi.waitFor(() => expect(sockets.size).toBe(0));
+            socketClosedDuringRead = socket.destroyed;
+        };
+        try {
+            const result = await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true });
+            expect(gateCalls).toBe(1);
+            expect(socketClosedDuringRead).toBe(true);
+            expect(result).toMatchObject({ available: false, reason: 'owner_changed', goal: { availability: 'unknown' } });
+            expect(requests.filter((r) => r.method === 'thread-owner-discovery')).toHaveLength(1);
+            expect(requests.filter((r) => r.method === 'thread-follower-load-complete-history' || r.method === 'thread-stream-following-changed')).toHaveLength(0);
+        } finally { systemFileReads.afterStat = null; }
+    });
+
+    it('reads a current persisted goal on a hot lease without another history request', async () => {
+        await writeGoal();
         await startRouter();
         const followed = await DesktopIpc.open(codexHome);
         await followed.discoverOwner(input.remoteSessionId);
         await followed.readControlSnapshot(input.remoteSessionId, () => {});
-        const getFollowedIpc = () => followed;
         try {
+            requests.length = 0;
+            const getFollowedIpc = () => followed;
             expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true, getFollowedIpc }))
-                .toMatchObject({ available: true, goal: { availability: 'unknown' } });
-            const socket = [...sockets][0]!;
-            respond(socket, { type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner-synthetic',
-                params: { hostId: 'local', conversationId: input.remoteSessionId, change: { type: 'patches', revision: 2, baseRevision: 1,
-                    patches: [{ op: 'add', path: ['threadGoal'], value: {
-                        threadId: input.remoteSessionId, objective: '完成后仍在', status: 'paused', tokenBudget: 1000,
-                        tokensUsed: 8, timeUsedSeconds: 3, updatedAt: 12,
-                    } }] } } });
+                .toMatchObject({ available: true, goal: { availability: 'available', status: 'blocked' } });
+            await writeGoal('paused');
             expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true, getFollowedIpc }))
-                .toMatchObject({ available: true, goal: { availability: 'available', status: 'paused', objective: '完成后仍在', updatedAt: 12 } });
-            expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
-            expect(requests.filter((request) => request.method === 'thread-follower-load-complete-history')).toHaveLength(1);
+                .toMatchObject({ goal: { status: 'paused' } });
+            expect(requests).toHaveLength(0);
         } finally { followed.close(); }
     });
 
-    it.each(['missing', 'null', 'malformed'] as const)('distinguishes a %s raw goal without losing the owner', async (shape) => {
-        onFollow = (request, socket) => {
-            if (!request.params.following) return;
-            const state = idleControlState();
-            if (shape === 'null') state.threadGoal = null;
-            if (shape === 'malformed') state.threadGoal = { threadId: 'other', objective: '完成接入', status: 'running' };
-            respond(socket, controlSnapshotFrame(state));
-        };
+    it('keeps owner capability with an unreadable goal and rejects a revoked target', async () => {
         await startRouter();
-        const result = await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true });
-        expect(result).toMatchObject({ available: true, ownerClientId: 'owner-synthetic', goal: {
-            availability: shape === 'null' ? 'none' : 'unknown', ...(shape === 'null' ? { source: 'desktop' } : {}),
-        } });
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
-    });
-
-    it('keeps owner capability when the raw goal read fails and aborts a replaced lease', async () => {
-        onHistory = (request, socket) => respond(socket, { type: 'response', requestId: request.requestId, method: request.method,
-            resultType: 'error', error: 'request-timeout' });
-        await startRouter();
-        await expect(getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true }))
-            .resolves.toMatchObject({ available: true, ownerClientId: 'owner-synthetic', goal: { availability: 'unknown' } });
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
+        expect(await getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true }))
+            .toMatchObject({ available: true, goal: { availability: 'unknown' } });
         requests.length = 0;
         const getFollowedIpc = () => {
-            if (requests.some((request) => request.method === 'thread-follower-load-complete-history')) throw new Error('source_unavailable');
+            if (requests.some((r) => r.method === 'thread-owner-discovery')) throw new Error('source_unavailable');
             return null;
         };
         await expect(getDesktopSessionControl({ codexHome, remoteSessionId: input.remoteSessionId, includeGoal: true, getFollowedIpc }))
             .rejects.toThrow('source_unavailable');
-        expect(requests.filter((request) => request.method === 'thread-owner-discovery')).toHaveLength(1);
     });
 
     it.each(['valid', 'revoked'] as const)('checks warm status against the %s current lease without cold discovery', async (mode) => {
