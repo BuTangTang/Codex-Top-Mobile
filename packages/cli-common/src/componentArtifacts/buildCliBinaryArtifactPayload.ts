@@ -20,6 +20,7 @@ import { ensureBundledWorkspacePackagesBuilt } from './ensureBundledWorkspacePac
 import { finalizeRuntimeArtifactPayload } from './finalizeRuntimeArtifactPayload.js';
 import { recordCliBinaryArtifactRuntimeAssetBuildManifest } from './refreshCliBinaryArtifactRuntimeAssetBuildManifest.js';
 import { shouldReuseCliDistSnapshot } from './shouldReuseCliDistSnapshot.js';
+import { pruneCliOnnxRuntimePlatforms } from './pruneCliOnnxRuntimePlatforms.js';
 
 const CLI_RUNTIME_SIDECAR_ENTRIES = [
   ['childProcessOptions.cjs'],
@@ -172,6 +173,7 @@ async function snapshotCliDistDir(params: Readonly<{ cliDir: string; distDir: st
   }
 }
 
+/** 构建完整运行闭包，只在签名前按目标 OS 裁剪已核实的非本平台 ONNX 二进制。 */
 export async function buildCliBinaryArtifactPayload({
   repoRoot,
   payloadDir,
@@ -293,6 +295,7 @@ export async function buildCliBinaryArtifactPayload({
 
   await copyCliRuntimeSidecars(repoRoot, payloadDir);
   await copyCliRuntimeTools(repoRoot, payloadDir, target);
+  await pruneCliOnnxRuntimePlatforms({ payloadDir, targetOs: target.os });
   await finalizeRuntimeArtifactPayload(payloadDir);
   recordCliBinaryArtifactRuntimeAssetBuildManifest({
     payloadDir,
