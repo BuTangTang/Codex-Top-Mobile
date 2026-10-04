@@ -3,10 +3,14 @@
  * Provides endpoints for listing sessions, stopping sessions, and daemon shutdown
  */
 
-import fastify, { FastifyInstance } from 'fastify';
+import {
+  createDaemonControlCore,
+  listenDaemonControlApp,
+  safeTokenEquals,
+  type DaemonSelfRestartRequest,
+} from './controlServerCore';
+import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import { Metadata } from '@/api/types';
 import { resolveCatalogAgentIdForCliSubcommand } from '@/backends/catalog';
@@ -107,7 +111,6 @@ import {
   type RuntimeAuthRecoveryProofKind,
 } from './connectedServices/runtimeAuth/resolveRuntimeAuthRecoveryOutcome';
 import { buildConnectedServiceRuntimeAuthSwitchAttemptLogContext } from './connectedServices/runtimeAuth/buildConnectedServiceRuntimeAuthSwitchAttemptLogContext';
-import { registerDaemonControlRequestTiming } from './diagnostics/registerDaemonControlRequestTiming';
 import {
   ConnectedServiceTurnLifecycleRequestBodySchema,
   ConnectedServiceTurnLifecycleResultSchema,
@@ -125,15 +128,6 @@ import {
 } from './connectedServices/runtimeAuth/projection/connectedServiceRuntimeAuthRecoveryProjection';
 import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
 import { buildRuntimeAuthRecoveryAttemptTransitionLocalId } from './connectedServices/runtimeAuth/commitConnectedServiceRuntimeAuthRecoverySessionEvent';
-
-const DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
-const DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY = 'HAPPIER_DAEMON_CONTROL_BODY_LIMIT_BYTES';
-const DAEMON_DIST_CLOSURE_FINGERPRINT_PATTERN = /^[a-f0-9]{16}$/;
-const DaemonDistClosureFingerprintSchema = z.string().regex(DAEMON_DIST_CLOSURE_FINGERPRINT_PATTERN);
-
-type DaemonSelfRestartRequest = Readonly<{
-  successorDistClosureFingerprint?: string;
-}>;
 const DAEMON_CONTROL_ERROR_MESSAGE_MAX_LENGTH = 500;
 
 const brokerBridgeAuthzDeniedSchema = z.object({
@@ -326,24 +320,7 @@ function isCanonicalSessionId(value: unknown): value is string {
   return !/^PID-\d+$/.test(normalized);
 }
 
-function safeTokenEquals(provided: string, expected: string): boolean {
-  const hashA = createHash('sha256').update(provided).digest();
-  const hashB = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(hashA, hashB);
-}
-
-function resolveDaemonControlBodyLimitBytes(): number {
-  const raw = String(process.env[DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY] ?? '').trim();
-  if (!raw) return DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES;
-
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES;
-  }
-
-  return Math.max(1024 * 1024, Math.min(parsed, 64 * 1024 * 1024));
-}
-
+/** 在共享控制核心的同一 app 上保留全部默认能力及各自认证边界。 */
 export function createDaemonControlApp({
   getChildren,
   machineId,
@@ -476,28 +453,9 @@ export function createDaemonControlApp({
   }>) => Promise<ClaudeSubscriptionAuthTokensRefreshResponse>;
   requestSelfRestart?: (request?: DaemonSelfRestartRequest) => Promise<unknown>;
 }): FastifyInstance {
-  void machineId;
-  const normalizedRuntimeId = runtimeId.trim();
-  const normalizedControlToken = controlToken.trim();
-  if (!normalizedControlToken) {
-    throw new Error('Daemon control token is required');
-  }
-
-  const app = fastify({
-    logger: false, // We use our own logger
-    bodyLimit: resolveDaemonControlBodyLimitBytes(),
-  });
-  registerDaemonControlRequestTiming(app, {
-    debug: (message, data) => logger.debug(message, data),
-  });
-
-  // Set up Zod type provider
-  app.setValidatorCompiler(validatorCompiler);
-  app.setSerializerCompiler(serializerCompiler);
-  const typed = app.withTypeProvider<ZodTypeProvider>();
-  const authSchema401 = z.object({
-    success: z.literal(false),
-    error: z.string(),
+  const { app, typed, requireAuth, authSchema401, normalizedControlToken } = createDaemonControlCore({
+    getChildren, machineId, runtimeId, stopSession, prepareStopSession,
+    requestShutdown, beforeShutdown, controlToken, isShuttingDown, requestSelfRestart,
   });
 
   const runtimeAuthReportClaims = new Map<string, Readonly<{
@@ -559,15 +517,6 @@ export function createDaemonControlApp({
     return settled;
   };
 
-  const requireAuth = async (request: { headers: Record<string, unknown> }, reply: any): Promise<void> => {
-    const rawHeader = (request.headers as any)['x-happier-daemon-token'];
-    const provided = typeof rawHeader === 'string' ? rawHeader : Array.isArray(rawHeader) ? rawHeader[0] : null;
-    if (!provided || !safeTokenEquals(provided, normalizedControlToken)) {
-      reply.code(401);
-      return reply.send({ success: false as const, error: 'Unauthorized' });
-    }
-  };
-
   // Least-privilege gate for the broker-only endpoints (F2): they accept ONLY the SCOPED broker-refresh
   // capability token derived from the master control token, NOT the broad master token itself. The
   // broker plugin holds only this scoped token, so a leaked broker token cannot reach the broad surface.
@@ -621,30 +570,6 @@ export function createDaemonControlApp({
       return reply.send({ success: false as const, error: 'Unauthorized' });
     }
   };
-  let restartState: 'idle' | 'restarting' = 'idle';
-
-  typed.post('/ping', {
-    schema: {
-      response: {
-        200: z.object({
-          status: z.literal('ok'),
-          runtimeId: z.string().min(1).optional(),
-          distClosureFingerprint: DaemonDistClosureFingerprintSchema.optional(),
-        }),
-        401: authSchema401,
-      }
-    },
-    preHandler: requireAuth,
-  }, async () => {
-    const distClosureFingerprint = String(
-      process.env.HAPPIER_CLI_SUBPROCESS_DAEMON_DIST_CLOSURE_FINGERPRINT ?? '',
-    ).trim();
-    return {
-      status: 'ok' as const,
-      ...(normalizedRuntimeId ? { runtimeId: normalizedRuntimeId } : {}),
-      ...(DAEMON_DIST_CLOSURE_FINGERPRINT_PATTERN.test(distClosureFingerprint) ? { distClosureFingerprint } : {}),
-    };
-  });
 
   typed.post('/connected-service-auth/session/switch', {
     schema: {
@@ -1692,51 +1617,6 @@ export function createDaemonControlApp({
     };
   });
 
-  // List all tracked sessions
-  typed.post('/list', {
-    schema: {
-      response: {
-        200: z.object({
-          children: z.array(z.object({
-            startedBy: z.string(),
-            happySessionId: z.string(),
-            pid: z.number(),
-            status: z.enum(['runner_alive', 'runner_alive_host_dead']),
-            terminalHostHealth: z.object({
-              status: z.literal('host_dead'),
-              sessionId: z.string(),
-              runnerPid: z.number(),
-              hostKind: z.string(),
-              zellijSessionName: z.string().optional(),
-              observedAt: z.number(),
-              reason: z.string(),
-            }).optional(),
-          }))
-        }),
-        401: authSchema401,
-      }
-    },
-    preHandler: requireAuth,
-  }, async () => {
-    const children = getChildren();
-    logger.debug(`[CONTROL SERVER] Listing ${children.length} sessions`);
-    return { 
-      children: children
-        .filter(child => child.happySessionId !== undefined)
-        .map(child => ({
-          startedBy: child.startedBy,
-          happySessionId: child.happySessionId!,
-          pid: child.pid,
-          status: child.terminalHostHealth?.status === 'host_dead'
-            ? 'runner_alive_host_dead' as const
-            : 'runner_alive' as const,
-          ...(child.terminalHostHealth?.status === 'host_dead'
-            ? { terminalHostHealth: child.terminalHostHealth }
-            : {}),
-        }))
-    }
-  });
-
   // Stop specific session
   typed.post('/stop-session', {
     schema: {
@@ -2063,154 +1943,10 @@ export function createDaemonControlApp({
     }
   });
 
-  // Stop daemon
-  typed.post('/restart', {
-    schema: {
-      body: z
-        .object({
-          stopSessions: z.boolean().optional(),
-          restartSessionRunners: z.boolean().optional(),
-          successorDistClosureFingerprint: DaemonDistClosureFingerprintSchema.optional(),
-        })
-        .strict()
-        .nullish(),
-      response: {
-        202: z.object({
-          status: z.enum(['restarting', 'already_restarting']),
-        }),
-        401: authSchema401,
-        409: z.object({
-          status: z.literal('shutting_down'),
-        }),
-        400: z.union([
-          z.object({
-            status: z.literal('unsupported_restart_options'),
-          }),
-          z.object({
-            statusCode: z.literal(400),
-            code: z.string(),
-            error: z.string(),
-            message: z.string(),
-          }),
-        ]),
-        501: z.object({
-          status: z.literal('restart_unavailable'),
-        }),
-      },
-    },
-    preHandler: requireAuth,
-  }, async (request, reply) => {
-    if (isShuttingDown?.() === true) {
-      reply.code(409);
-      return { status: 'shutting_down' as const };
-    }
-    if (!requestSelfRestart) {
-      reply.code(501);
-      return { status: 'restart_unavailable' as const };
-    }
-    if (
-      request.body &&
-      (request.body.stopSessions !== undefined || request.body.restartSessionRunners !== undefined)
-    ) {
-      reply.code(400);
-      return { status: 'unsupported_restart_options' as const };
-    }
-    if (restartState === 'restarting') {
-      reply.code(202);
-      return { status: 'already_restarting' as const };
-    }
-
-    restartState = 'restarting';
-    setTimeout(() => {
-      void (async () => {
-        try {
-          const successorDistClosureFingerprint = request.body?.successorDistClosureFingerprint;
-          await requestSelfRestart(
-            successorDistClosureFingerprint ? { successorDistClosureFingerprint } : undefined,
-          );
-        } catch (error) {
-          logger.debug('[CONTROL SERVER] Daemon self-restart request failed; keeping current daemon alive', error);
-        } finally {
-          restartState = 'idle';
-        }
-      })();
-    }, 50);
-
-    reply.code(202);
-    return { status: 'restarting' as const };
-  });
-
-  typed.post('/stop', {
-    schema: {
-      body: z
-        .object({
-          stopSessions: z.boolean().optional(),
-        })
-        .nullish(),
-      response: {
-        200: z.object({
-          status: z.string()
-        }),
-        401: authSchema401,
-      }
-    },
-    preHandler: requireAuth,
-  }, async (request) => {
-    const stopSessions = request.body?.stopSessions === true;
-    logger.debug('[CONTROL SERVER] Stop daemon request received', { stopSessions });
-
-    // Give time for response to arrive
-    setTimeout(() => {
-      logger.debug('[CONTROL SERVER] Triggering daemon shutdown');
-      const runBeforeShutdown = async (): Promise<void> => {
-        if (!beforeShutdown) return;
-        try {
-          await beforeShutdown();
-        } catch (error) {
-          logger.debug('[CONTROL SERVER] beforeShutdown hook failed (best-effort)', error);
-        }
-      };
-
-      void (async () => {
-        try {
-          if (stopSessions) {
-            const children = getChildren();
-            logger.debug(`[CONTROL SERVER] stopSessions requested: stopping ${children.length} tracked sessions`);
-            for (const child of children) {
-              const sessionId = typeof child.happySessionId === 'string' ? child.happySessionId.trim() : '';
-              const fallbackSessionId =
-                Number.isFinite(child.pid) && child.pid > 1 ? `PID-${Math.trunc(child.pid)}` : '';
-              const id = sessionId || fallbackSessionId;
-              if (!id) continue;
-              try {
-                // eslint-disable-next-line no-await-in-loop
-                await prepareStopSession?.(child);
-              } catch (error) {
-                logger.debug(`[CONTROL SERVER] Failed to prepare session ${id} before stop`, error);
-              }
-              try {
-                // eslint-disable-next-line no-await-in-loop
-                await stopSession(id);
-              } catch (error) {
-                logger.debug(`[CONTROL SERVER] Failed to stop session ${id}`, error);
-              }
-            }
-          }
-          await runBeforeShutdown();
-        } catch (error) {
-          logger.debug('[CONTROL SERVER] stopSessions failed', error);
-        } finally {
-          requestShutdown();
-        }
-      })();
-    }, 50);
-
-    return { status: 'stopping' };
-  });
-
   return app;
 }
 
+/** 通过共享监听流程启动默认控制服务，保留原回调和异步失败契约。 */
 export function startDaemonControlServer({
   getChildren,
   machineId,
@@ -2333,8 +2069,7 @@ export function startDaemonControlServer({
   }>) => Promise<ClaudeSubscriptionAuthTokensRefreshResponse>;
   requestSelfRestart?: (request?: DaemonSelfRestartRequest) => Promise<unknown>;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
-  return new Promise((resolve) => {
-    const app = createDaemonControlApp({
+  return listenDaemonControlApp(() => createDaemonControlApp({
       getChildren,
       machineId,
       runtimeId,
@@ -2364,25 +2099,5 @@ export function startDaemonControlServer({
       runtimeAuthRecoveryScheduler,
       isShuttingDown,
       requestSelfRestart,
-    });
-
-    app.listen({ port: 0, host: '127.0.0.1' }, (err, address) => {
-      if (err) {
-        logger.debug('[CONTROL SERVER] Failed to start:', err);
-        throw err;
-      }
-
-      const port = parseInt(address.split(':').pop()!);
-      logger.debug(`[CONTROL SERVER] Started on port ${port}`);
-
-      resolve({
-        port,
-        stop: async () => {
-          logger.debug('[CONTROL SERVER] Stopping server');
-          await app.close();
-          logger.debug('[CONTROL SERVER] Server stopped');
-        }
-      });
-    });
-  });
+    }));
 }
