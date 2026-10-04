@@ -1,3 +1,20 @@
+import {
+  MachineIdConflictError,
+  MachineRevokedError,
+  MachineReplacedError,
+  MachineContentPublicKeyMismatchError,
+} from './machine/machineRegistrationErrors';
+export {
+  MachineIdConflictError,
+  MachineRevokedError,
+  MachineReplacedError,
+  MachineContentPublicKeyMismatchError,
+  isMachineIdConflictError,
+  isMachineRevokedError,
+  isMachineReplacedError,
+  isMachineContentPublicKeyMismatchError,
+} from './machine/machineRegistrationErrors';
+
 import axios from 'axios'
 import { z } from 'zod';
 import { logger } from '@/ui/logger'
@@ -230,97 +247,6 @@ type ConnectedServiceAuthGroupRuntimeStatePatchInput = Readonly<{
   state?: ConnectedServiceAuthGroupRuntimeStatePatchRequestV1['state'];
   memberStates?: ReadonlyArray<Readonly<ConnectedServiceAuthGroupRuntimeStatePatchRequestV1['memberStates'][number]>>;
 }>;
-
-export class MachineIdConflictError extends Error {
-  readonly machineId: string;
-  constructor(machineId: string) {
-    super(`Machine id conflict: ${machineId} is already registered to a different account on this relay`);
-    this.name = 'MachineIdConflictError';
-    this.machineId = machineId;
-  }
-}
-
-export class MachineRevokedError extends Error {
-  readonly machineId: string;
-  constructor(machineId: string) {
-    super(`Machine revoked: ${machineId} is no longer valid on this relay and must be rotated`);
-    this.name = 'MachineRevokedError';
-    this.machineId = machineId;
-  }
-}
-
-export class MachineReplacedError extends Error {
-  readonly machineId: string;
-  readonly replacementMachineId: string | null;
-  constructor(machineId: string, replacementMachineId?: string | null) {
-    const replacement = typeof replacementMachineId === 'string' && replacementMachineId.trim()
-      ? replacementMachineId.trim()
-      : null;
-    super(
-      replacement
-        ? `Machine replaced: ${machineId} was replaced by ${replacement}`
-        : `Machine replaced: ${machineId} is no longer the current machine identity on this relay`,
-    );
-    this.name = 'MachineReplacedError';
-    this.machineId = machineId;
-    this.replacementMachineId = replacement;
-  }
-}
-
-export class MachineContentPublicKeyMismatchError extends Error {
-  readonly machineId: string;
-  readonly reason: string;
-  constructor(machineId: string, reason: string) {
-    super(
-      `Machine registration rejected by server (reason=${reason}). ` +
-        'This usually means your local encryption key does not match your current account credentials. ' +
-        'Try `happier auth logout` then `happier auth login`.',
-    );
-    this.name = 'MachineContentPublicKeyMismatchError';
-    this.machineId = machineId;
-    this.reason = reason;
-  }
-}
-
-export function isMachineIdConflictError(error: unknown): error is MachineIdConflictError {
-  // Avoid relying on `instanceof`: bundlers / test runners may load multiple module instances.
-  if (!error || typeof error !== 'object') return false;
-  const maybe = error as Record<string, unknown>;
-  return maybe.name === 'MachineIdConflictError' && typeof maybe.machineId === 'string' && maybe.machineId.length > 0;
-}
-
-export function isMachineRevokedError(error: unknown): error is MachineRevokedError {
-  if (!error || typeof error !== 'object') return false;
-  const maybe = error as Record<string, unknown>;
-  return maybe.name === 'MachineRevokedError' && typeof maybe.machineId === 'string' && maybe.machineId.length > 0;
-}
-
-export function isMachineReplacedError(error: unknown): error is MachineReplacedError {
-  if (!error || typeof error !== 'object') return false;
-  const maybe = error as Record<string, unknown>;
-  return (
-    maybe.name === 'MachineReplacedError'
-    && typeof maybe.machineId === 'string'
-    && maybe.machineId.length > 0
-    && (
-      maybe.replacementMachineId === null
-      || typeof maybe.replacementMachineId === 'string'
-      || maybe.replacementMachineId === undefined
-    )
-  );
-}
-
-export function isMachineContentPublicKeyMismatchError(error: unknown): error is MachineContentPublicKeyMismatchError {
-  if (!error || typeof error !== 'object') return false;
-  const maybe = error as Record<string, unknown>;
-  return (
-    maybe.name === 'MachineContentPublicKeyMismatchError'
-    && typeof maybe.machineId === 'string'
-    && maybe.machineId.length > 0
-    && typeof maybe.reason === 'string'
-    && maybe.reason.length > 0
-  );
-}
 
 function didServerAcknowledgeMachineReplacement(
   data: unknown,

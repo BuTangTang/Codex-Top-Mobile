@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { ApiClient } from '@/api/api';
-import { isMachineIdConflictError, isMachineReplacedError, isMachineRevokedError } from '@/api/api';
+import { isMachineIdConflictError, isMachineReplacedError, isMachineRevokedError } from './machineRegistrationErrors';
 import type { DaemonState, Machine, MachineMetadata } from '@/api/types';
 import { updateSettings } from '@/persistence';
 import { sanitizeServerIdForFilesystem } from '@/server/serverId';
