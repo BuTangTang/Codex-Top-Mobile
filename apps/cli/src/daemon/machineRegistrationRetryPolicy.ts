@@ -1,4 +1,4 @@
-import { isMachineContentPublicKeyMismatchError } from '@/api/api';
+import { isMachineContentPublicKeyMismatchError } from '@/api/machine/machineRegistrationErrors';
 import { isAuthenticationError } from '@/api/client/httpStatusError';
 
 export function shouldRetryMachineRegistrationError(error: unknown): boolean {
