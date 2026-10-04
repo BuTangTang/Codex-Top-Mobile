@@ -176,6 +176,7 @@ async function clearTransientBunCompileArtifacts(error: unknown, outfile: string
   )));
 }
 
+/** 沿用默认编译行为；调用方显式启用时仅压缩语法和空白，不改标识符名称。 */
 export async function compileBunBinary({
   entrypoint,
   bunTarget,
@@ -186,6 +187,7 @@ export async function compileBunBinary({
   runCommand = execOrThrow,
   maxAttempts,
   buildRunnerEntrypoint,
+  minifySyntaxWhitespace = false,
 }: {
   entrypoint: string;
   bunTarget: string;
@@ -196,7 +198,11 @@ export async function compileBunBinary({
   runCommand?: RunCommand;
   maxAttempts?: number;
   buildRunnerEntrypoint?: string;
+  minifySyntaxWhitespace?: boolean;
 }): Promise<void> {
+  if (minifySyntaxWhitespace === true && buildRunnerEntrypoint) {
+    throw new Error('[component-artifacts] minifySyntaxWhitespace is not supported with buildRunnerEntrypoint');
+  }
   const resolvedBunCommand = (() => {
     const candidate = String(bunCommand ?? '').trim();
     if (candidate) return candidate;
@@ -220,6 +226,9 @@ export async function compileBunBinary({
     } else {
       args.push('--external', value);
     }
+  }
+  if (minifySyntaxWhitespace === true) {
+    args.push('--minify-whitespace', '--minify-syntax');
   }
   const attempts = resolveBunCompileMaxAttempts(process.env.HAPPIER_BUN_COMPILE_ATTEMPTS, maxAttempts);
   for (let attempt = 1; attempt <= attempts; attempt += 1) {

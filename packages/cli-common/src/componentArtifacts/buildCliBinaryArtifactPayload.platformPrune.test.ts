@@ -100,6 +100,33 @@ describe('canonical CLI payload platform pruning and Sharp deduplication', () =>
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
+  it.each([undefined, false, true])('only forwards explicitly enabled syntax/whitespace minification: %s', async (minifySyntaxWhitespace) => {
+    const { repoRoot, payloadDir } = await createRepo();
+    const compilationOptions: Array<Record<string, unknown>> = [];
+    await buildCliBinaryArtifactPayload({
+      repoRoot, payloadDir,
+      ...(minifySyntaxWhitespace === undefined ? {} : { minifySyntaxWhitespace }),
+      target: { bunTarget: 'bun-darwin-arm64', os: 'darwin', arch: 'arm64', exeExt: '' },
+      commandProbe: (command) => command === 'bun' || command === 'yarn',
+      ensureWorkspacePackagesBuiltByName: async (_root, names) => ({ ok: true, built: [], skipped: names }),
+      runCommand: async () => {
+        const entrypoint = join(repoRoot, 'apps/cli/dist/index.mjs');
+        await writeFixture(entrypoint, 'export const fixture = true;');
+        cliDistBuildManifest.writeCliDistBuildManifest(entrypoint);
+      },
+      compileBinary: async (options) => {
+        compilationOptions.push(options);
+        await writeFixture(options.outfile, 'fixture-compiled-binary');
+      },
+    });
+    expect(compilationOptions).toHaveLength(1);
+    expect(Object.keys(compilationOptions[0]).sort()).toEqual([
+      'entrypoint', 'bunTarget', 'outfile', 'cwd', 'externals', 'bunCommand', 'runCommand',
+      ...(minifySyntaxWhitespace === true ? ['minifySyntaxWhitespace'] : []),
+    ].sort());
+    expect(compilationOptions[0].minifySyntaxWhitespace).toBe(minifySyntaxWhitespace === true ? true : undefined);
+  });
+
   it('removes only other operating systems after vendoring and preserves every retained byte', async () => {
     const { repoRoot, payloadDir } = await createRepo();
     const before = await fileHashes(join(repoRoot, ...onnxSegments));

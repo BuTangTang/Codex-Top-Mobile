@@ -184,6 +184,7 @@ export async function buildCliBinaryArtifactPayload({
   runCommand = execOrThrow,
   commandProbe = commandExists,
   compileBinary = compileBunBinary,
+  minifySyntaxWhitespace = false,
   ensureWorkspacePackagesBuiltByName,
 }: {
   repoRoot: string;
@@ -194,6 +195,8 @@ export async function buildCliBinaryArtifactPayload({
   runCommand?: RunCommand;
   commandProbe?: (cmd: string) => boolean;
   compileBinary?: typeof compileBunBinary;
+  /** 仅由选择该策略的产品启用；省略时保持通用 CLI 的编译参数。 */
+  minifySyntaxWhitespace?: boolean;
   ensureWorkspacePackagesBuiltByName?: EnsureWorkspacePackagesBuiltByName;
 }): Promise<{ executableName: string; entrypoint: string }> {
   const bunCommand = resolveBunCommand({ commandProbe });
@@ -284,6 +287,7 @@ export async function buildCliBinaryArtifactPayload({
         externals: mergedExternals,
         bunCommand,
         runCommand,
+        ...(minifySyntaxWhitespace === true ? { minifySyntaxWhitespace: true } : {}),
       });
       await rm(join(payloadDir, 'node_modules'), { recursive: true, force: true });
       await copyCliNodeRuntimePayload(repoRoot, payloadDir, snapshotDistDir, workspaceBundles, { yarn, runCommand });

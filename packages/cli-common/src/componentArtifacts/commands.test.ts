@@ -146,6 +146,48 @@ describe('execOrThrow', () => {
 });
 
 describe('compileBunBinary', () => {
+    it.each([false, true])('keeps identifier names and adds only requested syntax/whitespace flags: %s', async (minifySyntaxWhitespace) => {
+        const tempRoot = mkdtempSync(join(tmpdir(), 'cli-common-bun-minify-'));
+        try {
+            const entrypoint = join(tempRoot, 'index.mjs');
+            const outfile = join(tempRoot, 'happier');
+            writeFileSync(entrypoint, 'class KeptName {}\nconsole.log(KeptName.name);\n', 'utf8');
+            const calls: string[][] = [];
+            await compileBunBinary({
+                entrypoint, outfile, bunTarget: 'bun-darwin-arm64', bunCommand: 'bun',
+                externals: ['node-pty'], minifySyntaxWhitespace,
+                runCommand: async (_cmd, args) => {
+                    calls.push(args);
+                    writeFileSync(outfile, 'compiled', 'utf8');
+                },
+            });
+            expect(calls).toEqual([[
+                'build', '--compile', '--no-cache', '--target=bun-darwin-arm64', entrypoint,
+                '--outfile', outfile, '--external', 'node-pty',
+                ...(minifySyntaxWhitespace ? ['--minify-whitespace', '--minify-syntax'] : []),
+            ]]);
+        } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+        }
+    });
+
+    it('rejects syntax/whitespace minification with a custom runner before invoking it', async () => {
+        const tempRoot = mkdtempSync(join(tmpdir(), 'cli-common-bun-runner-minify-'));
+        try {
+            const outfile = join(tempRoot, 'happier-server');
+            const runCommand = vi.fn(async () => { writeFileSync(outfile, 'should-not-build', 'utf8'); });
+            await expect(compileBunBinary({
+                entrypoint: join(tempRoot, 'index.mjs'), outfile,
+                bunTarget: 'bun-darwin-arm64', bunCommand: 'bun',
+                buildRunnerEntrypoint: join(tempRoot, 'runner.mjs'),
+                minifySyntaxWhitespace: true, runCommand,
+            })).rejects.toThrow('minifySyntaxWhitespace is not supported with buildRunnerEntrypoint');
+            expect(runCommand).not.toHaveBeenCalled();
+        } finally {
+            rmSync(tempRoot, { recursive: true, force: true });
+        }
+    });
+
     it('passes --no-cache for release binary compilation', async () => {
         const tempRoot = mkdtempSync(join(tmpdir(), 'cli-common-bun-compile-'));
         try {
