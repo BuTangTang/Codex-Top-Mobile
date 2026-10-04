@@ -8,6 +8,7 @@ import {
   type ActionSurfaces,
   type ActionUiPlacement,
 } from '@happier-dev/protocol';
+import { applyProductActionCapabilities } from '@/runtime/applyProductActionCapabilities';
 
 const ENV_KEY = 'HAPPIER_ACTIONS_SETTINGS_V1';
 const EMPTY_ACTIONS_SETTINGS = ActionsSettingsV1Schema.parse({ v: 1, actions: {} });
@@ -28,8 +29,8 @@ export function readActionsSettingsOverrideFromEnv(): ActionsSettingsV1 | null {
 }
 
 export function readActionsSettingsFromEnv(): ActionsSettingsV1 {
-  return readActionsSettingsOverrideFromEnv()
-    ?? EMPTY_ACTIONS_SETTINGS;
+  return applyProductActionCapabilities(readActionsSettingsOverrideFromEnv()
+    ?? EMPTY_ACTIONS_SETTINGS);
 }
 
 export function isActionEnabledByEnv(

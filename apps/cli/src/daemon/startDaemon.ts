@@ -62,9 +62,11 @@ import {
   resolveConnectedServiceSwitchContinuity,
   resolveAgentCliSubcommand,
   resolveCatalogAgentId,
+  getCatalogBackendTargetSupportError,
   resolveTerminalAttachmentControlDescriptorStatusThroughCatalog,
   notifyTerminalAttachmentRetiredThroughCatalog,
 } from '@/backends/catalog';
+import { CATALOG_AGENT_ID_POLICY } from '@/backends/catalogRegistry';
 import { CATALOG_AGENT_IDS } from '@/backends/types';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { writeConnectedServiceBrokerState, DaemonLocallyPersistedState, readCredentials } from '@/persistence';
@@ -223,7 +225,8 @@ import { computeDaemonSpawnRequestKey, createSpawnRequestCoalescer } from './spa
 import { createDaemonSpawnAttemptRegistry } from './spawn/daemonSpawnAttemptRegistry';
 import { normalizeSpawnSessionDirectory } from '@/rpc/handlers/spawnSessionOptionsContract';
 import { startAutomationWorker, type AutomationWorkerHandle } from './automation/automationWorker';
-import { startMemoryWorker, type MemoryWorkerHandle } from './memory/memoryWorker';
+import type { MemoryWorkerHandle } from './memory/memoryWorker';
+import { daemonMemoryCapability } from '@/daemon/memory/daemonMemoryCapability';
 import { createDaemonConnectivityCoordinator } from './connection/createDaemonConnectivityCoordinator';
 import {
   createDaemonServerWorkBudget,
@@ -2572,9 +2575,21 @@ async function createDefaultDaemonCapabilities(lifecycle: DaemonLifecycleContext
                   options: SpawnSessionOptions,
                   acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
                 ): Promise<SpawnSessionResult> => {
+          // 在归一化、重放与进程状态变更前校验原输入，避免产品接收不支持的目标。
+          const unsupportedTarget = getCatalogBackendTargetSupportError(
+            (options as SpawnSessionOptions & { agent?: unknown }).agent,
+            options.backendTarget,
+          );
+          if (unsupportedTarget) {
+            return { type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST, errorMessage: unsupportedTarget };
+          }
           let normalizedOptions: SpawnSessionOptions = {
             ...options,
             directory: normalizeSpawnSessionDirectory(options.directory, process.env),
+            // 固定产品将缺省目标写入同一 respawn 描述；通用 CLI 保留原缺省语义。
+            ...(CATALOG_AGENT_ID_POLICY.unsupportedAgentId === 'reject' && options.backendTarget == null
+              ? { backendTarget: { kind: 'builtInAgent' as const, agentId: resolveCatalogAgentId(null) } }
+              : {}),
           };
           const requestedSpawnNonce = normalizeSpawnNonceForAck(normalizedOptions.spawnNonce);
           if (requestedSpawnNonce) {
@@ -7776,8 +7791,9 @@ async function createDefaultDaemonCapabilities(lifecycle: DaemonLifecycleContext
             }
 
             memoryWorker = await (async () => {
+              if (!daemonMemoryCapability) return null;
               try {
-                return await startMemoryWorker({
+                return await daemonMemoryCapability.start({
                   credentials,
                   machineId: lifecycle.state.machineId,
                 });

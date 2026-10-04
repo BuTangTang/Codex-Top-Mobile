@@ -6,22 +6,7 @@ import {
   type ConnectedServiceId,
   type DirectSessionsProviderId,
 } from '@happier-dev/protocol';
-import { BUILT_IN_CATALOG_DEFINED_ACP_AGENTS } from '@/agent/acp/catalog';
-import { agent as auggie } from '@/backends/auggie';
-import { agent as agy } from '@/backends/agy';
-import { agent as claude } from '@/backends/claude';
-import { agent as codex } from '@/backends/codex';
-import { agent as copilot } from '@/backends/copilot';
-import { agent as cursor } from '@/backends/cursor';
-import { agent as devin } from '@/backends/devin';
-import { agent as gemini } from '@/backends/gemini';
-import { agent as grok } from '@/backends/grok';
-import { agent as kimi } from '@/backends/kimi';
-import { agent as kilo } from '@/backends/kilo';
-import { agent as opencode } from '@/backends/opencode';
-import { agent as pi } from '@/backends/pi';
-import { agent as qwen } from '@/backends/qwen';
-import { DEFAULT_CATALOG_AGENT_ID } from './types';
+import { AGENTS, CATALOG_AGENT_ID_POLICY } from '@/backends/catalogRegistry';
 import type {
   AcpForkContinuationHandler,
   AgentCatalogEntry,
@@ -59,23 +44,7 @@ import type {
 
 export type { AgentCatalogEntry, AgentChecklistContributions, CatalogAgentId, CliDetectSpec } from './types';
 
-export const AGENTS: Partial<Record<CatalogAgentId, AgentCatalogEntry>> = {
-  claude,
-  codex,
-  gemini,
-  opencode,
-  auggie,
-  qwen,
-  kimi,
-  kilo,
-  grok,
-  ...BUILT_IN_CATALOG_DEFINED_ACP_AGENTS,
-  pi,
-  copilot,
-  cursor,
-  devin,
-  agy,
-};
+export { AGENTS } from '@/backends/catalogRegistry';
 
 export function requireCatalogEntry(agentId: CatalogAgentId): AgentCatalogEntry {
   const entry = AGENTS[agentId];
@@ -377,13 +346,41 @@ export async function getProviderNativeForkHandler(agentId: CatalogAgentId): Pro
   );
 }
 
+/** 精确检查当前注册表，显式产品输入不能通过前缀截取变为另一种请求。 */
+function isExactRegisteredCatalogAgentId(agentId: unknown): agentId is CatalogAgentId {
+  return typeof agentId === 'string' && Object.prototype.hasOwnProperty.call(AGENTS, agentId);
+}
+
+/** 默认 CLI 沿用原输入校验；受限产品在任何归一化前检查原始 agent 与 backendTarget。 */
+export function getCatalogBackendTargetSupportError(rawAgent: unknown, rawBackendTarget: unknown): string | null {
+  if (CATALOG_AGENT_ID_POLICY.unsupportedAgentId === 'legacy-default') return null;
+  if (rawAgent != null && !isExactRegisteredCatalogAgentId(rawAgent)) {
+    return 'Unsupported catalog agent for this CLI artifact';
+  }
+  if (rawBackendTarget != null) {
+    if (typeof rawBackendTarget !== 'object' || Array.isArray(rawBackendTarget)) {
+      return 'Unsupported backend target for this CLI artifact';
+    }
+    const target = rawBackendTarget as { kind?: unknown; agentId?: unknown };
+    if (target.kind !== 'builtInAgent' || !isExactRegisteredCatalogAgentId(target.agentId)) {
+      return 'Unsupported backend target for this CLI artifact';
+    }
+  }
+  return null;
+}
+
+/** 默认构建保留历史前缀与回退规则，产品只允许缺省或精确注册的提供方。 */
 export function resolveCatalogAgentId(agentId?: AgentId | null): CatalogAgentId {
-  const raw = agentId ?? DEFAULT_CATALOG_AGENT_ID;
+  const raw = agentId ?? CATALOG_AGENT_ID_POLICY.defaultAgentId;
+  if (CATALOG_AGENT_ID_POLICY.unsupportedAgentId === 'reject') {
+    if (!isExactRegisteredCatalogAgentId(raw)) throw new Error('Unsupported catalog agent for this CLI artifact');
+    return raw;
+  }
   const base = raw.split('-')[0] as CatalogAgentId;
   if (Object.prototype.hasOwnProperty.call(AGENTS, base)) {
     return base;
   }
-  return DEFAULT_CATALOG_AGENT_ID;
+  return CATALOG_AGENT_ID_POLICY.defaultAgentId;
 }
 
 export function resolveAgentCliSubcommand(agentId?: AgentId | null): CatalogAgentId {

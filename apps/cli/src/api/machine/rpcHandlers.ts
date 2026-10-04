@@ -77,7 +77,7 @@ import type { DaemonExecutionRunEntry, DaemonExecutionRunProcessInfo } from '@ha
 
 import type { RpcHandlerManager } from '../rpc/RpcHandlerManager';
 import type { MemoryWorkerHandle } from '@/daemon/memory/memoryWorker';
-import { registerMachineMemoryRpcHandlers } from './rpcHandlers.memory';
+import { daemonMemoryCapability } from '@/daemon/memory/daemonMemoryCapability';
 import { registerMachineTerminalRpcHandlers } from './rpcHandlers.terminal';
 import { registerMachineMcpServersRpcHandlers } from './rpcHandlers.mcpServers';
 import { registerMachineDirectSessionsRpcHandlers } from './rpcHandlers.directSessions';
@@ -130,7 +130,7 @@ import {
   readOpenCodeSessionAffinityFromMetadata,
 } from '@/backends/opencode/utils/opencodeSessionAffinity';
 import { inferAgentIdFromSessionMetadata, resolveVendorResumeIdFromSessionMetadata } from '@happier-dev/agents';
-import { getAcpForkContinuationHandler } from '@/backends/catalog';
+import { getAcpForkContinuationHandler, getCatalogBackendTargetSupportError } from '@/backends/catalog';
 import {
   isProviderNativeForkFailedBeforeDispatchError,
   isProviderNativeForkIndeterminateError,
@@ -686,6 +686,11 @@ export function registerMachineRpcHandlers(params: Readonly<{
   // Both public spawn RPCs delegate to this single nonce/custody owner. Their
   // response projections intentionally differ below for released-client compatibility.
   const handleSpawnHappySession = async (params: any): Promise<SpawnSessionResult> => {
+    // RPC 原值不能先被 schema 丢成缺省，再启动产品的默认提供方。
+    const unsupportedTarget = getCatalogBackendTargetSupportError(params?.agent, params?.backendTarget);
+    if (unsupportedTarget) {
+      return { type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST, errorMessage: unsupportedTarget };
+    }
     const {
       directory,
       spawnNonce,
@@ -1122,8 +1127,8 @@ export function registerMachineRpcHandlers(params: Readonly<{
     }
   });
 
-  if (memoryWorker) {
-    registerMachineMemoryRpcHandlers({
+  if (memoryWorker && daemonMemoryCapability) {
+    daemonMemoryCapability.registerRpcHandlers({
       rpcHandlerManager,
       memoryWorker,
     });

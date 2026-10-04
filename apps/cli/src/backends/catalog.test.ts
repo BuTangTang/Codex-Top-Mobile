@@ -31,6 +31,47 @@ import {
 } from './catalog';
 import { DEFAULT_CATALOG_AGENT_ID } from './types';
 
+describe('default catalog registry compatibility', () => {
+  it('retains all eighteen providers in their original enumeration order', () => {
+    expect(Object.keys(AGENTS)).toEqual([
+      'claude', 'codex', 'gemini', 'opencode', 'auggie', 'qwen', 'kimi', 'kilo', 'grok',
+      'customAcp', 'kiro', 'fx', 'droid', 'pi', 'copilot', 'cursor', 'devin', 'agy',
+    ]);
+  });
+
+  it('retains the original default and prefix fallback behavior', () => {
+    const cases = [
+      [undefined, 'claude'], [null, 'claude'], ['', 'claude'], ['unknown-provider', 'claude'],
+      ['CODEX', 'claude'], ['codex-extra', 'codex'], ['claude-extra', 'claude'], ['customAcp', 'customAcp'],
+    ] as const;
+    for (const [input, expected] of cases) {
+      expect(catalog.resolveCatalogAgentId(input as Parameters<typeof catalog.resolveCatalogAgentId>[0])).toBe(expected);
+    }
+  });
+
+  it('retains the provider entry objects rather than cloning them', async () => {
+    const [{ agent: codex }, { agent: claude }, { BUILT_IN_CATALOG_DEFINED_ACP_AGENTS }] = await Promise.all([
+      import('@/backends/codex'), import('@/backends/claude'), import('@/agent/acp/catalog'),
+    ]);
+    expect(AGENTS.codex).toBe(codex);
+    expect(AGENTS.claude).toBe(claude);
+    for (const [id, entry] of Object.entries(BUILT_IN_CATALOG_DEFINED_ACP_AGENTS)) {
+      expect(AGENTS[id as keyof typeof AGENTS]).toBe(entry);
+    }
+  });
+
+  it('re-exports the same mutable default registry and leaves raw validation to legacy callers', async () => {
+    const registry = await import('./catalogRegistry');
+    expect(AGENTS).toBe(registry.AGENTS);
+    expect(registry.CATALOG_AGENT_ID_POLICY).toEqual({ defaultAgentId: 'claude', unsupportedAgentId: 'legacy-default' });
+    for (const rawAgent of [undefined, null, 'claude', 'codex-extra', 'unknown', '', 42, {}]) {
+      for (const rawTarget of [undefined, null, {}, 'unknown', { kind: 'configuredAcpBackend', backendId: 'example' }]) {
+        expect(catalog.getCatalogBackendTargetSupportError(rawAgent, rawTarget)).toBeNull();
+      }
+    }
+  });
+});
+
 describe('direct-session catalog cache boundaries', () => {
   it('checks the current mutable hook before consulting a successful cache', async () => {
     const providerId = '__direct_mutable__' as DirectSessionsProviderId;

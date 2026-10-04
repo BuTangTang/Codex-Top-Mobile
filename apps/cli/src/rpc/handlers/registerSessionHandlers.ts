@@ -27,8 +27,7 @@ import { TransferSessionStore } from '@/transfers/core/transferSessionStore';
 import { resolveSessionRpcTransferMaxBytes } from '@/transfers/policy/sessionRpcTransferPolicy';
 import { registerSessionTransferRpcHandlers } from '@/transfers/rpc/registerSessionTransferRpcHandlers';
 import { createTransferPathAllowanceRegistry } from '@/transfers/targets/createTransferPathAllowanceRegistry';
-import { registerRipgrepHandler } from './ripgrep';
-import { registerDifftasticHandler } from './difftastic';
+import { sessionToolRegistrars } from '@/rpc/handlers/sessionToolCapabilities';
 import {
     registerSessionUserMessageSendHandler,
     type ExplicitUserRecoveryDecision,
@@ -309,8 +308,9 @@ export function registerSessionHandlers(
             pathAllowanceRegistry,
         },
     });
-    registerRipgrepHandler(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
-    registerDifftasticHandler(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
+    for (const registerTool of sessionToolRegistrars) {
+        registerTool(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
+    }
     registerSessionUserMessageSendHandler(rpcHandlerManager, {
         workingDirectory: effectiveWorkingDirectory,
         enqueueSessionUserMessage: opts?.enqueueSessionUserMessage ?? null,

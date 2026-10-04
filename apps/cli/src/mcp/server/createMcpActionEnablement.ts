@@ -9,6 +9,7 @@ import {
 
 import { readActionsSettingsFromEnv } from '@/settings/actionsSettings';
 import { getActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
+import { applyProductActionCapabilities } from '@/runtime/applyProductActionCapabilities';
 
 const EMPTY_ACTIONS_SETTINGS: ActionsSettingsV1 = Object.freeze({
   v: 1,
@@ -46,7 +47,7 @@ export function createMcpActionSettingsProvider(params: Readonly<{
           ?? params.accountSettings
           ?? null;
       if (accountSettings) {
-        return accountSettings.actionsSettingsV1 ?? EMPTY_ACTIONS_SETTINGS;
+        return applyProductActionCapabilities(accountSettings.actionsSettingsV1 ?? EMPTY_ACTIONS_SETTINGS);
       }
       return readActionsSettingsFromEnv() as ActionsSettingsV1;
     },
