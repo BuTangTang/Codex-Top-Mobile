@@ -8,6 +8,8 @@ The product entry exposes `auth`, `daemon` and `codex`. Its static catalog conta
 
 Product capabilities are selected by four build aliases in `CODEX_TOP_ARTIFACT_PROFILE`, not by a runtime environment toggle. The default entry and registry continue through the same shared bootstrap and lifecycle owners.
 
+Daemon startup does not evaluate the complete doctor or service-repair modules. Their original command branches import them when requested; JSON status and help keep their existing paths. Startup and diagnostics share the same environment-information leaf, which reads the current environment, arguments, working directory and configuration on every call. The historical doctor export delegates to that leaf. This changes loading time, not service ownership or the available repair actions.
+
 ## Artifact and launch
 
 The currently validated target is `darwin-arm64`. The canonical component builder accepts `artifactProfile: 'codex-top'`, uses the existing CLI build lock and immutable source snapshot, then publishes a complete staged payload. A failed generation preserves the previous payload; failed replacement restores it.

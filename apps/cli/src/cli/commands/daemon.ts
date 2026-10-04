@@ -18,7 +18,6 @@ import {
   runDaemonServiceCliCommand,
 } from '@/daemon/service/cli';
 import { getLatestDaemonLog } from '@/ui/logger';
-import { runDoctorCommand } from '@/ui/doctor';
 import { listDaemonStatusesForAllKnownServers, stopAllDaemonsBestEffort } from '@/daemon/multiDaemon';
 import { spawnDetachedDaemonStartSync } from '@/daemon/runtime/spawnDetachedDaemonStartSync';
 import { readCredentials } from '@/persistence';
@@ -32,7 +31,6 @@ import {
 } from '@/daemon/startupWaitDefaults';
 import { readDaemonStatusSnapshot } from '@/daemon/statusSnapshot';
 import { restartDaemonAndWait } from '@/daemon/restartDaemonAndWait';
-import { handleServiceRepairCliCommand } from './serviceRepair/handleServiceRepairCliCommand';
 import { evaluateCurrentDaemonOwner } from '@/daemon/ownership/evaluateCurrentDaemonOwner';
 import { renderDaemonOwnerConflict } from '@/daemon/ownership/renderDaemonOwnerConflict';
 import {
@@ -171,12 +169,14 @@ function isChildProcessAlive(child: Readonly<{ pid?: number }>): boolean {
   }
 }
 
+/** 分派 daemon 命令；完整诊断和修复只在对应分支加载，启动检查保持同步依赖。 */
 export async function handleDaemonCliCommand(context: CommandContext): Promise<void> {
   const args = context.args;
   const daemonSubcommand = args[1];
 
   if (daemonSubcommand === 'service') {
     if (args[2] === 'repair') {
+      const { handleServiceRepairCliCommand } = await import('./serviceRepair/handleServiceRepairCliCommand');
       await handleServiceRepairCliCommand({
         argv: args.slice(2),
         commandPath: 'happier doctor',
@@ -792,6 +792,7 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
       }
       process.exit(0);
     }
+    const { runDoctorCommand } = await import('@/ui/doctor');
     await runDoctorCommand('daemon');
     process.exit(0);
   }

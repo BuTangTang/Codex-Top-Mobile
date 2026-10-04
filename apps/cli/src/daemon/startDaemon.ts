@@ -43,7 +43,7 @@ import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 
 import packageJson from '../../package.json';
-import { getEnvironmentInfo } from '@/ui/doctor';
+import { getEnvironmentInfo } from '@/ui/doctorEnvironment';
 import {
   buildHappyCliSubprocessLaunchSpec,
   pruneHappyCliRunnerSnapshots,

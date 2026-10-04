@@ -7,6 +7,8 @@
 
 import chalk from 'chalk'
 import { configuration } from '@/configuration'
+import { getEnvironmentInfo } from './doctorEnvironment'
+
 import { readSettings, readCredentials } from '@/persistence'
 import { checkIfDaemonRunningAndCleanupStaleState } from '@/daemon/controlClient'
 import { findRunawayHappyProcesses, findAllHappyProcesses } from '@/daemon/doctor'
@@ -28,6 +30,8 @@ import {
 } from '@/ui/doctorCleanupOwnershipSummary'
 import { getReleaseRingCatalogEntry } from '@happier-dev/release-runtime/releaseRings'
 import { resolveDaemonStartupSourceServiceManagedState } from '@/daemon/ownership/daemonOwnershipMetadata'
+
+export { getEnvironmentInfo } from './doctorEnvironment'
 
 export function maskValue(value: string): string;
 export function maskValue(value: string | undefined): string | undefined;
@@ -114,34 +118,6 @@ export function hasDaemonOwnerMismatchForCurrentInvocation(params: Readonly<{
         && params.currentPublicReleaseChannel.trim() !== params.daemonState.startedWithPublicReleaseChannel.trim(),
     );
     return versionMismatch || releaseChannelMismatch;
-}
-
-/**
- * Get relevant environment information for debugging
- */
-export function getEnvironmentInfo(): Record<string, any> {
-    return {
-        PWD: process.env.PWD,
-        HAPPIER_HOME_DIR: process.env.HAPPIER_HOME_DIR,
-        HAPPIER_SERVER_URL: process.env.HAPPIER_SERVER_URL,
-        HAPPIER_PROJECT_ROOT: process.env.HAPPIER_PROJECT_ROOT,
-        DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING: process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING,
-        NODE_ENV: process.env.NODE_ENV,
-        DEBUG: process.env.DEBUG,
-        workingDirectory: process.cwd(),
-        processArgv: process.argv,
-        happyDir: configuration?.happyHomeDir,
-        serverUrl: configuration?.serverUrl,
-        logsDir: configuration?.logsDir,
-        processPid: process.pid,
-        nodeVersion: process.version,
-        platform: process.platform,
-        arch: process.arch,
-        user: process.env.USER,
-        home: process.env.HOME,
-        shell: process.env.SHELL,
-        terminal: process.env.TERM,
-    };
 }
 
 function getLogFiles(logDir: string): { file: string, path: string, modified: Date }[] {
