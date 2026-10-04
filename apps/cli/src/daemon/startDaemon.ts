@@ -164,6 +164,7 @@ import {
   type SessionRunnerServiceabilityProbe,
 } from './sessions/isSessionRunnerActive';
 import { startDaemonHeartbeatLoop } from './lifecycle/heartbeat';
+import { runMachineBootstrap } from './lifecycle/runMachineBootstrap';
 import { requestDaemonSelfRestartWithLockHandoff } from './lifecycle/requestDaemonSelfRestartWithLockHandoff';
 import { assertCurrentDaemonSelfRestartAuthorization } from './lifecycle/selfRestartAuthorization';
 import { resolveDaemonSelfRestartExpectedCliVersion } from './lifecycle/resolveDaemonSelfRestartExpectedCliVersion';
@@ -8120,22 +8121,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       );
 
       // Do machine bootstrap in the background so shutdown requests are not blocked by /v1/machines latency.
-      void (async () => {
-        let attempts = 0;
-        while (!shutdownInitiated) {
-          try {
-            const ensured = preflightMachineRegistration ?? await ensureMachineRegistered({
+      void runMachineBootstrap({
+        getPreflightRegistration: () => preflightMachineRegistration,
+        clearPreflightRegistration: () => { preflightMachineRegistration = null; },
+        isShuttingDown: () => shutdownInitiated,
+        ensureRegistered: () => ensureMachineRegistered({
               api,
               machineId,
               metadata: metadataForRegistration,
               daemonState: initialDaemonState,
               timeoutMs: machineRegistrationTimeoutMs,
               caller: 'startDaemon',
-            });
-            preflightMachineRegistration = null;
-            if (shutdownInitiated) {
-              return;
-            }
+            }),
+        publishRegisteredIdentity: (ensured) => {
             const ensuredMachineId = ensured.machineId;
             if (fileState.machineId !== ensuredMachineId) {
               const nextState: DaemonLocallyPersistedState = {
@@ -8143,11 +8141,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 machineId: ensuredMachineId,
               };
               if (!writeDaemonStateIfLockOwned(nextState)) {
-                return;
+                return false;
               }
               fileState.machineId = ensuredMachineId;
             }
             machineId = ensuredMachineId;
+            return true;
+        },
+        attachMachine: async (ensured) => {
             const machine = ensured.machine;
             logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
 
@@ -8553,24 +8554,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             }
 
             return;
-          } catch (error) {
-            if (!shouldRetryMachineRegistrationError(error)) {
-              logger.warn('[DAEMON RUN] Machine registration rejected (non-retryable); giving up', {
-                ...(isMachineContentPublicKeyMismatchError(error) ? { reason: error.reason } : {}),
-                ...(serializeAxiosErrorForLog(error) as any),
-              });
-              return;
-            }
-
-            attempts += 1;
-            if (machineRegistrationMaxAttempts > 0 && attempts >= machineRegistrationMaxAttempts) {
-              logger.warn('[DAEMON RUN] Machine registration failed too many times; giving up', {
-                attempt: attempts,
-              });
-              return;
-            }
-
-            const retryDelayMs = Math.min(
+        },
+        retry: {
+          maxAttempts: machineRegistrationMaxAttempts,
+          shouldRetry: shouldRetryMachineRegistrationError,
+          delayForAttempt: (attempts) => Math.min(
               machineRegistrationRetryEffectiveMaxDelayMs,
               computeRestartDelayMs({
                 attempt: attempts,
@@ -8579,8 +8567,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 jitterMs: machineRegistrationRetryJitterMs,
                 random: () => Math.random(),
               }),
-            );
-
+            ),
+          wait: (retryDelayMs) => sleepMsOrShutdown(retryDelayMs, resolvesWhenShutdownRequested),
+          reportRejected: (error) => {
+              logger.warn('[DAEMON RUN] Machine registration rejected (non-retryable); giving up', {
+                ...(isMachineContentPublicKeyMismatchError(error) ? { reason: error.reason } : {}),
+                ...(serializeAxiosErrorForLog(error) as any),
+              });
+          },
+          reportExhausted: (attempts) => {
+              logger.warn('[DAEMON RUN] Machine registration failed too many times; giving up', {
+                attempt: attempts,
+              });
+          },
+          reportRetry: (error, attempts, retryDelayMs) => {
             // IMPORTANT: Do not log raw Axios errors here; they can contain bearer tokens.
             logger.warn(
               '[DAEMON RUN] Machine registration unavailable; retrying',
@@ -8590,18 +8590,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 error: serializeAxiosErrorForLog(error),
               },
             );
-
-            if (shutdownInitiated) {
-              return;
-            }
-
-            const sleepResult = await sleepMsOrShutdown(retryDelayMs, resolvesWhenShutdownRequested);
-            if (sleepResult === 'shutdown') {
-              return;
-            }
-          }
-        }
-      })();
+          },
+        },
+      });
 
     // Every 60 seconds:
     // 1. Prune stale sessions
