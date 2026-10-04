@@ -59,9 +59,14 @@ vi.mock('@/ui/logger', () => ({
 
 vi.mock('@/rpc/handlers/registerSessionHandlers', () => ({ registerSessionHandlers: vi.fn() }));
 vi.mock('@/rpc/handlers/scm', () => ({ registerScmHandlers: vi.fn() }));
-vi.mock('@/rpc/handlers/fileSystem', () => ({ registerFileSystemHandlers: vi.fn() }));
+vi.mock('@/rpc/handlers/fileSystem', () => ({
+  // 夹具按正式注册契约返回生命周期及同一上传上限，避免构造阶段先失败。
+  registerFileSystemHandlers: vi.fn(() => ({ dispose: async () => {}, attachmentUploadMaxBytes: 2048 })),
+}));
 vi.mock('@/rpc/handlers/machineFileBrowser/registerMachineFileBrowserHandlers', () => ({ registerMachineFileBrowserHandlers: vi.fn() }));
-vi.mock('./machine/rpcHandlers', () => ({ registerMachineRpcHandlers: vi.fn() }));
+vi.mock('./machine/rpcHandlers', () => ({
+  registerMachineRpcHandlers: vi.fn(() => ({ dispose: async () => {} })),
+}));
 vi.mock('./rpc/RpcHandlerManager', () => ({
   RpcHandlerManager: class {
     constructor(config: Record<string, unknown>) {
