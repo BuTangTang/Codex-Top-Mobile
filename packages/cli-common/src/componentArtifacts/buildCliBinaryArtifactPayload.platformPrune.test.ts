@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,7 +38,7 @@ async function createRepo(): Promise<{ repoRoot: string; payloadDir: string }> {
   await writeFixture(join(repoRoot, 'package.json'), JSON.stringify({ name: 'fixture', private: true }));
   await writeFixture(join(repoRoot, 'yarn.lock'), '');
   await writeFixture(join(repoRoot, 'apps/cli/package.json'), JSON.stringify({
-    name: '@happier-dev/cli', version: '0.0.0', bundledDependencies: [], dependencies: {},
+    name: '@happier-dev/cli', version: '0.0.0', bundledDependencies: [], dependencies: { sharp: '0.34.5' },
   }));
   await writeFixture(join(repoRoot, 'apps/cli/src/index.ts'), 'export {};');
   for (const name of ['childProcessOptions.cjs', 'claude_launcher_runtime.cjs', 'claude_local_launcher.cjs',
@@ -67,10 +67,35 @@ async function createRepo(): Promise<{ repoRoot: string; payloadDir: string }> {
       await writeFixture(join(onnxRoot, 'bin/napi-v3', platform, arch, 'runtime-library'), `fixture-library-${platform}-${arch}`);
     }
   }
+  const sharpRoot = join(repoRoot, 'node_modules/sharp');
+  const addonName = '@img/sharp-darwin-arm64';
+  const libvipsName = '@img/sharp-libvips-darwin-arm64';
+  await writeFixture(join(sharpRoot, 'package.json'), JSON.stringify({
+    name: 'sharp', version: '0.34.5', main: 'lib/index.js', type: 'commonjs',
+    optionalDependencies: { [addonName]: '0.34.5', [libvipsName]: '1.2.4' },
+  }));
+  await writeFixture(join(sharpRoot, 'lib/index.js'), 'module.exports = {};');
+  await writeFixture(join(sharpRoot, 'node_modules', addonName, 'package.json'), JSON.stringify({
+    name: addonName, version: '0.34.5', type: 'commonjs', os: ['darwin'], cpu: ['arm64'],
+    optionalDependencies: { [libvipsName]: '1.2.4' },
+    exports: { './sharp.node': './lib/sharp-darwin-arm64.node', './package': './package.json' },
+  }));
+  await writeFixture(join(sharpRoot, 'node_modules', addonName, 'lib/sharp-darwin-arm64.node'), 'fixture-addon');
+  const libvipsRoot = join(sharpRoot, 'node_modules', libvipsName);
+  await writeFixture(join(libvipsRoot, 'package.json'), JSON.stringify({
+    name: libvipsName, version: '1.2.4', type: 'commonjs', os: ['darwin'], cpu: ['arm64'],
+    exports: { './lib': './lib/index.js', './package': './package.json', './versions': './versions.json' },
+  }));
+  await writeFixture(join(libvipsRoot, 'README.md'), 'fixture license notices');
+  await writeFixture(join(libvipsRoot, 'versions.json'), JSON.stringify({ vips: '8.17.3' }));
+  await writeFixture(join(libvipsRoot, 'lib/index.js'), 'module.exports = __dirname;');
+  await writeFixture(join(libvipsRoot, 'lib/glib-2.0/include/glibconfig.h'), 'fixture-glib');
+  await writeFixture(join(libvipsRoot, 'lib/libvips-cpp.8.17.3.dylib'), 'fixture-native-library');
+  await mkdir(join(libvipsRoot, 'node_modules'));
   return { repoRoot, payloadDir: join(repoRoot, 'payload') };
 }
 
-describe('canonical CLI payload ONNX platform pruning', () => {
+describe('canonical CLI payload platform pruning and Sharp deduplication', () => {
   afterEach(async () => {
     await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
@@ -98,5 +123,30 @@ describe('canonical CLI payload ONNX platform pruning', () => {
     expect(await fileHashes(join(repoRoot, ...onnxSegments))).toEqual(before);
     expect(existsSync(join(payloadDir, 'happier'))).toBe(true);
     expect(existsSync(join(payloadDir, 'package-dist/.build-manifest.json'))).toBe(true);
+  });
+
+  it('deduplicates identical libvips packages inside the vendored Sharp container without changing source files', async () => {
+    const { repoRoot, payloadDir } = await createRepo();
+    const source = join(repoRoot, 'node_modules/sharp');
+    const before = await fileHashes(source);
+    await buildCliBinaryArtifactPayload({
+      repoRoot, payloadDir,
+      target: { bunTarget: 'bun-darwin-arm64', os: 'darwin', arch: 'arm64', exeExt: '' },
+      commandProbe: (command) => command === 'bun' || command === 'yarn',
+      ensureWorkspacePackagesBuiltByName: async (_root, names) => ({ ok: true, built: [], skipped: names }),
+      runCommand: async () => {
+        const entrypoint = join(repoRoot, 'apps/cli/dist/index.mjs');
+        await writeFixture(entrypoint, 'export const fixture = true;');
+        cliDistBuildManifest.writeCliDistBuildManifest(entrypoint);
+      },
+      compileBinary: async ({ outfile }) => { await writeFixture(outfile, 'fixture-compiled-binary'); },
+    });
+    const retained = join(payloadDir, 'node_modules/sharp/node_modules/@img/sharp-libvips-darwin-arm64');
+    const nested = join(payloadDir, 'node_modules/sharp/node_modules/@img/sharp-darwin-arm64/node_modules/@img/sharp-libvips-darwin-arm64');
+    expect((await lstat(nested)).isSymbolicLink()).toBe(true);
+    expect(await readlink(nested)).toBe('../../../sharp-libvips-darwin-arm64');
+    expect(await realpath(nested)).toBe(await realpath(retained));
+    expect(await fileHashes(retained)).toEqual(await fileHashes(join(source, 'node_modules/@img/sharp-libvips-darwin-arm64')));
+    expect(await fileHashes(source)).toEqual(before);
   });
 });

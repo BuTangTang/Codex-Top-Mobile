@@ -21,6 +21,7 @@ import { finalizeRuntimeArtifactPayload } from './finalizeRuntimeArtifactPayload
 import { recordCliBinaryArtifactRuntimeAssetBuildManifest } from './refreshCliBinaryArtifactRuntimeAssetBuildManifest.js';
 import { shouldReuseCliDistSnapshot } from './shouldReuseCliDistSnapshot.js';
 import { pruneCliOnnxRuntimePlatforms } from './pruneCliOnnxRuntimePlatforms.js';
+import { deduplicateCliSharpLibvipsPackage } from './deduplicateCliSharpLibvipsPackage.js';
 
 const CLI_RUNTIME_SIDECAR_ENTRIES = [
   ['childProcessOptions.cjs'],
@@ -173,7 +174,7 @@ async function snapshotCliDistDir(params: Readonly<{ cliDir: string; distDir: st
   }
 }
 
-/** 构建完整运行闭包，只在签名前按目标 OS 裁剪已核实的非本平台 ONNX 二进制。 */
+/** 构建完整运行闭包，签名前仅裁已核实的 ONNX 平台文件并去重 Sharp 容器内相同副本。 */
 export async function buildCliBinaryArtifactPayload({
   repoRoot,
   payloadDir,
@@ -296,6 +297,7 @@ export async function buildCliBinaryArtifactPayload({
   await copyCliRuntimeSidecars(repoRoot, payloadDir);
   await copyCliRuntimeTools(repoRoot, payloadDir, target);
   await pruneCliOnnxRuntimePlatforms({ payloadDir, targetOs: target.os });
+  await deduplicateCliSharpLibvipsPackage({ payloadDir, targetOs: target.os, targetArch: target.arch });
   await finalizeRuntimeArtifactPayload(payloadDir);
   recordCliBinaryArtifactRuntimeAssetBuildManifest({
     payloadDir,
