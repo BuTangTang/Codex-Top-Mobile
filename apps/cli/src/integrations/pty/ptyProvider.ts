@@ -7,7 +7,9 @@ import {
   resolveRuntimeRootsFromLaunchedProcess,
 } from '@/runtime/resolveRuntimeEntrypointArgv';
 import { isEmbeddedBunBundlePath } from '@/runtime/js/isEmbeddedBunBundlePath';
+import { CLI_PRODUCT_CAPABILITIES } from '@/runtime/productCapabilities';
 import { logger } from '@/ui/logger';
+import { createBunPtyProvider } from './bunPtyProvider';
 import { createNodePtyRelayProvider } from './nodePtyRelayProvider';
 import { createPythonPtyRelayProvider } from './pythonPtyRelayProvider';
 
@@ -278,6 +280,10 @@ export function createNodePtyProvider(params?: Readonly<{
   currentExecPath?: string;
 }>): PtyProvider {
   const platform = params?.platform ?? process.platform;
+  // 产品包携带 Bun；macOS 下使用其原生 PTY，避开 node-pty 的异步 EAGAIN 挂起。
+  if (CLI_PRODUCT_CAPABILITIES.id === 'codex-top' && platform === 'darwin' && process.versions.bun) {
+    return createBunPtyProvider();
+  }
   const currentExecPath = params?.currentExecPath ?? process.execPath;
   const requireBase = resolvePtyProviderRequireBase({
     argv: params?.argv,

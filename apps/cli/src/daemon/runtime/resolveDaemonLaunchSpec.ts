@@ -1,9 +1,11 @@
-import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 
 import { parseOptionalBooleanEnv } from '@happier-dev/protocol';
+import cliDistBuildManifest from '@happier-dev/cli-common/cliDistBuildManifest';
 
 import { projectPath } from '@/projectPath';
+import { CLI_PRODUCT_CAPABILITIES } from '@/runtime/productCapabilities';
 import { resolvePackagedRuntimeEntrypoint } from '@/runtime/resolvePackagedRuntimeEntrypoint';
 import { ensureJavaScriptRuntimeExecutable } from '@/runtime/js/ensureJavaScriptRuntimeExecutable';
 import { isEmbeddedBunBundlePath } from '@/runtime/js/isEmbeddedBunBundlePath';
@@ -177,10 +179,52 @@ function resolveWindowsSiblingPackagedBinary(packagedEntrypoint: string): string
   return siblingBinaryNativeSeparators;
 }
 
+/** 产品的磁盘 JS 只使用同包物理 Bun 和原完整性 owner；缺证据时禁止 HOME/Node 回退。 */
+function resolveCodexTopBundledBunLaunchSpec(cliArgs: readonly string[]): DaemonLaunchSpec {
+  const entrypoint = String(process.argv[1] ?? '');
+  const currentExecPath = String(process.execPath ?? '');
+  const runtimeRoot = dirname(dirname(entrypoint));
+  const bundledBun = join(runtimeRoot, 'runtime', 'bun');
+  if (
+    !process.versions.bun
+    || !isAbsolute(entrypoint)
+    || basename(entrypoint) !== 'index.mjs'
+    || basename(dirname(entrypoint)) !== 'package-dist'
+    || currentExecPath !== bundledBun
+  ) {
+    throw new Error('Codex Top bundled Bun layout is invalid');
+  }
+  try {
+    // 绝对路径必须指向同包实际文件；父目录符号链接也不能把 Bun 或 JS 带到包外。
+    if (
+      realpathSync(entrypoint) !== entrypoint
+      || realpathSync(bundledBun) !== bundledBun
+      || !lstatSync(entrypoint).isFile()
+    ) {
+      throw new Error('invalid physical layout');
+    }
+  } catch {
+    throw new Error('Codex Top bundled Bun physical layout is invalid');
+  }
+  const integrity = cliDistBuildManifest.readCliRuntimeAssetIntegrity({
+    runtimeRoot,
+    entrypoint,
+    relativePath: 'runtime/bun',
+  });
+  if (!integrity.ok) {
+    throw new Error(`Codex Top bundled Bun integrity check failed: ${integrity.reason}`);
+  }
+  return { filePath: bundledBun, args: [entrypoint, ...cliArgs] };
+}
+
 export async function resolveDaemonLaunchSpec(
   cliArgs: readonly string[],
   env: Readonly<NodeJS.ProcessEnv> = process.env,
 ): Promise<DaemonLaunchSpec> {
+  // 编译型入口沿用原二进制分支；产品磁盘入口先验证固定布局，不调用泛用 runtime 解析。
+  if (CLI_PRODUCT_CAPABILITIES.id === 'codex-top' && !isEmbeddedBunBundlePath(String(process.argv[1] ?? ''))) {
+    return resolveCodexTopBundledBunLaunchSpec(cliArgs);
+  }
   const bundledCurrentProcessLaunchSpec = resolveBundledCurrentProcessLaunchSpec(cliArgs, env);
   if (bundledCurrentProcessLaunchSpec) {
     return bundledCurrentProcessLaunchSpec;
