@@ -7,6 +7,8 @@ import { AGENT_IDS, DEFAULT_AGENT_ID } from '@happier-dev/agents';
 import { AGENTS_CORE } from '@happier-dev/agents';
 import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 import type { ConnectedServicesProviderMaterializer } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
+import type { DirectSessionsProviderId } from '@happier-dev/protocol';
+import type { DirectSessionProviderOps } from './directSessions/providerOps';
 
 import * as catalog from './catalog';
 import {
@@ -28,6 +30,114 @@ import {
   requireCatalogEntry,
 } from './catalog';
 import { DEFAULT_CATALOG_AGENT_ID } from './types';
+
+describe('direct-session catalog cache boundaries', () => {
+  it('checks the current mutable hook before consulting a successful cache', async () => {
+    const providerId = '__direct_mutable__' as DirectSessionsProviderId;
+    const template = AGENTS.codex;
+    if (!template) throw new Error('Missing codex catalog entry');
+    const ops: DirectSessionProviderOps = { listCandidates: async () => ({ candidates: [], nextCursor: null }) };
+    const contexts: unknown[] = [];
+    const firstLoader = vi.fn(function (this: unknown) {
+      contexts.push(this);
+      return Promise.resolve(ops);
+    });
+    const replacementLoader = vi.fn(async () => ({ ...ops }));
+    AGENTS[providerId] = { ...template, getDirectSessionProviderOps: firstLoader };
+    try {
+      const first = getDirectSessionProviderOps(providerId);
+      expect(firstLoader).toHaveBeenCalledOnce();
+      expect(contexts).toEqual([undefined]);
+      await expect(first).resolves.toBe(ops);
+
+      AGENTS[providerId] = { ...template, getDirectSessionProviderOps: replacementLoader };
+      await expect(getDirectSessionProviderOps(providerId)).resolves.toBe(ops);
+      expect(replacementLoader).not.toHaveBeenCalled();
+      delete AGENTS[providerId];
+      await expect(getDirectSessionProviderOps(providerId)).rejects.toThrow(`Missing direct-session provider ops for ${providerId}`);
+      AGENTS[providerId] = { ...template, getDirectSessionProviderOps: undefined };
+      await expect(getDirectSessionProviderOps(providerId)).rejects.toThrow(`Missing direct-session provider ops for ${providerId}`);
+      AGENTS[providerId] = { ...template, getDirectSessionProviderOps: replacementLoader };
+      await expect(getDirectSessionProviderOps(providerId)).resolves.toBe(ops);
+      expect(replacementLoader).not.toHaveBeenCalled();
+    } finally {
+      delete AGENTS[providerId];
+    }
+  });
+
+  it('shares concurrent loads and retries asynchronous failure without hiding current hook removal', async () => {
+    const providerId = '__direct_retry__' as DirectSessionsProviderId;
+    const template = AGENTS.codex;
+    if (!template) throw new Error('Missing codex catalog entry');
+    const failure = new Error('synthetic direct load failure');
+    const ops: DirectSessionProviderOps = { listCandidates: async () => ({ candidates: [], nextCursor: null }) };
+    let resolveRetry!: (value: DirectSessionProviderOps) => void;
+    const retry = new Promise<DirectSessionProviderOps>((resolve) => { resolveRetry = resolve; });
+    const loader = vi.fn<() => Promise<DirectSessionProviderOps>>()
+      .mockRejectedValueOnce(failure)
+      .mockImplementationOnce(() => retry);
+    AGENTS[providerId] = { ...template, getDirectSessionProviderOps: loader };
+    try {
+      const failed = await Promise.allSettled([getDirectSessionProviderOps(providerId), getDirectSessionProviderOps(providerId)]);
+      expect(failed).toEqual([{ status: 'rejected', reason: failure }, { status: 'rejected', reason: failure }]);
+      expect(loader).toHaveBeenCalledOnce();
+      const firstRetry = getDirectSessionProviderOps(providerId);
+      const secondRetry = getDirectSessionProviderOps(providerId);
+      expect(loader).toHaveBeenCalledTimes(2);
+      delete AGENTS[providerId];
+      await expect(getDirectSessionProviderOps(providerId)).rejects.toThrow(`Missing direct-session provider ops for ${providerId}`);
+      resolveRetry(ops);
+      expect(await Promise.all([firstRetry, secondRetry])).toEqual([ops, ops]);
+      AGENTS[providerId] = { ...template, getDirectSessionProviderOps: loader };
+      await expect(getDirectSessionProviderOps(providerId)).resolves.toBe(ops);
+      expect(loader).toHaveBeenCalledTimes(2);
+    } finally {
+      delete AGENTS[providerId];
+    }
+  });
+
+  it('keeps the named async wrapper and immediate loader timing after synchronous failure', async () => {
+    const providerId = '__direct_sync__' as DirectSessionsProviderId;
+    const template = AGENTS.codex;
+    if (!template) throw new Error('Missing codex catalog entry');
+    const failure = new Error('synthetic synchronous load failure');
+    const events: string[] = [];
+    const ops: DirectSessionProviderOps = { listCandidates: async () => ({ candidates: [], nextCursor: null }) };
+    const loader = vi.fn<() => Promise<DirectSessionProviderOps>>()
+      .mockImplementationOnce(() => { throw failure; })
+      .mockImplementationOnce(() => { events.push('loader'); return Promise.resolve(ops); });
+    AGENTS[providerId] = { ...template, getDirectSessionProviderOps: loader };
+    try {
+      expect(getDirectSessionProviderOps.name).toBe('getDirectSessionProviderOps');
+      expect(getDirectSessionProviderOps.constructor.name).toBe('AsyncFunction');
+      let failed: Promise<DirectSessionProviderOps> | undefined;
+      expect(() => { failed = getDirectSessionProviderOps(providerId); }).not.toThrow();
+      expect(loader).toHaveBeenCalledOnce();
+      await expect(failed).rejects.toBe(failure);
+      const recovered = getDirectSessionProviderOps(providerId);
+      events.push('caller');
+      void recovered.then(() => { events.push('resolved'); });
+      queueMicrotask(() => { events.push('queued'); });
+      expect(events).toEqual(['loader', 'caller']);
+      await Promise.resolve();
+      expect(events).toEqual(['loader', 'caller', 'queued']);
+      await Promise.resolve();
+      expect(events).toEqual(['loader', 'caller', 'queued', 'resolved']);
+      await expect(recovered).resolves.toBe(ops);
+      expect(loader).toHaveBeenCalledTimes(2);
+    } finally {
+      delete AGENTS[providerId];
+    }
+  });
+
+  it('rejects unknown or altered provider ids without defaulting or normalization', async () => {
+    for (const input of ['__missing_direct__', 'CODEX', ' codex ']) {
+      const providerId = input as DirectSessionsProviderId;
+      await expect(getDirectSessionProviderOps(providerId)).rejects.toThrow(`Missing direct-session provider ops for ${providerId}`);
+      await expect(getDirectSessionProviderOps(providerId)).rejects.toThrow(`Missing direct-session provider ops for ${providerId}`);
+    }
+  });
+});
 
 describe('AGENTS', () => {
   it('distinguishes providers without attachment-bound control descriptors from missing descriptors', async () => {

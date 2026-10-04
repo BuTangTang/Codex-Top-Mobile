@@ -1,4 +1,6 @@
 import type { AgentId } from '@/agent/core';
+import { getOrLoadCatalogHookPromise } from './catalogHookPromiseCache';
+import { createDirectSessionProviderOpsResolver } from './directSessions/createDirectSessionProviderOpsResolver';
 import { AGENTS_CORE } from '@happier-dev/agents';
 import {
   type ConnectedServiceId,
@@ -105,7 +107,8 @@ export async function resolveTerminalAttachmentControlDescriptorStatusThroughCat
 }
 
 const cachedVendorResumeSupportPromises = new Map<CatalogAgentId, Promise<VendorResumeSupportFn>>();
-const cachedDirectSessionProviderOpsPromises = new Map<DirectSessionsProviderId, Promise<DirectSessionProviderOps>>();
+// 默认注册表仍可变；共享解析器逐调用读取当前条目，且此入口只创建一份缓存。
+const resolveDirectSessionProviderOps = createDirectSessionProviderOpsResolver((providerId) => AGENTS[providerId]);
 const cachedProviderAttachOpsPromises = new Map<CatalogAgentId, Promise<ProviderAttachOps | null>>();
 const cachedConnectedServiceMaterializerPromises = new Map<CatalogAgentId, Promise<ConnectedServicesProviderMaterializer | null>>();
 const cachedConnectedServiceRuntimeAuthAdapterPromises = new Map<CatalogAgentId, Promise<ConnectedServiceProviderRuntimeAuthAdapter | null>>();
@@ -116,24 +119,6 @@ const cachedSessionGoalControlAdapterPromises = new Map<CatalogAgentId, Promise<
 const cachedSessionUsageLimitRecoveryControlAdapterPromises = new Map<CatalogAgentId, Promise<SessionUsageLimitRecoveryControlAdapter | null>>();
 const cachedAcpForkContinuationHandlerPromises = new Map<CatalogAgentId, Promise<AcpForkContinuationHandler | null>>();
 const cachedProviderNativeForkHandlerPromises = new Map<CatalogAgentId, Promise<ProviderNativeForkHandler | null>>();
-
-function getOrLoadCatalogHookPromise<TKey, TValue>(
-  cache: Map<TKey, Promise<TValue>>,
-  key: TKey,
-  load: () => Promise<TValue>,
-): Promise<TValue> {
-  const existing = cache.get(key);
-  if (existing) return existing;
-
-  const promise = load();
-  cache.set(key, promise);
-  void promise.catch(() => {
-    if (cache.get(key) === promise) {
-      cache.delete(key);
-    }
-  });
-  return promise;
-}
 
 export async function getVendorResumeSupport(agentId?: AgentId | null): Promise<VendorResumeSupportFn> {
   const catalogId = resolveCatalogAgentId(agentId);
@@ -160,17 +145,9 @@ export async function getVendorResumeSupport(agentId?: AgentId | null): Promise<
   });
 }
 
+/** 保留原公开异步函数及单个 await，解析与缓存规则由共享叶负责。 */
 export async function getDirectSessionProviderOps(providerId: DirectSessionsProviderId): Promise<DirectSessionProviderOps> {
-  const entry = AGENTS[providerId];
-  if (!entry?.getDirectSessionProviderOps) {
-    throw new Error(`Missing direct-session provider ops for ${providerId}`);
-  }
-
-  return await getOrLoadCatalogHookPromise(
-    cachedDirectSessionProviderOpsPromises,
-    providerId,
-    entry.getDirectSessionProviderOps,
-  );
+  return await resolveDirectSessionProviderOps(providerId);
 }
 
 export async function getProviderAttachOps(agentId?: AgentId | null): Promise<ProviderAttachOps | null> {
