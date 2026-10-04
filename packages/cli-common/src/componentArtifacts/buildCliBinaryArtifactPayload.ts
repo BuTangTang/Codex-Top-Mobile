@@ -22,6 +22,7 @@ import { recordCliBinaryArtifactRuntimeAssetBuildManifest } from './refreshCliBi
 import { shouldReuseCliDistSnapshot } from './shouldReuseCliDistSnapshot.js';
 import { pruneCliOnnxRuntimePlatforms } from './pruneCliOnnxRuntimePlatforms.js';
 import { deduplicateCliSharpLibvipsPackage } from './deduplicateCliSharpLibvipsPackage.js';
+import { buildCodexTopBinaryArtifactPayload } from './buildCodexTopBinaryArtifactPayload.js';
 
 const CLI_RUNTIME_SIDECAR_ENTRIES = [
   ['childProcessOptions.cjs'],
@@ -186,6 +187,7 @@ export async function buildCliBinaryArtifactPayload({
   compileBinary = compileBunBinary,
   minifySyntaxWhitespace = false,
   ensureWorkspacePackagesBuiltByName,
+  artifactProfile = 'happier',
 }: {
   repoRoot: string;
   payloadDir: string;
@@ -198,11 +200,19 @@ export async function buildCliBinaryArtifactPayload({
   /** 仅由选择该策略的产品启用；省略时保持通用 CLI 的编译参数。 */
   minifySyntaxWhitespace?: boolean;
   ensureWorkspacePackagesBuiltByName?: EnsureWorkspacePackagesBuiltByName;
+  artifactProfile?: 'happier' | 'codex-top';
 }): Promise<{ executableName: string; entrypoint: string }> {
   const bunCommand = resolveBunCommand({ commandProbe });
   if (!bunCommand) {
     throw new Error('[component-artifacts] bun is required to build CLI binary artifacts');
   }
+
+  if (artifactProfile === 'codex-top') {
+    if (externals.length) throw new Error('Codex Top product externals are defined by its artifact profile');
+    return buildCodexTopBinaryArtifactPayload({ repoRoot, payloadDir, target, releaseVersion, bunCommand,
+      runCommand, ensureWorkspacePackagesBuiltByName });
+  }
+  if (artifactProfile !== 'happier') throw new Error('Unknown CLI artifact profile');
 
   const cliDir = join(repoRoot, 'apps', 'cli');
   const distDir = join(cliDir, 'dist');

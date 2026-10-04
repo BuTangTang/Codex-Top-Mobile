@@ -35,7 +35,7 @@ async function reclaimAbandonedCliBuildDirs(packageRoot, activeOutputDir) {
     .map((entryPath) => rm(entryPath, { recursive: true, force: true })));
 }
 
-async function createImmutableBuildSource({ packageRoot, buildVersion = '' }) {
+export async function createImmutableBuildSource({ packageRoot, buildVersion = '' }) {
   if (!existsSync(join(packageRoot, 'src'))) {
     return {
       packageRoot,
