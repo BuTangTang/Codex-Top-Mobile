@@ -300,3 +300,9 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) for developme
 ## License
 
 MIT
+
+## Development: command loading
+
+The command registry loads built-in handlers when their command is selected. Keep dynamic import paths as string literals so the bundler can include the modules, and keep public aliases pointing to the same handler wrapper. Authentication loads AuthSelector, Ink and React only when the interactive method selector is needed; explicit auth methods and noninteractive flows retain their existing behavior.
+
+From this directory, run `yarn vitest run --config vitest.config.ts src/cli/commandRegistry.importBoundary.test.ts` to check the loading boundary, real command dispatch, and auth selection/cancellation. For a compiled CLI, also exercise actual handlers: `plugins list --json`, `status --yes` (expected read-only error), and `auth --help`. Use non-TTY subprocesses with a clean environment, temporary `HOME`/`CODEX_HOME`/`HAPPIER_HOME_DIR`, `HAPPIER_CLI_UPDATE_CHECK=0`, `HAPPIER_CLI_RUNTIME_DISABLE=1`, and `HAPPIER_SESSION_AUTOSTART_DAEMON=0`. Do not enable the entry integrity-probe flag, which skips dispatch. An entry import or `--version` alone does not exercise deferred handlers. Module-load probes do not establish memory savings for the installed daemon.

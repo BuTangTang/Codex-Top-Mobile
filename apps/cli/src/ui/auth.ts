@@ -9,9 +9,7 @@ import { writeCredentialsLegacy, readCredentials, readSettings, updateSettings, 
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { sanitizeServerIdForFilesystem } from "@/server/serverId";
 import { openBrowser } from '@/ui/openBrowser';
-import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
-import { render } from 'ink';
-import React from 'react';
+import type { AuthMethod } from "./ink/AuthSelector";
 import { randomUUID } from 'node:crypto';
 import { logger } from './logger';
 import { ensureDaemonRunningForSessionCommand, shouldAutoStartDaemonAfterAuth } from '@/daemon/ensureDaemon';
@@ -366,7 +364,13 @@ async function postTerminalAuthRequestCompatible(params: Readonly<{
 /**
  * Display authentication method selector and return user choice
  */
-function selectAuthenticationMethod(): Promise<AuthMethod | null> {
+async function selectAuthenticationMethod(): Promise<AuthMethod | null> {
+    // 只有交互式选择才加载终端界面，凭据检查与常驻服务不提前初始化 React / Ink。
+    const [{ AuthSelector }, { render }, { default: React }] = await Promise.all([
+        import('./ink/AuthSelector'),
+        import('ink'),
+        import('react'),
+    ]);
     return new Promise((resolve) => {
         let hasResolved = false;
 
